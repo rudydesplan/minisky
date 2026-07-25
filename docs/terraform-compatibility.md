@@ -50,20 +50,26 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_bigquery_table` | Profile-persisted table and schema metadata CRUD | Synchronous | Table reference is read through the canonical endpoint |
 | `google_service_account` | Profile-persisted service-account metadata CRUD | Synchronous | Account email is read through the canonical endpoint |
 | `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
-| `google_redis_instance` | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint |
-| `google_spanner_instance` | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint |
-| `google_spanner_database` | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint |
+| `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
+| `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
+| `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
 
 The table sets `deletion_protection = false`, and the dataset sets
 `delete_contents_on_destroy = true`, so the example can be destroyed
 reproducibly. BigQuery and IAM metadata survive daemon restart. Storage bucket
 data belongs to the Docker emulator and is not part of MiniSky state export.
+The fixture uses `US-CENTRAL1`, the location returned consistently by the
+current pinned `fake-gcs-server` backend, so refresh remains drift-free.
+Bucket labels are omitted because that backend does not persist them.
 
-The Redis and Spanner resources are local-profile-only because
-`emulator-config` is not a production Spanner configuration. Resources not
-listed above are not claimed as Terraform-compatible. In particular, the
-tracked stack excludes Compute, Cloud SQL, serverless, GKE/Kind, and Compute
-load-balancer resources. See
+The Redis and Spanner resources are disabled by default and local-profile-only
+because `emulator-config` is not a production Spanner configuration. Enable
+them with `enable_phase15_resources = true`; their outputs are `null` while
+disabled. The guarded Terraform script accepts `MINISKY_TERRAFORM_PHASE15=1`,
+but the separate Phase-15 emulator integration remains the authoritative
+data-plane gate. Resources not listed above are not claimed as
+Terraform-compatible. In particular, the tracked stack excludes Compute,
+Cloud SQL, serverless, GKE/Kind, and Compute load-balancer resources. See
 `docs/service-compatibility.md` for their implementation status; API routes
 alone do not establish provider compatibility.
 
@@ -76,6 +82,7 @@ canonical gateway paths:
 
 - BigQuery: `${MINISKY_ENDPOINT}/_minisky/bigquery/bigquery/v2/`
 - IAM: `${MINISKY_ENDPOINT}/_minisky/iam/v1/`
+- IAM Credentials: `${MINISKY_ENDPOINT}/_minisky/iamcredentials/` (the generated clients append `v1/`)
 - Storage: `${MINISKY_ENDPOINT}/_minisky/storage/storage/v1/`
 
 Each program creates, reads, and deletes a uniquely named BigQuery dataset and
@@ -120,7 +127,17 @@ loopback ports, and runs `sdk-smoke/phase15`. That Go SDK smoke proves Firestore
 document CRUD/query, Datastore entity CRUD/ancestor query, and Spanner
 instance/database/DDL/insert/read/delete behavior. It requires
 `MINISKY_PHASE15_INTEGRATION=1` and refuses existing MiniSky container or
-network collisions.
+network collisions. Before starting MiniSky it explicitly pulls missing heavy
+emulator images, with a 600-second per-image default timeout configurable via
+`MINISKY_PHASE15_PULL_TIMEOUT_SECONDS`, and prints the pull log on failure.
+
+Live local evidence on 2026-07-25: the default Terraform gate applied seven
+resources, passed direct assertions plus Go/Python SDK smokes, produced a
+zero-change plan, destroyed all seven resources, and passed post-destroy 404
+checks. The separate Phase-15 gate also passed after public emulator images
+were pulled with an isolated Docker client configuration; its SDK smoke covered
+Firestore document CRUD/query, Datastore entity CRUD/ancestor queries, and
+Spanner instance/database/DDL/insert/read/delete behavior.
 
 The Docker-backed `terraform-integration` job is opt-in because starting
 MiniSky requires a Docker network. It runs for:
@@ -134,8 +151,9 @@ containers or networks, uses isolated ports, home, provider data, and state,
 and installs cleanup traps. It then builds and starts MiniSky, runs
 `init`/`validate`/`apply`, asserts the tracked resources over canonical
 `/_minisky` endpoints, runs both SDK smoke suites, requires a zero-exit
-no-drift plan, destroys the stack, and verifies that each resource returns
-`404`.
+no-drift plan, destroys the stack, and verifies that each enabled resource
+returns `404`. Redis and Spanner are excluded unless
+`MINISKY_TERRAFORM_PHASE15=1` is set.
 
 The separate opt-in `state-durability-integration` workflow runs the persisted
 BigQuery/IAM subset through create → restart → no-drift → metadata export →

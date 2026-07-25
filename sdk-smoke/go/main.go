@@ -56,7 +56,7 @@ func run() error {
 		return fmt.Errorf("create IAM client: %w", err)
 	}
 	credentialsService, err := iamcredentials.NewService(ctx, append(clientOptions,
-		option.WithEndpoint(gateway+"/_minisky/iamcredentials/v1/"),
+		option.WithEndpoint(gateway+"/_minisky/iamcredentials/"),
 	)...)
 	if err != nil {
 		return fmt.Errorf("create IAM Credentials client: %w", err)

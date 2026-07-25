@@ -6,16 +6,17 @@ RUN npm ci
 COPY ui/ ./
 RUN npm run build
 ARG TARGETARCH
+ARG PACK_VERSION=0.40.8
 RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64) pack_suffix="" ;; \
         arm64) pack_suffix="-arm64" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    asset="pack-v0.34.2-linux${pack_suffix}.tgz"; \
+    asset="pack-v${PACK_VERSION}-linux${pack_suffix}.tgz"; \
     cd /tmp; \
-    wget -q "https://github.com/buildpacks/pack/releases/download/v0.34.2/${asset}"; \
-    wget -q "https://github.com/buildpacks/pack/releases/download/v0.34.2/${asset}.sha256"; \
+    wget -q "https://github.com/buildpacks/pack/releases/download/v${PACK_VERSION}/${asset}"; \
+    wget -q "https://github.com/buildpacks/pack/releases/download/v${PACK_VERSION}/${asset}.sha256"; \
     sha256sum -c "${asset}.sha256"; \
     tar -xzf "${asset}" -C /usr/local/bin pack; \
     rm "${asset}" "${asset}.sha256"

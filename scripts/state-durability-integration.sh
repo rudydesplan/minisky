@@ -39,7 +39,23 @@ fi
 work_dir="$(mktemp -d)"
 minisky_pid=""
 active_profile=""
-applied=0
+run_profile="state-durability-$$"
+source_profile="${run_profile}-source"
+imported_profile="${run_profile}-imported"
+
+cleanup_profile_docker() {
+  local profile=$1
+  while IFS= read -r container; do
+    [[ -n "${container}" ]] && docker rm -f "${container}" >/dev/null 2>&1 || true
+  done < <(docker ps -aq \
+    --filter "label=managed-by=minisky" \
+    --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
+  network_manager="$(docker network inspect --format '{{index .Labels "managed-by"}}' minisky-net 2>/dev/null || true)"
+  network_profile="$(docker network inspect --format '{{index .Labels "minisky.profile"}}' minisky-net 2>/dev/null || true)"
+  if [[ "${network_manager}" == "minisky" && "${network_profile}" == "${profile}" ]]; then
+    docker network rm minisky-net >/dev/null 2>&1 || true
+  fi
+}
 
 cleanup() {
   exit_code=$?
@@ -48,6 +64,8 @@ cleanup() {
     kill -TERM "${minisky_pid}" 2>/dev/null || true
     wait "${minisky_pid}" 2>/dev/null || true
   fi
+  cleanup_profile_docker "${source_profile}"
+  cleanup_profile_docker "${imported_profile}"
   rm -rf "${work_dir}"
   rmdir "${lock_dir}" 2>/dev/null || true
   exit "${exit_code}"
@@ -69,7 +87,6 @@ ui_port="${MINISKY_DURABILITY_UI_PORT:-$(free_port)}"
 gateway="http://127.0.0.1:${api_port}"
 project_id="local-dev-project"
 dataset_id="minisky_durability"
-table_id="events"
 service_account_id="minisky-durability"
 service_account_email="${service_account_id}@${project_id}.iam.gserviceaccount.com"
 state_root="${work_dir}/state"
@@ -126,13 +143,12 @@ tf_vars=(
   -var="profile=local"
 )
 
-start_minisky source
+start_minisky "${source_profile}"
 terraform -chdir="${terraform_dir}" apply -auto-approve -input=false \
   "${tf_targets[@]}" "${tf_vars[@]}"
-applied=1
 stop_minisky
 
-start_minisky source
+start_minisky "${source_profile}"
 set +e
 terraform -chdir="${terraform_dir}" plan -detailed-exitcode -input=false \
   "${tf_targets[@]}" "${tf_vars[@]}"
@@ -143,15 +159,16 @@ if [[ "${plan_exit}" != "0" ]]; then
   exit "${plan_exit}"
 fi
 stop_minisky
+cleanup_profile_docker "${source_profile}"
 
-MINISKY_STATE_DIR="${state_root}" "${work_dir}/minisky" state --profile source export "${snapshot}"
-if [[ -e "${state_root}/profiles/imported" ]]; then
+MINISKY_STATE_DIR="${state_root}" "${work_dir}/minisky" state --profile "${source_profile}" export "${snapshot}"
+if [[ -e "${state_root}/profiles/${imported_profile}" ]]; then
   echo "Imported profile must be clean before state import." >&2
   exit 1
 fi
-MINISKY_STATE_DIR="${state_root}" "${work_dir}/minisky" state --profile imported import "${snapshot}"
+MINISKY_STATE_DIR="${state_root}" "${work_dir}/minisky" state --profile "${imported_profile}" import "${snapshot}"
 
-start_minisky imported
+start_minisky "${imported_profile}"
 set +e
 terraform -chdir="${terraform_dir}" plan -detailed-exitcode -input=false \
   "${tf_targets[@]}" "${tf_vars[@]}"
@@ -164,7 +181,6 @@ fi
 
 terraform -chdir="${terraform_dir}" destroy -auto-approve -input=false \
   "${tf_targets[@]}" "${tf_vars[@]}"
-applied=0
 
 dataset_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${project_id}/datasets/${dataset_id}"
 service_account_url="${gateway}/_minisky/iam/v1/projects/${project_id}/serviceAccounts/${service_account_email}"

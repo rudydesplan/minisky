@@ -21,7 +21,10 @@ import (
 	"time"
 )
 
-const networkName = "minisky-net"
+const (
+	networkName            = "minisky-net"
+	dockerImagePullTimeout = 2 * time.Minute
+)
 
 // ServiceManager handles native REST-driven lifecycle events over the Docker Unix Socket.
 type ServiceManager struct {
@@ -169,8 +172,8 @@ func (sm *ServiceManager) EnsureServiceRunning(ctx context.Context, domain strin
 			}
 			if !exists {
 				log.Printf("[Orchestrator] Pulling image '%s'...", iconfig.Image)
-				if err := sm.pullImageInternal(iconfig.Image); err != nil {
-					log.Printf("[Orchestrator] Image pull warning: %v", err)
+				if err := sm.pullImageInternal(ctx, iconfig.Image); err != nil {
+					return "", fmt.Errorf("pull image %q: %w", iconfig.Image, err)
 				}
 				log.Printf("[Orchestrator] Image '%s' pull complete.", iconfig.Image)
 			} else {
@@ -198,9 +201,8 @@ func (sm *ServiceManager) EnsureServiceRunning(ctx context.Context, domain strin
 
 	// Wait until the emulator is truly ready inside the network
 	containerPort := strings.Split(iconfig.ContainerPort, "/")[0]
-	internalAddr := strings.TrimPrefix(internalURL, "http://")
-	log.Printf("[Orchestrator] Waiting for readiness probe at %s...", internalAddr)
-	if err := sm.waitUntilReady(internalAddr, 60*time.Second); err != nil {
+	log.Printf("[Orchestrator] Waiting for HTTP readiness probe at %s...", internalURL)
+	if err := waitUntilHTTPReady(internalURL, 60*time.Second); err != nil {
 		return "", fmt.Errorf("readiness probe failed: %v", err)
 	}
 
@@ -486,15 +488,55 @@ func (sm *ServiceManager) CheckStatusPublic(name string) (string, error) {
 	return sm.checkStatus(name)
 }
 
-func (sm *ServiceManager) pullImageInternal(image string) error {
-	req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/images/create?fromImage=%s", image), nil)
+func (sm *ServiceManager) pullImageInternal(ctx context.Context, image string) error {
+	pullCtx, cancel := context.WithTimeout(ctx, dockerImagePullTimeout)
+	defer cancel()
+
+	endpoint := "http://localhost/images/create?" + url.Values{"fromImage": {image}}.Encode()
+	req, err := http.NewRequestWithContext(pullCtx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	return nil
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			return fmt.Errorf("Docker image pull returned HTTP %d and unreadable error body: %w", resp.StatusCode, readErr)
+		}
+		var dockerError struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &dockerError) == nil && dockerError.Message != "" {
+			return fmt.Errorf("Docker image pull returned HTTP %d: %s", resp.StatusCode, dockerError.Message)
+		}
+		return fmt.Errorf("Docker image pull returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var event struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("decode Docker image pull stream: %w", err)
+		}
+		if event.ErrorDetail.Message != "" {
+			return fmt.Errorf("Docker image pull failed: %s", event.ErrorDetail.Message)
+		}
+		if event.Error != "" {
+			return fmt.Errorf("Docker image pull failed: %s", event.Error)
+		}
+	}
 }
 
 func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
@@ -516,7 +558,7 @@ func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
 }
 
 // ProvisionComputeVM actively boots a Data Plane Docker container mimicking a GCE VM.
-func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
+func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning compute VM: %s (image: %s vpc: %s ports: %d env: %d cmd: %v)", containerName, osImage, vpcName, len(ports), len(env), cmd)
 
 	exists, err := sm.ImageExistsPublic(osImage)
@@ -524,8 +566,8 @@ func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage strin
 		log.Printf("[Orchestrator] Image check error for %s: %v", osImage, err)
 	}
 	if !exists {
-		if err := sm.pullImageInternal(osImage); err != nil {
-			log.Printf("[Orchestrator] Data Plane pull warning for %s: %v", osImage, err)
+		if err := sm.pullImageInternal(ctx, osImage); err != nil {
+			return fmt.Errorf("pull data plane image %q: %w", osImage, err)
 		}
 	} else {
 		log.Printf("[Orchestrator] Image '%s' already exists locally, skipping pull.", osImage)
@@ -609,7 +651,7 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 		return "", fmt.Errorf("inspect Redis image: %w", err)
 	}
 	if !exists {
-		if err := sm.pullImageInternal(image); err != nil {
+		if err := sm.pullImageInternal(ctx, image); err != nil {
 			return "", fmt.Errorf("pull Redis image: %w", err)
 		}
 	}
@@ -795,12 +837,14 @@ func isOwnedRedisResource(labels map[string]string, resourceID string) bool {
 }
 
 // ProvisionCloudSQLVM starts a fully-interactive PostgreSQL or MySQL docker database data plane.
-func (sm *ServiceManager) ProvisionBuildStep(containerName string, image string, binds []string, env []string, cmd []string) error {
+func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName string, image string, binds []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning build step: %s (image: %s binds: %v cmd: %v)", containerName, image, binds, cmd)
 
 	exists, _ := sm.ImageExistsPublic(image)
 	if !exists {
-		sm.pullImageInternal(image)
+		if err := sm.pullImageInternal(ctx, image); err != nil {
+			return fmt.Errorf("pull build image %q: %w", image, err)
+		}
 	}
 
 	payload := map[string]interface{}{
@@ -838,7 +882,7 @@ func (sm *ServiceManager) ProvisionBuildStep(containerName string, image string,
 	return sm.startContainer(containerName)
 }
 
-func (sm *ServiceManager) ProvisionCloudSQLVM(instanceName string, version string, rootPassword string) (string, error) {
+func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName string, version string, rootPassword string) (string, error) {
 	var image string
 	var env []string
 	var expPort string
@@ -896,8 +940,8 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(instanceName string, version strin
 		log.Printf("[Orchestrator] Image check error for %s: %v", image, err)
 	}
 	if !exists {
-		if err := sm.pullImageInternal(image); err != nil {
-			log.Printf("[Orchestrator] Pull warning for %s: %v", image, err)
+		if err := sm.pullImageInternal(ctx, image); err != nil {
+			return "", fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
 		}
 	} else {
 		log.Printf("[Orchestrator] Image '%s' already exists locally, skipping pull.", image)
@@ -1015,6 +1059,8 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 	sm.dockerClient.Do(req)
 
 	expPort := "8080/tcp"
+	labels := ownedDockerLabels()
+	labels["resource"] = resourceName
 	payload := map[string]interface{}{
 		"Image": image,
 		"Env":   append(sm.standardEnv(), env...),
@@ -1029,10 +1075,7 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 				},
 			},
 		},
-		"Labels": map[string]string{
-			"managed-by": "minisky-serverless",
-			"resource":   resourceName,
-		},
+		"Labels": labels,
 	}
 
 	b, _ := json.Marshal(payload)
@@ -1056,6 +1099,9 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 	internalURL, err := sm.discoverInternalURL(config)
 	if err != nil {
 		return "", fmt.Errorf("port discovery: %v", err)
+	}
+	if err := waitUntilHTTPReady(internalURL, 60*time.Second); err != nil {
+		return "", fmt.Errorf("serverless readiness probe failed: %w", err)
 	}
 
 	log.Printf("[Orchestrator] ✅ Serverless Instance '%s' ONLINE at %s", resourceName, internalURL)
@@ -1300,6 +1346,21 @@ func (sm *ServiceManager) waitUntilReady(addr string, timeout time.Duration) err
 	return fmt.Errorf("'%s' not reachable after %s", addr, timeout)
 }
 
+func waitUntilHTTPReady(target string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(target)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("%q did not return an HTTP response after %s", target, timeout)
+}
+
 // resolveDockerSocket and dialDocker are implemented in OS-specific files (dialer_unix.go, dialer_windows.go)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1509,7 +1570,7 @@ func (sm *ServiceManager) ApplyFirewallPortsToVPC(vpcName string, containerNames
 	for i, cName := range containerNames {
 		osImage := osImages[i]
 		sm.DeleteComputeVM(cName)
-		sm.ProvisionComputeVM(cName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
+		sm.ProvisionComputeVM(context.Background(), cName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
 	}
 	return nil
 }

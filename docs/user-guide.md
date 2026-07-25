@@ -209,7 +209,7 @@ results = client.query(query)
 ## Lazy Loading & State
 
 ### Lazy Loading
-MiniSky is "Lazy" by default. If you run a command like `gcloud pubsub topics create ...`, MiniSky will detect that Pub/Sub is not running, pull the image (if missing), start the container, and then execute your command.
+MiniSky is "Lazy" by default. If you run a command like `gcloud pubsub topics create ...`, MiniSky will detect that Pub/Sub is not running, pull the image (if missing), start the container, and then execute your command. Docker image pulls honor request cancellation and are bounded to two minutes; timeout and registry failures are returned to the caller instead of leaving the request pending indefinitely.
 
 ### State lifecycle
 Adopted Go shims persist metadata under

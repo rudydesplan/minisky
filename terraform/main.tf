@@ -38,13 +38,8 @@ resource "google_service_account" "compatibility" {
 
 resource "google_storage_bucket" "compatibility" {
   name          = var.storage_bucket_name
-  location      = "US"
+  location      = "US-CENTRAL1"
   force_destroy = true
-
-  labels = {
-    environment = "minisky"
-    managed_by  = "terraform"
-  }
 }
 
 resource "google_bigquery_dataset" "secondary_compatibility" {
@@ -73,7 +68,7 @@ resource "google_pubsub_subscription" "cross_project" {
 # Spanner emulator exposes its exact admin/LRO contract, while MiniSky owns the
 # Redis control plane and loopback Docker data plane.
 resource "google_redis_instance" "compatibility" {
-  count = local.use_minisky ? 1 : 0
+  count = local.use_minisky && var.enable_phase15_resources ? 1 : 0
 
   name           = "minisky-terraform"
   tier           = "BASIC"
@@ -83,7 +78,7 @@ resource "google_redis_instance" "compatibility" {
 }
 
 resource "google_spanner_instance" "compatibility" {
-  count = local.use_minisky ? 1 : 0
+  count = local.use_minisky && var.enable_phase15_resources ? 1 : 0
 
   name          = "minisky-terraform"
   config        = "emulator-config"
@@ -93,7 +88,7 @@ resource "google_spanner_instance" "compatibility" {
 }
 
 resource "google_spanner_database" "compatibility" {
-  count = local.use_minisky ? 1 : 0
+  count = local.use_minisky && var.enable_phase15_resources ? 1 : 0
 
   instance            = google_spanner_instance.compatibility[0].name
   name                = "minisky-terraform"

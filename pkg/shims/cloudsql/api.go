@@ -1,6 +1,7 @@
 package cloudsql
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -304,7 +305,7 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Provision physical Docker container with standard "minisky" root password
-		internalURL, err := api.svcMgr.ProvisionCloudSQLVM(body.Name, dbVersion, "minisky")
+		internalURL, err := api.svcMgr.ProvisionCloudSQLVM(context.Background(), body.Name, dbVersion, "minisky")
 		if err != nil {
 			log.Printf("[Shim: Cloud SQL] Provisioning failed: %v", err)
 			return err

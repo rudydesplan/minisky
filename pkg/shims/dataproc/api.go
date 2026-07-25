@@ -1,6 +1,7 @@
 package dataproc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -277,7 +278,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 
 		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterStr)
-		api.svcMgr.ProvisionComputeVM(masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+		api.svcMgr.ProvisionComputeVM(context.Background(), masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"})
 
 		// Provision Worker Nodes
 		numWorkers := 2
@@ -286,7 +287,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 		for i := 0; i < numWorkers; i++ {
 			workerName := fmt.Sprintf("minisky-dataproc-%s-w-%d", clusterStr, i)
-			api.svcMgr.ProvisionComputeVM(workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+			api.svcMgr.ProvisionComputeVM(context.Background(), workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"})
 		}
 
 		api.mu.Lock()

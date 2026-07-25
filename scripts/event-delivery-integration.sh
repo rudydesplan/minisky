@@ -27,6 +27,10 @@ handler_pid=""
 
 cleanup() {
   local status=$?
+  if [[ "${status}" != "0" && -f "${tmp}/daemon.log" ]]; then
+    echo "MiniSky event integration log:" >&2
+    python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text())' "${tmp}/daemon.log" >&2
+  fi
   [[ -n "${daemon_pid}" ]] && kill -TERM "${daemon_pid}" >/dev/null 2>&1 || true
   [[ -n "${handler_pid}" ]] && kill -TERM "${handler_pid}" >/dev/null 2>&1 || true
   wait "${daemon_pid}" >/dev/null 2>&1 || true

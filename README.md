@@ -193,7 +193,7 @@ and is not safe to invoke from standalone diagnostics.
 | Phase | Feature set | Verification | Status |
 | :--- | :--- | :--- | :---: |
 | 6 | Service fidelity baseline and compatibility matrices | Every registered domain has manifest/docs coherence and an executable in-process or backend-gated contract | ✅ Baseline |
-| 7 | Terraform and SDK compatibility | The opt-in fixture covers BigQuery, IAM, Storage, cross-project Pub/Sub, Memorystore, and Spanner through canonical endpoints | ✅ Baseline |
+| 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; Phase-15 Redis and Spanner resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
 | 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🚧 Local slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | 🚧 Local slice |
@@ -225,8 +225,8 @@ and is not safe to invoke from standalone diagnostics.
   that covers every documented custom endpoint without ambiguous `/v1` routes.
 - Expand the Terraform example only where the provider-visible lifecycle is
   proven. The current fixture includes BigQuery, IAM, Storage, cross-project
-  Pub/Sub, Memorystore, and Spanner; Cloud SQL, Compute, and serverless remain
-  outside this fixture.
+  Pub/Sub, and optional Phase-15 Memorystore/Spanner resources; Cloud SQL,
+  Compute, and serverless remain outside this fixture.
 - Run `terraform apply`, resource assertions, a no-drift plan, and
   `terraform destroy` in CI.
 - Publish `docs/terraform-compatibility.md` with provider resources, endpoint
@@ -234,6 +234,10 @@ and is not safe to invoke from standalone diagnostics.
 - Add SDK smoke suites for Go and Python against the same gateway.
 
 ### Phase 8 — Durable state and team workflows
+
+**Status (2026-07-25): guarded durability gate passed locally.** The persisted
+BigQuery/IAM subset passed create → restart → no-drift → export → clean-profile
+import → no-drift → destroy with run-scoped Docker ownership and cleanup.
 
 - Introduce a versioned state store with per-shim persistence adapters.
 - Rehydrate Compute, IAM, DNS, BigQuery metadata, Scheduler, Secret Manager,
@@ -249,8 +253,9 @@ and is not safe to invoke from standalone diagnostics.
 
 **Status (2026-07-25): local delivery slice implemented.** Cloud Tasks state,
 Scheduler gateway wiring, strict Buildpacks failure handling, and the guarded
-event-delivery harness have focused tests. The Docker/Pack end-to-end gate was
-not run while an existing MiniSky network was active.
+event-delivery harness have focused tests. The guarded Docker/Pack gate passed
+locally with Pack 0.40.8: Scheduler and Cloud Tasks reached HTTP targets, while
+Storage and Pub/Sub events built and invoked real function containers.
 
 - [x] Add explicit `full` and backward-compatible `simulation` runtime profiles,
   dependency-aware real backends, and consistent doctor/dashboard state.
@@ -283,8 +288,10 @@ push/list/delete integration remain guarded Docker acceptance work.
 
 **Status (2026-07-25): local tooling slice implemented.** Doctor, safe fixes,
 gateway-first delivery/artifact commands, Make targets, and release smoke
-validation are present. Homebrew, Scoop, deb, and rpm are not described as
-published until native install and credentialed publication gates exist.
+validation are present. GoReleaser v2 configuration, a native macOS ARM64
+snapshot, `version`, and `doctor bigquery` passed locally. Homebrew, Scoop,
+deb, and rpm are not described as published until native Linux install and
+credentialed publication gates exist.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.
@@ -333,9 +340,9 @@ impersonation remain explicit `501 UNIMPLEMENTED` boundaries.
 cover project CRUD, persistence/export/import, unknown-project enforcement,
 inherited IAM, same-name BigQuery isolation, and cross-project Pub/Sub
 permission denial. The two-project Terraform/Pub/Sub fixture validates
-statically; Docker-backed apply/no-drift/destroy remains an integration gate and
-does not establish isolation for shared passthrough backends. Shared VPC packet
-routing remains out of scope.
+statically, and its guarded Docker apply/assert/no-drift/destroy lifecycle
+passed locally on 2026-07-25. This does not establish isolation for shared
+passthrough backends. Shared VPC packet routing remains out of scope.
 
 - Support multiple GCP projects running concurrently with isolated resource
   namespaces.
@@ -353,8 +360,10 @@ routing remains out of scope.
 **Status (2026-07-25): bounded emulator slices implemented.** Memorystore
 metadata and owned Redis lifecycle, profile-scoped Spanner/Firestore/Datastore
 backends, and SDK/Terraform fixtures have local contract and static validation.
-The guarded Docker data-plane suite was not run while an existing MiniSky
-network was active. Firestore listeners/rules remain unsupported.
+The guarded Docker data-plane suite passed locally after public emulator images
+were preflighted without inheriting host credential helpers; its SDK smoke
+covered Firestore document CRUD/query, Datastore entity/ancestor operations,
+and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
 
 - Add a Spanner emulator with DDL support, read/write transactions, and
   query execution.

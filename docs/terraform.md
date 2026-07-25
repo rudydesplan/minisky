@@ -3,7 +3,8 @@
 The tracked `terraform/` configuration is a reproducible compatibility example
 for the official Google provider. Its tested local scope is deliberately
 limited to BigQuery dataset/table metadata, an IAM service account, and a
-Docker-backed Storage bucket.
+Docker-backed Storage bucket. The fixture also contains optional local
+Phase-15 Redis and Spanner resources, disabled by default.
 
 ## Local profile
 
@@ -58,6 +59,10 @@ MINISKY_TERRAFORM_INTEGRATION=1 ./scripts/terraform-integration.sh
 The script requires Docker because the current MiniSky daemon creates an
 isolated Docker network and Storage uses `fake-gcs-server`. It refuses to run
 when existing MiniSky containers or networks are present.
+
+Set `MINISKY_TERRAFORM_PHASE15=1` to opt the guarded script into the Redis and
+Spanner Terraform resources. The separate Phase-15 emulator integration remains
+the authoritative data-plane gate.
 
 The metadata durability subset has a separate opt-in gate:
 

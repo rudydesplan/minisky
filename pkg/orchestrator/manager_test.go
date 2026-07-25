@@ -4,12 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestWaitUntilHTTPReadyAcceptsAnyHTTPResponse(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	if err := waitUntilHTTPReady(server.URL, time.Second); err != nil {
+		t.Fatalf("wait for HTTP response: %v", err)
+	}
+}
 
 func TestEmulatorVolumesUseProfileScopedRuntimePaths(t *testing.T) {
 	root := t.TempDir()
@@ -170,6 +182,60 @@ func TestRedisProvisioningRefusesUnownedExistingVolume(t *testing.T) {
 	})}}
 	if _, err := manager.ProvisionRedis(context.Background(), "resource", "redis:test"); err == nil {
 		t.Fatal("unowned existing Redis volume was adopted")
+	}
+}
+
+func TestPullImageUsesContextAndEncodedImageName(t *testing.T) {
+	const image = "gcr.io/cloud-spanner-emulator/emulator:latest"
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodPost || request.URL.Path != "/images/create" {
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+		}
+		if got := request.URL.Query().Get("fromImage"); got != image {
+			t.Fatalf("fromImage = %q, want %q", got, image)
+		}
+		return dockerResponse(http.StatusOK, `{"status":"Pull complete"}`), nil
+	})}}
+
+	if err := manager.pullImageInternal(context.Background(), image); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPullImageReportsDockerHTTPAndStreamErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		body string
+		want string
+	}{
+		{name: "http status", code: http.StatusInternalServerError, body: `{"message":"registry unavailable"}`, want: "registry unavailable"},
+		{name: "stream error", code: http.StatusOK, body: `{"errorDetail":{"message":"manifest unknown"},"error":"manifest unknown"}`, want: "manifest unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return dockerResponse(tt.code, tt.body), nil
+			})}}
+			err := manager.pullImageInternal(context.Background(), "example.invalid/image:tag")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("pull error = %v, want error containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPullImageHonorsCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		cancel()
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}}
+
+	err := manager.pullImageInternal(ctx, "example.invalid/image:tag")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("pull error = %v, want context cancellation", err)
 	}
 }
 

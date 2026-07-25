@@ -42,7 +42,7 @@ def main() -> None:
     iam_credentials = client(
         "iamcredentials",
         "v1",
-        f"{gateway}/_minisky/iamcredentials/v1/",
+        f"{gateway}/_minisky/iamcredentials/",
     )
     storage = client("storage", "v1", f"{gateway}/_minisky/storage/storage/v1/")
 

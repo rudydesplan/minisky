@@ -18,6 +18,40 @@ type deliveredRequest struct {
 	contentType string
 }
 
+func TestVersionedRunPathFindsCreatedJob(t *testing.T) {
+	delivered := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		delivered <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	api := NewAPIWithConfig(nil, Config{HTTPClient: target.Client()})
+	defer api.Close()
+
+	body := `{"name":"projects/test/locations/us-central1/jobs/http","schedule":"0 0 1 1 *","httpTarget":{"uri":"` + target.URL + `","httpMethod":"POST"}}`
+	create := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/jobs", strings.NewReader(body))
+	create.Header.Set("Content-Type", "application/json")
+	createResponse := httptest.NewRecorder()
+	api.ServeHTTP(createResponse, create)
+	if createResponse.Code != http.StatusOK {
+		t.Fatalf("create job returned %d: %s", createResponse.Code, createResponse.Body.String())
+	}
+
+	run := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/jobs/http:run", nil)
+	runResponse := httptest.NewRecorder()
+	api.ServeHTTP(runResponse, run)
+	if runResponse.Code != http.StatusOK {
+		t.Fatalf("run job returned %d: %s", runResponse.Code, runResponse.Body.String())
+	}
+
+	select {
+	case <-delivered:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled HTTP target was not invoked")
+	}
+}
+
 func TestHTTPDeliveryRecordsSuccessAndHonorsRequest(t *testing.T) {
 	request := make(chan struct {
 		method string

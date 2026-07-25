@@ -1,6 +1,7 @@
 package compute
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -614,7 +615,7 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		allowedPorts := api.getAllowedPortsForVPC(vpcName)
 
 		// Tell the Orchestrator to physically spin up the Docker container!
-		err := api.svcMgr.ProvisionComputeVM(containerName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
+		err := api.svcMgr.ProvisionComputeVM(context.Background(), containerName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
 
 		// Keep the simulated delay outside the metadata lock.
 		if err == nil {

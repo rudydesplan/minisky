@@ -41,27 +41,26 @@ fi
 
 work_dir="$(mktemp -d)"
 minisky_pid=""
-terraform_initialized=0
+profile="terraform-integration-$$"
 
 cleanup() {
   exit_code=$?
   trap - EXIT INT TERM
 
-  if [[ "${terraform_initialized}" == "1" && -n "${api_port:-}" ]]; then
-    state_resources="$(TF_DATA_DIR="${work_dir}/terraform-data" terraform -chdir="${terraform_dir}" state list 2>/dev/null || true)"
-    if [[ -n "${state_resources}" ]]; then
-      TF_DATA_DIR="${work_dir}/terraform-data" terraform -chdir="${terraform_dir}" destroy \
-        -auto-approve \
-        -input=false \
-        -var="minisky_endpoint=http://127.0.0.1:${api_port}" \
-        -var="storage_bucket_name=${storage_bucket_name}" \
-        -var="profile=local" >/dev/null 2>&1 || true
-    fi
-  fi
-
   if [[ -n "${minisky_pid}" ]] && kill -0 "${minisky_pid}" 2>/dev/null; then
     kill -TERM "${minisky_pid}" 2>/dev/null || true
     wait "${minisky_pid}" 2>/dev/null || true
+  fi
+
+  while IFS= read -r container; do
+    [[ -n "${container}" ]] && docker rm -f "${container}" >/dev/null 2>&1 || true
+  done < <(docker ps -aq \
+    --filter "label=managed-by=minisky" \
+    --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
+  network_manager="$(docker network inspect --format '{{index .Labels "managed-by"}}' minisky-net 2>/dev/null || true)"
+  network_profile="$(docker network inspect --format '{{index .Labels "minisky.profile"}}' minisky-net 2>/dev/null || true)"
+  if [[ "${network_manager}" == "minisky" && "${network_profile}" == "${profile}" ]]; then
+    docker network rm minisky-net >/dev/null 2>&1 || true
   fi
 
   rm -rf "${work_dir}"
@@ -90,11 +89,26 @@ table_id="events"
 service_account_id="minisky-terraform"
 service_account_email="${service_account_id}@${project_id}.iam.gserviceaccount.com"
 storage_bucket_name="minisky-terraform-$$"
+enable_phase15_resources="${MINISKY_TERRAFORM_PHASE15:-0}"
+if [[ "${enable_phase15_resources}" != "0" && "${enable_phase15_resources}" != "1" ]]; then
+  echo "MINISKY_TERRAFORM_PHASE15 must be 0 or 1." >&2
+  exit 2
+fi
+tf_phase15_enabled=false
+if [[ "${enable_phase15_resources}" == "1" ]]; then
+  tf_phase15_enabled=true
+fi
+tf_vars=(
+  -var="enable_phase15_resources=${tf_phase15_enabled}"
+  -var="minisky_endpoint=${gateway}"
+  -var="storage_bucket_name=${storage_bucket_name}"
+  -var="profile=local"
+)
 
 mkdir -p "${work_dir}/home"
 go build -trimpath -o "${work_dir}/minisky" ./cmd/minisky
 
-HOME="${work_dir}/home" "${work_dir}/minisky" start \
+HOME="${work_dir}/home" MINISKY_PROFILE="${profile}" "${work_dir}/minisky" start \
   --port "${api_port}" \
   --ui-port "${ui_port}" >"${work_dir}/minisky.log" 2>&1 &
 minisky_pid=$!
@@ -122,14 +136,11 @@ terraform -chdir="${terraform_dir}" init \
   -backend-config="path=${work_dir}/terraform.tfstate" \
   -input=false \
   -lockfile=readonly
-terraform_initialized=1
 terraform -chdir="${terraform_dir}" validate
 terraform -chdir="${terraform_dir}" apply \
   -auto-approve \
   -input=false \
-  -var="minisky_endpoint=${gateway}" \
-  -var="storage_bucket_name=${storage_bucket_name}" \
-  -var="profile=local"
+  "${tf_vars[@]}"
 
 assert_json_value() {
   local url=$1
@@ -172,9 +183,11 @@ assert_json_value "${secondary_dataset_url}" "datasetReference.projectId" "${sec
 assert_json_value "${table_url}" "tableReference.tableId" "${table_id}"
 assert_json_value "${service_account_url}" "email" "${service_account_email}"
 assert_json_value "${storage_bucket_url}" "name" "${storage_bucket_name}"
-assert_json_value "${redis_instance_url}" "name" "projects/${project_id}/locations/us-central1/instances/minisky-terraform"
-assert_json_value "${spanner_instance_url}" "name" "projects/${project_id}/instances/minisky-terraform"
-assert_json_value "${spanner_database_url}" "name" "projects/${project_id}/instances/minisky-terraform/databases/minisky-terraform"
+if [[ "${enable_phase15_resources}" == "1" ]]; then
+  assert_json_value "${redis_instance_url}" "name" "projects/${project_id}/locations/us-central1/instances/minisky-terraform"
+  assert_json_value "${spanner_instance_url}" "name" "projects/${project_id}/instances/minisky-terraform"
+  assert_json_value "${spanner_database_url}" "name" "projects/${project_id}/instances/minisky-terraform/databases/minisky-terraform"
+fi
 
 export MINISKY_ENDPOINT="${gateway}"
 export MINISKY_PROJECT_ID="${project_id}"
@@ -186,9 +199,7 @@ set +e
 terraform -chdir="${terraform_dir}" plan \
   -detailed-exitcode \
   -input=false \
-  -var="minisky_endpoint=${gateway}" \
-  -var="storage_bucket_name=${storage_bucket_name}" \
-  -var="profile=local"
+  "${tf_vars[@]}"
 plan_exit=$?
 set -e
 if [[ "${plan_exit}" != "0" ]]; then
@@ -199,12 +210,13 @@ fi
 terraform -chdir="${terraform_dir}" destroy \
   -auto-approve \
   -input=false \
-  -var="minisky_endpoint=${gateway}" \
-  -var="storage_bucket_name=${storage_bucket_name}" \
-  -var="profile=local"
+  "${tf_vars[@]}"
 
-for url in "${table_url}" "${dataset_url}" "${secondary_dataset_url}" "${service_account_url}" "${storage_bucket_url}" \
-  "${redis_instance_url}" "${spanner_database_url}" "${spanner_instance_url}"; do
+destroyed_urls=("${table_url}" "${dataset_url}" "${secondary_dataset_url}" "${service_account_url}" "${storage_bucket_url}")
+if [[ "${enable_phase15_resources}" == "1" ]]; then
+  destroyed_urls+=("${redis_instance_url}" "${spanner_database_url}" "${spanner_instance_url}")
+fi
+for url in "${destroyed_urls[@]}"; do
   status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"
   if [[ "${status}" != "404" ]]; then
     echo "Expected destroyed resource ${url} to return HTTP 404, received ${status}." >&2

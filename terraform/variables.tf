@@ -10,6 +10,12 @@ variable "dataset_id" {
   default     = "minisky_terraform"
 }
 
+variable "enable_phase15_resources" {
+  description = "Create the optional local Redis and Spanner Phase-15 resources"
+  type        = bool
+  default     = false
+}
+
 variable "local_access_token" {
   description = "Non-secret access token used only for the local MiniSky profile"
   type        = string

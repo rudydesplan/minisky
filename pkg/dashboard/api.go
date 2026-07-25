@@ -829,7 +829,7 @@ func (api *API) handleInstallDependency(w http.ResponseWriter, r *http.Request) 
 	id := parts[5]
 
 	log.Printf("[UI/API] Request to install dependency: %s", id)
-	if err := api.svcMgr.InstallDependency(id); err != nil {
+	if err := api.svcMgr.InstallDependency(r.Context(), id); err != nil {
 		log.Printf("[UI/API] Installation failed: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

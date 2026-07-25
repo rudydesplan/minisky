@@ -27,3 +27,18 @@ output "cross_project_subscription" {
   description = "Subscription in the second project attached to the first-project topic"
   value       = google_pubsub_subscription.cross_project.id
 }
+
+output "phase15_redis_instance_name" {
+  description = "Name of the optional local Phase-15 Redis instance, or null when disabled"
+  value       = var.enable_phase15_resources ? google_redis_instance.compatibility[0].name : null
+}
+
+output "phase15_spanner_instance_name" {
+  description = "Name of the optional local Phase-15 Spanner instance, or null when disabled"
+  value       = var.enable_phase15_resources ? google_spanner_instance.compatibility[0].name : null
+}
+
+output "phase15_spanner_database_name" {
+  description = "Name of the optional local Phase-15 Spanner database, or null when disabled"
+  value       = var.enable_phase15_resources ? google_spanner_database.compatibility[0].name : null
+}

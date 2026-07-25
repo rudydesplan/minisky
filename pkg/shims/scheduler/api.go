@@ -230,7 +230,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud Scheduler] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 
-	path := r.URL.Path
+	path := canonicalSchedulerPath(r.URL.Path)
 
 	// Job verbs (run, pause, resume)
 	switch {
@@ -547,6 +547,11 @@ func extractJobName(path string) string {
 		return parts[0] + "/jobs/" + parts[1]
 	}
 	return ""
+}
+
+func canonicalSchedulerPath(path string) string {
+	path = strings.TrimPrefix(path, "/v1/")
+	return strings.TrimPrefix(path, "/")
 }
 
 func extractProject(path string) string {
