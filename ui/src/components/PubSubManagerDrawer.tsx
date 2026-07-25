@@ -15,12 +15,32 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type PubSubManagerDrawerProps = { open: boolean; onClose: () => void };
 
+type Topic = { name: string };
+type Subscription = { name: string; topic: string };
+type ReceivedMessage = {
+  ackId: string;
+  message: {
+    messageId: string;
+    publishTime: string;
+    data: string;
+  };
+};
+type PulledMessage = {
+  id: string;
+  publishTime: string;
+  data: string;
+  ackId: string;
+};
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
 export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [topics, setTopics] = useState<any[]>([]);
+  const [topics, setTopics] = useState<Topic[]>([]);
   const [activeTopic, setActiveTopic] = useState<string | null>(null);
   
-  const [subscriptions, setSubscriptions] = useState<any[]>([]);
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [activeSubscription, setActiveSubscription] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
@@ -35,7 +55,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
 
   // Sandbox State
   const [publishPayload, setPublishPayload] = useState('{\n  "hello": "world"\n}');
-  const [pulledMessages, setPulledMessages] = useState<any[]>([]);
+  const [pulledMessages, setPulledMessages] = useState<PulledMessage[]>([]);
   
   const apiRoot = `/api/manage/pubsub/projects/${activeProject}`;
 
@@ -46,7 +66,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
     try {
       const res = await fetch(`${apiRoot}/topics`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { topics?: Topic[] } = await res.json();
         setTopics(data.topics || []);
       }
     } catch (e) { console.error(e); }
@@ -56,7 +76,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
     try {
       const res = await fetch(`${apiRoot}/subscriptions`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { subscriptions?: Subscription[] } = await res.json();
         setSubscriptions(data.subscriptions || []);
       }
     } catch (e) { console.error(e); }
@@ -89,7 +109,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         const e = await res.json();
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(errorMessage(e), 'error'); }
     setNewTopicOpen(false);
     setNewColName('');
   };
@@ -109,7 +129,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         const e = await res.json();
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(errorMessage(e), 'error'); }
     setNewSubOpen(false);
     setNewSubName('');
   };
@@ -144,8 +164,8 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         const e = await res.json();
         showToast(e.error?.message || 'Failed to publish', 'error');
       }
-    } catch (e: any) {
-      showToast('Error publishing: ' + e.message, 'error');
+    } catch (e: unknown) {
+      showToast('Error publishing: ' + errorMessage(e), 'error');
     } finally {
       setLoading(false);
     }
@@ -161,11 +181,11 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         body: JSON.stringify({ returnImmediately: true, maxMessages: 10 })
       });
       if (res.ok) {
-        const data = await res.json();
+        const data: { receivedMessages?: ReceivedMessage[] } = await res.json();
         if (data.receivedMessages && data.receivedMessages.length > 0) {
-          const decoded = data.receivedMessages.map((msg: any) => {
-            let text = '';
-            try { text = decodeURIComponent(escape(atob(msg.message.data))); } catch(err) { text = '<binary>'; }
+          const decoded = data.receivedMessages.map((msg) => {
+            let text: string;
+            try { text = decodeURIComponent(escape(atob(msg.message.data))); } catch { text = '<binary>'; }
             return {
               id: msg.message.messageId,
               publishTime: msg.message.publishTime,
@@ -177,7 +197,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
           showToast(`Pulled ${decoded.length} messages`);
 
           // Auto-ack to avoid pulling same messages immediately again (common emulator workflow)
-          const ackIds = data.receivedMessages.map((m: any) => m.ackId);
+          const ackIds = data.receivedMessages.map((message) => message.ackId);
           fetch(`/api/manage/pubsub/${activeSubscription}:acknowledge`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -191,8 +211,8 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         const e = await res.json();
         showToast(e.error?.message || 'Failed to pull', 'error');
       }
-    } catch (e: any) {
-      showToast('Error pulling: ' + e.message, 'error');
+    } catch (e: unknown) {
+      showToast('Error pulling: ' + errorMessage(e), 'error');
     } finally {
       setLoading(false);
     }

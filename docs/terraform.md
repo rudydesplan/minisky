@@ -104,7 +104,9 @@ When you run `terraform apply`, MiniSky will:
 2. **Handle Identity:** Verify that the provided dummy credentials have the required Mock IAM permissions.
 3. **Trigger Asynchronous Work:** If the resource creation is slow (e.g., a GKE cluster), MiniSky returns an **Operation** token.
 4. **Poll for Completion:** Terraform will poll MiniSky until the internal LRO Manager marks the task as `DONE`.
-5. **Persist State:** Ensure the new resource is saved to the local database for subsequent plans.
+5. **Track State:** Terraform records resource state in its own state file. MiniSky
+   keeps most shim metadata in memory, while Docker-backed services may use
+   containers or volumes.
 
 ## 5. Troubleshooting
 - **SSL Errors**: Ensure you use `http://` instead of `https://` in the endpoints.
@@ -112,6 +114,6 @@ When you run `terraform apply`, MiniSky will:
 - **Concurrency**: Version 1.2.0 introduced `DeepCopy` state management for the Compute Engine shim, resolving data races during high-concurrency `terraform apply` operations.
 - **Logs**: Run `minisky logs tail` or watch the **Dashboard** to see the API calls being intercepted.
 
-## 6. Verified Examples
+## 6. Example
 
-Check the `examples/demo-launch` directory for a complete, end-to-end working configuration that provisions Compute, BigQuery, Storage, and Pub/Sub in one go.
+The tracked `terraform/main.tf` contains a minimal storage bucket example.

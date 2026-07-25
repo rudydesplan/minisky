@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 export type Service = {
   id: string;
@@ -12,28 +12,28 @@ export type Service = {
 
 export function useServices() {
   const [services, setServices] = useState<Service[]>([]);
-  const [settings, setSettings] = useState<any>({});
+  const [settings, setSettings] = useState<Record<string, unknown>>({});
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const res = await fetch('/api/services');
       if (res.ok) {
-        setServices(await res.json());
+        setServices(await res.json() as Service[]);
       }
       const setRes = await fetch('/api/settings');
       if (setRes.ok) {
-        setSettings(await setRes.json());
+        setSettings(await setRes.json() as Record<string, unknown>);
       }
     } catch (e) {
       console.error("error loading UI data", e);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 3000);
     return () => clearInterval(interval);
-  }, []);
+  }, [loadData]);
 
   const handleStartContainer = async (id: string, projectID?: string) => {
     let url = `/api/services/${id}/start`;
@@ -61,8 +61,9 @@ export function useServices() {
         alert(`Failed to update setting: ${errText}`);
       }
       loadData();
-    } catch (e: any) {
-      alert(`Error updating setting: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      alert(`Error updating setting: ${message}`);
     }
   };
 
@@ -76,8 +77,9 @@ export function useServices() {
         alert(`${id} installed successfully! You can now enable the service.`);
       }
       loadData();
-    } catch (e: any) {
-      alert(`Error installing dependency: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      alert(`Error installing dependency: ${message}`);
     }
   };
 

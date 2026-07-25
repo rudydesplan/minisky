@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Drawer, Box, Typography, TextField, Button, Stack, Divider, Alert,
   List, ListItem, ListItemText, ListItemSecondaryAction, IconButton,
   CircularProgress, Tooltip, Collapse, Paper, Select, MenuItem,
   FormControl, InputLabel, Chip, Tabs, Tab
 } from '@mui/material';
+import type { ChipProps } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
@@ -36,6 +37,12 @@ interface CryptoKeyVersion {
   destroyTime?: string;
 }
 
+interface ErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -43,6 +50,8 @@ interface Props {
 
 const BASE = '/api/manage/cloudkms';
 const LOCATION = 'global';
+const getErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
 
 export default function CloudKmsDrawer({ open, onClose }: Props) {
   const { activeProject } = useProjectContext();
@@ -80,56 +89,56 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
 
   const krBase = `${BASE}/projects/${activeProject}/locations/${LOCATION}/keyRings`;
 
-  const fetchKeyRings = async () => {
+  const fetchKeyRings = useCallback(async () => {
     setLoadingKR(true);
     try {
       const res = await fetch(krBase);
       if (!res.ok) throw new Error('Failed to fetch key rings');
-      const data = await res.json();
+      const data: { keyRings?: KeyRing[] } = await res.json();
       setKeyRings(data.keyRings || []);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setLoadingKR(false); }
-  };
+  }, [krBase]);
 
-  const fetchCryptoKeys = async (krId: string) => {
+  const fetchCryptoKeys = useCallback(async (krId: string) => {
     setLoadingCK(true);
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys`);
       if (!res.ok) throw new Error('Failed to fetch crypto keys');
-      const data = await res.json();
+      const data: { cryptoKeys?: CryptoKey[] } = await res.json();
       setCryptoKeys(data.cryptoKeys || []);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setLoadingCK(false); }
-  };
+  }, [krBase]);
 
-  const fetchVersions = async (krId: string, ckId: string) => {
+  const fetchVersions = useCallback(async (krId: string, ckId: string) => {
     setLoadingVersions(true);
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys/${ckId}/cryptoKeyVersions`);
       if (!res.ok) throw new Error('Failed to fetch versions');
-      const data = await res.json();
+      const data: { cryptoKeyVersions?: CryptoKeyVersion[] } = await res.json();
       setVersions(data.cryptoKeyVersions || []);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setLoadingVersions(false); }
-  };
+  }, [krBase]);
 
   useEffect(() => {
     if (open) { fetchKeyRings(); setTab(0); }
     else { setSelectedKr(''); setCryptoKeys([]); setExpandedKey(null); }
-  }, [open, activeProject]);
+  }, [open, fetchKeyRings]);
 
   useEffect(() => {
     if (selectedKr) { fetchCryptoKeys(selectedKr); setExpandedKey(null); }
-  }, [selectedKr]);
+  }, [selectedKr, fetchCryptoKeys]);
 
   const handleCreateKeyRing = async () => {
     if (!newKrId.trim()) return;
     setCreatingKR(true); setError(null);
     try {
       const res = await fetch(`${krBase}?keyRingId=${newKrId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      if (!res.ok) { const d = await res.json(); throw new Error(d.error?.message || 'Failed'); }
+      if (!res.ok) { const d: ErrorResponse = await res.json(); throw new Error(d.error?.message || 'Failed'); }
       setNewKrId(''); fetchKeyRings();
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setCreatingKR(false); }
   };
 
@@ -141,9 +150,9 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ purpose: newCkPurpose })
       });
-      if (!res.ok) { const d = await res.json(); throw new Error(d.error?.message || 'Failed'); }
+      if (!res.ok) { const d: ErrorResponse = await res.json(); throw new Error(d.error?.message || 'Failed'); }
       setNewCkId(''); fetchCryptoKeys(selectedKr);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setCreatingCK(false); }
   };
 
@@ -153,7 +162,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
       if (!res.ok) throw new Error('Failed to rotate key');
       fetchCryptoKeys(krId);
       if (expandedKey === ckId) fetchVersions(krId, ckId);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
   };
 
   const handleDestroyVersion = async (krId: string, ckId: string, versionName: string) => {
@@ -163,7 +172,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
       const res = await fetch(`${BASE}/${versionName}:destroy`, { method: 'POST' });
       if (!res.ok) throw new Error('Failed to destroy version');
       fetchVersions(krId, ckId);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
   };
 
   const toggleVersions = (krId: string, ckId: string) => {
@@ -177,9 +186,11 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     if (!krId) return;
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys`);
-      const data = await res.json();
+      const data: { cryptoKeys?: CryptoKey[] } = await res.json();
       setSandboxCkList((data.cryptoKeys || []).filter((k: CryptoKey) => k.purpose === 'ENCRYPT_DECRYPT'));
-    } catch {}
+    } catch (e: unknown) {
+      console.error(e);
+    }
   };
 
   const handleEncrypt = async () => {
@@ -191,9 +202,9 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
         body: JSON.stringify({ plaintext: btoa(plaintext) })
       });
       if (!res.ok) throw new Error('Encryption failed');
-      const data = await res.json();
+      const data: { ciphertext: string } = await res.json();
       setEncryptResult(data.ciphertext);
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setSandboxLoading(false); }
   };
 
@@ -206,13 +217,14 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
         body: JSON.stringify({ ciphertext })
       });
       if (!res.ok) throw new Error('Decryption failed — invalid ciphertext or wrong key');
-      const data = await res.json();
+      const data: { plaintext: string } = await res.json();
       setDecryptResult(atob(data.plaintext));
-    } catch (e: any) { setError(e.message); }
+    } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setSandboxLoading(false); }
   };
 
-  const stateColor = (s: string) => s === 'ENABLED' ? 'success' : s === 'DESTROYED' ? 'error' : 'default';
+  const stateColor = (s: string): ChipProps['color'] =>
+    s === 'ENABLED' ? 'success' : s === 'DESTROYED' ? 'error' : 'default';
 
   return (
     <Drawer anchor="right" open={open} onClose={onClose} sx={{ '& .MuiDrawer-paper': { width: 600 } }}>

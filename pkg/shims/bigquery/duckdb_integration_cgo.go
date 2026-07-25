@@ -157,10 +157,10 @@ func (d *DuckDBBackend) LoadData(project, dataset, table, sourceURI, format stri
 		return fmt.Errorf("duckdb backend not enabled")
 	}
 	tableName := fmt.Sprintf("%s__%s", dataset, table)
-	
+
 	var query string
 	format = strings.ToUpper(format)
-	
+
 	// Convert Windows path separators to forward slashes to prevent SQL escape sequence errors
 	safeURI := filepath.ToSlash(sourceURI)
 
@@ -201,24 +201,24 @@ func (d *DuckDBBackend) CreateTable(project, dataset, table string, schema *Tabl
 
 // bqToDuckTypeMap maps BigQuery field types to DuckDB equivalents.
 var bqToDuckTypeMap = map[string]string{
-	"STRING":    "VARCHAR",
-	"BYTES":     "BLOB",
-	"INTEGER":   "BIGINT",
-	"INT64":     "BIGINT",
-	"FLOAT":     "DOUBLE",
-	"FLOAT64":   "DOUBLE",
-	"NUMERIC":   "DECIMAL(38,9)",
+	"STRING":     "VARCHAR",
+	"BYTES":      "BLOB",
+	"INTEGER":    "BIGINT",
+	"INT64":      "BIGINT",
+	"FLOAT":      "DOUBLE",
+	"FLOAT64":    "DOUBLE",
+	"NUMERIC":    "DECIMAL(38,9)",
 	"BIGNUMERIC": "DECIMAL(76,38)",
-	"BOOLEAN":   "BOOLEAN",
-	"BOOL":      "BOOLEAN",
-	"TIMESTAMP": "TIMESTAMPTZ",
-	"DATE":      "DATE",
-	"TIME":      "TIME",
-	"DATETIME":  "TIMESTAMP",
-	"GEOGRAPHY": "VARCHAR", // approximate — DuckDB lacks native GEOGRAPHY
-	"JSON":      "JSON",
-	"RECORD":    "STRUCT", // nested — requires recursive handling
-	"STRUCT":    "STRUCT",
+	"BOOLEAN":    "BOOLEAN",
+	"BOOL":       "BOOLEAN",
+	"TIMESTAMP":  "TIMESTAMPTZ",
+	"DATE":       "DATE",
+	"TIME":       "TIME",
+	"DATETIME":   "TIMESTAMP",
+	"GEOGRAPHY":  "VARCHAR", // approximate — DuckDB lacks native GEOGRAPHY
+	"JSON":       "JSON",
+	"RECORD":     "STRUCT", // nested — requires recursive handling
+	"STRUCT":     "STRUCT",
 }
 
 // translateBQtoDuck does lightweight BigQuery → DuckDB SQL dialect conversion.

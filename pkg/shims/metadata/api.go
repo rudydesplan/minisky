@@ -182,9 +182,9 @@ func (api *API) handleToken(w http.ResponseWriter, r *http.Request) {
 	// so that GCP client libraries don't raise parsing errors.
 	// Services like fake-gcs-server accept any valid-looking bearer without verifying it.
 	fakeToken := map[string]interface{}{
-		"access_token":  "minisky-dev-access-token-" + fmt.Sprintf("%d", time.Now().Unix()),
-		"expires_in":    3599,
-		"token_type":    "Bearer",
+		"access_token": "minisky-dev-access-token-" + fmt.Sprintf("%d", time.Now().Unix()),
+		"expires_in":   3599,
+		"token_type":   "Bearer",
 	}
 	json.NewEncoder(w).Encode(fakeToken)
 }

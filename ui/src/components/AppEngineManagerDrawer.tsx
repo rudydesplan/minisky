@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback } from 'react';
+import { useLocation } from 'wouter';
 import { useProjectContext } from '../contexts/ProjectContext';
 import {
   Box, Typography, Button, Drawer, IconButton, Table, TableBody, TableCell,
@@ -43,6 +43,10 @@ const RUNTIMES = [
   'go122', 'go121',
 ];
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function statusChip(status: string) {
   const serving = status === 'SERVING';
   return (
@@ -65,7 +69,7 @@ function statusChip(status: string) {
 }
 
 export default function AppEngineManagerDrawer({ open, onClose }: Props) {
-  const navigate = useNavigate();
+  const [, navigate] = useLocation();
   const [tab, setTab] = useState(0);
   const [services, setServices] = useState<AEService[]>([]);
   const [versions, setVersions] = useState<AEVersion[]>([]);
@@ -83,16 +87,9 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
     code: DEFAULT_CODE['python312'],
   });
 
-  // Sync default code when runtime changes
-  useEffect(() => {
-    if (!form.code || Object.values(DEFAULT_CODE).includes(form.code)) {
-      setForm(f => ({ ...f, code: DEFAULT_CODE[f.runtime] ?? f.code, entrypoint: f.runtime.startsWith('go') ? '' : f.runtime.startsWith('nodejs') ? 'node index.js' : 'gunicorn -b :$PORT main:app' }));
-    }
-  }, [form.runtime]);
-
   const { activeProject } = useProjectContext();
 
-  const fetchServices = async (silent = false) => {
+  const fetchServices = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
@@ -106,9 +103,9 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
     } finally {
       if (!silent) setLoading(false);
     }
-  };
+  }, [activeProject]);
 
-  const fetchVersions = async (svc = selectedService, silent = false) => {
+  const fetchVersions = useCallback(async (svc = selectedService, silent = false) => {
     if (!silent) setLoading(true);
     try {
       const res = await fetch(`/api/manage/appengine/projects/${activeProject}/services/${svc}/versions`);
@@ -121,7 +118,7 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
     } finally {
       if (!silent) setLoading(false);
     }
-  };
+  }, [activeProject, selectedService]);
 
   const pollOperation = async (opName: string) => {
     setOpPoll(opName);
@@ -150,7 +147,7 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
       const t = setInterval(() => { fetchServices(true); fetchVersions(selectedService, true); }, 5000);
       return () => clearInterval(t);
     }
-  }, [open, selectedService]);
+  }, [open, selectedService, fetchServices, fetchVersions]);
 
   const handleDeploy = async () => {
     setDeployOpen(false);
@@ -177,8 +174,8 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
         const txt = await res.text();
         setError(`Deploy failed: ${txt}`);
       }
-    } catch (e: any) {
-      setError(`Network error: ${e.message}`);
+    } catch (error: unknown) {
+      setError(`Network error: ${errorMessage(error)}`);
     } finally {
       setLoading(false);
     }
@@ -456,7 +453,22 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
             />
             <FormControl fullWidth size="small">
               <InputLabel>Runtime</InputLabel>
-              <Select value={form.runtime} label="Runtime" onChange={e => setForm({ ...form, runtime: e.target.value })}>
+              <Select
+                value={form.runtime}
+                label="Runtime"
+                onChange={e => setForm(current => {
+                  const runtime = e.target.value;
+                  const usesDefaultCode = !current.code || Object.values(DEFAULT_CODE).includes(current.code);
+                  return {
+                    ...current,
+                    runtime,
+                    code: usesDefaultCode ? DEFAULT_CODE[runtime] ?? current.code : current.code,
+                    entrypoint: usesDefaultCode
+                      ? runtime.startsWith('go') ? '' : runtime.startsWith('nodejs') ? 'node index.js' : 'gunicorn -b :$PORT main:app'
+                      : current.entrypoint,
+                  };
+                })}
+              >
                 {RUNTIMES.map(r => <MenuItem key={r} value={r}>{r}</MenuItem>)}
               </Select>
             </FormControl>

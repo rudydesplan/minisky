@@ -12,7 +12,7 @@ MiniSky is a high-fidelity GCP emulator designed for local development, testing,
 5. [Databases (Firestore, SQL, Bigtable)](#databases)
 6. [Observability (Logging & Monitoring)](#observability)
 7. [BigQuery](#bigquery)
-8. [Lazy Loading & Snapshots](#lazy-loading--snapshots)
+8. [Lazy Loading & State](#lazy-loading--state)
 
 ---
 
@@ -131,15 +131,16 @@ results = client.query(query)
 
 ---
 
-## Lazy Loading & Snapshots
+## Lazy Loading & State
 
 ### Lazy Loading
 MiniSky is "Lazy" by default. If you run a command like `gcloud pubsub topics create ...`, MiniSky will detect that Pub/Sub is not running, pull the image (if missing), start the container, and then execute your command.
 
-### Collaboration with Snapshots
-MiniSky allows you to share your environment state with your team.
-- **Save your state**: `minisky state save --name=testing-feature-x`
-- **Share/Load**: Share the `.minisky` file. Teammates can load it with `minisky state load testing-feature-x.minisky`.
+### State lifecycle
+Most Go shim metadata is held in memory and is cleared when MiniSky restarts.
+Docker-backed services may retain data in their managed containers or volumes, and
+Cloud Logging and BigQuery store selected data under `~/.minisky`. MiniSky does
+not currently provide state export or import commands.
 
 ---
 

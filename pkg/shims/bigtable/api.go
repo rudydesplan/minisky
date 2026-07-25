@@ -38,9 +38,9 @@ type Instance struct {
 
 // Table mirrors the Bigtable Table resource.
 type Table struct {
-	Name           string                     `json:"name"`
-	ColumnFamilies map[string]ColumnFamily    `json:"columnFamilies"`
-	Granularity    string                     `json:"granularity"` // MILLIS
+	Name           string                  `json:"name"`
+	ColumnFamilies map[string]ColumnFamily `json:"columnFamilies"`
+	Granularity    string                  `json:"granularity"` // MILLIS
 }
 
 type ColumnFamily struct {
@@ -48,8 +48,8 @@ type ColumnFamily struct {
 }
 
 type GcRule struct {
-	MaxAge         string  `json:"maxAge,omitempty"`
-	MaxNumVersions int32   `json:"maxNumVersions,omitempty"`
+	MaxAge         string `json:"maxAge,omitempty"`
+	MaxNumVersions int32  `json:"maxNumVersions,omitempty"`
 }
 
 // API is the high-fidelity Bigtable Admin & Data shim.
@@ -101,8 +101,12 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	project := ""
 	instanceId := ""
-	if len(parts) >= 3 { project = parts[2] }
-	if len(parts) >= 5 { instanceId = parts[4] }
+	if len(parts) >= 3 {
+		project = parts[2]
+	}
+	if len(parts) >= 5 {
+		instanceId = parts[4]
+	}
 
 	switch r.Method {
 	case http.MethodPost:
@@ -111,7 +115,7 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			Instance   Instance `json:"instance"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		
+
 		name := fmt.Sprintf("projects/%s/instances/%s", project, body.InstanceId)
 		inst := &Instance{
 			Name:        name,
@@ -120,7 +124,7 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			Type:        body.Instance.Type,
 			Labels:      body.Instance.Labels,
 		}
-		
+
 		api.mu.Lock()
 		api.instances[name] = inst
 		api.mu.Unlock()
@@ -177,7 +181,9 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 	project := parts[2]
 	instance := parts[4]
 	tableId := ""
-	if len(parts) >= 7 { tableId = parts[6] }
+	if len(parts) >= 7 {
+		tableId = parts[6]
+	}
 
 	parent := fmt.Sprintf("projects/%s/instances/%s", project, instance)
 
@@ -188,7 +194,7 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 			Table   Table  `json:"table"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		
+
 		name := fmt.Sprintf("%s/tables/%s", parent, body.TableId)
 		t := &Table{
 			Name:           name,
@@ -198,7 +204,7 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 		if t.ColumnFamilies == nil {
 			t.ColumnFamilies = make(map[string]ColumnFamily)
 		}
-		
+
 		api.mu.Lock()
 		api.tables[name] = t
 		api.mu.Unlock()
@@ -270,7 +276,7 @@ func (api *API) handleReadRows(w http.ResponseWriter, r *http.Request, resourceP
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	client, err := bigtable.NewClient(ctx, projectID, instanceID, 
+	client, err := bigtable.NewClient(ctx, projectID, instanceID,
 		option.WithEndpoint(addr),
 		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
 		option.WithoutAuthentication(),
@@ -282,14 +288,14 @@ func (api *API) handleReadRows(w http.ResponseWriter, r *http.Request, resourceP
 	defer client.Close()
 
 	table := client.Open(tableID)
-	
+
 	var rows []map[string]interface{}
 	err = table.ReadRows(ctx, bigtable.InfiniteRange(""), func(row bigtable.Row) bool {
 		rowMap := map[string]interface{}{
-			"key": row.Key(),
+			"key":  row.Key(),
 			"data": make(map[string]interface{}),
 		}
-		
+
 		data := rowMap["data"].(map[string]interface{})
 		for family, items := range row {
 			familyData := make(map[string]interface{})

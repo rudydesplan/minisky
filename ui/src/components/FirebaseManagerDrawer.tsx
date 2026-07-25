@@ -25,6 +25,16 @@ type User = {
 
 type FirebaseManagerDrawerProps = { open: boolean; onClose: () => void };
 
+interface ApiErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
 export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManagerDrawerProps) {
   const { activeProject } = useProjectContext();
   const [tab, setTab] = useState(0);
@@ -79,11 +89,11 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
         setNewUserEmail('');
         setNewUserPass('');
       } else {
-        const err = await res.json();
+        const err = await res.json() as ApiErrorResponse;
         showToast(err.error?.message || 'Failed to create user', 'error');
       }
-    } catch (e: any) {
-      showToast(e.message, 'error');
+    } catch (e: unknown) {
+      showToast(getErrorMessage(e, 'Failed to create user'), 'error');
     }
   };
 
@@ -98,8 +108,8 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
         showToast('User deleted');
         loadUsers();
       }
-    } catch (e: any) {
-      showToast(e.message, 'error');
+    } catch (e: unknown) {
+      showToast(getErrorMessage(e, 'Failed to delete user'), 'error');
     }
   };
 
@@ -133,8 +143,8 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
         showToast('Database updated');
         loadRtdb(dbPath);
       }
-    } catch (e: any) {
-      showToast('Invalid JSON: ' + e.message, 'error');
+    } catch (e: unknown) {
+      showToast('Invalid JSON: ' + getErrorMessage(e, 'Unknown parsing error'), 'error');
     }
   };
 

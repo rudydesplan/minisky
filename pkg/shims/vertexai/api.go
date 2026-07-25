@@ -16,7 +16,7 @@ import (
 func init() {
 	registry.Register("aiplatform.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return &API{
-			svcMgr:    ctx.SvcMgr,
+			svcMgr:   ctx.SvcMgr,
 			provider: "ollama",
 			endpoint: "http://localhost:11434",
 			model:    "llama3",
@@ -25,12 +25,12 @@ func init() {
 }
 
 type API struct {
-	mu        sync.Mutex
-	svcMgr    *orchestrator.ServiceManager
-	provider  string // ollama, openai
-	endpoint  string
-	apiKey    string
-	model     string
+	mu       sync.Mutex
+	svcMgr   *orchestrator.ServiceManager
+	provider string // ollama, openai
+	endpoint string
+	apiKey   string
+	model    string
 }
 
 type VertexRequest struct {
@@ -134,9 +134,13 @@ func (api *API) proxyToOllama(w http.ResponseWriter, vReq VertexRequest) {
 	}
 	for _, c := range vReq.Contents {
 		role := c.Role
-		if role == "" { role = "user" }
+		if role == "" {
+			role = "user"
+		}
 		var texts []string
-		for _, p := range c.Parts { texts = append(texts, p.Text) }
+		for _, p := range c.Parts {
+			texts = append(texts, p.Text)
+		}
 		oReq.Messages = append(oReq.Messages, OllamaMsg{
 			Role:    role,
 			Content: strings.Join(texts, "\n"),

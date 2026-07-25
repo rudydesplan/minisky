@@ -5,8 +5,8 @@ project_name: minisky
 
 before:
   hooks:
-    - go mod tidy
-    - bash -c "cd ui && npm run build"
+    - go mod download
+    - bash -c "cd ui && npm ci && npm run build"
 
 builds:
   - id: linux
@@ -63,18 +63,16 @@ nfpms:
       - deb
       - rpm
 
-brews:
+homebrew_casks:
   - name: minisky
     repository:
       owner: qamarudeenm
       name: homebrew-tap
-    directory: Formula
     homepage: https://github.com/qamarudeenm/minisky
     description: High-fidelity local GCP emulator.
-    install: |
-      bin.install "minisky"
-    test: |
-      system "#{bin}/minisky version"
+    license: MIT
+    binaries:
+      - minisky
 
 checksum:
   name_template: 'checksums.txt'

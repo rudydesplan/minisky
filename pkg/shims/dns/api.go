@@ -24,16 +24,16 @@ func init() {
 
 // ManagedZone mirrors the Cloud DNS ManagedZone resource.
 type ManagedZone struct {
-	Kind              string            `json:"kind"`
-	Name              string            `json:"name"`
-	DnsName           string            `json:"dnsName"`
-	Description       string            `json:"description,omitempty"`
-	ID                uint64            `json:"id,string"`
-	NameServers       []string          `json:"nameServers"`
-	CreationTime      string            `json:"creationTime"`
-	Visibility        string            `json:"visibility"` // public, private
-	DNSSECConfig      *DNSSECConfig     `json:"dnssecConfig,omitempty"`
-	Labels            map[string]string `json:"labels,omitempty"`
+	Kind                    string                   `json:"kind"`
+	Name                    string                   `json:"name"`
+	DnsName                 string                   `json:"dnsName"`
+	Description             string                   `json:"description,omitempty"`
+	ID                      uint64                   `json:"id,string"`
+	NameServers             []string                 `json:"nameServers"`
+	CreationTime            string                   `json:"creationTime"`
+	Visibility              string                   `json:"visibility"` // public, private
+	DNSSECConfig            *DNSSECConfig            `json:"dnssecConfig,omitempty"`
+	Labels                  map[string]string        `json:"labels,omitempty"`
 	PrivateVisibilityConfig *PrivateVisibilityConfig `json:"privateVisibilityConfig,omitempty"`
 }
 
@@ -54,21 +54,21 @@ type PrivateNetwork struct {
 // The key fields used by Terraform and gcloud are name, type, ttl, rrdatas.
 type ResourceRecordSet struct {
 	Kind    string   `json:"kind"`
-	Name    string   `json:"name"`    // FQDN, e.g. "www.example.com."
-	Type    string   `json:"type"`    // A, AAAA, CNAME, MX, TXT, NS, SOA, PTR, SRV, CAA
+	Name    string   `json:"name"` // FQDN, e.g. "www.example.com."
+	Type    string   `json:"type"` // A, AAAA, CNAME, MX, TXT, NS, SOA, PTR, SRV, CAA
 	TTL     int      `json:"ttl"`
 	Rrdatas []string `json:"rrdatas"`
 }
 
 // Change represents an atomic batch of DNS record additions/deletions.
 type Change struct {
-	Kind        string               `json:"kind"`
-	ID          string               `json:"id"`
-	Status      string               `json:"status"` // pending → done
-	StartTime   string               `json:"startTime"`
-	Additions   []ResourceRecordSet  `json:"additions,omitempty"`
-	Deletions   []ResourceRecordSet  `json:"deletions,omitempty"`
-	IsServing   bool                 `json:"isServing"`
+	Kind      string              `json:"kind"`
+	ID        string              `json:"id"`
+	Status    string              `json:"status"` // pending → done
+	StartTime string              `json:"startTime"`
+	Additions []ResourceRecordSet `json:"additions,omitempty"`
+	Deletions []ResourceRecordSet `json:"deletions,omitempty"`
+	IsServing bool                `json:"isServing"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,9 +77,9 @@ type Change struct {
 
 // zoneStore holds all data for a single managed zone.
 type zoneStore struct {
-	zone    *ManagedZone
-	rrsets  map[string]*ResourceRecordSet // key: name+":"+type
-	changes []*Change
+	zone      *ManagedZone
+	rrsets    map[string]*ResourceRecordSet // key: name+":"+type
+	changes   []*Change
 	changeSeq int
 }
 
@@ -89,8 +89,8 @@ type zoneStore struct {
 
 // API is the high-fidelity Cloud DNS v1 shim.
 type API struct {
-	mu    sync.RWMutex
-	zones map[string]*zoneStore // key: project:zoneName
+	mu      sync.RWMutex
+	zones   map[string]*zoneStore // key: project:zoneName
 	zoneSeq uint64
 }
 
@@ -103,17 +103,18 @@ func NewAPI() *API {
 // ServeHTTP dispatches Cloud DNS v1 paths.
 //
 // Supported paths (dns.googleapis.com):
-//   POST   /dns/v1/projects/{project}/managedZones
-//   GET    /dns/v1/projects/{project}/managedZones
-//   GET    /dns/v1/projects/{project}/managedZones/{zone}
-//   PATCH  /dns/v1/projects/{project}/managedZones/{zone}
-//   DELETE /dns/v1/projects/{project}/managedZones/{zone}
-//   GET    /dns/v1/projects/{project}/managedZones/{zone}/rrsets
-//   POST   /dns/v1/projects/{project}/managedZones/{zone}/rrsets
-//   DELETE /dns/v1/projects/{project}/managedZones/{zone}/rrsets/{name}/{type}
-//   POST   /dns/v1/projects/{project}/managedZones/{zone}/changes
-//   GET    /dns/v1/projects/{project}/managedZones/{zone}/changes
-//   GET    /dns/v1/projects/{project}/managedZones/{zone}/changes/{changeId}
+//
+//	POST   /dns/v1/projects/{project}/managedZones
+//	GET    /dns/v1/projects/{project}/managedZones
+//	GET    /dns/v1/projects/{project}/managedZones/{zone}
+//	PATCH  /dns/v1/projects/{project}/managedZones/{zone}
+//	DELETE /dns/v1/projects/{project}/managedZones/{zone}
+//	GET    /dns/v1/projects/{project}/managedZones/{zone}/rrsets
+//	POST   /dns/v1/projects/{project}/managedZones/{zone}/rrsets
+//	DELETE /dns/v1/projects/{project}/managedZones/{zone}/rrsets/{name}/{type}
+//	POST   /dns/v1/projects/{project}/managedZones/{zone}/changes
+//	GET    /dns/v1/projects/{project}/managedZones/{zone}/changes
+//	GET    /dns/v1/projects/{project}/managedZones/{zone}/changes/{changeId}
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud DNS] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
@@ -199,16 +200,16 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 	api.mu.Unlock()
 
 	zone := &ManagedZone{
-		Kind:         "dns#managedZone",
-		Name:         body.Name,
-		DnsName:      dnsName,
-		Description:  body.Description,
-		ID:           id,
-		Labels:       body.Labels,
-		Visibility:   visibility,
-		DNSSECConfig: body.DNSSECConfig,
+		Kind:                    "dns#managedZone",
+		Name:                    body.Name,
+		DnsName:                 dnsName,
+		Description:             body.Description,
+		ID:                      id,
+		Labels:                  body.Labels,
+		Visibility:              visibility,
+		DNSSECConfig:            body.DNSSECConfig,
 		PrivateVisibilityConfig: body.PrivateVisibilityConfig,
-		CreationTime: time.Now().UTC().Format(time.RFC3339),
+		CreationTime:            time.Now().UTC().Format(time.RFC3339),
 		// Return realistic-looking MiniSky name servers
 		NameServers: []string{
 			fmt.Sprintf("ns-cloud-a1.minisky.dev."),
@@ -223,7 +224,7 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 	nsRdatas := zone.NameServers
 
 	store := &zoneStore{
-		zone:   zone,
+		zone: zone,
 		rrsets: map[string]*ResourceRecordSet{
 			rrKey(dnsName, "SOA"): {
 				Kind:    "dns#resourceRecordSet",
@@ -454,9 +455,9 @@ func (api *API) listRRSets(w http.ResponseWriter, r *http.Request, project, zone
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"kind":               "dns#resourceRecordSetsListResponse",
-		"rrsets":             items,
-		"nextPageToken":      "",
+		"kind":          "dns#resourceRecordSetsListResponse",
+		"rrsets":        items,
+		"nextPageToken": "",
 	})
 }
 

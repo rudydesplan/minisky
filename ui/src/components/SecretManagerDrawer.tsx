@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { 
   Drawer, Box, Typography, TextField, Button, 
   Stack, Divider, Alert, List, ListItem, ListItemText, ListItemSecondaryAction, IconButton,
@@ -30,6 +30,10 @@ interface Props {
   onClose: () => void;
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function SecretManagerDrawer({ open, onClose }: Props) {
   const { activeProject } = useProjectContext();
   const [secrets, setSecrets] = useState<Secret[]>([]);
@@ -48,19 +52,19 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
   const [revealedVersion, setRevealedVersion] = useState<string | null>(null);
   const [versionValue, setVersionValue] = useState<string | null>(null);
 
-  const fetchSecrets = async () => {
+  const fetchSecrets = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/secretmanager/projects/${activeProject}/secrets`);
       if (!res.ok) throw new Error('Failed to fetch secrets');
-      const data = await res.json();
+      const data = await res.json() as { secrets?: Secret[] };
       setSecrets(data.secrets || []);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   const fetchVersions = async (secretName: string) => {
     setLoadingVersions(true);
@@ -69,10 +73,10 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
     try {
       const res = await fetch(`/api/manage/secretmanager/${secretName}/versions`);
       if (!res.ok) throw new Error('Failed to fetch versions');
-      const data = await res.json();
+      const data = await res.json() as { versions?: SecretVersion[] };
       setVersions(data.versions || []);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setLoadingVersions(false);
     }
@@ -85,7 +89,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
       setExpandedSecret(null);
       setVersions([]);
     }
-  }, [open, activeProject]);
+  }, [open, fetchSecrets]);
 
   const handleCreate = async () => {
     setCreating(true);
@@ -97,7 +101,9 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
         body: JSON.stringify({ replication: { automatic: {} } })
       });
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
+        const errData = await res.json().catch(() => ({})) as {
+          error?: { message?: string };
+        };
         throw new Error(errData.error?.message || 'Failed to create secret');
       }
 
@@ -112,8 +118,8 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
       setNewSecretId('');
       setInitialValue('');
       fetchSecrets();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setCreating(false);
     }
@@ -131,8 +137,8 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
       if (!res.ok) throw new Error('Failed to add version');
       setNewVersionValue('');
       fetchVersions(secretName);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setAddingVersion(false);
     }
@@ -148,11 +154,11 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
     try {
       const res = await fetch(`/api/manage/secretmanager/${versionName}:access`);
       if (!res.ok) throw new Error('Failed to access secret version');
-      const data = await res.json();
+      const data = await res.json() as { payload: { data: string } };
       setVersionValue(atob(data.payload.data));
       setRevealedVersion(versionName);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     }
   };
 
@@ -165,8 +171,8 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
       if (!res.ok) throw new Error('Failed to delete secret');
       if (expandedSecret === name) setExpandedSecret(null);
       fetchSecrets();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     }
   };
 

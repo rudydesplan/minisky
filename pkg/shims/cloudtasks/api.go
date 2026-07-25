@@ -20,11 +20,11 @@ func init() {
 }
 
 type Task struct {
-	Name         string            `json:"name"`
-	HTTPRequest  *HTTPRequest      `json:"httpRequest,omitempty"`
-	CreateTime   string            `json:"createTime"`
-	ScheduleTime string            `json:"scheduleTime,omitempty"`
-	Status       string            `json:"status"` // Internal use
+	Name         string       `json:"name"`
+	HTTPRequest  *HTTPRequest `json:"httpRequest,omitempty"`
+	CreateTime   string       `json:"createTime"`
+	ScheduleTime string       `json:"scheduleTime,omitempty"`
+	Status       string       `json:"status"` // Internal use
 }
 
 type HTTPRequest struct {
@@ -171,7 +171,7 @@ func (api *API) createQueue(w http.ResponseWriter, r *http.Request, project stri
 func (api *API) deleteQueue(w http.ResponseWriter, r *http.Request, project, queueId string) {
 	name := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
 	log.Printf("[Shim: Cloud Tasks] Attempting to delete queue: %s", name)
-	
+
 	api.mu.Lock()
 	_, exists := api.queues[name]
 	delete(api.queues, name)
@@ -188,7 +188,7 @@ func (api *API) deleteQueue(w http.ResponseWriter, r *http.Request, project, que
 
 func (api *API) listTasks(w http.ResponseWriter, r *http.Request, project, queueId string) {
 	name := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
-	
+
 	api.mu.RLock()
 	tasks := api.tasks[name]
 	api.mu.RUnlock()
@@ -209,7 +209,7 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 	}
 
 	queueName := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
-	
+
 	task := body.Task
 	if task == nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -227,7 +227,7 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 	api.mu.Unlock()
 
 	api.pushLog(project, "INFO", queueName, "Task created: "+task.Name)
-	
+
 	// Background: Simulate task execution if it's an HTTP task
 	if task.HTTPRequest != nil {
 		go api.executeTask(project, queueName, task)
@@ -240,13 +240,13 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 func (api *API) executeTask(project, queueName string, task *Task) {
 	// Wait a bit to simulate asynchronous processing
 	time.Sleep(2 * time.Second)
-	
+
 	log.Printf("[Shim: Cloud Tasks] Executing task %s -> %s %s", task.Name, task.HTTPRequest.HTTPMethod, task.HTTPRequest.URL)
-	
+
 	// In a real emulator, we would make the HTTP call here.
 	// For now, we'll just log it in MiniSky's logs.
 	api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", task.Name, task.HTTPRequest.URL))
-	
+
 	// Update task status
 	api.mu.Lock()
 	for _, t := range api.tasks[queueName] {

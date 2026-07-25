@@ -29,16 +29,16 @@ func init() {
 
 // Dataset mirrors the BigQuery Dataset resource.
 type Dataset struct {
-	Kind        string            `json:"kind"`
-	ID          string            `json:"id"`
-	DatasetReference DatasetRef  `json:"datasetReference"`
-	Description string            `json:"description,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Location    string            `json:"location"`
-	CreationTime string           `json:"creationTime"`
-	LastModifiedTime string       `json:"lastModifiedTime"`
-	Etag        string            `json:"etag"`
-	SelfLink    string            `json:"selfLink"`
+	Kind             string            `json:"kind"`
+	ID               string            `json:"id"`
+	DatasetReference DatasetRef        `json:"datasetReference"`
+	Description      string            `json:"description,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	Location         string            `json:"location"`
+	CreationTime     string            `json:"creationTime"`
+	LastModifiedTime string            `json:"lastModifiedTime"`
+	Etag             string            `json:"etag"`
+	SelfLink         string            `json:"selfLink"`
 }
 
 type DatasetRef struct {
@@ -48,20 +48,20 @@ type DatasetRef struct {
 
 // Table mirrors the BigQuery Table resource.
 type Table struct {
-	Kind             string     `json:"kind"`
-	ID               string     `json:"id"`
-	TableReference   TableRef   `json:"tableReference"`
-	Schema           *TableSchema `json:"schema,omitempty"`
-	Description      string     `json:"description,omitempty"`
+	Kind             string            `json:"kind"`
+	ID               string            `json:"id"`
+	TableReference   TableRef          `json:"tableReference"`
+	Schema           *TableSchema      `json:"schema,omitempty"`
+	Description      string            `json:"description,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
-	Location         string     `json:"location"`
-	CreationTime     string     `json:"creationTime"`
-	LastModifiedTime string     `json:"lastModifiedTime"`
-	NumRows          string     `json:"numRows"`
-	NumBytes         string     `json:"numBytes"`
-	Type             string     `json:"type"` // TABLE, VIEW, EXTERNAL
-	Etag             string     `json:"etag"`
-	SelfLink         string     `json:"selfLink"`
+	Location         string            `json:"location"`
+	CreationTime     string            `json:"creationTime"`
+	LastModifiedTime string            `json:"lastModifiedTime"`
+	NumRows          string            `json:"numRows"`
+	NumBytes         string            `json:"numBytes"`
+	Type             string            `json:"type"` // TABLE, VIEW, EXTERNAL
+	Etag             string            `json:"etag"`
+	SelfLink         string            `json:"selfLink"`
 	// In-memory row storage (for insertAll)
 	rows []map[string]interface{}
 }
@@ -77,21 +77,21 @@ type TableSchema struct {
 }
 
 type FieldSchema struct {
-	Name        string       `json:"name"`
-	Type        string       `json:"type"` // STRING, INTEGER, FLOAT, BOOLEAN, RECORD, TIMESTAMP, DATE, etc.
-	Mode        string       `json:"mode"` // NULLABLE, REQUIRED, REPEATED
-	Description string       `json:"description,omitempty"`
+	Name        string        `json:"name"`
+	Type        string        `json:"type"` // STRING, INTEGER, FLOAT, BOOLEAN, RECORD, TIMESTAMP, DATE, etc.
+	Mode        string        `json:"mode"` // NULLABLE, REQUIRED, REPEATED
+	Description string        `json:"description,omitempty"`
 	Fields      []FieldSchema `json:"fields,omitempty"` // nested RECORD
 }
 
 // Job mirrors the BigQuery Job resource.
 type Job struct {
-	Kind         string       `json:"kind"`
-	ID           string       `json:"id"`
-	JobReference JobRef       `json:"jobReference"`
-	Status       JobStatus    `json:"status"`
-	Statistics   JobStatistics `json:"statistics"`
-	Configuration JobConfig   `json:"configuration"`
+	Kind          string        `json:"kind"`
+	ID            string        `json:"id"`
+	JobReference  JobRef        `json:"jobReference"`
+	Status        JobStatus     `json:"status"`
+	Statistics    JobStatistics `json:"statistics"`
+	Configuration JobConfig     `json:"configuration"`
 
 	// Internal state
 	RawRows []map[string]interface{} `json:"-"`
@@ -105,7 +105,7 @@ type JobRef struct {
 }
 
 type JobStatus struct {
-	State string      `json:"state"` // PENDING, RUNNING, DONE
+	State       string      `json:"state"` // PENDING, RUNNING, DONE
 	ErrorResult *ErrorProto `json:"errorResult,omitempty"`
 }
 
@@ -129,10 +129,10 @@ type JobConfig struct {
 }
 
 type QueryConfig struct {
-	Query                   string `json:"query"`
-	UseLegacySql            bool   `json:"useLegacySql"`
-	DefaultDataset          *DatasetRef `json:"defaultDataset,omitempty"`
-	DestinationTable        *TableRef   `json:"destinationTable,omitempty"`
+	Query            string      `json:"query"`
+	UseLegacySql     bool        `json:"useLegacySql"`
+	DefaultDataset   *DatasetRef `json:"defaultDataset,omitempty"`
+	DestinationTable *TableRef   `json:"destinationTable,omitempty"`
 }
 
 type LoadConfig struct {
@@ -242,7 +242,7 @@ func (api *API) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
-		"path": absPath,
+		"path":     absPath,
 		"filename": handler.Filename,
 	})
 }
@@ -371,9 +371,9 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 	switch r.Method {
 	case http.MethodPost:
 		var body struct {
-			TableReference TableRef     `json:"tableReference"`
-			Schema         *TableSchema `json:"schema"`
-			Description    string       `json:"description"`
+			TableReference TableRef          `json:"tableReference"`
+			Schema         *TableSchema      `json:"schema"`
+			Description    string            `json:"description"`
 			Labels         map[string]string `json:"labels"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
@@ -555,7 +555,7 @@ func (api *API) insertJob(w http.ResponseWriter, r *http.Request, project string
 			Location:  location,
 		},
 		Configuration: body.Configuration,
-		Status: JobStatus{State: "RUNNING"},
+		Status:        JobStatus{State: "RUNNING"},
 		Statistics: JobStatistics{
 			CreationTime:        nowMs,
 			StartTime:           nowMs,
@@ -573,7 +573,7 @@ func (api *API) insertJob(w http.ResponseWriter, r *http.Request, project string
 	go func() {
 		var execErr error
 		var rows []map[string]interface{}
-		
+
 		if api.backend.Enabled() {
 			if body.Configuration.Query != nil && body.Configuration.Query.Query != "" {
 				rows, execErr = api.backend.ExecuteQuery(body.Configuration.Query.Query)
@@ -704,7 +704,7 @@ func (api *API) getQueryResults(w http.ResponseWriter, r *http.Request, path str
 		"rows":                outRows,
 		"totalBytesProcessed": "0",
 	}
-	
+
 	if ok && job.Status.ErrorResult != nil {
 		response["errors"] = []interface{}{job.Status.ErrorResult}
 	}

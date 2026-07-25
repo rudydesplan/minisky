@@ -11,11 +11,20 @@ import LanIcon from '@mui/icons-material/Lan';
 import SecurityIcon from '@mui/icons-material/Security';
 import DnsIcon from '@mui/icons-material/Dns';
 import { useProjectContext } from '../contexts/ProjectContext';
+import type { ChipProps } from '@mui/material/Chip';
 
 type VpcNetwork  = { name: string; autoCreateSubnetworks: boolean; creationTimestamp: string };
 type Firewall    = { name: string; direction: string; priority: number; sourceRanges: string[]; destinationRanges: string[]; allowed: { IPProtocol: string; ports: string[] }[]; denied: { IPProtocol: string; ports: string[] }[]; disabled: boolean; description: string; creationTimestamp: string };
 type ManagedZone = { name: string; dnsName: string; visibility: string; nameServers: string[] };
 type RRSet       = { name: string; type: string; ttl: number; rrdatas: string[] };
+type FirewallRequest = {
+  name: string;
+  direction: string;
+  allowed?: { IPProtocol: string; ports: string[] }[];
+  denied?: { IPProtocol: string; ports: string[] }[];
+  sourceRanges?: string[];
+  destinationRanges?: string[];
+};
 
 export default function NetworkPage() {
   const { activeProject } = useProjectContext();
@@ -94,7 +103,7 @@ export default function NetworkPage() {
     const rule = fwAction === 'allow'
       ? { allowed: [{ IPProtocol: fwProtocol, ports: fwPorts ? fwPorts.split(',').map(p => p.trim()) : [] }] }
       : { denied:  [{ IPProtocol: fwProtocol, ports: fwPorts ? fwPorts.split(',').map(p => p.trim()) : [] }] };
-    const body: any = {
+    const body: FirewallRequest = {
       name: fwName.trim(),
       direction: fwDirection,
       ...rule,
@@ -148,7 +157,17 @@ export default function NetworkPage() {
     showToast('Record deleted'); loadRRSets(selectedZone.name);
   };
 
-  const rrColor = (t: string): any => ({ A: 'primary', AAAA: 'info', CNAME: 'secondary', MX: 'warning', TXT: 'success', NS: 'error' }[t] || 'default');
+  const rrColor = (t: string): ChipProps['color'] => {
+    const colors: Record<string, ChipProps['color']> = {
+      A: 'primary',
+      AAAA: 'info',
+      CNAME: 'secondary',
+      MX: 'warning',
+      TXT: 'success',
+      NS: 'error',
+    };
+    return colors[t] || 'default';
+  };
 
   return (
     <Box sx={{ animation: 'fadeIn 0.4s ease-out' }}>

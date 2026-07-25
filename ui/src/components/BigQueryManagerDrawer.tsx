@@ -20,17 +20,40 @@ type Props = { open: boolean; onClose: () => void };
 
 type VisualField = { name: string; type: string; mode: string };
 
+type BigQueryDataset = {
+  id: string;
+  datasetReference: { datasetId: string };
+  location?: string;
+};
+
+type BigQueryTable = {
+  id: string;
+  tableReference: { tableId: string };
+};
+
+type QueryField = { name: string };
+type QueryValue = string | number | boolean | null;
+type QueryRow = { f: Array<{ v: QueryValue }> };
+type QueryResults = {
+  schema: { fields: QueryField[] };
+  rows?: QueryRow[];
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function BigQueryManagerDrawer({ open, onClose }: Props) {
   const { activeProject } = useProjectContext();
-  const [datasets, setDatasets] = useState<any[]>([]);
-  const [tablesByDataset, setTablesByDataset] = useState<Record<string, any[]>>({});
+  const [datasets, setDatasets] = useState<BigQueryDataset[]>([]);
+  const [tablesByDataset, setTablesByDataset] = useState<Record<string, BigQueryTable[]>>({});
   const [loading, setLoading] = useState(false);
   const [tabValue, setTabValue] = useState(0); // 0: Resources, 1: SQL Workspace, 2: Ingest Data
   const [toast, setToast] = useState({ open: false, msg: '', severity: 'success' as 'success' | 'error' });
 
   // SQL Workspace State
   const [sqlQuery, setSqlQuery] = useState('SELECT * FROM dataset1__table1 LIMIT 10;');
-  const [queryResults, setQueryResults] = useState<any>(null);
+  const [queryResults, setQueryResults] = useState<QueryResults | null>(null);
   const [queryLoading, setQueryLoading] = useState(false);
 
   // Ingest State
@@ -67,10 +90,10 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
       const res = await fetch(`${apiRoot}/datasets`);
       if (res.ok) {
         const data = await res.json();
-        const dsList = data.datasets || [];
+        const dsList: BigQueryDataset[] = data.datasets || [];
         setDatasets(dsList);
         
-        const tbResults: Record<string, any[]> = {};
+        const tbResults: Record<string, BigQueryTable[]> = {};
         for (const ds of dsList) {
            const dsId = ds.datasetReference.datasetId;
            const tbRes = await fetch(`${apiRoot}/datasets/${dsId}/tables`);
@@ -113,8 +136,8 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
         showToast('Query failed', 'error');
         setQueryLoading(false);
       }
-    } catch (e: any) { 
-      showToast(e.message, 'error'); 
+    } catch (error: unknown) {
+      showToast(errorMessage(error), 'error');
       setQueryLoading(false);
     }
   };
@@ -144,20 +167,20 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
   const downloadResults = (format: 'CSV' | 'JSON') => {
     if (!queryResults || !queryResults.rows) return;
     
-    let content = '';
+    let content: string;
     let fileName = `bigquery_results_${new Date().getTime()}`;
-    const headers = queryResults.schema.fields.map((f: any) => f.name);
+    const headers = queryResults.schema.fields.map(f => f.name);
 
     if (format === 'CSV') {
       content = headers.join(',') + '\n';
-      content += queryResults.rows.map((row: any) => 
-        row.f.map((cell: any) => `"${cell.v}"`).join(',')
+      content += queryResults.rows.map(row =>
+        row.f.map(cell => `"${cell.v}"`).join(',')
       ).join('\n');
       fileName += '.csv';
     } else {
-      const jsonData = queryResults.rows.map((row: any) => {
-        const item: any = {};
-        row.f.forEach((cell: any, i: number) => {
+      const jsonData = queryResults.rows.map(row => {
+        const item: Record<string, QueryValue> = {};
+        row.f.forEach((cell, i) => {
           item[headers[i]] = cell.v;
         });
         return item;
@@ -198,7 +221,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
       } else {
         showToast('Upload failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (error: unknown) { showToast(errorMessage(error), 'error'); }
     finally { setIngesting(false); }
   };
 
@@ -232,7 +255,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
       } else {
         showToast('Ingestion failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (error: unknown) { showToast(errorMessage(error), 'error'); }
     finally { setIngesting(false); }
   };
 
@@ -250,7 +273,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
         setNewDsOpen(false);
         setNewDsId('');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (error: unknown) { showToast(errorMessage(error), 'error'); }
   };
 
   const handleAddField = () => {
@@ -293,7 +316,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
       } else {
         showToast('Failed to create table', 'error');
       }
-    } catch (e: any) { showToast('Invalid configuration', 'error'); }
+    } catch { showToast('Invalid configuration', 'error'); }
   };
 
   return (
@@ -406,15 +429,15 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
                     <Table size="small" stickyHeader>
                       <TableHead>
                         <TableRow>
-                          {queryResults.schema?.fields?.map((f: any) => (
+                          {queryResults.schema?.fields?.map(f => (
                             <TableCell key={f.name} sx={{ bgcolor: '#f8f9fa', fontWeight: 600 }}>{f.name}</TableCell>
                           ))}
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {queryResults.rows?.map((row: any, i: number) => (
+                        {queryResults.rows?.map((row, i) => (
                           <TableRow key={i}>
-                            {row.f.map((cell: any, j: number) => (
+                            {row.f.map((cell, j) => (
                               <TableCell key={j}>{cell.v}</TableCell>
                             ))}
                           </TableRow>

@@ -18,11 +18,76 @@ import { useState, useEffect, useCallback } from 'react';
 
 type Props = { open: boolean; onClose: () => void };
 
+type SpannerInstance = {
+  name: string;
+  displayName?: string;
+  state?: string;
+};
+
+type SpannerDatabase = {
+  name: string;
+};
+
+type QueryField = {
+  name: string;
+};
+
+type QueryResults = {
+  metadata?: {
+    rowType?: {
+      fields?: QueryField[];
+    };
+  };
+  rows?: unknown[][];
+  message?: string;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const isSpannerInstance = (value: unknown): value is SpannerInstance =>
+  isRecord(value) && typeof value.name === 'string';
+
+const isSpannerDatabase = (value: unknown): value is SpannerDatabase =>
+  isRecord(value) && typeof value.name === 'string';
+
+const getErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const getApiErrorMessage = (value: unknown): string | undefined => {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.message === 'string') return value.message;
+  return isRecord(value.error) && typeof value.error.message === 'string'
+    ? value.error.message
+    : undefined;
+};
+
+const parseQueryResults = (value: unknown): QueryResults => {
+  if (!isRecord(value)) return {};
+
+  const rowType = isRecord(value.metadata) && isRecord(value.metadata.rowType)
+    ? value.metadata.rowType
+    : undefined;
+  const fields = rowType && Array.isArray(rowType.fields)
+    ? rowType.fields.flatMap((field) =>
+        isRecord(field) && typeof field.name === 'string' ? [{ name: field.name }] : [])
+    : undefined;
+  const rows = Array.isArray(value.rows)
+    ? value.rows.filter((row): row is unknown[] => Array.isArray(row))
+    : undefined;
+
+  return {
+    metadata: fields ? { rowType: { fields } } : undefined,
+    rows,
+    message: typeof value.message === 'string' ? value.message : undefined,
+  };
+};
+
 export default function SpannerManagerDrawer({ open, onClose }: Props) {
   const { activeProject } = useProjectContext();
-  const [instances, setInstances] = useState<any[]>([]);
-  const [databasesByInstance, setDatabasesByInstance] = useState<Record<string, any[]>>({});
-  const [tablesByDb, setTablesByDb] = useState<Record<string, any[]>>({});
+  const [instances, setInstances] = useState<SpannerInstance[]>([]);
+  const [databasesByInstance, setDatabasesByInstance] = useState<Record<string, SpannerDatabase[]>>({});
+  const [tablesByDb, setTablesByDb] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(false);
   const [tabValue, setTabValue] = useState(0); // 0: Instances, 1: SQL Workspace
   const [toast, setToast] = useState({ open: false, msg: '', severity: 'success' as 'success' | 'error' });
@@ -30,7 +95,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
   // SQL Workspace State
   const [selectedDb, setSelectedDb] = useState('');
   const [sqlQuery, setSqlQuery] = useState('SELECT * FROM INFORMATION_SCHEMA.TABLES;');
-  const [queryResults, setQueryResults] = useState<any>(null);
+  const [queryResults, setQueryResults] = useState<QueryResults | null>(null);
   const [queryLoading, setQueryLoading] = useState(false);
 
   // Dialog State
@@ -51,17 +116,22 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
     try {
       const res = await fetch(`${apiRoot}/instances`);
       if (res.ok) {
-        const data = await res.json();
-        const instList = data.instances || [];
+        const data: unknown = await res.json();
+        const instList = isRecord(data) && Array.isArray(data.instances)
+          ? data.instances.filter(isSpannerInstance)
+          : [];
         setInstances(instList);
         
-        const dbMap: Record<string, any[]> = {};
+        const dbMap: Record<string, SpannerDatabase[]> = {};
         for (const inst of instList) {
           const instId = inst.name.split('/').pop();
+          if (!instId) continue;
           const dbRes = await fetch(`${apiRoot}/instances/${instId}/databases`);
           if (dbRes.ok) {
-            const dbData = await dbRes.json();
-            dbMap[instId] = dbData.databases || [];
+            const dbData: unknown = await dbRes.json();
+            dbMap[instId] = isRecord(dbData) && Array.isArray(dbData.databases)
+              ? dbData.databases.filter(isSpannerDatabase)
+              : [];
           }
         }
         setDatabasesByInstance(dbMap);
@@ -80,7 +150,10 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       body: JSON.stringify({})
     });
     if (!res.ok) throw new Error('Failed to create session');
-    const data = await res.json();
+    const data: unknown = await res.json();
+    if (!isRecord(data) || typeof data.name !== 'string') {
+      throw new Error('Session response did not include a name');
+    }
     return data.name; // full resource name
   };
 
@@ -100,8 +173,10 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
         })
       });
       if (res.ok) {
-        const data = await res.json();
-        const tables = data.rows?.map((r: any) => r[0]) || [];
+        const data: unknown = await res.json();
+        const rows = isRecord(data) && Array.isArray(data.rows) ? data.rows : [];
+        const tables = rows.flatMap((row) =>
+          Array.isArray(row) && typeof row[0] === 'string' ? [row[0]] : []);
         setTablesByDb(prev => ({ ...prev, [dbPath]: tables }));
       }
     } catch (e) {
@@ -118,7 +193,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       const isDDL = /^\s*(CREATE|ALTER|DROP)\s+/i.test(sqlQuery);
       
       let url = '';
-      let body: any = {};
+      let body: Record<string, unknown> = {};
       let method = 'POST';
 
       if (isDDL) {
@@ -140,17 +215,17 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
         body: JSON.stringify(body)
       });
       
-      const data = await res.json();
+      const data: unknown = await res.json();
       if (res.ok) {
-        setQueryResults(isDDL ? { message: 'Schema updated successfully' } : data);
+        setQueryResults(isDDL ? { message: 'Schema updated successfully' } : parseQueryResults(data));
         showToast(isDDL ? 'Schema updated' : 'Query executed successfully');
         if (isDDL) loadTables(instId, dbId);
       } else {
-        const errMsg = data.error?.message || data.message || 'Operation failed';
+        const errMsg = getApiErrorMessage(data) || 'Operation failed';
         showToast(errMsg, 'error');
       }
-    } catch (e: any) {
-      showToast(e.message, 'error');
+    } catch (e: unknown) {
+      showToast(getErrorMessage(e), 'error');
     } finally {
       setQueryLoading(false);
     }
@@ -182,7 +257,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       } else {
         showToast('Failed to create instance', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     finally { setLoading(false); setNewInstanceOpen(false); setNewInstanceId(''); }
   };
 
@@ -201,7 +276,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       } else {
         showToast('Failed to create database', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     finally { setLoading(false); setNewDbOpen(false); setNewDbId(''); }
   };
 
@@ -242,7 +317,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
             ) : (
               <List>
                 {instances.map((inst) => {
-                  const instId = inst.name.split('/').pop();
+                  const instId = inst.name.split('/').pop() || inst.name;
                   const dbs = databasesByInstance[instId] || [];
                   return (
                     <Paper key={inst.name} sx={{ mb: 2, overflow: 'hidden', border: '1px solid #dadce0' }} elevation={0}>
@@ -258,8 +333,8 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
                       <List disablePadding sx={{ bgcolor: '#fafafa' }}>
                         {dbs.length === 0 ? (
                           <ListItem><Typography variant="caption" sx={{ color: '#5f6368', pl: 7 }}>No databases</Typography></ListItem>
-                        ) : dbs.map(db => {
-                          const dbId = db.name.split('/').pop();
+                        ) : dbs.map((db) => {
+                          const dbId = db.name.split('/').pop() || db.name;
                           const dbPath = `${instId}/${dbId}`;
                           const isExpanded = expandedDb === dbPath;
                           const tables = tablesByDb[dbPath];
@@ -385,15 +460,15 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
                   <Table size="small" stickyHeader>
                     <TableHead>
                       <TableRow>
-                        {queryResults.metadata?.rowType?.fields?.map((f: any) => (
+                        {queryResults.metadata?.rowType?.fields?.map((f) => (
                           <TableCell key={f.name} sx={{ bgcolor: '#f8f9fa', fontWeight: 600 }}>{f.name}</TableCell>
                         ))}
                       </TableRow>
                     </TableHead>
                     <TableBody>
-                      {queryResults.rows?.map((row: any, i: number) => (
+                      {queryResults.rows?.map((row, i) => (
                         <TableRow key={i}>
-                          {row.map((cell: any, j: number) => (
+                          {row.map((cell, j) => (
                             <TableCell key={j}>{JSON.stringify(cell)}</TableCell>
                           ))}
                         </TableRow>

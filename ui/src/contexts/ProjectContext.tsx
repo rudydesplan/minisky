@@ -1,15 +1,9 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
+import { ProjectContext } from './projectContextValue';
 
-type ProjectContextType = {
-  activeProject: string;
-  setActiveProject: (name: string) => void;
-  availableProjects: string[];
-  addProject: (name: string) => void;
-};
+export { useProjectContext } from './projectContextValue';
 
-const ProjectContext = createContext<ProjectContextType | undefined>(undefined);
-
-export function ProjectProvider({ children }: { children: React.ReactNode }) {
+const projectProvider = function ProjectProvider({ children }: { children: React.ReactNode }) {
   const [activeProject, setActiveProjectState] = useState<string>('local-dev-project');
   const [availableProjects, setAvailableProjects] = useState<string[]>(['local-dev-project']);
 
@@ -25,7 +19,9 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     if (savedList) {
       try {
         baseList = Array.from(new Set([...baseList, ...JSON.parse(savedList)]));
-      } catch (e) {}
+      } catch {
+        // Ignore malformed persisted data and use the default project list.
+      }
     }
 
     // Fetch discovered projects from backend
@@ -58,12 +54,6 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
       {children}
     </ProjectContext.Provider>
   );
-}
+};
 
-export function useProjectContext() {
-  const context = useContext(ProjectContext);
-  if (context === undefined) {
-    throw new Error('useProjectContext must be used within a ProjectProvider');
-  }
-  return context;
-}
+export const ProjectProvider = projectProvider;

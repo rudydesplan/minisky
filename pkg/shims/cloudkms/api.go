@@ -29,20 +29,20 @@ func init() {
 // ---------------------------------------------------------------------------
 
 type CryptoKeyVersion struct {
-	Name            string `json:"name"`
-	State           string `json:"state"` // ENABLED | DISABLED | DESTROYED
-	CreateTime      string `json:"createTime"`
-	DestroyTime     string `json:"destroyTime,omitempty"`
-	Algorithm       string `json:"algorithm"`
-	aesKey          []byte // 32-byte AES-256 key, never serialised
+	Name        string `json:"name"`
+	State       string `json:"state"` // ENABLED | DISABLED | DESTROYED
+	CreateTime  string `json:"createTime"`
+	DestroyTime string `json:"destroyTime,omitempty"`
+	Algorithm   string `json:"algorithm"`
+	aesKey      []byte // 32-byte AES-256 key, never serialised
 }
 
 type CryptoKey struct {
-	Name            string             `json:"name"`
-	Purpose         string             `json:"purpose"` // ENCRYPT_DECRYPT | ASYMMETRIC_SIGN | MAC
-	CreateTime      string             `json:"createTime"`
-	VersionTemplate map[string]any     `json:"versionTemplate,omitempty"`
-	Labels          map[string]string  `json:"labels,omitempty"`
+	Name            string            `json:"name"`
+	Purpose         string            `json:"purpose"` // ENCRYPT_DECRYPT | ASYMMETRIC_SIGN | MAC
+	CreateTime      string            `json:"createTime"`
+	VersionTemplate map[string]any    `json:"versionTemplate,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
 	mu              sync.Mutex
 	versions        []*CryptoKeyVersion
 }
@@ -55,10 +55,10 @@ type KeyRing struct {
 }
 
 type API struct {
-	mu       sync.RWMutex
+	mu sync.RWMutex
 	// map[project/location] -> map[keyRingId] -> *KeyRing
-	store    map[string]map[string]*KeyRing
-	logAPI   *logging.API
+	store  map[string]map[string]*KeyRing
+	logAPI *logging.API
 }
 
 func NewAPI() *API {
@@ -529,8 +529,8 @@ func (api *API) encrypt(w http.ResponseWriter, r *http.Request, project, locKey,
 
 	api.pushLog(project, "INFO", ck.Name, "Encrypt operation performed")
 	jsonOK(w, map[string]any{
-		"name":           v.Name,
-		"ciphertext":     base64.StdEncoding.EncodeToString(ciphertext),
+		"name":             v.Name,
+		"ciphertext":       base64.StdEncoding.EncodeToString(ciphertext),
 		"ciphertextCrc32c": 0, // Not implemented; CRC32c verification is optional
 	})
 }
@@ -577,9 +577,9 @@ func (api *API) decrypt(w http.ResponseWriter, r *http.Request, project, locKey,
 		if err == nil {
 			api.pushLog(project, "INFO", ck.Name, "Decrypt operation performed")
 			jsonOK(w, map[string]any{
-				"plaintext":          base64.StdEncoding.EncodeToString(plaintext),
-				"usedPrimary":        i == len(versions)-1,
-				"protectionLevel":    "SOFTWARE",
+				"plaintext":       base64.StdEncoding.EncodeToString(plaintext),
+				"usedPrimary":     i == len(versions)-1,
+				"protectionLevel": "SOFTWARE",
 			})
 			return
 		}

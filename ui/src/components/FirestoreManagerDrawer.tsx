@@ -15,12 +15,31 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type Document = {
   name: string;
-  fields: Record<string, any>;
+  fields: Record<string, unknown>;
   createTime: string;
   updateTime: string;
 };
 
 type FirestoreManagerDrawerProps = { open: boolean; onClose: () => void };
+
+interface ApiErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+interface FirestoreDocumentSnapshot {
+  id: string;
+  data: () => Record<string, unknown>;
+}
+
+interface FirestoreQuerySnapshot {
+  forEach: (callback: (document: FirestoreDocumentSnapshot) => void) => void;
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
 
 export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManagerDrawerProps) {
   const { activeProject } = useProjectContext();
@@ -36,7 +55,7 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
 
   // Dynamic SDK Live Sync feature
   const [liveSync, setLiveSync] = useState(false);
-  const [firebaseDb, setFirebaseDb] = useState<any>(null);
+  const [firebaseDb, setFirebaseDb] = useState<object | null>(null);
 
   // Dialog for new collection/doc
   const [newColOpen, setNewColOpen] = useState(false);
@@ -52,9 +71,9 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
       setLoading(true);
       (async () => {
         try {
-          // @ts-ignore
+          // @ts-expect-error -- Firebase SDK is loaded from a runtime CDN URL.
           const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js');
-          // @ts-ignore
+          // @ts-expect-error -- Firebase SDK is loaded from a runtime CDN URL.
           const { getFirestore, connectFirestoreEmulator } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js');
           
           const app = initializeApp({ projectId: activeProject });
@@ -63,8 +82,8 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
           connectFirestoreEmulator(db, window.location.hostname, 8080, { mockUserToken: "foo" });
           setFirebaseDb(db);
           showToast('Dynamic Firebase SDK Injected & Initialized');
-        } catch (err: any) {
-          showToast('Failed to load SDK dynamically: ' + err.message, 'error');
+        } catch (err: unknown) {
+          showToast('Failed to load SDK dynamically: ' + getErrorMessage(err, 'Unknown SDK error'), 'error');
           setLiveSync(false);
         } finally {
           setLoading(false);
@@ -118,18 +137,18 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
 
   // When collection changes, load docs
   useEffect(() => {
-    let unsub: any = null;
+    let unsub: (() => void) | null = null;
     
     if (activeCollection) {
       if (liveSync && firebaseDb) {
         setLoading(true);
         (async () => {
-          // @ts-ignore
+          // @ts-expect-error -- Firebase SDK is loaded from a runtime CDN URL.
           const { collection, onSnapshot } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js');
           const colRef = collection(firebaseDb, activeCollection);
-          unsub = onSnapshot(colRef, (snapshot: any) => {
+          unsub = onSnapshot(colRef, (snapshot: FirestoreQuerySnapshot) => {
             const docs: Document[] = [];
-            snapshot.forEach((docSnap: any) => {
+            snapshot.forEach((docSnap: FirestoreDocumentSnapshot) => {
               // Convert SDK doc format locally
               docs.push({
                 name: `projects/${activeProject}/databases/(default)/documents/${activeCollection}/${docSnap.id}`,
@@ -176,11 +195,11 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
         showToast('Created new document');
         loadDocuments(activeCollection);
       } else {
-        const e = await res.json();
+        const e = await res.json() as ApiErrorResponse;
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) {
-      showToast(e.message, 'error');
+    } catch (e: unknown) {
+      showToast(getErrorMessage(e, 'Failed to create document'), 'error');
     }
   };
 
@@ -204,11 +223,11 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
         showToast('Document saved successfully');
         loadDocuments(activeCollection!);
       } else {
-        const e = await res.json();
+        const e = await res.json() as ApiErrorResponse;
         showToast(e.error?.message || 'Save failed', 'error');
       }
-    } catch (e: any) {
-      showToast('Invalid JSON format: ' + e.message, 'error');
+    } catch (e: unknown) {
+      showToast('Invalid JSON format: ' + getErrorMessage(e, 'Unknown parsing error'), 'error');
     }
   };
 

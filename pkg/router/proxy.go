@@ -74,7 +74,7 @@ func (p *ProxyRouter) RegisterLazyDocker(domain string) {
 
 func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	targetDomain := r.Host
-	
+
 	// 1. Support Path-based Routing for local requests (Terraform/CLI)
 	if strings.Contains(targetDomain, "localhost") || strings.Contains(targetDomain, "127.0.0.1") {
 		path := r.URL.Path
@@ -103,7 +103,7 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Router] %s %s%s", r.Method, targetDomain, r.URL.Path)
 
 	// 2. Schema Validation
-	if !p.validator.ValidateRequest(w, r) {
+	if !p.validator.ValidateRequestForDomain(w, r, targetDomain) {
 		return
 	}
 

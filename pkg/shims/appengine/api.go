@@ -83,8 +83,8 @@ type API struct {
 	serverless *serverless.API
 	logAPI     *logging.API
 	apps       map[string]*App
-	services   map[string]map[string]*Service                 // appId -> serviceId -> Service
-	versions   map[string]map[string]map[string]*Version      // appId -> serviceId -> versionId -> Version
+	services   map[string]map[string]*Service            // appId -> serviceId -> Service
+	versions   map[string]map[string]map[string]*Version // appId -> serviceId -> versionId -> Version
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, serverless *serverless.API, logAPI *logging.API) *API {
@@ -106,7 +106,6 @@ func (api *API) pushLog(projectId, severity, service, text string) {
 	}
 	api.logAPI.PushLog(projectId, severity, "gae_app", service, text)
 }
-
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: AppEngine] %s %s", r.Method, r.URL.Path)
@@ -154,8 +153,8 @@ func (api *API) handleApps(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			// In MiniSky, we auto-create the app for the project if requested
 			app = &App{
-				Id:           project,
-				LocationId:   "us-central1",
+				Id:              project,
+				LocationId:      "us-central1",
 				DefaultHostname: fmt.Sprintf("%s.appspot.com", project),
 			}
 			api.mu.Lock()
@@ -235,8 +234,12 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Service == "" { req.Service = "default" }
-	if req.Version == "" { req.Version = fmt.Sprintf("v-%d", time.Now().Unix()) }
+	if req.Service == "" {
+		req.Service = "default"
+	}
+	if req.Version == "" {
+		req.Version = fmt.Sprintf("v-%d", time.Now().Unix())
+	}
 
 	fullName := fmt.Sprintf("apps/%s/services/%s/versions/%s", req.Project, req.Service, req.Version)
 	op := api.opMgr.Register("appengine#operation", "CREATE", fullName, "", "us-central1")
@@ -245,41 +248,57 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 
 	// Initialize state
 	api.mu.Lock()
-	if api.services[req.Project] == nil { api.services[req.Project] = make(map[string]*Service) }
-	if api.versions[req.Project] == nil { api.versions[req.Project] = make(map[string]map[string]*Version) }
-	if api.versions[req.Project][req.Service] == nil { api.versions[req.Project][req.Service] = make(map[string]*Version) }
+	if api.services[req.Project] == nil {
+		api.services[req.Project] = make(map[string]*Service)
+	}
+	if api.versions[req.Project] == nil {
+		api.versions[req.Project] = make(map[string]map[string]*Version)
+	}
+	if api.versions[req.Project][req.Service] == nil {
+		api.versions[req.Project][req.Service] = make(map[string]*Version)
+	}
 
-	api.services[req.Project][req.Service] = &Service{Id: req.Service, Name: "apps/"+req.Project+"/services/"+req.Service}
+	api.services[req.Project][req.Service] = &Service{Id: req.Service, Name: "apps/" + req.Project + "/services/" + req.Service}
 	api.versions[req.Project][req.Service][req.Version] = &Version{
-		Id: req.Version,
-		Name: fullName,
-		Runtime: req.Runtime,
-		State: "SERVING",
+		Id:         req.Version,
+		Name:       fullName,
+		Runtime:    req.Runtime,
+		State:      "SERVING",
 		CreateTime: time.Now().Format(time.RFC3339),
 	}
 	api.mu.Unlock()
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Leverage Serverless Backend
-		if api.serverless == nil { return fmt.Errorf("serverless backend not initialized") }
+		if api.serverless == nil {
+			return fmt.Errorf("serverless backend not initialized")
+		}
 		backend := api.serverless.GetBackend()
 
 		tmpDir, err := os.MkdirTemp("", "minisky-gae-*")
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		defer os.RemoveAll(tmpDir)
 
 		fileName := "main.py"
-		if strings.HasPrefix(req.Runtime, "node") { fileName = "index.js" }
-		if strings.HasPrefix(req.Runtime, "go") { fileName = "main.go" }
+		if strings.HasPrefix(req.Runtime, "node") {
+			fileName = "index.js"
+		}
+		if strings.HasPrefix(req.Runtime, "go") {
+			fileName = "main.go"
+		}
 
 		os.WriteFile(tmpDir+"/"+fileName, []byte(req.Code), 0644)
 
 		image, err := backend.BuildFunction("gae-"+req.Service+"-"+req.Version, tmpDir, req.Entrypoint)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 
 		// Provision as a Serverless VM
 		containerName := fmt.Sprintf("minisky-appengine-%s-%s-%s", req.Project, req.Service, req.Version)
-		_, err = api.svcMgr.ProvisionServerlessVM(containerName, image, []string{"PORT=8080", "GAE_SERVICE="+req.Service, "GAE_VERSION="+req.Version})
+		_, err = api.svcMgr.ProvisionServerlessVM(containerName, image, []string{"PORT=8080", "GAE_SERVICE=" + req.Service, "GAE_VERSION=" + req.Version})
 		if err != nil {
 			api.pushLog(req.Project, "ERROR", req.Service, fmt.Sprintf("Deployment failed for version %s: %v", req.Version, err))
 			return err

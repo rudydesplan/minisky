@@ -74,7 +74,7 @@ func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
 	if req.Method == "POST" && (strings.Contains(path, "/b/") && strings.HasSuffix(path, "/o")) {
 		bucket := extractSegmentAfter(path, "b")
 		object := req.URL.Query().Get("name")
-		
+
 		if object != "" {
 			log.Printf("[Storage Event] File finalized: gs://%s/%s", bucket, object)
 			go api.observer.OnStorageEvent(bucket, object, "google.storage.object.finalize")

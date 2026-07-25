@@ -28,15 +28,15 @@ type secretVersion struct {
 	Name        string `json:"name"`
 	CreateTime  string `json:"createTime"`
 	DestroyTime string `json:"destroyTime,omitempty"`
-	State       string `json:"state"` // ENABLED | DISABLED | DESTROYED
+	State       string `json:"state"`          // ENABLED | DISABLED | DESTROYED
 	Payload     string `json:"data,omitempty"` // base64-encoded
 }
 
 type secret struct {
-	Name        string              `json:"name"`
-	CreateTime  string              `json:"createTime"`
-	Labels      map[string]string   `json:"labels,omitempty"`
-	Replication map[string]any      `json:"replication"`
+	Name        string            `json:"name"`
+	CreateTime  string            `json:"createTime"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Replication map[string]any    `json:"replication"`
 	versions    []*secretVersion
 	mu          sync.Mutex
 }
@@ -46,7 +46,7 @@ type secret struct {
 // ---------------------------------------------------------------------------
 
 type API struct {
-	mu     sync.RWMutex
+	mu sync.RWMutex
 	// map[project] -> map[secretId] -> *secret
 	store  map[string]map[string]*secret
 	svcMgr *orchestrator.ServiceManager
@@ -196,8 +196,8 @@ func (api *API) createSecret(w http.ResponseWriter, r *http.Request, project str
 	}
 
 	var body struct {
-		Labels      map[string]string   `json:"labels"`
-		Replication map[string]any      `json:"replication"`
+		Labels      map[string]string `json:"labels"`
+		Replication map[string]any    `json:"replication"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 

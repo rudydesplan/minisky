@@ -18,11 +18,29 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type BigtableManagerDrawerProps = { open: boolean; onClose: () => void };
 
+interface BigtableInstance {
+  name: string;
+  displayName: string;
+  type: string;
+}
+
+interface BigtableTable {
+  name: string;
+}
+
+interface BigtableRow {
+  key: string;
+  data: Record<string, Record<string, string>>;
+}
+
+const getErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
 export default function BigtableManagerDrawer({ open, onClose }: BigtableManagerDrawerProps) {
   const { activeProject } = useProjectContext();
   
-  const [instances, setInstances] = useState<any[]>([]);
-  const [tablesByInstance, setTablesByInstance] = useState<Record<string, any[]>>({});
+  const [instances, setInstances] = useState<BigtableInstance[]>([]);
+  const [tablesByInstance, setTablesByInstance] = useState<Record<string, BigtableTable[]>>({});
   
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState({ msg: '', open: false, severity: 'success' as 'success' | 'error' });
@@ -30,7 +48,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
 
   // Data Explorer State
   const [selectedTablePath, setSelectedTablePath] = useState(''); // instance/table
-  const [rows, setRows] = useState<any[]>([]);
+  const [rows, setRows] = useState<BigtableRow[]>([]);
   const [dataLoading, setDataLoading] = useState(false);
 
   // Creation State
@@ -52,16 +70,16 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
     try {
       const res = await fetch(`${apiRoot}/instances`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { instances?: BigtableInstance[] } = await res.json();
         const instList = data.instances || [];
         setInstances(instList);
         
-        const tbMap: Record<string, any[]> = {};
+        const tbMap: Record<string, BigtableTable[]> = {};
         for (const inst of instList) {
-          const instId = inst.name.split('/').pop();
+          const instId = inst.name.split('/').pop()!;
           const tbRes = await fetch(`${apiRoot}/instances/${instId}/tables`);
           if (tbRes.ok) {
-            const tbData = await tbRes.json();
+            const tbData: { tables?: BigtableTable[] } = await tbRes.json();
             tbMap[instId] = tbData.tables || [];
           }
         }
@@ -88,12 +106,12 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
         body: JSON.stringify({})
       });
       if (res.ok) {
-        const data = await res.json();
+        const data: { rows?: BigtableRow[] } = await res.json();
         setRows(data.rows || []);
       } else {
         showToast('Failed to load rows', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     finally { setDataLoading(false); }
   };
 
@@ -118,7 +136,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
       } else {
         showToast('Failed to create instance', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     finally { setLoading(false); setNewInstanceOpen(false); setNewInstanceId(''); setNewInstanceName(''); }
   };
 
@@ -140,7 +158,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
       } else {
         showToast('Failed to create table', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     finally { setLoading(false); setNewTableOpen(false); setNewTableId(''); }
   };
 
@@ -152,7 +170,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
         showToast(`Instance ${id} deleted`);
         loadInstances();
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
   };
 
   const handleDeleteTable = async (instId: string, tbId: string) => {
@@ -162,7 +180,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
         showToast(`Table ${tbId} deleted`);
         loadInstances();
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
   };
 
   return (
@@ -202,7 +220,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
               ) : (
                 <List sx={{ p: 0 }}>
                   {instances.map(inst => {
-                    const instId = inst.name.split('/').pop();
+                    const instId = inst.name.split('/').pop()!;
                     const tables = tablesByInstance[instId] || [];
                     return (
                       <Paper key={instId} elevation={0} sx={{ mb: 2, border: '1px solid #dadce0', overflow: 'hidden' }}>
@@ -225,7 +243,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
                             <Typography sx={{ fontSize: '0.75rem', p: 2, color: '#80868b', fontStyle: 'italic', textAlign: 'center' }}>No tables in this instance.</Typography>
                           )}
                           {tables.map(tb => {
-                            const tbId = tb.name.split('/').pop();
+                            const tbId = tb.name.split('/').pop()!;
                             const path = `${instId}/${tbId}`;
                             return (
                               <ListItemButton 
@@ -267,7 +285,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
                   <option value="">Choose a table...</option>
                   {Object.entries(tablesByInstance).flatMap(([instId, tables]) => 
                     tables.map(tb => {
-                      const tbId = tb.name.split('/').pop();
+                      const tbId = tb.name.split('/').pop()!;
                       return <option key={`${instId}/${tbId}`} value={`${instId}/${tbId}`}>{instId} / {tbId}</option>
                     })
                   )}
@@ -299,10 +317,10 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
                           <TableRow key={row.key}>
                             <TableCell sx={{ fontFamily: 'monospace', verticalAlign: 'top' }}>{row.key}</TableCell>
                             <TableCell>
-                              {Object.entries(row.data).map(([family, columns]: [string, any]) => (
+                              {Object.entries(row.data).map(([family, columns]) => (
                                 <Box key={family} sx={{ mb: 1 }}>
                                   <Typography variant="caption" sx={{ fontWeight: 600, color: '#e67c73' }}>{family}:</Typography>
-                                  {Object.entries(columns).map(([col, val]: [string, any]) => (
+                                  {Object.entries(columns).map(([col, val]) => (
                                     <Box key={col} sx={{ pl: 1, display: 'flex', gap: 1 }}>
                                       <Typography variant="caption" sx={{ color: '#5f6368' }}>{col.split(':').pop()} →</Typography>
                                       <Typography variant="caption" sx={{ fontWeight: 500 }}>{val}</Typography>

@@ -18,13 +18,13 @@ MiniSky provides a seamless, professional-grade development environment that emu
 - **🚀 29+ GCP Services**: Support for Compute Engine, GKE, Bigtable, Pub/Sub, Storage, Cloud SQL, Vertex AI, Artifact Registry, and more.
 - **🖥️ Embedded Dashboard**: Real-time observability and resource management via a premium web UI.
 - **🛠️ Terraform Ready**: First-class support for the official Google Cloud Terraform provider via custom endpoint routing.
-- **🔌 Dynamic Registry**: Modular plugin system for community-led service contributions.
+- **🔌 Dynamic Registry**: Modular Go shim registry for community-led service contributions.
 - **📦 Single Binary**: Developed entirely in Go. A single, ultra-lightweight binary where all services are lazy-loaded for maximum efficiency and sub-100ms startup times.
 
 ## 📋 Prerequisites
 MiniSky requires the following tools installed and running on your local machine:
 - **[Docker Desktop](https://www.docker.com/products/docker-desktop/)**: Used for high-fidelity service emulation (Compute, SQL, etc.).
-- **[Git](https://git-scm.com/downloads)**: Required for installation and plugin management.
+- **[Git](https://git-scm.com/downloads)**: Required when building or contributing from source.
 
 ## 🚀 Quick Start
 
@@ -124,7 +124,7 @@ The darwin/arm64 binary is currently built with `CGO_ENABLED=0`. DuckDB compiles
 
 | Step | What | Status |
 | :--- | :--- | :---: |
-| 1 | Integrate `goreleaser-cross` Docker image into `release.sh --docker` | 🔜 Planned |
+| 1 | Add a CGO-capable Darwin cross-compilation toolchain to the GoReleaser workflow | 🔜 Planned |
 | 2 | Set darwin target: `CC=o64-clang`, `CGO_ENABLED=1` in `.goreleaser.yaml` | 🔜 Planned |
 | 3 | Validate `minisky_darwin_arm64.tar.gz` DuckDB BQ execution on M-series Mac | 🔜 Planned |
 | 4 | Update installer + compatibility table to ✅ | 🔜 Planned |

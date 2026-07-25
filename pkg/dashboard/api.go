@@ -16,9 +16,9 @@ import (
 
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
-	"minisky/pkg/shims/compute"
 	"minisky/pkg/shims/appengine"
 	"minisky/pkg/shims/bigquery"
+	"minisky/pkg/shims/compute"
 	"minisky/pkg/shims/gke"
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/shims/memorystore"
@@ -35,16 +35,16 @@ var upgrader = websocket.Upgrader{
 }
 
 type API struct {
-	svcMgr        *orchestrator.ServiceManager
-	bqBackend     *bigquery.DuckDBBackend
-	gkeBackend    *gke.KindBackend
-	servBackend   *serverless.BuildpacksBackend
-	logAPI        *logging.API
-	monAPI        *monitoring.API
-	appEngineAPI  *appengine.API
-	memoAPI       *memorystore.API
-	schedulerAPI  *scheduler.API
-	computeAPI    *compute.API
+	svcMgr       *orchestrator.ServiceManager
+	bqBackend    *bigquery.DuckDBBackend
+	gkeBackend   *gke.KindBackend
+	servBackend  *serverless.BuildpacksBackend
+	logAPI       *logging.API
+	monAPI       *monitoring.API
+	appEngineAPI *appengine.API
+	memoAPI      *memorystore.API
+	schedulerAPI *scheduler.API
+	computeAPI   *compute.API
 }
 
 func NewAPIHandler(
@@ -237,29 +237,29 @@ func (api *API) handleProjects(w http.ResponseWriter, r *http.Request) {
 	projects["production"] = true
 	projects["local-dev-project"] = true
 
-	// Ask the shims — we don't have a direct link to all shims here, 
+	// Ask the shims — we don't have a direct link to all shims here,
 	// but we can add them to the API struct or use the registry.
 	// Actually, let's just use the ones we have in the API struct.
-	
+
 	// Logging
 	if api.logAPI != nil {
 		for _, p := range api.logAPI.ListProjects() {
 			projects[p] = true
 		}
 	}
-	
+
 	// Compute
 	if api.computeAPI != nil {
 		for _, p := range api.computeAPI.ListProjects() {
 			projects[p] = true
 		}
 	}
-	
+
 	res := []string{}
 	for p := range projects {
 		res = append(res, p)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
 }
@@ -280,21 +280,21 @@ func (api *API) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 
 	// Map ID to docker domains.
 	domainMap := map[string]string{
-		"storage":   "storage.googleapis.com",
-		"pubsub":    "pubsub.googleapis.com",
-		"firestore": "firestore.googleapis.com",
-		"bigtable":  "bigtable.googleapis.com",
-		"datastore": "datastore.googleapis.com",
-		"spanner":   "spanner.googleapis.com",
-		"firebase-auth": "identitytoolkit.googleapis.com",
-		"firebase-rtdb": "firebaseio.com",
+		"storage":          "storage.googleapis.com",
+		"pubsub":           "pubsub.googleapis.com",
+		"firestore":        "firestore.googleapis.com",
+		"bigtable":         "bigtable.googleapis.com",
+		"datastore":        "datastore.googleapis.com",
+		"spanner":          "spanner.googleapis.com",
+		"firebase-auth":    "identitytoolkit.googleapis.com",
+		"firebase-rtdb":    "firebaseio.com",
 		"firebase-hosting": "firebasehosting.googleapis.com",
-		"memorystore": "redis.googleapis.com",
-		"cloudtasks": "cloudtasks.googleapis.com",
-		"cloudkms":   "cloudkms.googleapis.com",
-		"cloudbuild": "cloudbuild.googleapis.com",
+		"memorystore":      "redis.googleapis.com",
+		"cloudtasks":       "cloudtasks.googleapis.com",
+		"cloudkms":         "cloudkms.googleapis.com",
+		"cloudbuild":       "cloudbuild.googleapis.com",
 		"artifactregistry": "artifactregistry.googleapis.com",
-		"vertexai": "aiplatform.googleapis.com",
+		"vertexai":         "aiplatform.googleapis.com",
 	}
 
 	if action == "start" {
@@ -304,14 +304,14 @@ func (api *API) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 				// We don't block the UI
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				
+
 				var env []string
 				if project != "" {
 					env = append(env, "CLOUDSDK_CORE_PROJECT="+project)
 					env = append(env, "GCP_PROJECT="+project)
 					env = append(env, "GOOGLE_CLOUD_PROJECT="+project)
 				}
-				
+
 				_, err := api.svcMgr.EnsureServiceRunning(ctx, domain, env...)
 				if err != nil {
 					log.Printf("[UI/API] Failed to EnsureServiceRunning for %s (project: %s): %v", domain, project, err)
@@ -389,16 +389,16 @@ func (api *API) checkDockerStatus(name string, defaultPort int) (string, *int) {
 func (api *API) handleManageStorage() http.Handler {
 	target, _ := url.Parse("http://localhost:8080")
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	
+
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		
+
 		path := strings.TrimPrefix(req.URL.Path, "/api/manage/storage")
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		
+
 		if req.Method == "POST" && strings.HasSuffix(path, "/o") {
 			req.URL.Path = "/upload/storage/v1" + path
 			q := req.URL.Query()
@@ -409,22 +409,22 @@ func (api *API) handleManageStorage() http.Handler {
 		} else {
 			req.URL.Path = "/storage/v1" + path
 		}
-		
+
 		req.Host = "storage.googleapis.com"
 		log.Printf("[UI/API Proxy] Translated to %s", req.URL.Path)
 	}
-	
+
 	return proxy
 }
 
 func (api *API) handleManageIam() http.Handler {
 	target, _ := url.Parse("http://localhost:8080")
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	
+
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		
+
 		path := strings.TrimPrefix(req.URL.Path, "/api/manage/iam")
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
@@ -433,7 +433,7 @@ func (api *API) handleManageIam() http.Handler {
 		req.Host = "iam.googleapis.com"
 		log.Printf("[UI/API Proxy] Translated to %s for IAM", req.URL.Path)
 	}
-	
+
 	return proxy
 }
 
@@ -586,16 +586,16 @@ func (api *API) handleManageBigtable() http.Handler {
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		
+
 		req.URL.Path = "/v2" + path
-		
+
 		// Switch between Admin and Data APIs
 		if strings.Contains(path, ":") {
 			req.Host = "bigtable.googleapis.com"
 		} else {
 			req.Host = "bigtableadmin.googleapis.com"
 		}
-		
+
 		log.Printf("[UI/API Proxy] Bigtable (%s) \u2192 %s", req.Host, req.URL.Path)
 	}
 	return proxy
@@ -629,7 +629,7 @@ func (api *API) handleManageServerless() http.Handler {
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		
+
 		if strings.Contains(path, "/functions") {
 			req.Host = "cloudfunctions.googleapis.com"
 			req.URL.Path = "/v2" + path
@@ -822,7 +822,7 @@ func (api *API) handleInstallDependency(w http.ResponseWriter, r *http.Request) 
 func (api *API) handleManageGke() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/manage/gke/clusters")
-		
+
 		if r.Method == http.MethodGet && (path == "" || path == "/") {
 			clusters, err := api.gkeBackend.ListClusters()
 			if err != nil {
@@ -860,7 +860,7 @@ func (api *API) handleManageGke() http.Handler {
 				http.Error(w, "missing cluster name", http.StatusBadRequest)
 				return
 			}
-			
+
 			log.Printf("[UI/API] Request to provision GKE cluster: %s", req.Name)
 			go func() {
 				// Creation is slow, run in background
@@ -868,7 +868,7 @@ func (api *API) handleManageGke() http.Handler {
 					log.Printf("[UI/API] Cluster provisioning failed: %v", err)
 				}
 			}()
-			
+
 			w.WriteHeader(http.StatusAccepted) // 202 Accepted
 			return
 		}
@@ -879,14 +879,14 @@ func (api *API) handleManageGke() http.Handler {
 				http.Error(w, "missing cluster name", http.StatusBadRequest)
 				return
 			}
-			
+
 			configPath := fmt.Sprintf("/tmp/minisky-kubeconfig-%s.yaml", name)
 			data, err := os.ReadFile(configPath)
 			if err != nil {
 				http.Error(w, "kubeconfig not found", http.StatusNotFound)
 				return
 			}
-			
+
 			w.Header().Set("Content-Type", "application/x-yaml")
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-kubeconfig.yaml\"", name))
 			w.Write(data)
@@ -987,7 +987,7 @@ func (api *API) handleManageFirebase() http.Handler {
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		
+
 		// Map back to specific domains if needed, or just forward as is for project logic
 		// Most management calls will be to firebaseio.com or identitytoolkit
 		req.URL.Path = path

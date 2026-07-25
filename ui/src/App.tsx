@@ -1,6 +1,6 @@
 
 import { useEffect, useState } from 'react';
-import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { Link, Route, Switch, useLocation } from 'wouter';
 import { Box, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography } from '@mui/material';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import StorageIcon from '@mui/icons-material/Storage';
@@ -43,7 +43,7 @@ const NAV_ITEMS = [
 ];
 
 function NavItem({ to, label, icon }: { to: string; label: string; icon: React.ReactNode }) {
-  const { pathname } = useLocation();
+  const [pathname] = useLocation();
   const active = pathname === to;
   return (
     <ListItemButton
@@ -62,7 +62,7 @@ function NavItem({ to, label, icon }: { to: string; label: string; icon: React.R
 }
 
 function NavigationContent() {
-  const { pathname } = useLocation();
+  const [pathname] = useLocation();
   const isLogging = pathname === '/logging';
   const isMonitoring = pathname === '/monitoring';
   const [version, setVersion] = useState('...');
@@ -150,29 +150,25 @@ function NavigationContent() {
                                           : { p: 6, position: 'relative' })
       }}>
         {!isLogging && !isMonitoring && <ProjectSelector />}
-        <Routes>
-          <Route path="/"         element={<Dashboard />} />
-          <Route path="/compute"  element={<ComputePage />} />
-          <Route path="/storage"  element={<StoragePage />} />
-          <Route path="/database" element={<DatabasePage />} />
-          <Route path="/network"  element={<NetworkPage />} />
-          <Route path="/logging"  element={<LogExplorer />} />
-          <Route path="/monitoring" element={<MonitoringPage />} />
-          <Route path="/firebase"   element={<FirebasePage />} />
-          <Route path="/appengine" element={<AppEnginePage />} />
-          <Route path="/security"  element={<SecurityPage />} />
-          <Route path="/memorystore" element={<MemorystorePage />} />
-          <Route path="/tasks" element={<TasksAndSchedulingPage />} />
-        </Routes>
+        <Switch>
+          <Route path="/" component={Dashboard} />
+          <Route path="/compute" component={ComputePage} />
+          <Route path="/storage" component={StoragePage} />
+          <Route path="/database" component={DatabasePage} />
+          <Route path="/network" component={NetworkPage} />
+          <Route path="/logging" component={LogExplorer} />
+          <Route path="/monitoring" component={MonitoringPage} />
+          <Route path="/firebase" component={FirebasePage} />
+          <Route path="/appengine" component={AppEnginePage} />
+          <Route path="/security" component={SecurityPage} />
+          <Route path="/memorystore" component={MemorystorePage} />
+          <Route path="/tasks" component={TasksAndSchedulingPage} />
+        </Switch>
       </Box>
     </Box>
   );
 }
 
 export default function App() {
-  return (
-    <Router>
-      <NavigationContent />
-    </Router>
-  );
+  return <NavigationContent />;
 }

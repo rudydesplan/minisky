@@ -60,18 +60,12 @@ Lists all emulated GCE instances (Docker VMs).
 ### `minisky storage buckets list`
 Lists all buckets in the Storage emulator.
 
-### `minisky storage buckets create`
-*Coming soon*: Create a bucket via CLI. (Currently use Dashboard or `gsutil`).
-
 ---
 
 ## Messaging & Events
 
 ### `minisky pubsub topics list`
 Lists all Pub/Sub topics.
-
-### `minisky pubsub topics create`
-*Coming soon*: Create a topic via CLI.
 
 ---
 

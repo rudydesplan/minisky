@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { 
   Box, Typography, TextField, Button, 
   Stack, Alert, IconButton,
@@ -28,6 +28,16 @@ interface Task {
   status?: string;
 }
 
+interface ApiErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
 export default function CloudTasksPageContent() {
   const { activeProject } = useProjectContext();
   const [queues, setQueues] = useState<Queue[]>([]);
@@ -50,19 +60,19 @@ export default function CloudTasksPageContent() {
 
   const location = 'us-central1';
 
-  const fetchQueues = async () => {
+  const fetchQueues = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/cloudtasks/projects/${activeProject}/locations/${location}/queues`);
       if (!res.ok) throw new Error('Failed to fetch queues');
       const data = await res.json();
       setQueues(data.queues || []);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to fetch queues'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   const fetchTasks = async (queueName: string) => {
     setLoadingTasks(true);
@@ -71,8 +81,8 @@ export default function CloudTasksPageContent() {
       if (!res.ok) throw new Error('Failed to fetch tasks');
       const data = await res.json();
       setTasks(data.tasks || []);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to fetch tasks'));
     } finally {
       setLoadingTasks(false);
     }
@@ -80,7 +90,7 @@ export default function CloudTasksPageContent() {
 
   useEffect(() => {
     fetchQueues();
-  }, [activeProject]);
+  }, [fetchQueues]);
 
   const handleCreateQueue = async () => {
     setCreating(true);
@@ -94,14 +104,14 @@ export default function CloudTasksPageContent() {
         })
       });
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
+        const errData = await res.json().catch(() => ({})) as ApiErrorResponse;
         throw new Error(errData.error?.message || 'Failed to create queue');
       }
 
       setNewQueueId('');
       fetchQueues();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to create queue'));
     } finally {
       setCreating(false);
     }
@@ -116,8 +126,8 @@ export default function CloudTasksPageContent() {
       if (!res.ok) throw new Error('Failed to delete queue');
       if (expandedQueue === name) setExpandedQueue(null);
       fetchQueues();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to delete queue'));
     }
   };
 
@@ -151,8 +161,8 @@ export default function CloudTasksPageContent() {
       if (!res.ok) throw new Error('Failed to create task');
       setTaskDialogOpen(false);
       if (expandedQueue === targetQueue) fetchTasks(targetQueue);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to create task'));
     } finally {
       setSubmittingTask(false);
     }
@@ -166,8 +176,8 @@ export default function CloudTasksPageContent() {
       const res = await fetch(`/api/manage/cloudtasks/${taskName}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete task');
       fetchTasks(queueName);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to delete task'));
     }
   };
 

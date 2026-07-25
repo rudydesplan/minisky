@@ -89,26 +89,26 @@ func (api *API) StartCollector() {
 		for {
 			containers := api.svcMgr.ListManagedContainers()
 			now := time.Now().Format(time.RFC3339)
-			
+
 			api.mu.Lock()
 			for _, c := range containers {
 				if !strings.Contains(c.Status, "Up") {
 					continue
 				}
-				
+
 				stats, err := api.svcMgr.GetContainerStats(c.Name)
 				if err != nil {
 					continue
 				}
 
 				name := strings.TrimPrefix(c.Name, "minisky-")
-				
+
 				// CPU Point
 				cpuPoint := Point{}
 				cpuPoint.Interval.EndTime = now
 				cpuVal := stats.CPUPercentage
 				cpuPoint.Value.DoubleValue = &cpuVal
-				
+
 				api.stats[name+"_cpu"] = append(api.stats[name+"_cpu"], cpuPoint)
 				if len(api.stats[name+"_cpu"]) > 60 { // keep last 60 points (10 minutes at 10s intervals)
 					api.stats[name+"_cpu"] = api.stats[name+"_cpu"][1:]
@@ -119,7 +119,7 @@ func (api *API) StartCollector() {
 				memPoint.Interval.EndTime = now
 				memVal := stats.MemoryUsageMB
 				memPoint.Value.DoubleValue = &memVal
-				
+
 				api.stats[name+"_mem"] = append(api.stats[name+"_mem"], memPoint)
 				if len(api.stats[name+"_mem"]) > 60 {
 					api.stats[name+"_mem"] = api.stats[name+"_mem"][1:]
@@ -130,4 +130,3 @@ func (api *API) StartCollector() {
 		}
 	}()
 }
-

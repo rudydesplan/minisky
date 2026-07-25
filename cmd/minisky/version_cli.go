@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"minisky/pkg/version"
 	"github.com/spf13/cobra"
+	"minisky/pkg/version"
 )
 
 var versionCmd = &cobra.Command{

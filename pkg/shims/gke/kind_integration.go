@@ -59,7 +59,7 @@ func (k *KindBackend) SetEnabled(enabled bool) error {
 		localKind := filepath.Join(orchestrator.GetLocalBinPath(), orchestrator.GetKindBinaryName())
 		_, localErr := os.Stat(localKind)
 		_, sysErr := exec.LookPath(orchestrator.GetKindBinaryName())
-		
+
 		if localErr != nil && sysErr != nil {
 			return fmt.Errorf("'kind' CLI not found, cannot enable")
 		}

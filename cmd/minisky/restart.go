@@ -31,16 +31,16 @@ var restartCmd = &cobra.Command{
 		// Note: We use the same binary that is running.
 		// If running via 'go run', this might be tricky, but for the compiled binary it works.
 		executable, _ := os.Executable()
-		
+
 		newCmd := exec.Command(executable, "start")
 		newCmd.Stdout = os.Stdout
 		newCmd.Stderr = os.Stderr
-		
+
 		fmt.Println("🚀 Starting new instance...")
 		if err := newCmd.Start(); err != nil {
 			log.Fatalf("Failed to restart: %v", err)
 		}
-		
+
 		fmt.Printf("✅ MiniSky restarted (PID: %d)\n", newCmd.Process.Pid)
 		fmt.Println("Note: This process is now running in the background.")
 	},

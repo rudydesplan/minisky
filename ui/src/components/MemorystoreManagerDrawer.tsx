@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box, Typography, Button, Drawer, IconButton, Table, TableBody, TableCell,
   TableHead, TableRow, Chip, Alert, CircularProgress, Tooltip,
@@ -77,13 +77,13 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
     engineVersion: 'REDIS_8_0',
   });
 
-  const fetchInstances = async (silent = false) => {
+  const fetchInstances = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
       // GCP Redis API usually scopes instances under locations, but for the shim we use a simple project filter
       const res = await fetch(`/api/manage/memorystore/projects/${activeProject}/locations/-/instances`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { instances?: Instance[] } = await res.json();
         setInstances(data.instances || []);
       }
     } catch {
@@ -91,7 +91,7 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
     } finally {
       if (!silent) setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   useEffect(() => {
     if (open) {
@@ -99,7 +99,7 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
       const t = setInterval(() => fetchInstances(true), 5000);
       return () => clearInterval(t);
     }
-  }, [open, activeProject]);
+  }, [open, fetchInstances]);
 
   const handleCreate = async () => {
     setCreateOpen(false);

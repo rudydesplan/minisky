@@ -21,8 +21,8 @@ var (
 )
 
 var deployCmd = &cobra.Command{
-	Use:   "deploy",
-	Short: "Deploy a serverless resource to MiniSky",
+	Use:     "deploy",
+	Short:   "Deploy a serverless resource to MiniSky",
 	Example: `./minisky deploy --name my-func --runtime python312 --entry-point handler --source main.py`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// 1. Read source code
@@ -48,7 +48,7 @@ var deployCmd = &cobra.Command{
 			port = "8080"
 		}
 		url := fmt.Sprintf("http://localhost:%s/v2/deploy", port)
-		
+
 		fmt.Printf("🚀 Deploying %s '%s' to MiniSky...\n", deployType, deployName)
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 		if err != nil {
@@ -130,7 +130,7 @@ func init() {
 	deployCmd.Flags().StringVar(&deployEntryPoint, "entry-point", "handler", "Function entry point")
 	deployCmd.Flags().StringVar(&deploySource, "source", "", "Path to source code file")
 	deployCmd.Flags().StringVar(&deployType, "type", "function", "Resource type (function or service)")
-	
+
 	deployCmd.MarkFlagRequired("name")
 	deployCmd.MarkFlagRequired("source")
 

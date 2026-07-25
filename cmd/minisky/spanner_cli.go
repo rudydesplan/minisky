@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"encoding/json"
-	"bytes"
 
 	"github.com/spf13/cobra"
 )
@@ -27,8 +27,10 @@ var listSpannerInstancesCmd = &cobra.Command{
 	Short: "List Spanner instances",
 	Run: func(cmd *cobra.Command, args []string) {
 		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" { port = "8081" }
-		
+		if port == "" {
+			port = "8081"
+		}
+
 		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/spanner/projects/%s/instances", port, spannerProject))
 		if err != nil {
 			fmt.Printf("❌ Error: %v\n", err)
@@ -62,10 +64,12 @@ var createSpannerInstanceCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" { port = "8081" }
-		
+		if port == "" {
+			port = "8081"
+		}
+
 		id := args[0]
-		
+
 		payload := map[string]interface{}{
 			"instanceId": id,
 			"instance": map[string]string{
@@ -74,7 +78,7 @@ var createSpannerInstanceCmd = &cobra.Command{
 			},
 		}
 		data, _ := json.Marshal(payload)
-		
+
 		resp, err := http.Post(fmt.Sprintf("http://localhost:%s/api/manage/spanner/projects/%s/instances", port, spannerProject), "application/json", bytes.NewBuffer(data))
 		if err != nil {
 			fmt.Printf("❌ Error: %v\n", err)

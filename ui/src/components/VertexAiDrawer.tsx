@@ -16,6 +16,25 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type VertexAiDrawerProps = { open: boolean; onClose: () => void };
 
+type ChatMessage = {
+  role: 'user' | 'model' | 'error';
+  text: string;
+};
+
+type ModelsResponse = {
+  models?: string[];
+};
+
+type GenerateContentResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
+};
+
+const apiRoot = '/api/manage/vertexai/v1';
+
 export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
   const { activeProject } = useProjectContext();
   const [tab, setTab] = useState(0);
@@ -30,26 +49,25 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
 
   // Chat
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<any[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  const apiRoot = `/api/manage/vertexai/v1`;
 
   const fetchModels = useCallback(async () => {
     setIsFetchingModels(true);
     try {
       const res = await fetch(`${apiRoot}/internal/models`);
       if (res.ok) {
-        const data = await res.json();
-        setAvailableModels(data.models || []);
-        if (data.models?.length > 0 && !data.models.includes(model)) {
-          setModel(data.models[0]);
+        const data = await res.json() as ModelsResponse;
+        const models = data.models ?? [];
+        setAvailableModels(models);
+        if (models.length > 0 && !models.includes(model)) {
+          setModel(models[0]);
         }
       }
     } catch (e) { console.error(e); }
     finally { setIsFetchingModels(false); }
-  }, [apiRoot, model]);
+  }, [model]);
 
   useEffect(() => {
     if (open) {
@@ -76,7 +94,7 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
 
   const handleSend = async () => {
     if (!input || loading) return;
-    const userMsg = { role: 'user', text: input };
+    const userMsg: ChatMessage = { role: 'user', text: input };
     setMessages(prev => [...prev, userMsg]);
     const currentInput = input;
     setInput('');
@@ -97,15 +115,16 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
       });
 
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json() as GenerateContentResponse;
         const modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from model.';
         setMessages(prev => [...prev, { role: 'model', text: modelText }]);
       } else {
         const err = await res.text();
         setMessages(prev => [...prev, { role: 'error', text: `Error: ${err}` }]);
       }
-    } catch (e: any) {
-      setMessages(prev => [...prev, { role: 'error', text: `Connection Error: ${e.message}` }]);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setMessages(prev => [...prev, { role: 'error', text: `Connection Error: ${message}` }]);
     } finally {
       setLoading(false);
     }

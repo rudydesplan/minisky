@@ -96,7 +96,7 @@ func (api *API) handlePublish(w http.ResponseWriter, r *http.Request, targetURL 
 	// Proxy the request
 	target, _ := url.Parse(targetURL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	
+
 	if api.observer != nil && topic != "" {
 		log.Printf("[PubSub Shim] 📢 Intercepted publish to topic: %s", topic)
 		api.observer.HandleEvent("google.cloud.pubsub.topic.v1.messagePublished", topic, string(body))

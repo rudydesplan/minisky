@@ -101,26 +101,26 @@ type EventTrigger struct {
 
 // Service mirrors the Cloud Run v2 Service resource.
 type Service struct {
-	Name            string            `json:"name"`
-	Description     string            `json:"description,omitempty"`
-	Uid             string            `json:"uid"`
-	Generation      string            `json:"generation"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Annotations     map[string]string `json:"annotations,omitempty"`
-	CreateTime      string            `json:"createTime"`
-	UpdateTime      string            `json:"updateTime"`
-	Creator         string            `json:"creator"`
-	LastModifier    string            `json:"lastModifier"`
-	Ingress         string            `json:"ingress"`     // INGRESS_TRAFFIC_ALL, INGRESS_TRAFFIC_INTERNAL_ONLY
-	LaunchStage     string            `json:"launchStage"` // GA, BETA
-	Template        *RevisionTemplate `json:"template,omitempty"`
-	TrafficStatuses []TrafficStatus   `json:"trafficStatuses,omitempty"`
-	Uri             string            `json:"uri"`
-	Reconciling        bool        `json:"reconciling"`
-	Conditions         []Condition `json:"conditions,omitempty"`
-	ObservedGeneration string      `json:"observedGeneration"`
-	SourceCode         string      `json:"sourceCode,omitempty"`
-	Runtime            string      `json:"runtime,omitempty"`
+	Name               string            `json:"name"`
+	Description        string            `json:"description,omitempty"`
+	Uid                string            `json:"uid"`
+	Generation         string            `json:"generation"`
+	Labels             map[string]string `json:"labels,omitempty"`
+	Annotations        map[string]string `json:"annotations,omitempty"`
+	CreateTime         string            `json:"createTime"`
+	UpdateTime         string            `json:"updateTime"`
+	Creator            string            `json:"creator"`
+	LastModifier       string            `json:"lastModifier"`
+	Ingress            string            `json:"ingress"`     // INGRESS_TRAFFIC_ALL, INGRESS_TRAFFIC_INTERNAL_ONLY
+	LaunchStage        string            `json:"launchStage"` // GA, BETA
+	Template           *RevisionTemplate `json:"template,omitempty"`
+	TrafficStatuses    []TrafficStatus   `json:"trafficStatuses,omitempty"`
+	Uri                string            `json:"uri"`
+	Reconciling        bool              `json:"reconciling"`
+	Conditions         []Condition       `json:"conditions,omitempty"`
+	ObservedGeneration string            `json:"observedGeneration"`
+	SourceCode         string            `json:"sourceCode,omitempty"`
+	Runtime            string            `json:"runtime,omitempty"`
 }
 
 type RevisionTemplate struct {
@@ -624,17 +624,18 @@ func (api *API) deleteService(w http.ResponseWriter, r *http.Request, project, l
 }
 
 type DeployRequest struct {
-	Type     string `json:"type"` // function, service
-	Name     string `json:"name"`
-	Runtime  string `json:"runtime"`
-	Code     string `json:"code"`
-	Project  string `json:"project"`
-	Location string `json:"location"`
-	EntryPoint string `json:"entryPoint"`
+	Type         string        `json:"type"` // function, service
+	Name         string        `json:"name"`
+	Runtime      string        `json:"runtime"`
+	Code         string        `json:"code"`
+	Project      string        `json:"project"`
+	Location     string        `json:"location"`
+	EntryPoint   string        `json:"entryPoint"`
 	EventTrigger *EventTrigger `json:"eventTrigger,omitempty"`
 }
 
-func (api *API) deployResource(w http.ResponseWriter, r *http.Request) { log.Printf("[Serverless] deployResource called")
+func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Serverless] deployResource called")
 	var req DeployRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -764,7 +765,7 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) { log.Pri
 }
 
 func (api *API) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name") // Full or short name
+	name := r.URL.Query().Get("name")    // Full or short name
 	resType := r.URL.Query().Get("type") // function or service
 
 	if name == "" {
@@ -834,7 +835,9 @@ func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	project := extractSegmentAfter(path, "projects")
-	if project == "" { project = "default-project" }
+	if project == "" {
+		project = "default-project"
+	}
 	res := map[string]interface{}{
 		"name":     fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, "us-central1", op.Name), // simplified for dashboard
 		"done":     op.Done,
@@ -873,22 +876,22 @@ func toRunLRO(op *orchestrator.Operation, project, location string) map[string]i
 
 func (api *API) OnStorageEvent(bucket, object, eventType string) {
 	log.Printf("[Serverless] ⚡ Processing Storage Event: %s on %s/%s", eventType, bucket, object)
-	
+
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 
 	for _, f := range api.functions {
 		if f.EventTrigger != nil && strings.Contains(f.EventTrigger.Resource, bucket) {
 			log.Printf("[Serverless] 🎯 Triggering function: %s", f.Name)
-			
+
 			// Prepare CloudEvent payload
 			payload := map[string]interface{}{
-				"name":        object,
-				"bucket":      bucket,
-				"contentType": "application/octet-stream",
+				"name":           object,
+				"bucket":         bucket,
+				"contentType":    "application/octet-stream",
 				"metageneration": "1",
-				"timeCreated": time.Now().Format(time.RFC3339),
-				"updated":     time.Now().Format(time.RFC3339),
+				"timeCreated":    time.Now().Format(time.RFC3339),
+				"updated":        time.Now().Format(time.RFC3339),
 			}
 			data, _ := json.Marshal(payload)
 
