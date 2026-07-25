@@ -156,12 +156,11 @@ jobs:
       - name: Smoke test native binary
         run: ./minisky doctor bigquery
 
-  windows-cgo-feasibility:
-    name: DuckDB feasibility (windows-amd64)
+  windows-cgo:
+    name: DuckDB conformance (windows-amd64)
     needs: quality
     runs-on: windows-latest
     timeout-minutes: 30
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v6
@@ -220,7 +219,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-cgo-feasibility
+          name: windows-cgo-evidence
           path: |
             minisky.exe
             windows-dll-dependencies.txt

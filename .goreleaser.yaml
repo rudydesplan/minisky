@@ -44,7 +44,9 @@ builds:
   - id: windows-amd64
     main: ./cmd/minisky
     binary: minisky
-    env: [CGO_ENABLED=0]
+    env:
+      - CGO_ENABLED=1
+      - CC=gcc
     goos: [windows]
     goarch: [amd64]
     ldflags:

@@ -65,8 +65,8 @@ jobs:
           - name: windows-amd64
             runner: windows-latest
             expected_arch: amd64
-            cgo: "0"
-            cc: ""
+            cgo: "1"
+            cc: gcc
             archive: minisky_windows_amd64.zip
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -84,6 +84,18 @@ jobs:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
+
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Add UCRT toolchain to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH 'C:\msys64\ucrt64\bin'
 
       - name: Verify Unix runner architecture
         if: runner.os != 'Windows'
@@ -127,6 +139,7 @@ jobs:
         shell: pwsh
         env:
           CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           New-Item -ItemType Directory package
@@ -136,7 +149,9 @@ jobs:
           Copy-Item README.md, CONTRIBUTING.md, LICENSE package\
           Copy-Item -Recurse docs package\
           Compress-Archive -Path package\* -DestinationPath "${{ matrix.archive }}"
-          .\package\minisky.exe version
+          New-Item -ItemType Directory installed
+          Expand-Archive -Path "${{ matrix.archive }}" -DestinationPath installed
+          .\installed\minisky.exe doctor bigquery
 
       - uses: actions/upload-artifact@v4
         with:
