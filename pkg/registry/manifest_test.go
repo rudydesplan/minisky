@@ -2,6 +2,7 @@ package registry_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,8 +36,18 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 			if service.Persistence == "" {
 				t.Error("persistence category is empty")
 			}
-			if !strings.Contains(string(documentation), "`"+service.Domain+"`") {
-				t.Errorf("docs/service-compatibility.md does not list %q", service.Domain)
+			domainReference := "`" + service.Domain + "`"
+			if count := strings.Count(string(documentation), domainReference); count != 1 {
+				t.Errorf("docs/service-compatibility.md lists %q %d times, want exactly once", service.Domain, count)
+			}
+			expectedRow := fmt.Sprintf(
+				"| `%s` | %s | %s |",
+				service.Domain,
+				service.Fidelity,
+				service.Persistence,
+			)
+			if !strings.Contains(string(documentation), expectedRow) {
+				t.Errorf("docs/service-compatibility.md does not contain manifest row %q", expectedRow)
 			}
 			if !service.ProbeUnsupported && service.Persistence != registry.PersistenceDocker {
 				t.Errorf("contract probe skipped for non-Docker persistence %q", service.Persistence)
