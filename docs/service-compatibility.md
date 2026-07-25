@@ -55,11 +55,20 @@ Persistence categories describe where service state lives: **memory**, **file**,
 
 ## Security and project boundaries
 
-- IAM Credentials supports direct, one-hour-or-shorter local
-  `generateAccessToken`; delegation chains are `501 UNIMPLEMENTED`.
-- Security Token Service exchanges only MiniSky-authenticated local access
-  tokens. External OIDC, SAML, AWS, workforce, and workload provider flows are
-  `501 UNIMPLEMENTED`.
+- IAM Credentials supports direct and ordered delegated, one-hour-or-shorter
+  local `generateAccessToken` with at most four delegates. Longer chains,
+  `generateIdToken`, `signJwt`, and `signBlob` are unsupported.
+- Security Token Service supports MiniSky local-token exchange plus one bounded
+  workload identity path: a local project-ID canonical audience (not a project
+  number), an OIDC provider with static inline JWKS, RS256 JWT verification,
+  exact issuer/audience matching and temporal checks, and only
+  `google.subject=assertion.sub`. The bounded `sub` value is preserved exactly
+  in the escaped federated principal, whose IAM binding must match. The result
+  is a local `ms1` token, not a Google credential.
+- AWS, SAML, X.509, workforce federation, remote OIDC discovery/JWKS, CEL
+  conditions or arbitrary mappings, non-RS256 signatures, Google trust roots,
+  credential portability/revocation, and WIF undelete/soft-delete recovery
+  remain unsupported. WIF exchange performs no network or discovery calls.
 - Resource Manager persists project metadata and the
   minimal local organization/folder parent chain. It does not claim complete
   Resource Manager LRO, search, undelete, tag, lien, or org-policy parity.
@@ -92,6 +101,11 @@ resources, IAM service accounts, and a Docker-backed Storage bucket. The
 separate durability gate covers only persisted BigQuery/IAM metadata; Storage
 emulator data is outside metadata export/import. Broader compatibility must be
 supported by focused executable tests before its manifest fidelity is raised.
+The separate guarded Phase-13 gate passed Google provider 7.41.0 apply,
+restart/no-drift, static-JWKS JWT exchange, one-delegate impersonation,
+authenticated target-token use, destroy, and post-destroy `404` checks. Public
+JWKS appeared in Terraform and MiniSky state as expected; the harness verified
+that its private key and signed subject JWT were not persisted or logged.
 
 ## Phase 9–11 boundaries
 

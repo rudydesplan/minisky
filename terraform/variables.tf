@@ -28,6 +28,66 @@ variable "enable_phase10_artifact_resources" {
   default     = false
 }
 
+variable "enable_phase13_wif_resources" {
+  description = "Create the optional local Phase-13 workload identity federation resources"
+  type        = bool
+  default     = false
+}
+
+variable "phase13_wif_delegate_account_ids" {
+  description = "Ordered account IDs for the local Phase-13 delegation chain"
+  type        = list(string)
+  default     = ["minisky-wif-delegate"]
+
+  validation {
+    condition = (
+      length(var.phase13_wif_delegate_account_ids) >= 1 &&
+      length(var.phase13_wif_delegate_account_ids) <= 4 &&
+      length(distinct(var.phase13_wif_delegate_account_ids)) == length(var.phase13_wif_delegate_account_ids) &&
+      alltrue([
+        for account_id in var.phase13_wif_delegate_account_ids :
+        can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", account_id))
+      ])
+    )
+    error_message = "phase13_wif_delegate_account_ids must contain one to four unique service account IDs."
+  }
+}
+
+variable "phase13_wif_issuer_uri" {
+  description = "Issuer URI embedded in Phase-13 workload identity subject tokens"
+  type        = string
+  default     = "https://issuer.minisky.invalid"
+}
+
+variable "phase13_wif_public_jwks" {
+  description = "Public static RSA JWKS used by the optional local Phase-13 OIDC provider"
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = !var.enable_phase13_wif_resources || var.profile != "local" || var.phase13_wif_public_jwks != null
+    error_message = "phase13_wif_public_jwks is required when local Phase-13 WIF resources are enabled."
+  }
+}
+
+variable "phase13_wif_subject" {
+  description = "OIDC subject authorized to impersonate the first Phase-13 delegate"
+  type        = string
+  default     = "minisky-phase13-caller"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._~-]{1,128}$", var.phase13_wif_subject))
+    error_message = "phase13_wif_subject must be a non-empty URL-path-safe subject."
+  }
+}
+
+variable "phase13_wif_token_audience" {
+  description = "Audience claim accepted in Phase-13 OIDC subject tokens"
+  type        = string
+  default     = "minisky-phase13"
+}
+
 variable "local_access_token" {
   description = "Non-secret access token used only for the local MiniSky profile"
   type        = string

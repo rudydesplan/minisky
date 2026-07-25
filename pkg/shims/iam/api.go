@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	localsecurity "minisky/pkg/security"
 	"minisky/pkg/state"
@@ -22,7 +23,9 @@ const principalHeader = "X-MiniSky-Principal"
 
 func init() {
 	registry.Register("iam.googleapis.com", func(ctx *registry.Context) http.Handler {
-		return NewAPI()
+		api := NewAPI()
+		api.opMgr = ctx.OpMgr
+		return api
 	})
 }
 
@@ -77,15 +80,19 @@ type Binding struct {
 // API is the high-fidelity IAM v1 shim.
 // It handles service account CRUD, key generation, and IAM policy management.
 type API struct {
-	mu              sync.RWMutex
-	persistMu       sync.Mutex
-	store           stateStore
-	serviceAccounts map[string]*ServiceAccount      // key: "project:email"
-	keys            map[string][]*ServiceAccountKey // key: "project:email"
-	policies        map[string]*IamPolicy           // key: resource full name
-	strict          bool
-	issuer          *localsecurity.Issuer
-	hierarchy       hierarchyResolver
+	mu                        sync.RWMutex
+	persistMu                 sync.Mutex
+	store                     stateStore
+	opMgr                     *orchestrator.OperationManager
+	serviceAccounts           map[string]*ServiceAccount      // key: "project:email"
+	keys                      map[string][]*ServiceAccountKey // key: "project:email"
+	policies                  map[string]*IamPolicy           // key: resource full name
+	workloadIdentityPools     map[string]*WorkloadIdentityPool
+	workloadIdentityProviders map[string]*WorkloadIdentityPoolProvider
+	strict                    bool
+	issuer                    *localsecurity.Issuer
+	tokenAudience             string
+	hierarchy                 hierarchyResolver
 }
 
 type hierarchyResolver interface {
@@ -100,9 +107,11 @@ type stateStore interface {
 const iamStateEntry = "iam/metadata"
 
 type iamMetadata struct {
-	ServiceAccounts map[string]*ServiceAccount      `json:"serviceAccounts"`
-	Keys            map[string][]*ServiceAccountKey `json:"keys"`
-	Policies        map[string]*IamPolicy           `json:"policies"`
+	ServiceAccounts           map[string]*ServiceAccount               `json:"serviceAccounts"`
+	Keys                      map[string][]*ServiceAccountKey          `json:"keys"`
+	Policies                  map[string]*IamPolicy                    `json:"policies"`
+	WorkloadIdentityPools     map[string]*WorkloadIdentityPool         `json:"workloadIdentityPools,omitempty"`
+	WorkloadIdentityProviders map[string]*WorkloadIdentityPoolProvider `json:"workloadIdentityProviders,omitempty"`
 }
 
 func NewAPI() *API {
@@ -147,6 +156,12 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	if persisted.Policies != nil {
 		api.policies = persisted.Policies
 	}
+	if persisted.WorkloadIdentityPools != nil {
+		api.workloadIdentityPools = cloneWorkloadIdentityPools(persisted.WorkloadIdentityPools)
+	}
+	if persisted.WorkloadIdentityProviders != nil {
+		api.workloadIdentityProviders = cloneWorkloadIdentityProviders(persisted.WorkloadIdentityProviders)
+	}
 	return api, nil
 }
 
@@ -154,12 +169,15 @@ func newAPI(store stateStore) *API {
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
 	return &API{
-		store:           store,
-		serviceAccounts: make(map[string]*ServiceAccount),
-		keys:            make(map[string][]*ServiceAccountKey),
-		policies:        make(map[string]*IamPolicy),
-		strict:          strings.EqualFold(strings.TrimSpace(os.Getenv("MINISKY_IAM_MODE")), "strict"),
-		issuer:          localsecurity.NewIssuer(key, time.Now),
+		store:                     store,
+		serviceAccounts:           make(map[string]*ServiceAccount),
+		keys:                      make(map[string][]*ServiceAccountKey),
+		policies:                  make(map[string]*IamPolicy),
+		workloadIdentityPools:     make(map[string]*WorkloadIdentityPool),
+		workloadIdentityProviders: make(map[string]*WorkloadIdentityPoolProvider),
+		strict:                    strings.EqualFold(strings.TrimSpace(os.Getenv("MINISKY_IAM_MODE")), "strict"),
+		issuer:                    localsecurity.NewIssuer(key, time.Now),
+		tokenAudience:             "minisky-gateway",
 	}
 }
 
@@ -177,6 +195,8 @@ func (api *API) persistMetadata() error {
 	defer api.persistMu.Unlock()
 	api.mu.RLock()
 	metadata := cloneIAMMetadata(api.serviceAccounts, api.keys, api.policies)
+	metadata.WorkloadIdentityPools = cloneWorkloadIdentityPools(api.workloadIdentityPools)
+	metadata.WorkloadIdentityProviders = cloneWorkloadIdentityProviders(api.workloadIdentityProviders)
 	api.mu.RUnlock()
 	return api.store.Save(iamStateEntry, metadata)
 }
@@ -197,6 +217,9 @@ func (api *API) Authorize(resource, principal, permission string) bool {
 	}
 	canonical := strings.TrimPrefix(resource, "/v1/")
 	resources := []string{canonical}
+	if alias := serviceAccountPolicyAlias(canonical); alias != "" {
+		resources = append(resources, alias)
+	}
 	parts := strings.Split(strings.Trim(canonical, "/"), "/")
 	projectResource := ""
 	for index, part := range parts {
@@ -233,6 +256,26 @@ func (api *API) Authorize(resource, principal, permission string) bool {
 	return false
 }
 
+func serviceAccountPolicyAlias(resource string) string {
+	const wildcardPrefix = "projects/-/serviceAccounts/"
+	if !strings.HasPrefix(resource, wildcardPrefix) {
+		return ""
+	}
+	email := strings.TrimPrefix(resource, wildcardPrefix)
+	if email == "" || strings.Contains(email, "/") {
+		return ""
+	}
+	_, domain, ok := strings.Cut(email, "@")
+	if !ok {
+		return ""
+	}
+	project := strings.TrimSuffix(domain, ".iam.gserviceaccount.com")
+	if project == domain || project == "" {
+		return ""
+	}
+	return "projects/" + project + "/serviceAccounts/" + email
+}
+
 func (api *API) IssueLocalToken(subject, audience string, scopes []string, lifetime time.Duration) (string, time.Time, error) {
 	api.mu.RLock()
 	disabled := false
@@ -257,6 +300,39 @@ func (api *API) IssueLocalToken(subject, audience string, scopes []string, lifet
 
 func (api *API) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
 	return api.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
+}
+
+// SetTokenAudience configures the audience shared by the gateway and local
+// credential-issuing shims.
+func (api *API) SetTokenAudience(audience string) {
+	audience = strings.TrimSpace(audience)
+	if audience == "" {
+		audience = "minisky-gateway"
+	}
+	api.mu.Lock()
+	api.tokenAudience = audience
+	api.mu.Unlock()
+}
+
+// TokenAudience returns the configured local credential audience.
+func (api *API) TokenAudience() string {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.tokenAudience
+}
+
+// ResolveServiceAccount resolves either an email address or unique ID to the
+// account's canonical email and reports its current enabled state.
+func (api *API) ResolveServiceAccount(identifier string) (email string, disabled, found bool) {
+	identifier = strings.TrimSpace(identifier)
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	for _, account := range api.serviceAccounts {
+		if account.Email == identifier || account.UniqueId == identifier {
+			return account.Email, account.Disabled, true
+		}
+	}
+	return "", false, false
 }
 
 func (api *API) persistOrError(w http.ResponseWriter) bool {
@@ -287,6 +363,11 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	path := r.URL.Path
+
+	if strings.Contains(path, "/workloadIdentityPools") {
+		api.routeWorkloadIdentity(w, r)
+		return
+	}
 
 	// Policy verbs come as path suffixes after a colon
 	switch {
@@ -807,6 +888,9 @@ var rolePermissions = map[string][]string{
 		"storage.objects.update",
 	},
 	"roles/iam.serviceAccountTokenCreator": {
+		"iam.serviceAccounts.getAccessToken",
+	},
+	"roles/iam.workloadIdentityUser": {
 		"iam.serviceAccounts.getAccessToken",
 	},
 	"roles/storage.admin": {

@@ -48,15 +48,47 @@ Google-shaped `401 UNAUTHENTICATED`; authenticated permission failures are
 `403 PERMISSION_DENIED`. Responses and request logs never include token
 material.
 
-`iamcredentials.googleapis.com` supports direct
-`projects/-/serviceAccounts/{email}:generateAccessToken`. Delegation chains are
-explicitly `501 UNIMPLEMENTED`. The STS endpoint accepts only MiniSky local
-access tokens; JWT, SAML, AWS, OIDC provider discovery, and arbitrary workforce
-or workload identity provider flows return `501 UNIMPLEMENTED`.
+`iamcredentials.googleapis.com` supports
+`projects/-/serviceAccounts/{email}:generateAccessToken` directly and through
+up to four ordered delegates. In strict mode, every caller → delegate →
+target edge must grant `iam.serviceAccounts.getAccessToken`; missing,
+out-of-order, duplicate, cyclic, disabled, or unknown chain members fail
+without returning credential material. Chains longer than four delegates and
+the `generateIdToken`, `signJwt`, and `signBlob` methods remain unsupported.
+
+The STS endpoint supports a deliberately bounded workload identity federation
+path in addition to MiniSky local-token exchange:
+
+- the canonical exchange audience names a local project ID, pool, and provider
+  (`//iam.googleapis.com/projects/{project-id}/locations/global/...`); project
+  numbers are not supported;
+- the provider is OIDC with a static inline public JWKS; MiniSky performs no
+  network access, issuer discovery, or remote JWKS retrieval;
+- JWT signatures use RS256 with an RSA public key selected by exact `kid`;
+- `iss` must exactly match the configured issuer, `aud` must exactly match an
+  allowed audience (or the canonical exchange audience when none is
+  configured), and `sub` must be non-empty and bounded;
+- `exp` is required and must be in the future; optional `nbf` and `iat` cannot
+  be more than 30 seconds in the future;
+- the only executable attribute mapping is
+  `google.subject=assertion.sub`; CEL attribute conditions and arbitrary
+  mappings are rejected.
+
+A successful exchange returns a profile-local `ms1` bearer token whose subject
+is the local federated principal. Delegated `generateAccessToken` returns
+another local `ms1` token for the target service account. Neither token is a
+Google credential or portable to Google Cloud.
 
 Service-account key metadata records disable, delete, and expiry lifecycle.
 Keys and local tokens are not Google credentials and cannot authenticate to
 Google Cloud.
+
+Workload identity pool/provider metadata, including the configured public JWKS,
+is profile-persisted and may also appear in Terraform state. The private RSA
+key and signed subject JWT are created only by the guarded integration harness;
+the passing gate verified they were not persisted in MiniSky state, Terraform
+state, repository files, diffs, or daemon logs. Public JWKS material is not a
+secret, but Terraform state still requires normal state-file handling.
 
 ## Authorization and projects
 
@@ -85,15 +117,20 @@ kernel, network, or storage isolation between projects.
 MiniSky does not provide:
 
 - Google trust roots, OAuth authorization servers, token introspection, or
-  revocation propagation;
+  credential portability or revocation propagation;
 - HSM-backed key custody, managed key rotation, audit-log guarantees, VPC
   Service Controls, Access Context Manager, or organization-policy parity;
 - production-grade tenant isolation or protection from a user who can read the
   profile, control the process, or access the Docker socket;
 - Shared VPC packet routing, Google front-end behavior, public DNS, certificate
   transparency, or managed certificate renewal;
-- complete IAM permission, condition, deny-policy, principal-set, WIF, or STS
-  provider semantics.
+- AWS, SAML, X.509, workforce federation, remote OIDC discovery or remote JWKS,
+  CEL conditions, arbitrary attribute mappings, or non-RS256 WIF signatures;
+- WIF pool/provider undelete or soft-delete recovery, delegation chains longer
+  than four service accounts, or IAM Credentials `generateIdToken`, `signJwt`,
+  and `signBlob`;
+- complete IAM permission, deny-policy, principal-set, WIF, or STS provider
+  semantics.
 
 Unsupported recognized flows fail explicitly instead of returning successful
 placeholder credentials.

@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase17 benchmark
+.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase13-wif test-phase17 benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -18,6 +18,9 @@ test-integration:
 
 test-phase10-artifact:
 	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
+
+test-phase13-wif:
+	MINISKY_PHASE13_INTEGRATION=1 ./scripts/phase13-wif-integration.sh
 
 test-phase17:
 	go test ./scripts ./pkg/pluginsdk ./pkg/security ./pkg/dashboard ./pkg/router ./pkg/observability ./cmd/minisky

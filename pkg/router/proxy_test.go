@@ -2,9 +2,11 @@ package router
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +116,120 @@ func TestStrictAuthorizationDefaultDeniesUnmappedMutations(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "unmapped mutation") {
 		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStrictSTSBootstrapReachesSubjectTokenValidation(t *testing.T) {
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "router-sts-bootstrap")
+	shims, _ := registry.BootAll(nil, nil)
+	authorizer, ok := shims["iam.googleapis.com"].(routeAuthorizer)
+	if !ok {
+		t.Fatal("IAM shim does not implement router authorization")
+	}
+	issuer, ok := shims["iam.googleapis.com"].(interface {
+		IssueLocalToken(string, string, []string, time.Duration) (string, time.Time, error)
+	})
+	if !ok {
+		t.Fatal("IAM shim does not implement local token issuance")
+	}
+	const scope = "https://www.googleapis.com/auth/cloud-platform"
+	subjectToken, _, err := issuer.IssueLocalToken(
+		"principal://iam.googleapis.com/pool/subject/workload", "sts-audience", []string{scope}, time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("sts.googleapis.com", shims["sts.googleapis.com"])
+	const gatewayAudience = "https://gateway.minisky.test"
+	router.ConfigureSecurity(authorizer, nil, false, gatewayAudience)
+
+	for _, test := range []struct {
+		name, subject string
+		want          int
+	}{
+		{name: "valid subject reaches handler", subject: subjectToken, want: http.StatusOK},
+		{name: "invalid subject rejected by handler", subject: "invalid-subject", want: http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			form := url.Values{
+				"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+				"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+				"subject_token_type":   {"urn:ietf:params:oauth:token-type:access_token"},
+				"subject_token":        {test.subject},
+				"audience":             {"sts-audience"},
+				"scope":                {scope},
+			}
+			request := httptest.NewRequest(http.MethodPost,
+				"http://localhost/_minisky/sts/v1/token",
+				strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.want {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.want, response.Body.String())
+			}
+			if test.want == http.StatusOK {
+				var body struct {
+					AccessToken string `json:"access_token"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := authorizer.VerifyLocalToken(body.AccessToken, gatewayAudience, scope); err != nil {
+					t.Fatalf("STS token does not match router audience: %v", err)
+				}
+			}
+		})
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/sts/v1/other", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("other STS path status=%d want=%d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestStrictIAMCredentialsUsesBearerPrincipalAndDefersAuthorization(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("iamcredentials.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-MiniSky-Principal"); got != "principal://iam.googleapis.com/pool/subject/workload" {
+			t.Fatalf("principal=%q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: false}, nil, false, "gateway")
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "principal://iam.googleapis.com/pool/subject/workload", Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost,
+		"http://localhost/_minisky/iamcredentials/v1/projects/-/serviceAccounts/target@example.com:generateAccessToken",
+		strings.NewReader(`{"scope":["scope"]}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("X-MiniSky-Principal", "user:attacker@example.com")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("conflict status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost,
+		"http://localhost/_minisky/iamcredentials/v1/projects/-/serviceAccounts/target@example.com:generateAccessToken",
+		strings.NewReader(`{"scope":["scope"]}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
