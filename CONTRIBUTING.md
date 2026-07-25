@@ -119,6 +119,17 @@ requests use MiniSky's local source-deployment helper, not the Cloud Run v2
 image API. The gate is intentionally local and may take several minutes on a
 cold Buildpacks cache.
 
+To verify persisted Monitoring samples through the bounded PromQL
+instant-query path, run:
+
+```bash
+make test-phase16-monitoring
+```
+
+This guarded gate uses temporary profile state and dynamic loopback ports. It
+does not require Docker, and it leaves MQL, range queries, and broader PromQL
+grammar explicitly unsupported.
+
 For the Phase 17 CI, plugin, control, offline-bundle, and Compose checks, run:
 
 ```bash
