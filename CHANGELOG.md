@@ -5,6 +5,25 @@ All notable changes to the MiniSky project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-25
+
+### Added
+- **Native DuckDB Releases**: Added CGO-enabled BigQuery SQL execution for Linux amd64/arm64, macOS arm64, and Windows amd64.
+- **BigQuery Conformance Suite**: Added coverage for queries, nested DDL, streaming inserts, file loads, persistence, and no-CGO platform behavior.
+- **Platform Diagnostics**: Added `minisky doctor bigquery` to verify DuckDB capability without starting Docker-backed services.
+- **Native Release CI**: Added native platform gates, Windows UCRT dependency auditing, checksummed release assembly, and installed-artifact smoke tests.
+
+### Changed
+- **Release Packaging**: Native runners now build and verify their platform artifacts before GitHub release publication.
+- **Installer Security**: Release archives are checksum-verified before extraction and installation.
+- **Docker Runtime**: Linux images now build DuckDB explicitly with CGO and run on a glibc-based distroless image.
+
+### Fixed
+- **BigQuery Persistence**: Streaming inserts now persist to DuckDB using parameterized transactions.
+- **Nested BigQuery Schemas**: RECORD/STRUCT and REPEATED fields now produce valid DuckDB types.
+- **DuckDB Lifecycle**: Custom database paths, connection cleanup, and no-CGO errors are handled consistently.
+- **Repository Quality**: Added CI, characterization tests, strict UI linting, reproducible builds, and corrected documentation/configuration drift.
+
 ## [1.2.2] - 2026-05-04
 
 ### Added
@@ -70,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single Binary**: Fully self-contained architecture for maximum portability.
 
 ---
+[1.3.0]: https://github.com/qamarudeenm/minisky/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/qamarudeenm/minisky/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/qamarudeenm/minisky/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/qamarudeenm/minisky/compare/v1.0.3...v1.2.0
