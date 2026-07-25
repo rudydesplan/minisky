@@ -9,26 +9,47 @@ before:
     - bash -c "cd ui && npm ci && npm run build"
 
 builds:
-  - id: linux
+  - id: linux-amd64
     main: ./cmd/minisky
     binary: minisky
     env: [CGO_ENABLED=1]
     goos: [linux]
     goarch: [amd64]
+    ldflags:
+      - -s -w
+      - -X minisky/pkg/version.Version={{ .Version }}
 
-  - id: darwin
+  - id: linux-arm64
     main: ./cmd/minisky
     binary: minisky
-    env: [CGO_ENABLED=0]
+    env: [CGO_ENABLED=1]
+    goos: [linux]
+    goarch: [arm64]
+    ldflags:
+      - -s -w
+      - -X minisky/pkg/version.Version={{ .Version }}
+
+  - id: darwin-arm64
+    main: ./cmd/minisky
+    binary: minisky
+    env:
+      - CGO_ENABLED=1
+      - CC=clang
     goos: [darwin]
     goarch: [arm64]
+    ldflags:
+      - -s -w
+      - -X minisky/pkg/version.Version={{ .Version }}
 
-  - id: windows
+  - id: windows-amd64
     main: ./cmd/minisky
     binary: minisky
     env: [CGO_ENABLED=0]
     goos: [windows]
     goarch: [amd64]
+    ldflags:
+      - -s -w
+      - -X minisky/pkg/version.Version={{ .Version }}
 
 archives:
   - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
@@ -53,6 +74,9 @@ scoops:
 
 nfpms:
   - id: minisky-pkg
+    ids:
+      - linux-amd64
+      - linux-arm64
     package_name: minisky
     vendor: MiniSky Open Source
     homepage: https://github.com/qamarudeenm/minisky

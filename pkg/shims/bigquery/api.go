@@ -410,6 +410,12 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 		if api.backend.Enabled() && t.Schema != nil {
 			if err := api.backend.CreateTable(project, datasetId, tID, t.Schema); err != nil {
 				log.Printf("[Shim: BigQuery] CreateTable failed for %s.%s: %v", datasetId, tID, err)
+				api.mu.Lock()
+				delete(api.tables, key)
+				api.mu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to create DuckDB table")
+				return
 			}
 		}
 
@@ -486,13 +492,31 @@ func (api *API) insertAll(w http.ResponseWriter, r *http.Request, path string) {
 	}
 
 	key := tableKey(project, datasetId, tableId)
-	api.mu.Lock()
-	if t, ok := api.tables[key]; ok {
-		for _, row := range body.Rows {
-			t.rows = append(t.rows, row.Json)
-		}
-		t.NumRows = fmt.Sprintf("%d", len(t.rows))
+	api.mu.RLock()
+	table, ok := api.tables[key]
+	api.mu.RUnlock()
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Table "+tableId+" not found")
+		return
 	}
+
+	rows := make([]map[string]interface{}, len(body.Rows))
+	for i, row := range body.Rows {
+		rows[i] = row.Json
+	}
+	if api.backend.Enabled() {
+		if err := api.backend.InsertRows(datasetId, tableId, table.Schema, rows); err != nil {
+			log.Printf("[Shim: BigQuery] insertAll DuckDB write failed for %s.%s: %v", datasetId, tableId, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist streaming rows")
+			return
+		}
+	}
+
+	api.mu.Lock()
+	table.rows = append(table.rows, rows...)
+	table.NumRows = fmt.Sprintf("%d", len(table.rows))
 	api.mu.Unlock()
 
 	// GCP returns 200 with empty insertErrors on success

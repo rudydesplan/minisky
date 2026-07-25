@@ -56,6 +56,32 @@ fi
 echo "📥 Downloading from $DOWNLOAD_URL..."
 curl -fsSL -o "minisky.$EXT" "$DOWNLOAD_URL"
 
+# Verify the release checksum before extracting executable content.
+CHECKSUM_URL=$(printf '%s' "$RELEASE_JSON" | grep -o '"browser_download_url": "[^"]*"' | sed -E 's/.*"([^"]+)"/\1/' | grep '/checksums.txt$' | head -n 1 || true)
+if [ -z "$CHECKSUM_URL" ]; then
+    echo "❌ Error: Release $VERSION does not include checksums.txt."
+    exit 1
+fi
+curl -fsSL -o checksums.txt "$CHECKSUM_URL"
+EXPECTED_SHA=$(awk -v asset="$ASSET_NAME" '$2 == asset {print $1}' checksums.txt)
+if [ -z "$EXPECTED_SHA" ]; then
+    echo "❌ Error: No checksum found for $ASSET_NAME."
+    exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_SHA=$(sha256sum "minisky.$EXT" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SHA=$(shasum -a 256 "minisky.$EXT" | awk '{print $1}')
+else
+    echo "❌ Error: sha256sum or shasum is required to verify the release."
+    exit 1
+fi
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+    echo "❌ Error: Checksum verification failed for $ASSET_NAME."
+    exit 1
+fi
+echo "🔐 Checksum verified."
+
 if [ "$EXT" = "tar.gz" ]; then
     tar -xzf "minisky.$EXT" minisky
 else
@@ -75,11 +101,16 @@ fi
 if [ -f "minisky.$EXT" ]; then
     rm "minisky.$EXT"
 fi
+rm -f checksums.txt
 
 # 4. Final check
 echo ""
 echo "🚀 MiniSky installation process finished!"
-if [ "$OS" != "windows" ]; then
+if [ "$OS" = "windows" ]; then
+    "./$BIN_OUT" version
+else
+    "/usr/local/bin/$BIN_OUT" version
+    "/usr/local/bin/$BIN_OUT" doctor bigquery
     echo "Try running: minisky start"
 fi
 echo ""

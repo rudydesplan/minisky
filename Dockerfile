@@ -16,7 +16,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
-RUN go build -trimpath -o minisky ./cmd/minisky
+RUN CGO_ENABLED=1 go build -trimpath -o minisky ./cmd/minisky
 
 # Stage 3: Copy the Docker CLI without its daemon.
 FROM docker:29-cli AS docker-cli
