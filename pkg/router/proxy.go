@@ -2,6 +2,7 @@ package router
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -14,20 +15,22 @@ import (
 
 // ProxyRouter intercepts and routes all incoming GCP API requests.
 type ProxyRouter struct {
-	mu          sync.RWMutex
-	routes      map[string]http.Handler
-	lazyDomains map[string]bool // domains that should trigger Docker orchestration
-	validator   *validator.Validator
-	serviceMgr  *orchestrator.ServiceManager
+	mu              sync.RWMutex
+	routes          map[string]http.Handler
+	lazyDomains     map[string]bool // domains that should trigger Docker orchestration
+	endpointAliases map[string]string
+	validator       *validator.Validator
+	serviceMgr      *orchestrator.ServiceManager
 }
 
 // NewProxyRouterWithManager creates the router with a pre-initialized ServiceManager injected.
 func NewProxyRouterWithManager(sm *orchestrator.ServiceManager) *ProxyRouter {
 	return &ProxyRouter{
-		routes:      make(map[string]http.Handler),
-		lazyDomains: make(map[string]bool),
-		validator:   validator.NewValidator(),
-		serviceMgr:  sm,
+		routes:          make(map[string]http.Handler),
+		lazyDomains:     make(map[string]bool),
+		endpointAliases: make(map[string]string),
+		validator:       validator.NewValidator(),
+		serviceMgr:      sm,
 	}
 }
 
@@ -46,9 +49,11 @@ func (p *ProxyRouter) RegisterProxy(domain string, targetURL string) error {
 	if err != nil {
 		return err
 	}
+	domain = normalizeDomain(domain)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	p.mu.Lock()
 	p.routes[domain] = proxy
+	p.registerEndpointAliasLocked(domain)
 	p.mu.Unlock()
 	log.Printf("[Router] Registered External Proxy: %s -> %s", domain, targetURL)
 	return nil
@@ -56,9 +61,11 @@ func (p *ProxyRouter) RegisterProxy(domain string, targetURL string) error {
 
 // RegisterShim maps a domain to an internal Go handler (no Docker required).
 func (p *ProxyRouter) RegisterShim(domain string, handler http.Handler) {
+	domain = normalizeDomain(domain)
 	p.mu.Lock()
 	p.routes[domain] = handler
 	p.lazyDomains[domain] = false
+	p.registerEndpointAliasLocked(domain)
 	p.mu.Unlock()
 	log.Printf("[Router] Registered Internal Shim: %s", domain)
 }
@@ -66,28 +73,29 @@ func (p *ProxyRouter) RegisterShim(domain string, handler http.Handler) {
 // RegisterLazyDocker marks a domain for lazy Docker-backed orchestration.
 // On first request, the orchestrator boots the container and dynamically wires the proxy.
 func (p *ProxyRouter) RegisterLazyDocker(domain string) {
+	domain = normalizeDomain(domain)
 	p.mu.Lock()
 	p.lazyDomains[domain] = true
+	p.registerEndpointAliasLocked(domain)
 	p.mu.Unlock()
 	log.Printf("[Router] Registered Lazy Docker Backend: %s (boots on first request)", domain)
 }
 
 func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	targetDomain := r.Host
+	targetDomain := normalizeDomain(r.Host)
 
 	// 1. Support Path-based Routing for local requests (Terraform/CLI)
-	if strings.Contains(targetDomain, "localhost") || strings.Contains(targetDomain, "127.0.0.1") {
-		path := r.URL.Path
-		if strings.HasPrefix(path, "/storage/") || strings.HasPrefix(path, "/upload/storage/") {
-			targetDomain = "storage.googleapis.com"
-		} else if strings.HasPrefix(path, "/bigquery/") {
-			targetDomain = "bigquery.googleapis.com"
-		} else if (strings.HasPrefix(path, "/v1/projects/") || strings.HasPrefix(path, "/projects/")) && (strings.Contains(path, "/topics") || strings.Contains(path, "/subscriptions")) {
-			targetDomain = "pubsub.googleapis.com"
-		} else if strings.HasPrefix(path, "/v2/") || (strings.HasPrefix(path, "/v1/projects/") && strings.Contains(path, "/locations/")) {
-			targetDomain = "cloudfunctions.googleapis.com"
-		} else if strings.HasPrefix(path, "/compute/") {
-			targetDomain = "compute.googleapis.com"
+	if isLocalhost(r.Host) {
+		if selector, servicePath, canonical := canonicalEndpoint(r.URL.Path); canonical {
+			domain, exists := p.resolveEndpoint(selector)
+			if !exists {
+				p.writeUnimplemented(w, selector)
+				return
+			}
+			targetDomain = domain
+			rewriteRequestPath(r, servicePath)
+		} else {
+			targetDomain = legacyLocalDomain(r.URL.Path, targetDomain)
 		}
 		log.Printf("[Router] Path-mapped local request: %s -> %s", r.URL.Path, targetDomain)
 	}
@@ -142,11 +150,105 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RUnlock()
 
 	if !exists {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
-		w.Write([]byte(`{"error":{"code":501,"message":"MiniSky: '` + targetDomain + `' is not yet implemented","status":"UNIMPLEMENTED"}}`))
+		p.writeUnimplemented(w, targetDomain)
 		return
 	}
 
 	handler.ServeHTTP(w, r)
+}
+
+func normalizeDomain(domain string) string {
+	host := strings.TrimSpace(domain)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	return strings.ToLower(strings.Trim(strings.TrimSpace(host), "[] ."))
+}
+
+func isLocalhost(hostport string) bool {
+	host := normalizeDomain(hostport)
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// registerEndpointAliasLocked registers the first DNS label as the convenient
+// canonical endpoint name. Conflicting aliases are disabled rather than being
+// resolved according to registration order; the full registered domain remains
+// available as an unambiguous selector.
+func (p *ProxyRouter) registerEndpointAliasLocked(domain string) {
+	alias, _, _ := strings.Cut(domain, ".")
+	current, exists := p.endpointAliases[alias]
+	if !exists {
+		p.endpointAliases[alias] = domain
+		return
+	}
+	if current != domain {
+		p.endpointAliases[alias] = ""
+	}
+}
+
+func (p *ProxyRouter) resolveEndpoint(selector string) (string, bool) {
+	selector = normalizeDomain(selector)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if _, exists := p.routes[selector]; exists {
+		return selector, true
+	}
+	if _, exists := p.lazyDomains[selector]; exists {
+		return selector, true
+	}
+	domain, exists := p.endpointAliases[selector]
+	return domain, exists && domain != ""
+}
+
+func canonicalEndpoint(path string) (selector, servicePath string, canonical bool) {
+	const prefix = "/_minisky/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+
+	remainder := strings.TrimPrefix(path, prefix)
+	selector, servicePath, _ = strings.Cut(remainder, "/")
+	if selector == "" {
+		return "", "", true
+	}
+	return selector, "/" + servicePath, true
+}
+
+func rewriteRequestPath(r *http.Request, path string) {
+	r.URL.Path = path
+	r.URL.RawPath = ""
+	r.RequestURI = r.URL.RequestURI()
+}
+
+func legacyLocalDomain(path, fallbackDomain string) string {
+	if strings.HasPrefix(path, "/storage/") || strings.HasPrefix(path, "/upload/storage/") {
+		return "storage.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/bigquery/") {
+		return "bigquery.googleapis.com"
+	}
+	if (strings.HasPrefix(path, "/v1/projects/") || strings.HasPrefix(path, "/projects/")) &&
+		(strings.Contains(path, "/topics") || strings.Contains(path, "/subscriptions")) {
+		return "pubsub.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/v2/") ||
+		(strings.HasPrefix(path, "/v1/projects/") && strings.Contains(path, "/locations/")) {
+		return "cloudfunctions.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/compute/") {
+		return "compute.googleapis.com"
+	}
+	return fallbackDomain
+}
+
+func (p *ProxyRouter) writeUnimplemented(w http.ResponseWriter, service string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	w.Write([]byte(`{"error":{"code":501,"message":"MiniSky: '` + service + `' is not yet implemented","status":"UNIMPLEMENTED"}}`))
 }

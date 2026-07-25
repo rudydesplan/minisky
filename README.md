@@ -96,10 +96,10 @@ scoop update minisky
 
 ## 🖥️ Platform Compatibility
 
-MiniSky is cross-platform. BigQuery SQL execution uses the embedded
-[DuckDB](https://duckdb.org) engine when MiniSky is built with CGO and
-`MINISKY_BQ_BACKEND=duckdb` is set. Builds without CGO retain dataset and table
-metadata behavior but use mock query execution.
+MiniSky is cross-platform. BigQuery SQL execution can use the embedded
+[DuckDB](https://duckdb.org) engine when MiniSky is built with CGO. Builds
+without CGO retain dataset and table metadata behavior but use simulated query
+execution.
 
 | Feature | Linux amd64 | Linux arm64 | macOS arm64 | Windows amd64 | Windows WSL2 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -108,8 +108,31 @@ metadata behavior but use mock query execution.
 | BigQuery SQL execution | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* |
 | CGO build | Yes | Yes | Yes | Yes | Yes |
 
-\* DuckDB is currently opt-in. Set `MINISKY_BQ_BACKEND=duckdb` before starting
-MiniSky.
+\* DuckDB is enabled by the `full` runtime profile on CGO builds, or by the
+explicit `MINISKY_BQ_BACKEND=duckdb` override.
+
+### Runtime profiles
+
+`MINISKY_RUNTIME_PROFILE` makes backend defaults explicit:
+
+- `simulation` is the backward-compatible default. DuckDB, Buildpacks, and
+  Kind remain disabled unless individually overridden. This avoids creating
+  resource-intensive Kind clusters unexpectedly.
+- `full` enables DuckDB automatically on CGO builds. It enables Buildpacks and
+  Kind only when their required CLIs (`pack`/`kind` and `docker`) are installed;
+  otherwise MiniSky reports the dependency and falls back to simulation.
+
+Per-backend overrides take precedence over the profile:
+
+```bash
+MINISKY_BQ_BACKEND=duckdb
+MINISKY_SERVERLESS_BACKEND=buildpacks
+MINISKY_GKE_BACKEND=kind
+```
+
+Set any override to `simulation` to disable that real backend even under the
+`full` profile. Invalid profile or backend values also fall back to simulation
+with a diagnostic in startup logs, `minisky doctor`, and dashboard API state.
 
 Published v1.2.x macOS and Windows artifacts predate native CGO support.
 Upgrade to v1.3.0 or later for native DuckDB, or run the Linux build through
@@ -142,8 +165,15 @@ public gateway in CI.
 - Native, checksummed release artifacts with installed-binary smoke tests.
 - Strict UI linting, Go race tests, release validation, and reproducible builds.
 
-Run `minisky doctor bigquery` to verify DuckDB without starting Docker-backed
-services.
+Run `minisky doctor` for concise checks of Docker connectivity, DuckDB, optional
+Kind and Pack tooling, API/UI port availability, and `~/.minisky` writability.
+Required failures return a nonzero exit status; missing Kind or Pack is reported
+as optional because each gates only its corresponding service.
+
+`minisky doctor bigquery` remains available for an isolated DuckDB check without
+starting Docker-backed services. `doctor --fix` is intentionally unavailable:
+the current Kind/Pack installer is coupled to the running Docker service manager
+and is not safe to invoke from standalone diagnostics.
 
 ### Roadmap principles
 
@@ -168,6 +198,12 @@ services.
 | 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🔜 Planned |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | 🔜 Planned |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🔜 Planned |
+| 12 | Observability and request diagnostics | Structured logs, distributed traces, and metrics are queryable; request replay reproduces any prior API call | 🔜 Planned |
+| 13 | Security, authentication, and credential simulation | TLS/mTLS terminates locally; service account impersonation and credential rotation behave like production IAM | 🔜 Planned |
+| 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🔜 Planned |
+| 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🔜 Planned |
+| 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🔜 Planned |
+| 17 | CI/CD integration, plugin ecosystem, and enterprise | GitHub Actions and GitLab CI templates work out of the box; third-party shims install via a plugin SDK; enterprise audit and RBAC are enforceable | 🔜 Planned |
 
 ### Phase 6 — Fidelity baseline
 
@@ -206,9 +242,8 @@ services.
 
 ### Phase 9 — Serverless and event-driven workflows
 
-- Make the local development profile enable DuckDB and Buildpacks when their
-  dependencies are available; preserve an explicit simulation profile.
-- Fix dashboard backend settings so CLI, API, and UI report the same state.
+- [x] Add explicit `full` and backward-compatible `simulation` runtime profiles,
+  dependency-aware real backends, and consistent doctor/dashboard state.
 - Execute deployed Cloud Functions and Cloud Run user handlers rather than
   fallback containers.
 - Deliver Cloud Tasks HTTP requests with retry, backoff, attempt, and terminal
@@ -240,12 +275,102 @@ services.
 - Add `make dev` and `make test-integration` as reproducible contributor entry
   points.
 
+### Phase 12 — Observability and request diagnostics
+
+- Emit structured JSON logs for every API request with correlation IDs,
+  latency, and response status.
+- Integrate OpenTelemetry tracing so spans propagate across gateway, shims,
+  and Docker-backed services.
+- Expose a Prometheus-compatible `/metrics` endpoint for request rates, error
+  rates, and resource counts.
+- Add a request replay system that captures and re-executes any prior API call
+  from the dashboard or CLI.
+- Surface trace and log data in the embedded dashboard with filtering and
+  search.
+
+### Phase 13 — Security, authentication, and credential simulation
+
+- Terminate TLS locally with auto-generated or user-provided certificates;
+  support mTLS between services.
+- Emulate service account impersonation, short-lived tokens, and workload
+  identity federation flows.
+- Simulate credential rotation (key creation, expiry, and revocation) for
+  service accounts and API keys.
+- Validate OAuth2 scopes and audience claims against configured IAM policies
+  in strict mode.
+- Document security simulation boundaries and differences from production GCP.
+
+### Phase 14 — Multi-tenancy and organization emulation
+
+- Support multiple GCP projects running concurrently with isolated resource
+  namespaces.
+- Emulate organization-level policies (org policies, folder hierarchy, and
+  inherited IAM bindings).
+- Resolve cross-project references for Pub/Sub subscriptions, shared VPCs,
+  BigQuery datasets, and Storage buckets.
+- Add `minisky project create`, `minisky project list`, and
+  `minisky project switch` CLI commands.
+- Verify multi-project Terraform stacks with cross-project data references
+  in CI.
+
+### Phase 15 — Extended data services and caching
+
+- Add a Spanner emulator with DDL support, read/write transactions, and
+  query execution.
+- Promote Firestore beyond metadata-only to support document CRUD, queries,
+  real-time listeners, and security rules evaluation.
+- Emulate Datastore (legacy mode) with entity operations, indexes, and
+  ancestor queries.
+- Add Memorystore emulation backed by a local Redis instance for caching
+  and session workflows.
+- Verify each data service with SDK-level integration tests and Terraform
+  resource lifecycle.
+
+### Phase 16 — ML/AI, monitoring, and advanced networking
+
+- Emulate Vertex AI model deployment, online prediction endpoints, and batch
+  prediction jobs with configurable mock responses.
+- Add a feature store shim for feature ingestion, serving, and point-in-time
+  lookups.
+- Emulate Cloud Monitoring with metric descriptors, time-series writes, and
+  MQL/PromQL queries.
+- Emulate Cloud Logging with log entries, sinks, log-based metrics, and
+  alerting policy evaluation.
+- Implement VPC peering, Private Service Connect, and Cloud NAT with local
+  network routing.
+- Add DNS zone emulation with record sets and local resolution for service
+  discovery.
+
+### Phase 17 — CI/CD integration, plugin ecosystem, and enterprise
+
+- Publish a GitHub Actions action (`uses: minisky/setup-minisky@v1`) that
+  installs and starts MiniSky with configurable services.
+- Provide a GitLab CI template and pre-built Docker Compose stacks for
+  common multi-service topologies.
+- Release a third-party shim SDK with versioned plugin API, lifecycle hooks,
+  and a contribution scaffold generator.
+- Host a plugin marketplace (registry) for community-contributed service
+  shims with discoverability and version pinning.
+- Add a benchmarking suite for throughput, latency, and resource consumption
+  under concurrent load.
+- Emulate resource quotas and rate limits matching GCP defaults with
+  configurable overrides.
+- Provide interactive tutorials, video walkthroughs, and architecture
+  decision records in the documentation site.
+- Add enterprise features: audit logging for all mutations, compliance mode
+  with immutable logs, air-gapped installation support, and role-based
+  access control (RBAC) for team environments.
+
 ---
 
 ## 📖 Documentation
 
 - [CLI Reference](docs/cli_reference.md)
 - [Terraform Guide](docs/terraform.md)
+- [Service Compatibility](docs/service-compatibility.md)
+- [State Model](docs/state-model.md)
+- [Terraform Compatibility](docs/terraform-compatibility.md)
+- [Distribution](docs/distribution.md)
 - [Changelog](CHANGELOG.md)
 - [Contributor Guide](CONTRIBUTING.md)
 
