@@ -19,15 +19,15 @@ import {
 
 const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
-  ["7", "Terraform and SDK", "Foundation", "Static validation passes; guarded live lifecycle remains"],
-  ["8", "Durable state", "Foundation", "Restart/export contracts pass; Docker reconciliation remains gated"],
-  ["9", "Serverless and events", "Local slice", "Pack-backed event integration remains gated"],
+  ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; optional Phase-15 Terraform remains"],
+  ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
+  ["9", "Serverless and events", "Verified local slice", "Pack-backed Scheduler, Tasks, Storage, and Pub/Sub delivery passes locally"],
   ["10", "Networking and artifacts", "Local slice", "Docker push/LB Terraform integration remains gated"],
-  ["11", "DX and distribution", "Local slice", "Published package-manager install gates remain"],
+  ["11", "DX and distribution", "Verified local slice", "macOS ARM64 snapshot smoke passes; native Linux package publication remains"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
   ["13", "Security simulation", "Local slice", "Provider-backed WIF and delegated impersonation remain 501"],
   ["14", "Multi-tenancy", "Metadata slice", "Shared Docker backends are not project-isolated"],
-  ["15", "Data services", "Bounded slices", "Docker SDK/data-plane integration remains gated"],
+  ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Bounded slices", "Advanced peering/NAT/PSC and broad query engines remain 501"],
   ["17", "CI/CD, plugins, enterprise", "Bounded local slice", "Remote marketplace and compliance storage deferred"],
 ];
@@ -128,24 +128,25 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Text>
       </Stack>
 
-      <Callout tone="warning" title="Implementation status">
-        The dependency-ordered local slices are implemented. Completion remains evidence-based:
-        Docker, Buildpacks, Terraform apply/no-drift/destroy, package publication, and unsupported
-        production-grade semantics stay open until their guarded integration gates pass.
+      <Callout tone="info" title="Implementation status">
+        Guarded Terraform, state durability, Buildpacks event delivery, and Phase-15 emulator data-plane
+        gates now pass locally. Remaining completion work is concentrated in Phase-10 load-balancer/artifact
+        integration, native Linux package installation, credentialed publication, and explicit unsupported
+        production-grade semantics.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
-          <CardHeader>Current roadmap range</CardHeader>
-          <CardBody><H2>6–17</H2><Text tone="secondary">All require remaining work</Text></CardBody>
+          <CardHeader>Guarded local gates</CardHeader>
+          <CardBody><H2>4 passed</H2><Text tone="secondary">Terraform, durability, events, and Phase 15</Text></CardBody>
         </Card>
         <Card>
-          <CardHeader>Recommended execution waves</CardHeader>
-          <CardBody><H2>7</H2><Text tone="secondary">Ordered by hard dependencies</Text></CardBody>
+          <CardHeader>Native release smoke</CardHeader>
+          <CardBody><H2>Passed</H2><Text tone="secondary">macOS ARM64 snapshot and DuckDB doctor</Text></CardBody>
         </Card>
         <Card>
-          <CardHeader>Completion rule</CardHeader>
-          <CardBody><H2>Workflow evidence</H2><Text tone="secondary">Not endpoint count or HTTP 200s</Text></CardBody>
+          <CardHeader>Remaining external gate</CardHeader>
+          <CardBody><H2>Linux packages</H2><Text tone="secondary">Native install and credentialed publication</Text></CardBody>
         </Card>
       </Grid>
 
@@ -154,7 +155,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         <Table
           headers={["Phase", "Scope", "Reality", "Remaining completion condition"]}
           rows={phases}
-          rowTone={phases.map((row) => row[2] === "Implemented" ? "success" : "warning")}
+          rowTone={phases.map((row) => row[2] === "Implemented" || row[2].startsWith("Verified") ? "success" : "warning")}
           striped
           stickyHeader
         />
@@ -213,10 +214,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Stack>
       </Grid>
 
-      <Callout tone="info" title="Recommended first implementation milestone">
-        Close phases 6–8 before adding broad new services: honest matrices, complete contract coverage,
-        multi-service Terraform/SDK CI, profile-scoped emulator data, Docker reconciliation, and durable
-        restart/export/import behavior. That foundation prevents phases 15–17 from repeating shallow compatibility.
+      <Callout tone="info" title="Next evidence milestone">
+        Complete the Phase-10 Terraform load-balancer and registry push/list/delete workflows, then validate
+        deb/rpm installation on native Linux runners. Homebrew and Scoop publication remains blocked until
+        maintainer-owned repositories, scoped credentials, and protected approval gates exist.
       </Callout>
     </Stack>
   );
