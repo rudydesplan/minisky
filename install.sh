@@ -108,6 +108,7 @@ echo ""
 echo "🚀 MiniSky installation process finished!"
 if [ "$OS" = "windows" ]; then
     "./$BIN_OUT" version
+    "./$BIN_OUT" doctor bigquery
 else
     "/usr/local/bin/$BIN_OUT" version
     "/usr/local/bin/$BIN_OUT" doctor bigquery

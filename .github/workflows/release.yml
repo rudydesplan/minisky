@@ -6,15 +6,31 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  release-metadata:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require a stable semantic version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
   ui:
     name: Build UI assets
+    needs: release-metadata
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -164,6 +180,8 @@ jobs:
     needs: native-binaries
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v6
@@ -176,16 +194,49 @@ jobs:
 
       - name: Validate native artifact set
         run: |
-          for artifact in \
-            minisky_linux_amd64.tar.gz \
-            minisky_linux_arm64.tar.gz \
-            minisky_darwin_arm64.tar.gz \
-            minisky_windows_amd64.zip; do
-            test -s "release-assets/${artifact}"
+          set -euo pipefail
+          artifacts=(
+            minisky_linux_amd64.tar.gz
+            minisky_linux_arm64.tar.gz
+            minisky_darwin_arm64.tar.gz
+            minisky_windows_amd64.zip
+          )
+          required_files=(
+            README.md
+            CONTRIBUTING.md
+            LICENSE
+            docs/cli_reference.md
+          )
+
+          for artifact in "${artifacts[@]}"; do
+            archive="release-assets/${artifact}"
+            test -s "${archive}"
+
+            if [[ "${artifact}" == *.tar.gz ]]; then
+              mapfile -t contents < <(tar -tzf "${archive}")
+              required_binary=minisky
+            else
+              mapfile -t contents < <(unzip -Z1 "${archive}")
+              required_binary=minisky.exe
+            fi
+
+            if printf '%s\n' "${contents[@]}" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+              echo "::error file=${archive}::Archive contains an unsafe path"
+              exit 1
+            fi
+
+            for required in "${required_binary}" "${required_files[@]}"; do
+              if ! printf '%s\n' "${contents[@]}" | grep -Fqx "${required}"; then
+                echo "::error file=${archive}::Missing required package entry: ${required}"
+                exit 1
+              fi
+            done
           done
+
           cd release-assets
-          sha256sum minisky_* > checksums.txt
-          sha256sum --check checksums.txt
+          sha256sum "${artifacts[@]}" > checksums.txt
+          test "$(wc -l < checksums.txt)" -eq "${#artifacts[@]}"
+          sha256sum --check --strict checksums.txt
 
       - name: Create GitHub release
         env:
@@ -197,3 +248,103 @@ jobs:
             --verify-tag \
             --generate-notes \
             --title "MiniSky ${GITHUB_REF_NAME}"
+
+  container-smoke:
+    name: Smoke test container (${{ matrix.platform }})
+    needs: release-metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            cache_scope: container-amd64
+            image_tag: minisky-smoke-amd64
+          - platform: linux/arm64
+            cache_scope: container-arm64
+            image_tag: minisky-smoke-arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ matrix.image_tag }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Run container conformance check
+        run: >-
+          docker run --rm
+          --entrypoint /app/minisky
+          "${{ matrix.image_tag }}"
+          doctor bigquery
+
+  container-publish:
+    name: Publish multi-architecture container
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - container-smoke
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve lowercase image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate container metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Build and publish multi-architecture image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          cache-from: |
+            type=gha,scope=container-amd64
+            type=gha,scope=container-arm64
+          cache-to: type=gha,mode=max,scope=container-release
