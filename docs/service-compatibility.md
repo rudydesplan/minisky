@@ -161,9 +161,14 @@ SDK coverage.
   row delete, and database/instance cleanup. The emulator does not provide
   production IAM, TLS, backups, multi-region replication, or production query
   performance, and its data is not included in MiniSky state export.
-- Monitoring implements profile-persisted metric descriptor CRUD and a bounded
-  time-series write/list subset with `metric.type` equality filters. Monitoring
-  Query Language is `501 UNIMPLEMENTED`.
+- Monitoring implements profile-persisted metric descriptor CRUD, a bounded
+  time-series write/list subset with `metric.type` equality filters, and
+  project-scoped PromQL instant queries for one exact
+  `{__name__="<metric-type>"}` selector. The instant-query slice returns the
+  latest DOUBLE or INT64 point at or before the evaluation time. Label matchers,
+  operators, functions, aggregations, ranges, Boolean samples, and
+  `query_range` are unsupported. Monitoring Query Language remains
+  `501 UNIMPLEMENTED`.
 - Logging migrates the legacy global log file into profile state, supports
   bounded `severity`, `logName`, and `resource.type` filters, and supports safe
   relative file sinks plus Pub/Sub sinks with a delivery-loop marker.
