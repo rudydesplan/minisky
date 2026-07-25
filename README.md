@@ -199,7 +199,7 @@ and is not safe to invoke from standalone diagnostics.
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
 | 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
-| 13 | Security, authentication, and credential simulation | TLS protects both loopback listeners; optional client-certificate mTLS applies only to the gateway; local credentials remain non-production simulations | 🚧 Local simulation |
+| 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🚧 Metadata slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
 | 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🚧 Bounded slices |
@@ -322,11 +322,20 @@ read-only CI on 2026-07-25. Homebrew, Scoop, deb, and rpm are not published.
 
 ### Phase 13 — Security, authentication, and credential simulation
 
-**Status (2026-07-25): local simulation slice implemented.** Go race tests
+**Status (2026-07-25): bounded local simulation slice verified.** Go race tests
 cover TLS key permissions, mTLS gateway handshakes, token
-expiry/audience/scope, key disable/delete persistence, impersonation allow/deny,
-and redacted `401`/`403` responses. Provider-backed WIF and delegated
-impersonation remain explicit `501 UNIMPLEMENTED` boundaries.
+expiry/audience/scope, key disable/delete persistence, WIF JWT validation,
+ordered delegation, impersonation allow/deny, and redacted `401`/`403`
+responses. A guarded Google provider 7.41.0 gate passed WIF resource apply,
+restart/no-drift, RS256 static-inline-JWKS exchange, one-delegate
+`generateAccessToken`, authenticated use, and destroy. This accepts local
+project-ID audiences only (not project numbers), maps only
+`google.subject=assertion.sub`, and issues local `ms1` credentials that are not
+Google credentials. AWS, SAML, X.509, workforce federation, remote OIDC
+discovery/JWKS, CEL conditions or arbitrary mappings, non-RS256 signatures,
+Google trust roots or credential portability/revocation, undelete/soft-delete
+recovery, chains over four delegates, and `generateIdToken`, `signJwt`, and
+`signBlob` remain unsupported.
 
 - Terminate TLS locally with auto-generated or user-provided certificates.
   Optional client-certificate mTLS is enforced only by the public gateway;

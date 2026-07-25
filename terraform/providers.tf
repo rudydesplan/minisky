@@ -13,6 +13,7 @@ provider "google" {
   big_query_custom_endpoint         = local.use_minisky ? "${local.minisky_base_url}/_minisky/bigquery/bigquery/v2/" : null
   compute_custom_endpoint           = local.use_minisky ? "${local.minisky_base_url}/_minisky/compute/compute/v1/" : null
   iam_beta_custom_endpoint          = local.use_minisky ? "${local.minisky_base_url}/_minisky/iam/v1/" : null
+  iam_credentials_custom_endpoint   = local.use_minisky ? "${local.minisky_base_url}/_minisky/iamcredentials/v1/" : null
   pubsub_custom_endpoint            = local.use_minisky ? "${local.minisky_base_url}/_minisky/pubsub/v1/" : null
   redis_custom_endpoint             = local.use_minisky ? "${local.minisky_base_url}/_minisky/redis/v1/" : null
   spanner_custom_endpoint           = local.use_minisky ? "${local.minisky_base_url}/_minisky/spanner/v1/" : null

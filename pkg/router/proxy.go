@@ -68,14 +68,18 @@ func NewProxyRouterWithManager(sm *orchestrator.ServiceManager) *ProxyRouter {
 // ConfigureSecurity installs the shared strict-mode authorization and optional
 // project-existence gates. Permissive mode remains unchanged.
 func (p *ProxyRouter) ConfigureSecurity(authorizer routeAuthorizer, projects projectRegistry, enforceProjects bool, audience string) {
+	audience = strings.TrimSpace(audience)
+	if audience == "" {
+		audience = "minisky-gateway"
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.authorizer = authorizer
 	p.projects = projects
 	p.enforceProjects = enforceProjects
-	p.tokenAudience = strings.TrimSpace(audience)
-	if p.tokenAudience == "" {
-		p.tokenAudience = "minisky-gateway"
+	p.tokenAudience = audience
+	p.mu.Unlock()
+	if configurer, ok := authorizer.(interface{ SetTokenAudience(string) }); ok {
+		configurer.SetTokenAudience(audience)
 	}
 }
 
@@ -282,8 +286,12 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 	if authorizer == nil || !authorizer.EnforcementEnabled() {
 		return true
 	}
+	if domain == "sts.googleapis.com" && r.Method == http.MethodPost && r.URL.Path == "/v1/token" {
+		return true
+	}
 
 	principal := ""
+	suppliedPrincipal := strings.TrimSpace(r.Header.Get("X-MiniSky-Principal"))
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authorization != "" {
 		scheme, token, ok := strings.Cut(authorization, " ")
@@ -296,12 +304,22 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 			p.writeAuthError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Bearer credential is invalid or expired")
 			return false
 		}
-		principal = claims.Subject
+		principal = strings.TrimSpace(claims.Subject)
+		if principal == "" || suppliedPrincipal != "" && suppliedPrincipal != principal {
+			p.writeAuthError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Bearer identity conflicts with the supplied principal")
+			return false
+		}
 		r.Header.Set("X-MiniSky-Principal", principal)
 	}
 	if principal == "" {
 		p.writeAuthError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication is required in strict IAM mode")
 		return false
+	}
+	if domain == "iamcredentials.googleapis.com" &&
+		r.Method == http.MethodPost &&
+		strings.HasPrefix(r.URL.Path, "/v1/projects/") &&
+		strings.HasSuffix(r.URL.Path, ":generateAccessToken") {
+		return true
 	}
 
 	permission, resource := routePermission(domain, r)

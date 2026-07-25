@@ -33,6 +33,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `artifact_registry_custom_endpoint` | `http://127.0.0.1:8080/_minisky/artifactregistry/` | `artifactregistry.googleapis.com` |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
+| `iam_credentials_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iamcredentials/v1/` | `iamcredentials.googleapis.com` |
 | `redis_custom_endpoint` | `http://127.0.0.1:8080/_minisky/redis/v1/` | `redis.googleapis.com` |
 | `spanner_custom_endpoint` | `http://127.0.0.1:8080/_minisky/spanner/v1/` | `spanner.googleapis.com` |
 | `storage_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storage/storage/v1/` | `storage.googleapis.com` |
@@ -50,6 +51,9 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_bigquery_dataset` | Profile-persisted dataset metadata CRUD | Synchronous | Dataset reference is read through the canonical endpoint |
 | `google_bigquery_table` | Profile-persisted table and schema metadata CRUD | Synchronous | Table reference is read through the canonical endpoint |
 | `google_service_account` | Profile-persisted service-account metadata CRUD | Synchronous | Account email is read through the canonical endpoint |
+| `google_iam_workload_identity_pool` (optional Phase 13) | Profile-persisted local pool metadata CRUD | Service LRO | Canonical local project-ID name survives daemon restart and returns 404 after destroy |
+| `google_iam_workload_identity_pool_provider` (optional Phase 13) | Profile-persisted OIDC metadata with static inline public JWKS | Service LRO | Provider survives restart and drives a verified RS256 JWT exchange |
+| `google_service_account_iam_member` (optional Phase 13) | Persisted policy edges for the federated caller and ordered delegates | Synchronous | Federated caller reaches the first delegate and each delegate reaches the next target |
 | `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
 | `google_artifact_registry_repository` (optional Phase 10) | In-memory repository metadata plus repository-scoped Registry v2 package/version views | Service LRO | Repository is created, read without drift, destroyed, and returns 404 |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
@@ -64,11 +68,13 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Artifact Registry, Redis, and Spanner resources are disabled by default and
-local-profile-only. Artifact Registry uses profile-owned Registry v2, and
+The Phase-13 WIF, Artifact Registry, Redis, and Spanner resources are disabled
+by default and local-profile-only. Artifact Registry uses profile-owned Registry v2, and
 `emulator-config` is not a production Spanner configuration. Enable Artifact
-Registry with `enable_phase10_artifact_resources = true` and Redis and Spanner
-with `enable_phase15_resources = true`; their outputs are `null` while disabled.
+Registry with `enable_phase10_artifact_resources = true`, WIF with
+`enable_phase13_wif_resources = true`, and Redis and Spanner with
+`enable_phase15_resources = true`; their outputs are `null` or empty while
+disabled.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
@@ -144,6 +150,29 @@ were pulled with an isolated Docker client configuration; its SDK smoke covered
 Firestore document CRUD/query, Datastore entity CRUD/ancestor queries, and
 Spanner instance/database/DDL/insert/read/delete behavior.
 
+The separate guarded Phase-13 WIF gate passed with Google provider 7.41.0. It
+applied six targeted resources, asserted the pool/provider and IAM bindings,
+reached zero drift before and after daemon restart, exchanged an RS256 subject
+JWT through the static inline JWKS provider, denied an invalid signature and a
+missing delegation edge without echoing credentials, used one ordered delegate
+to mint and authenticate a target local token, destroyed all resources, and
+verified post-destroy `404` responses. Terraform emitted its expected warning
+that `-target` is intended for exceptional use.
+
+This gate is intentionally narrower than Google WIF. The STS audience uses a
+local project ID, not a project number. Only static inline public JWKS,
+RS256, exact issuer/audience matching and temporal checks, and
+`google.subject=assertion.sub` are executable. The bounded `sub` value is
+preserved exactly in the escaped federated principal and must match the IAM
+binding; no network discovery or remote JWKS fetch occurs. Public JWKS is
+expected in Terraform and MiniSky state, while
+the harness verified that its private key and signed subject JWT were never
+persisted or logged. Returned `ms1` tokens are local MiniSky credentials, not
+Google credentials. AWS, SAML, X.509, workforce federation, CEL conditions or
+arbitrary mappings, non-RS256 signatures, Google trust roots or credential
+portability/revocation, undelete/soft-delete recovery, more than four delegates,
+`generateIdToken`, `signJwt`, and `signBlob` remain unsupported.
+
 The Docker-backed `terraform-integration` job is opt-in because starting
 MiniSky requires a Docker network. It runs for:
 
@@ -164,6 +193,13 @@ The separate opt-in `state-durability-integration` workflow runs the persisted
 BigQuery/IAM subset through create → restart → no-drift → metadata export →
 clean-profile import → no-drift → destroy. It intentionally excludes Storage
 because metadata snapshots do not archive Docker emulator data.
+
+The separate opt-in `phase13-wif-integration` workflow runs only on manual
+dispatch with `run_phase13_wif_integration` enabled. Its script requires
+`MINISKY_PHASE13_INTEGRATION=1`, refuses existing MiniSky Docker resources,
+uses isolated ports, home, profile state, provider data, and Terraform state,
+and cleans up owned resources. Because it is destructive to its isolated test
+resources, use the guarded script rather than reproducing its commands by hand.
 
 The separate guarded `scripts/phase10-artifact-integration.sh` creates a
 repository through the public gateway, cold-starts the profile-owned

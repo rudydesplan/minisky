@@ -123,6 +123,44 @@ func TestStrictModeDirectPermissionRole(t *testing.T) {
 	}
 }
 
+func TestServiceAccountImpersonationRolesAndResolution(t *testing.T) {
+	api := newAPI(nil)
+	api.strict = true
+	account := &ServiceAccount{
+		Name:      "projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com",
+		ProjectId: "test-project", UniqueId: "1234567890",
+		Email: "worker@test-project.iam.gserviceaccount.com",
+	}
+	api.serviceAccounts["test-project:"+account.Email] = account
+	policyResource := "projects/test-project/serviceAccounts/" + account.Email
+	api.policies[policyResource] = &IamPolicy{Bindings: []Binding{
+		{Role: "roles/iam.workloadIdentityUser", Members: []string{"principal://iam.googleapis.com/pool/subject/workload"}},
+		{Role: "roles/iam.serviceAccountTokenCreator", Members: []string{"serviceAccount:delegate@example.com"}},
+	}}
+	requestResource := "projects/-/serviceAccounts/" + account.Email
+	for principal := range map[string]struct{}{
+		"principal://iam.googleapis.com/pool/subject/workload": {},
+		"serviceAccount:delegate@example.com":                  {},
+	} {
+		if !api.Authorize(requestResource, principal, "iam.serviceAccounts.getAccessToken") {
+			t.Fatalf("%s lacks getAccessToken", principal)
+		}
+	}
+	for _, identifier := range []string{account.Email, account.UniqueId} {
+		email, disabled, found := api.ResolveServiceAccount(identifier)
+		if !found || disabled || email != account.Email {
+			t.Fatalf("resolve %q = %q, %v, %v", identifier, email, disabled, found)
+		}
+	}
+	account.Disabled = true
+	if _, disabled, found := api.ResolveServiceAccount(account.Email); !found || !disabled {
+		t.Fatalf("disabled account resolution = %v, %v", disabled, found)
+	}
+	if _, _, found := api.ResolveServiceAccount("missing@example.com"); found {
+		t.Fatal("missing account resolved")
+	}
+}
+
 func TestMiniSkyLocalRolesCoverDashboardAndGatewayPermissions(t *testing.T) {
 	t.Setenv("MINISKY_IAM_MODE", "strict")
 	api := newAPI(nil)

@@ -25,7 +25,7 @@ const phases = [
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
   ["11", "DX and distribution", "Verified local slice", "Native amd64/arm64 deb/rpm install gates pass; publication remains external"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
-  ["13", "Security simulation", "Local slice", "Provider-backed WIF and delegated impersonation remain 501"],
+  ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Metadata slice", "Shared Docker backends are not project-isolated"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Bounded slices", "Advanced peering/NAT/PSC and broad query engines remain 501"],
@@ -129,16 +129,17 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Stack>
 
       <Callout tone="info" title="Implementation status">
-        Guarded Terraform-managed HTTP load balancing and Artifact Registry push/list/delete now pass locally,
-        alongside state durability, Buildpacks delivery, and Phase-15 emulator gates. Native amd64 and arm64
-        deb/rpm build-install-smoke-uninstall jobs also pass in read-only CI. Credentialed publication and
-        production-grade semantics remain explicit external boundaries.
+        Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
+        static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
+        delivery, and Phase-15 emulator gates. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs
+        also pass in read-only CI. Google credential portability and production-grade semantics remain explicit
+        external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>5 passed</H2><Text tone="secondary">Including Phase-10 traffic and artifacts</Text></CardBody>
+          <CardBody><H2>6 passed</H2><Text tone="secondary">Including Phase-13 WIF and delegation</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -160,6 +161,31 @@ export default function MiniSkyRoadmapCompletionPlan() {
           stickyHeader
         />
       </Stack>
+
+      <Divider />
+
+      <Grid columns="2fr 1fr" gap={20}>
+        <Stack gap={8}>
+          <H2>Phase 13 verified boundary</H2>
+          <Text>
+            Google provider 7.41.0 passed apply → restart → no-drift → destroy for local project-ID WIF
+            resources, static inline public JWKS, RS256 exchange, and one-delegate impersonation.
+          </Text>
+          <Text tone="secondary">
+            Issuer and allowed audience match exactly, temporal claims are checked, and the bounded subject is
+            preserved exactly for IAM matching; only <Code>google.subject=assertion.sub</Code> executes.
+            Returned <Code>ms1</Code> tokens are local, not Google credentials.
+          </Text>
+        </Stack>
+        <Stack gap={8}>
+          <H3>Still unsupported</H3>
+          <Text tone="secondary">
+            Project numbers; AWS, SAML, X.509, and workforce federation; remote discovery/JWKS; CEL or arbitrary
+            mappings; non-RS256; Google trust, portability, or revocation; undelete; more than four delegates;
+            generateIdToken, signJwt, and signBlob.
+          </Text>
+        </Stack>
+      </Grid>
 
       <Divider />
 

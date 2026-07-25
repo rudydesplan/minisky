@@ -62,3 +62,31 @@ output "phase10_forwarding_proxy_url" {
     google_compute_global_forwarding_rule.phase10_http[0].name,
   ) : null
 }
+
+output "phase13_wif_pool_name" {
+  description = "Canonical name of the optional local Phase-13 workload identity pool, or null when disabled"
+  value       = local.phase13_wif_enabled ? google_iam_workload_identity_pool.phase13[0].name : null
+}
+
+output "phase13_wif_provider_name" {
+  description = "Canonical name of the optional local Phase-13 workload identity provider, or null when disabled"
+  value       = local.phase13_wif_enabled ? google_iam_workload_identity_pool_provider.phase13[0].name : null
+}
+
+output "phase13_wif_sts_audience" {
+  description = "Canonical STS exchange audience for the optional local Phase-13 provider, or null when disabled"
+  value       = local.phase13_wif_enabled ? "//iam.googleapis.com/${google_iam_workload_identity_pool_provider.phase13[0].name}" : null
+}
+
+output "phase13_wif_delegate_emails" {
+  description = "Ordered delegate service account emails for the optional local Phase-13 chain"
+  value = local.phase13_wif_enabled ? [
+    for index in range(length(var.phase13_wif_delegate_account_ids)) :
+    google_service_account.phase13_delegate[tostring(index)].email
+  ] : []
+}
+
+output "phase13_wif_target_email" {
+  description = "Final target service account email for the optional local Phase-13 chain, or null when disabled"
+  value       = local.phase13_wif_enabled ? google_service_account.phase13_target[0].email : null
+}
