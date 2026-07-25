@@ -311,18 +311,6 @@ func rejectSymlink(path string) error {
 	return nil
 }
 
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open profile directory: %w", err)
-	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync profile directory: %w", err)
-	}
-	return nil
-}
-
 func requireEOF(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
