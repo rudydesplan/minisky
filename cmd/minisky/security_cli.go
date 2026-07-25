@@ -2,9 +2,16 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	kmsProject     string
+	kmsLocation    string
+	secretsProject string
+	tasksProject   string
+	tasksLocation  string
 )
 
 var kmsCmd = &cobra.Command{
@@ -27,22 +34,22 @@ func init() {
 	kmsCmd.AddCommand(&cobra.Command{
 		Use: "keyrings list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				KeyRings []struct {
 					Name string `json:"name"`
 				} `json:"keyRings"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/cloudkms/keyRings", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("cloudkms", fmt.Sprintf("/v1/projects/%s/locations/%s/keyRings", kmsProject, kmsLocation))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("KMS KEY RINGS:")
+			fmt.Fprintln(cmd.OutOrStdout(), "KMS KEY RINGS:")
 			for _, k := range data.KeyRings {
-				fmt.Printf("  - %s\n", k.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", k.Name)
 			}
 		},
 	})
@@ -51,22 +58,22 @@ func init() {
 	secretCmd.AddCommand(&cobra.Command{
 		Use: "list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Secrets []struct {
 					Name string `json:"name"`
 				} `json:"secrets"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/secretmanager/secrets", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("secretmanager", fmt.Sprintf("/v1/projects/%s/secrets", secretsProject))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("SECRET MANAGER SECRETS:")
+			fmt.Fprintln(cmd.OutOrStdout(), "SECRET MANAGER SECRETS:")
 			for _, s := range data.Secrets {
-				fmt.Printf("  - %s\n", s.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", s.Name)
 			}
 		},
 	})
@@ -75,27 +82,32 @@ func init() {
 	tasksCmd.AddCommand(&cobra.Command{
 		Use: "queues list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Queues []struct {
 					Name  string `json:"name"`
 					State string `json:"state"`
 				} `json:"queues"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/cloudtasks/queues", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("cloudtasks", fmt.Sprintf("/v2/projects/%s/locations/%s/queues", tasksProject, tasksLocation))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("CLOUD TASKS QUEUES:")
+			fmt.Fprintln(cmd.OutOrStdout(), "CLOUD TASKS QUEUES:")
 			for _, q := range data.Queues {
-				fmt.Printf("  - %s [%s]\n", q.Name, q.State)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", q.Name, q.State)
 			}
 		},
 	})
 
+	kmsCmd.PersistentFlags().StringVar(&kmsProject, "project", "local-dev-project", "GCP project ID")
+	kmsCmd.PersistentFlags().StringVar(&kmsLocation, "location", "global", "Cloud KMS location")
+	secretCmd.PersistentFlags().StringVar(&secretsProject, "project", "local-dev-project", "GCP project ID")
+	tasksCmd.PersistentFlags().StringVar(&tasksProject, "project", "local-dev-project", "GCP project ID")
+	tasksCmd.PersistentFlags().StringVar(&tasksLocation, "location", "us-central1", "Cloud Tasks location")
 	rootCmd.AddCommand(kmsCmd)
 	rootCmd.AddCommand(secretCmd)
 	rootCmd.AddCommand(tasksCmd)

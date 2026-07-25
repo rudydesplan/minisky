@@ -8,20 +8,14 @@ import LocalFireDepartmentIcon from '@mui/icons-material/LocalFireDepartment';
 import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import LockIcon from '@mui/icons-material/LockOutlined';
 import PsychologyIcon from '@mui/icons-material/Psychology';
-import { Service } from '../hooks/useServices';
-
-type ServiceSettings = {
-  serverless_pack?: boolean;
-  bq_duckdb?: boolean;
-  gke_kind?: boolean;
-};
+import type { DashboardSettingKey, DashboardSettings, Service } from '../hooks/useServices';
 
 type ServiceCardProps = {
   service: Service;
   idx: number;
-  settings: ServiceSettings | null | undefined;
+  settings: DashboardSettings;
   onStartContainer: (id: string) => void;
-  onToggleSetting: (key: string, currentVal: boolean) => void;
+  onToggleSetting: (key: DashboardSettingKey, currentVal: boolean) => void;
   onManage?: (id: string) => void;
   onStopContainer?: (id: string) => void;
   onInstallDependency?: (id: string) => void;
@@ -237,20 +231,20 @@ export default function ServiceCard({
           )}
           
           {s.id === 'serverless' && (!s.missingDeps?.includes('pack')) && (
-            <Button size="small" variant="outlined" color={settings?.serverless_pack ? 'error' : 'primary'} onClick={() => onToggleSetting('serverless_pack', settings?.serverless_pack ?? false)}>
-              {settings?.serverless_pack ? 'Disable Buildpacks' : 'Enable Buildpacks'}
+            <Button size="small" variant="outlined" color={settings.serverless_pack ? 'error' : 'primary'} onClick={() => onToggleSetting('serverless_pack', settings.serverless_pack)}>
+              {settings.serverless_pack ? 'Disable Buildpacks' : 'Enable Buildpacks'}
             </Button>
           )}
           
           {s.id === 'bigquery' && (
-            <Button size="small" variant="outlined" color={settings?.bq_duckdb ? 'error' : 'primary'} onClick={() => onToggleSetting('bq_duckdb', settings?.bq_duckdb ?? false)}>
-              {settings?.bq_duckdb ? 'Disable DuckDB' : 'Enable DuckDB'}
+            <Button size="small" variant="outlined" color={settings.bq_duckdb ? 'error' : 'primary'} onClick={() => onToggleSetting('bq_duckdb', settings.bq_duckdb)}>
+              {settings.bq_duckdb ? 'Disable DuckDB' : 'Enable DuckDB'}
             </Button>
           )}
           
           {s.id === 'gke' && (
-            <Button size="small" variant="outlined" color={settings?.gke_kind ? 'error' : 'primary'} onClick={() => onToggleSetting('gke_kind', settings?.gke_kind ?? false)}>
-              {settings?.gke_kind ? 'Disable GKE Cluster' : 'Enable GKE Cluster'}
+            <Button size="small" variant="outlined" color={settings.gke_kind ? 'error' : 'primary'} onClick={() => onToggleSetting('gke_kind', settings.gke_kind)}>
+              {settings.gke_kind ? 'Disable GKE Cluster' : 'Enable GKE Cluster'}
             </Button>
           )}
         </Box>

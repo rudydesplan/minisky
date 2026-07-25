@@ -1,12 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	computeProject string
+	computeZone    string
 )
 
 var computeCmd = &cobra.Command{
@@ -23,38 +25,35 @@ var listInstancesCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List GCE instances",
 	Run: func(cmd *cobra.Command, args []string) {
-		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" {
-			port = "8081"
-		}
-
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/compute/instances", port))
-		if err != nil {
-			fmt.Printf("❌ Error: %v\n", err)
-			return
-		}
-		defer resp.Body.Close()
-
 		var data struct {
 			Items []struct {
 				Name   string `json:"name"`
 				Status string `json:"status"`
 			} `json:"items"`
 		}
-		json.NewDecoder(resp.Body).Decode(&data)
+		endpoint, err := miniskyAPIURL("compute", fmt.Sprintf("/compute/v1/projects/%s/zones/%s/instances", computeProject, computeZone))
+		if err == nil {
+			err = getJSON(endpoint, &data)
+		}
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+			return
+		}
 
-		fmt.Println("COMPUTE INSTANCES:")
+		fmt.Fprintln(cmd.OutOrStdout(), "COMPUTE INSTANCES:")
 		if len(data.Items) == 0 {
-			fmt.Println("  (None)")
+			fmt.Fprintln(cmd.OutOrStdout(), "  (None)")
 			return
 		}
 		for _, i := range data.Items {
-			fmt.Printf("  - %s [%s]\n", i.Name, i.Status)
+			fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", i.Name, i.Status)
 		}
 	},
 }
 
 func init() {
+	computeCmd.PersistentFlags().StringVar(&computeProject, "project", "local-dev-project", "GCP project ID")
+	computeCmd.PersistentFlags().StringVar(&computeZone, "zone", "us-central1-a", "Compute zone")
 	instancesCmd.AddCommand(listInstancesCmd)
 	computeCmd.AddCommand(instancesCmd)
 	rootCmd.AddCommand(computeCmd)

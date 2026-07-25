@@ -95,7 +95,7 @@ var startCmd = &cobra.Command{
 		shims, lazyDomains := registry.BootAll(opMgr, svcMgr)
 
 		for domain, handler := range shims {
-			proxyRouter.RegisterShim(domain, handler)
+			proxyRouter.RegisterShim(domain, registry.ContractHandler(domain, handler))
 		}
 		for _, domain := range lazyDomains {
 			proxyRouter.RegisterLazyDocker(domain)

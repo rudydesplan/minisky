@@ -117,13 +117,14 @@ func NewAPIHandler(
 
 // ServiceStatus matches the UI's expected schema
 type ServiceStatus struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Label       string   `json:"label"`
-	Status      string   `json:"status"` // RUNNING, SLEEPING
-	Port        *int     `json:"port"`
-	Description string   `json:"description"`
-	MissingDeps []string `json:"missingDeps,omitempty"`
+	ID          string               `json:"id"`
+	Name        string               `json:"name"`
+	Label       string               `json:"label"`
+	Status      string               `json:"status"` // RUNNING, SLEEPING
+	Port        *int                 `json:"port"`
+	Description string               `json:"description"`
+	MissingDeps []string             `json:"missingDeps,omitempty"`
+	Backend     *config.BackendState `json:"backend,omitempty"`
 }
 
 func (api *API) handleServices(w http.ResponseWriter, r *http.Request) {
@@ -198,10 +199,10 @@ func (api *API) handleServices(w http.ResponseWriter, r *http.Request) {
 		{ID: "pubsub", Name: "gcloud-pubsub", Label: "Cloud Pub/Sub", Status: pubsubStatus, Port: psPort, Description: "Official GCP emulator handling topic subscriptions"},
 		{ID: "firestore", Name: "gcloud-firestore", Label: "Cloud Firestore", Status: fsStatus, Port: fsPort, Description: "Official GCP emulator managing NoSQL document routing"},
 		{ID: "compute", Name: "minisky-gce", Label: "Compute Engine", Status: computeStatus, Port: nil, Description: "Docker VM orchestration & Armor Load Balancing"},
-		{ID: "gke", Name: "minisky-gke", Label: "Google Kubernetes Engine (GKE)", Status: gkeStatus, Port: nil, Description: "Native kind cluster provisioning", MissingDeps: gkeDeps},
-		{ID: "bigquery", Name: "bq-shim", Label: "BigQuery (DuckDB)", Status: bqStatus, Port: nil, Description: "Instant, serverless local analytical SQL parallel execution"},
+		{ID: "gke", Name: "minisky-gke", Label: "Google Kubernetes Engine (GKE)", Status: gkeStatus, Port: nil, Description: "Native kind cluster provisioning", MissingDeps: gkeDeps, Backend: backendState(api.gkeBackend.Status())},
+		{ID: "bigquery", Name: "bq-shim", Label: "BigQuery (DuckDB)", Status: bqStatus, Port: nil, Description: "Instant, serverless local analytical SQL parallel execution", Backend: backendState(api.bqBackend.Status())},
 		{ID: "sqladmin", Name: "cloud-sql", Label: "Cloud SQL", Status: sqlStatus, Port: nil, Description: "Postgres/MySQL docker container mapping"},
-		{ID: "serverless", Name: "cloud-functions", Label: "Cloud Functions & Run", Status: servStatus, Port: nil, Description: "Source to Image using GCP Buildpacks", MissingDeps: servDeps},
+		{ID: "serverless", Name: "cloud-functions", Label: "Cloud Functions & Run", Status: servStatus, Port: nil, Description: "Source to Image using GCP Buildpacks", MissingDeps: servDeps, Backend: backendState(api.servBackend.Status())},
 		{ID: "dns", Name: "cloud-dns", Label: "Cloud DNS", Status: dnsStatus, Port: nil, Description: "Internal managed zone resolution"},
 		{ID: "iam", Name: "cloud-iam", Label: "Cloud IAM", Status: iamStatus, Port: nil, Description: "Role binding & policy engine evaluation"},
 		{ID: "dataproc", Name: "cloud-dataproc", Label: "Cloud Dataproc", Status: dpStatus, Port: nil, Description: "Spark cluster emulation & LRO tracking"},
@@ -335,10 +336,16 @@ func (api *API) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		settings := map[string]bool{
+		settings := map[string]interface{}{
 			"bq_duckdb":       api.bqBackend.Enabled(),
 			"gke_kind":        api.gkeBackend.Enabled(),
 			"serverless_pack": api.servBackend.Enabled(),
+			"runtime_profile": config.GetRuntimeProfile(),
+			"backends": map[string]config.BackendState{
+				"bigquery":   api.bqBackend.Status(),
+				"gke":        api.gkeBackend.Status(),
+				"serverless": api.servBackend.Status(),
+			},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(settings)
@@ -376,6 +383,10 @@ func (api *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func backendState(state config.BackendState) *config.BackendState {
+	return &state
 }
 
 func (api *API) checkDockerStatus(name string, defaultPort int) (string, *int) {
