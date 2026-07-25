@@ -70,7 +70,11 @@ docs/*
 
 
 DESIGN.md
-.claude
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+.claude/skills/**/__pycache__/
+.claude/skills/**/*.pyc
 
 # Examples
 /examples/

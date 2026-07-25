@@ -28,6 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Validate project agent skills
+        run: python3 .claude/skills/validate.py
+
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
