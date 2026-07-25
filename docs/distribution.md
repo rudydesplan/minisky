@@ -73,12 +73,13 @@ packages. CI now configures native amd64 and arm64 jobs that use GoReleaser v2
 to build one host-architecture snapshot, inspect package contents, install and
 smoke-test each format independently, and verify uninstallation. The jobs have
 read-only repository permissions and explicitly skip publishing and
-announcements. Native CI results are still pending; this configuration is not
-evidence that either package has passed or been published.
+announcements. Both architecture jobs passed on 2026-07-25, including
+`minisky version`, `minisky doctor bigquery`, and post-uninstall removal
+checks. This is package-build evidence, not publication evidence.
 
 Local evidence from 2026-07-25 validates the GoReleaser v2 configuration,
 builds the macOS ARM64 snapshot, and runs both `minisky version` and
 `minisky doctor bigquery` from that artifact. The bundled Buildpacks CLI is
 Pack 0.40.8, which is compatible with Docker daemons that reject the legacy
 API level used by Pack 0.34.2. This evidence does not replace native Linux
-deb/rpm CI results or credentialed package publication.
+install-from-repository tests or credentialed package publication.

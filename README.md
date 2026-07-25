@@ -295,8 +295,8 @@ GCP package/version mutation, and registry blob snapshots remain unsupported.
 gateway-first delivery/artifact commands, Make targets, and release smoke
 validation are present. GoReleaser v2 configuration, a native macOS ARM64
 snapshot, `version`, and `doctor bigquery` passed locally. Native amd64 and
-arm64 deb/rpm install validation is configured in CI, but results remain
-pending. Homebrew, Scoop, deb, and rpm are not published.
+arm64 deb/rpm build → install → smoke → uninstall validation passed in
+read-only CI on 2026-07-25. Homebrew, Scoop, deb, and rpm are not published.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.
