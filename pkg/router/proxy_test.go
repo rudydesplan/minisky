@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,16 +22,31 @@ type testAuthorizer struct {
 	allow  bool
 }
 
-type permissionAuthorizer struct {
-	issuer  *localsecurity.Issuer
-	allowed map[string]bool
+type authorizationCheck struct {
+	resource   string
+	principal  string
+	permission string
 }
 
-func (a permissionAuthorizer) EnforcementEnabled() bool { return true }
-func (a permissionAuthorizer) Authorize(_ string, _ string, permission string) bool {
-	return a.allowed[permission]
+type resourcePermission struct {
+	resource   string
+	permission string
 }
-func (a permissionAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
+
+type recordingAuthorizer struct {
+	issuer  *localsecurity.Issuer
+	allowed map[resourcePermission]bool
+	checks  []authorizationCheck
+}
+
+func (a *recordingAuthorizer) EnforcementEnabled() bool { return true }
+func (a *recordingAuthorizer) Authorize(resource, principal, permission string) bool {
+	a.checks = append(a.checks, authorizationCheck{
+		resource: resource, principal: principal, permission: permission,
+	})
+	return a.allowed[resourcePermission{resource: resource, permission: permission}]
+}
+func (a *recordingAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
 	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
 }
 
@@ -500,12 +516,13 @@ func TestGatewayAloneEnforcesCrossProjectPubSubAttachment(t *testing.T) {
 	router.RegisterShim("pubsub.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Fatal("denied request reached Pub/Sub shim")
 	}))
-	router.ConfigureSecurity(permissionAuthorizer{
+	authorizer := &recordingAuthorizer{
 		issuer: issuer,
-		allowed: map[string]bool{
-			"pubsub.subscriptions.create": true,
+		allowed: map[resourcePermission]bool{
+			{resource: "projects/subscriber-project", permission: "pubsub.subscriptions.create"}: true,
 		},
-	}, nil, false, "gateway")
+	}
+	router.ConfigureSecurity(authorizer, nil, false, "gateway")
 	token, _, err := issuer.Issue(localsecurity.TokenRequest{
 		Subject: "user:subscriber@example.com", Audience: "gateway",
 		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
@@ -523,6 +540,182 @@ func TestGatewayAloneEnforcesCrossProjectPubSubAttachment(t *testing.T) {
 	if response.Code != http.StatusForbidden ||
 		!strings.Contains(response.Body.String(), "pubsub.topics.attachSubscription") {
 		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+	wantChecks := []authorizationCheck{
+		{
+			resource: "projects/subscriber-project", principal: "user:subscriber@example.com",
+			permission: "pubsub.subscriptions.create",
+		},
+		{
+			resource: "projects/publisher-project/topics/events", principal: "user:subscriber@example.com",
+			permission: "pubsub.topics.attachSubscription",
+		},
+	}
+	if !reflect.DeepEqual(authorizer.checks, wantChecks) {
+		t.Fatalf("authorization checks = %#v, want %#v", authorizer.checks, wantChecks)
+	}
+}
+
+func TestPubSubSubscriptionCreateAuthorizationContracts(t *testing.T) {
+	const (
+		principal           = "user:subscriber@example.com"
+		subscriptionProject = "subscriber-project"
+		subscription        = "projects/subscriber-project/subscriptions/events"
+		publisherTopic      = "projects/publisher-project/topics/events"
+	)
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createPermission := resourcePermission{
+		resource: "projects/" + subscriptionProject, permission: "pubsub.subscriptions.create",
+	}
+	attachPermission := resourcePermission{
+		resource: publisherTopic, permission: "pubsub.topics.attachSubscription",
+	}
+
+	for _, test := range []struct {
+		name          string
+		body          string
+		allowed       map[resourcePermission]bool
+		wantStatus    int
+		wantDispatch  int
+		wantChecks    []authorizationCheck
+		wantErrorText string
+	}{
+		{
+			name: "same project requires only create",
+			body: `{"topic":"projects/subscriber-project/topics/events","labels":{"source":"contract"}}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+			},
+			wantStatus:   http.StatusNoContent,
+			wantDispatch: 1,
+			wantChecks: []authorizationCheck{{
+				resource: createPermission.resource, principal: principal, permission: createPermission.permission,
+			}},
+		},
+		{
+			name: "cross project exact topic attach dispatches once",
+			body: `{"topic":"projects/publisher-project/topics/events","labels":{"source":"contract"}}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+				attachPermission: true,
+			},
+			wantStatus:   http.StatusNoContent,
+			wantDispatch: 1,
+			wantChecks: []authorizationCheck{
+				{resource: createPermission.resource, principal: principal, permission: createPermission.permission},
+				{resource: attachPermission.resource, principal: principal, permission: attachPermission.permission},
+			},
+		},
+		{
+			name: "attach on wrong topic is denied",
+			body: `{"topic":"projects/publisher-project/topics/events","labels":{"source":"contract"}}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+				{
+					resource:   "projects/publisher-project/topics/other",
+					permission: "pubsub.topics.attachSubscription",
+				}: true,
+			},
+			wantStatus:    http.StatusForbidden,
+			wantDispatch:  0,
+			wantErrorText: "pubsub.topics.attachSubscription",
+			wantChecks: []authorizationCheck{
+				{resource: createPermission.resource, principal: principal, permission: createPermission.permission},
+				{resource: attachPermission.resource, principal: principal, permission: attachPermission.permission},
+			},
+		},
+		{
+			name: "attach in wrong project is denied",
+			body: `{"topic":"projects/publisher-project/topics/events","labels":{"source":"contract"}}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+				{
+					resource:   "projects/other-project/topics/events",
+					permission: "pubsub.topics.attachSubscription",
+				}: true,
+			},
+			wantStatus:    http.StatusForbidden,
+			wantDispatch:  0,
+			wantErrorText: "pubsub.topics.attachSubscription",
+			wantChecks: []authorizationCheck{
+				{resource: createPermission.resource, principal: principal, permission: createPermission.permission},
+				{resource: attachPermission.resource, principal: principal, permission: attachPermission.permission},
+			},
+		},
+		{
+			name: "relative topic is invalid",
+			body: `{"topic":"topics/events"}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+			},
+			wantStatus:    http.StatusBadRequest,
+			wantDispatch:  0,
+			wantErrorText: `"INVALID_ARGUMENT"`,
+			wantChecks: []authorizationCheck{{
+				resource: createPermission.resource, principal: principal, permission: createPermission.permission,
+			}},
+		},
+		{
+			name: "malformed canonical topic is invalid",
+			body: `{"topic":"projects/publisher-project/topics"}`,
+			allowed: map[resourcePermission]bool{
+				createPermission: true,
+			},
+			wantStatus:    http.StatusBadRequest,
+			wantDispatch:  0,
+			wantErrorText: `"INVALID_ARGUMENT"`,
+			wantChecks: []authorizationCheck{{
+				resource: createPermission.resource, principal: principal, permission: createPermission.permission,
+			}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dispatches := 0
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim("pubsub.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dispatches++
+				gotBody, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read dispatched body: %v", err)
+				}
+				if string(gotBody) != test.body {
+					t.Fatalf("dispatched body = %q, want exact %q", gotBody, test.body)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			authorizer := &recordingAuthorizer{issuer: issuer, allowed: test.allowed}
+			router.ConfigureSecurity(authorizer, nil, false, "gateway")
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"http://localhost/_minisky/pubsub/v1/"+subscription,
+				strings.NewReader(test.body),
+			)
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if dispatches != test.wantDispatch {
+				t.Fatalf("dispatches=%d want=%d", dispatches, test.wantDispatch)
+			}
+			if test.wantErrorText != "" && !strings.Contains(response.Body.String(), test.wantErrorText) {
+				t.Fatalf("body=%s want substring %q", response.Body.String(), test.wantErrorText)
+			}
+			if !reflect.DeepEqual(authorizer.checks, test.wantChecks) {
+				t.Fatalf("authorization checks = %#v, want %#v", authorizer.checks, test.wantChecks)
+			}
+		})
 	}
 }
 
