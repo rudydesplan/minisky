@@ -62,9 +62,8 @@ func TestLoadBalancerResourceLifecycle(t *testing.T) {
 			if resource["kind"] != tc.resourceKind || resource["selfLink"] != canonicalSelfLink {
 				t.Fatalf("unexpected resource identity: %#v", resource)
 			}
-			if resource["status"] != metadataOnlyStatus ||
-				!strings.Contains(resource["description"].(string), "explicit supported backend configuration") {
-				t.Fatalf("resource did not disclose metadata-only behavior: %#v", resource)
+			if resource["description"] != nil && resource["description"] != "" {
+				t.Fatalf("resource changed the caller-managed description: %#v", resource)
 			}
 			if resource["id"] == "" || resource["creationTimestamp"] == "" {
 				t.Fatalf("resource omitted stable metadata: %#v", resource)
@@ -130,6 +129,13 @@ func TestLoadBalancerResourceUnsupportedRoutes(t *testing.T) {
 	assertComputeError(t, performComputeRequest(api, http.MethodGet, base+"/missing/unsupported", ""), http.StatusNotFound, "NOT_FOUND")
 	assertComputeError(t, performComputeRequest(api, http.MethodPost, base, `{}`), http.StatusBadRequest, "INVALID_ARGUMENT")
 	assertComputeError(t, performComputeRequest(api, http.MethodPost, base, `{invalid`), http.StatusBadRequest, "INVALID_ARGUMENT")
+	assertComputeError(
+		t,
+		performComputeRequest(api, http.MethodPost, "/compute/v1/projects/test-project/global/urlMaps",
+			`{"name":"routes","defaultService":"backend","hostRules":[{"hosts":["*"],"pathMatcher":"paths"}]}`),
+		http.StatusNotImplemented,
+		"UNIMPLEMENTED",
+	)
 }
 
 func TestLoadBalancerMetadataConcurrentAccess(t *testing.T) {
@@ -249,6 +255,151 @@ func TestLoadBalancerDataPlaneComputeInstanceEndpoint(t *testing.T) {
 	}
 }
 
+func TestUnmanagedInstanceGroupLifecycleAndBackendResolution(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "group:"+r.URL.Path)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api, _ := newComputeTestAPI()
+	api.instances[instanceKey("test-project", "us-central1-a", "vm-1")] = &Instance{
+		Name:    "vm-1",
+		project: "test-project",
+		zone:    "us-central1-a",
+		Status:  "RUNNING",
+		HostPorts: []orchestrator.PortMapping{{
+			ContainerPort: "80",
+			HostPort:      backendURL.Port(),
+		}},
+	}
+	base := "/compute/v1/projects/test-project/zones/us-central1-a/instanceGroups"
+
+	create := performComputeRequest(api, http.MethodPost, base, `{
+		"name":"web-group",
+		"description":"Terraform unmanaged group",
+		"namedPorts":[{"name":"initial","port":81}]
+	}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", create.Code, create.Body.String())
+	}
+	var createOperation map[string]interface{}
+	decodeComputeResponse(t, create, &createOperation)
+	if createOperation["zone"] != "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a" {
+		t.Fatalf("zonal operation = %#v", createOperation)
+	}
+
+	add := performComputeRequest(api, http.MethodPost, base+"/web-group/addInstances", `{
+		"instances":[{"instance":"https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/instances/vm-1"}]
+	}`)
+	if add.Code != http.StatusOK {
+		t.Fatalf("addInstances status = %d, body = %s", add.Code, add.Body.String())
+	}
+	namedPorts := performComputeRequest(api, http.MethodPost, base+"/web-group/setNamedPorts", `{
+		"namedPorts":[{"name":"http","port":80}]
+	}`)
+	if namedPorts.Code != http.StatusOK {
+		t.Fatalf("setNamedPorts status = %d, body = %s", namedPorts.Code, namedPorts.Body.String())
+	}
+
+	get := performComputeRequest(api, http.MethodGet, base+"/web-group", "")
+	if get.Code != http.StatusOK {
+		t.Fatalf("get status = %d, body = %s", get.Code, get.Body.String())
+	}
+	var group map[string]interface{}
+	decodeComputeResponse(t, get, &group)
+	if group["kind"] != "compute#instanceGroup" || group["network"] == "" ||
+		len(group["instances"].([]interface{})) != 1 || len(group["namedPorts"].([]interface{})) != 1 {
+		t.Fatalf("unexpected instance group: %#v", group)
+	}
+
+	createLoadBalancerResourceForTest(t, api, "backendServices", `{
+		"name":"backend",
+		"portName":"http",
+		"protocol":"HTTP",
+		"backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/instanceGroups/web-group"}]
+	}`)
+	createLoadBalancerControlPlane(t, api)
+	response := performComputeRequest(
+		api,
+		http.MethodGet,
+		"/compute/v1/projects/test-project/global/forwardingRules/frontend/proxy/from-group",
+		"",
+	)
+	if response.Code != http.StatusOK || response.Body.String() != "group:/from-group" {
+		t.Fatalf("proxy status = %d, body = %q", response.Code, response.Body.String())
+	}
+
+	remove := performComputeRequest(api, http.MethodDelete, base+"/web-group", "")
+	if remove.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", remove.Code, remove.Body.String())
+	}
+	assertComputeError(t, performComputeRequest(api, http.MethodGet, base+"/web-group", ""), http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestComputeGlobalOperationsExposePollingSelfLink(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	create := performComputeRequest(
+		api,
+		http.MethodPost,
+		"/compute/v1/projects/test-project/global/healthChecks",
+		`{"name":"health","httpHealthCheck":{"port":80}}`,
+	)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", create.Code, create.Body.String())
+	}
+	var operation map[string]interface{}
+	decodeComputeResponse(t, create, &operation)
+	name, _ := operation["name"].(string)
+	wantSelfLink := "https://www.googleapis.com/compute/v1/projects/test-project/global/operations/" + name
+	if operation["selfLink"] != wantSelfLink {
+		t.Fatalf("initial operation selfLink = %v, want %s", operation["selfLink"], wantSelfLink)
+	}
+
+	poll := performComputeRequest(
+		api,
+		http.MethodGet,
+		"/compute/v1/projects/test-project/global/operations/"+name,
+		"",
+	)
+	if poll.Code != http.StatusOK {
+		t.Fatalf("poll status = %d, body = %s", poll.Code, poll.Body.String())
+	}
+	var polled map[string]interface{}
+	decodeComputeResponse(t, poll, &polled)
+	if polled["selfLink"] != wantSelfLink {
+		t.Fatalf("polled operation = %#v", polled)
+	}
+}
+
+func TestCuratedComputeBackendImageSelection(t *testing.T) {
+	tests := []struct {
+		source    string
+		wantImage string
+		wantOK    bool
+	}{
+		{"projects/debian-cloud/global/images/debian-12-bookworm-v20260701", "nginx:1.27-alpine", true},
+		{"https://www.googleapis.com/compute/v1/projects/debian-cloud/global/images/family/debian-12", "nginx:1.27-alpine", true},
+		{"projects/debian-cloud/global/images/debian-11-bullseye", "", false},
+		{"docker.io/library/redis:latest", "", false},
+		{"projects/customer/global/images/arbitrary", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.source, func(t *testing.T) {
+			image, command, ok := curatedComputeBackend(tc.source)
+			if image != tc.wantImage || ok != tc.wantOK {
+				t.Fatalf("curatedComputeBackend(%q) = %q, %v", tc.source, image, ok)
+			}
+			if ok && len(command) != 0 {
+				t.Fatalf("curated nginx backend should use its default command, got %v", command)
+			}
+		})
+	}
+}
+
 func TestLoadBalancerDataPlaneUnresolvedReturns503(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -256,9 +407,9 @@ func TestLoadBalancerDataPlaneUnresolvedReturns503(t *testing.T) {
 		wantMessage string
 	}{
 		{
-			name:        "standard instance group is explicitly unsupported",
-			backendBody: `{"name":"backend","backends":[{"group":"projects/test-project/zones/us-central1-a/instanceGroups/group-1"}]}`,
-			wantMessage: "unsupported backend",
+			name:        "missing instance group is unresolved",
+			backendBody: `{"name":"backend","backends":[{"group":"projects/test-project/zones/us-central1-a/instanceGroups/missing"}]}`,
+			wantMessage: "was not found",
 		},
 		{
 			name:        "missing backends is unresolved",
@@ -369,6 +520,10 @@ func TestAdvancedNetworkingUnrepresentableSurfacesReturn501(t *testing.T) {
 		"/compute/v1/projects/test/regions/us-central1/serviceAttachments",
 		"/compute/v1/projects/test/global/interconnects",
 		"/compute/v1/projects/test/global/networks/default/addPeering",
+		"/compute/v1/projects/test/zones/us-central1-a/instanceGroupManagers/managed",
+		"/compute/v1/projects/test/regions/us-central1/instanceGroups/regional",
+		"/compute/v1/projects/test/global/targetHttpsProxies/https",
+		"/compute/v1/projects/test/global/targetTcpProxies/tcp",
 	} {
 		response := performComputeRequest(api, http.MethodPost, path, `{}`)
 		assertComputeError(t, response, http.StatusNotImplemented, "UNIMPLEMENTED")

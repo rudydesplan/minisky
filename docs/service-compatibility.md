@@ -106,10 +106,11 @@ supported by focused executable tests before its manifest fidelity is raised.
   provide `X-MiniSky-Principal`; default mode remains permissive.
 - Artifact Registry package/version listing comes from a lazily started,
   profile-owned `registry:2` container on a dynamic loopback port. GCP package
-  deletion is unsupported because Registry v2 deletion requires a digest.
-- The pinned Terraform fixture does not yet exercise Artifact Registry or
-  Compute load balancing; these remain deferred rather than returning synthetic
-  provider successes.
+  and version listing is scoped to the repository prefix. Registry v2 manifest
+  deletion is enabled and requires a digest; GCP package/version deletion stays
+  `501 UNIMPLEMENTED`.
+- The pinned Terraform fixture optionally exercises Artifact Registry repository
+  create/read/no-drift/destroy and the bounded Compute load-balancer graph.
 
 See [State model](state-model.md) for restart and export behavior and
 [Terraform compatibility](terraform-compatibility.md) for tested provider and

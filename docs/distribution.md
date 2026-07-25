@@ -69,13 +69,16 @@ proxy. The mounted Docker socket must never be exposed remotely.
 
 GoReleaser declares nFPM `deb` and `rpm` packages, but the native tag workflow
 does not invoke `goreleaser release` and therefore does not publish those
-packages. CI validates the GoReleaser v2 configuration and a host-native
-snapshot binary. Package build/install validation on native Linux runners is
-still required before deb/rpm files can become release assets.
+packages. CI now configures native amd64 and arm64 jobs that use GoReleaser v2
+to build one host-architecture snapshot, inspect package contents, install and
+smoke-test each format independently, and verify uninstallation. The jobs have
+read-only repository permissions and explicitly skip publishing and
+announcements. Native CI results are still pending; this configuration is not
+evidence that either package has passed or been published.
 
 Local evidence from 2026-07-25 validates the GoReleaser v2 configuration,
 builds the macOS ARM64 snapshot, and runs both `minisky version` and
 `minisky doctor bigquery` from that artifact. The bundled Buildpacks CLI is
 Pack 0.40.8, which is compatible with Docker daemons that reject the legacy
 API level used by Pack 0.34.2. This evidence does not replace native Linux
-deb/rpm install tests or credentialed package publication.
+deb/rpm CI results or credentialed package publication.

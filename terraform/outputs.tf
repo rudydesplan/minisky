@@ -42,3 +42,23 @@ output "phase15_spanner_database_name" {
   description = "Name of the optional local Phase-15 Spanner database, or null when disabled"
   value       = var.enable_phase15_resources ? google_spanner_database.compatibility[0].name : null
 }
+
+output "phase10_artifact_repository_name" {
+  description = "Name of the optional local Phase-10 Artifact Registry repository, or null when disabled"
+  value       = var.enable_phase10_artifact_resources ? google_artifact_registry_repository.phase10[0].name : null
+}
+
+output "phase10_forwarding_rule_name" {
+  description = "Name of the optional local Phase-10 global forwarding rule, or null when disabled"
+  value       = var.enable_phase10_lb_resources ? google_compute_global_forwarding_rule.phase10_http[0].name : null
+}
+
+output "phase10_forwarding_proxy_url" {
+  description = "MiniSky HTTP proxy URL for the optional local Phase-10 forwarding rule"
+  value = var.enable_phase10_lb_resources ? format(
+    "%s/_minisky/compute/compute/v1/projects/%s/global/forwardingRules/%s/proxy/",
+    local.minisky_base_url,
+    var.project_id,
+    google_compute_global_forwarding_rule.phase10_http[0].name,
+  ) : null
+}

@@ -196,7 +196,7 @@ and is not safe to invoke from standalone diagnostics.
 | 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; Phase-15 Redis and Spanner resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
 | 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🚧 Local slice |
-| 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | 🚧 Local slice |
+| 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
 | 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
 | 13 | Security, authentication, and credential simulation | TLS protects both loopback listeners; optional client-certificate mTLS applies only to the gateway; local credentials remain non-production simulations | 🚧 Local simulation |
@@ -225,8 +225,9 @@ and is not safe to invoke from standalone diagnostics.
   that covers every documented custom endpoint without ambiguous `/v1` routes.
 - Expand the Terraform example only where the provider-visible lifecycle is
   proven. The current fixture includes BigQuery, IAM, Storage, cross-project
-  Pub/Sub, and optional Phase-15 Memorystore/Spanner resources; Cloud SQL,
-  Compute, and serverless remain outside this fixture.
+  Pub/Sub, optional Phase-10 Compute/Artifact Registry resources, and optional
+  Phase-15 Memorystore/Spanner resources; Cloud SQL and serverless remain
+  outside this fixture.
 - Run `terraform apply`, resource assertions, a no-drift plan, and
   `terraform destroy` in CI.
 - Publish `docs/terraform-compatibility.md` with provider resources, endpoint
@@ -269,10 +270,14 @@ Storage and Pub/Sub events built and invoked real function containers.
 
 ### Phase 10 — Networking and artifact workflows
 
-**Status (2026-07-25): local networking/artifact slice implemented.** Compute
-load-balancer metadata/proxying, narrow strict-IAM enforcement, and the owned
-Registry v2 index have focused tests. Terraform load-balancer and real
-push/list/delete integration remain guarded Docker acceptance work.
+**Status (2026-07-25): bounded networking/artifact slice verified.** Google
+provider 7.41.0 creates a classic global HTTP load balancer backed by an
+unmanaged instance group, routes real traffic to an owned local VM, reaches a
+zero-drift plan, and destroys cleanly. Artifact Registry repository lifecycle
+also reaches zero drift, while a separate guarded gate verifies
+repository-scoped Registry v2 push/list/digest-delete with complete owned
+resource cleanup. Managed/regional groups, host/path routing, non-HTTP proxies,
+GCP package/version mutation, and registry blob snapshots remain unsupported.
 
 - Persist backend services, health checks, URL maps, target proxies, and
   forwarding rules in the Compute shim.
@@ -289,9 +294,9 @@ push/list/delete integration remain guarded Docker acceptance work.
 **Status (2026-07-25): local tooling slice implemented.** Doctor, safe fixes,
 gateway-first delivery/artifact commands, Make targets, and release smoke
 validation are present. GoReleaser v2 configuration, a native macOS ARM64
-snapshot, `version`, and `doctor bigquery` passed locally. Homebrew, Scoop,
-deb, and rpm are not described as published until native Linux install and
-credentialed publication gates exist.
+snapshot, `version`, and `doctor bigquery` passed locally. Native amd64 and
+arm64 deb/rpm install validation is configured in CI, but results remain
+pending. Homebrew, Scoop, deb, and rpm are not published.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.

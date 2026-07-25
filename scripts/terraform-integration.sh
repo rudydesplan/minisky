@@ -98,7 +98,27 @@ tf_phase15_enabled=false
 if [[ "${enable_phase15_resources}" == "1" ]]; then
   tf_phase15_enabled=true
 fi
+enable_phase10_resources="${MINISKY_TERRAFORM_PHASE10:-0}"
+if [[ "${enable_phase10_resources}" != "0" && "${enable_phase10_resources}" != "1" ]]; then
+  echo "MINISKY_TERRAFORM_PHASE10 must be 0 or 1." >&2
+  exit 2
+fi
+tf_phase10_enabled=false
+if [[ "${enable_phase10_resources}" == "1" ]]; then
+  tf_phase10_enabled=true
+fi
+enable_phase10_artifact_resources="${MINISKY_TERRAFORM_PHASE10_ARTIFACT:-0}"
+if [[ "${enable_phase10_artifact_resources}" != "0" && "${enable_phase10_artifact_resources}" != "1" ]]; then
+  echo "MINISKY_TERRAFORM_PHASE10_ARTIFACT must be 0 or 1." >&2
+  exit 2
+fi
+tf_phase10_artifact_enabled=false
+if [[ "${enable_phase10_artifact_resources}" == "1" ]]; then
+  tf_phase10_artifact_enabled=true
+fi
 tf_vars=(
+  -var="enable_phase10_artifact_resources=${tf_phase10_artifact_enabled}"
+  -var="enable_phase10_lb_resources=${tf_phase10_enabled}"
   -var="enable_phase15_resources=${tf_phase15_enabled}"
   -var="minisky_endpoint=${gateway}"
   -var="storage_bucket_name=${storage_bucket_name}"
@@ -177,6 +197,17 @@ storage_bucket_url="${gateway}/_minisky/storage/storage/v1/b/${storage_bucket_na
 redis_instance_url="${gateway}/_minisky/redis/v1/projects/${project_id}/locations/us-central1/instances/minisky-terraform"
 spanner_instance_url="${gateway}/_minisky/spanner/v1/projects/${project_id}/instances/minisky-terraform"
 spanner_database_url="${spanner_instance_url}/databases/minisky-terraform"
+compute_base_url="${gateway}/_minisky/compute/compute/v1/projects/${project_id}"
+phase10_firewall_url="${compute_base_url}/global/firewalls/minisky-phase10-http"
+phase10_instance_url="${compute_base_url}/zones/us-central1-a/instances/minisky-phase10-http"
+phase10_group_url="${compute_base_url}/zones/us-central1-a/instanceGroups/minisky-phase10-http"
+phase10_health_url="${compute_base_url}/global/healthChecks/minisky-phase10-http"
+phase10_backend_url="${compute_base_url}/global/backendServices/minisky-phase10-http"
+phase10_url_map_url="${compute_base_url}/global/urlMaps/minisky-phase10-http"
+phase10_proxy_url="${compute_base_url}/global/targetHttpProxies/minisky-phase10-http"
+phase10_forwarding_url="${compute_base_url}/global/forwardingRules/minisky-phase10-http"
+phase10_traffic_url="${phase10_forwarding_url}/proxy/"
+phase10_artifact_url="${gateway}/_minisky/artifactregistry/v1/projects/${project_id}/locations/us-central1/repositories/minisky-phase10"
 
 assert_json_value "${dataset_url}" "datasetReference.datasetId" "${dataset_id}"
 assert_json_value "${secondary_dataset_url}" "datasetReference.projectId" "${secondary_project_id}"
@@ -187,6 +218,27 @@ if [[ "${enable_phase15_resources}" == "1" ]]; then
   assert_json_value "${redis_instance_url}" "name" "projects/${project_id}/locations/us-central1/instances/minisky-terraform"
   assert_json_value "${spanner_instance_url}" "name" "projects/${project_id}/instances/minisky-terraform"
   assert_json_value "${spanner_database_url}" "name" "projects/${project_id}/instances/minisky-terraform/databases/minisky-terraform"
+fi
+if [[ "${enable_phase10_artifact_resources}" == "1" ]]; then
+  assert_json_value "${phase10_artifact_url}" "name" "projects/${project_id}/locations/us-central1/repositories/minisky-phase10"
+fi
+if [[ "${enable_phase10_resources}" == "1" ]]; then
+  assert_json_value "${phase10_firewall_url}" "name" "minisky-phase10-http"
+  assert_json_value "${phase10_instance_url}" "status" "RUNNING"
+  assert_json_value "${phase10_group_url}" "size" "1"
+  assert_json_value "${phase10_health_url}" "name" "minisky-phase10-http"
+  assert_json_value "${phase10_backend_url}" "name" "minisky-phase10-http"
+  assert_json_value "${phase10_url_map_url}" "name" "minisky-phase10-http"
+  assert_json_value "${phase10_proxy_url}" "name" "minisky-phase10-http"
+  assert_json_value "${phase10_forwarding_url}" "name" "minisky-phase10-http"
+  traffic_file="${work_dir}/phase10-traffic.txt"
+  traffic_status="$(curl --silent --show-error --output "${traffic_file}" --write-out '%{http_code}' "${phase10_traffic_url}")"
+  traffic_response="$(<"${traffic_file}")"
+  if [[ "${traffic_status}" != "200" || "${traffic_response}" != *"Welcome to nginx!"* ]]; then
+    echo "Expected HTTP 200 with real backend content through the Phase-10 forwarding-rule proxy; received ${traffic_status}." >&2
+    printf '%s\n' "${traffic_response}" >&2
+    exit 1
+  fi
 fi
 
 export MINISKY_ENDPOINT="${gateway}"
@@ -216,6 +268,21 @@ destroyed_urls=("${table_url}" "${dataset_url}" "${secondary_dataset_url}" "${se
 if [[ "${enable_phase15_resources}" == "1" ]]; then
   destroyed_urls+=("${redis_instance_url}" "${spanner_database_url}" "${spanner_instance_url}")
 fi
+if [[ "${enable_phase10_resources}" == "1" ]]; then
+  destroyed_urls+=(
+    "${phase10_firewall_url}"
+    "${phase10_instance_url}"
+    "${phase10_group_url}"
+    "${phase10_health_url}"
+    "${phase10_backend_url}"
+    "${phase10_url_map_url}"
+    "${phase10_proxy_url}"
+    "${phase10_forwarding_url}"
+  )
+fi
+if [[ "${enable_phase10_artifact_resources}" == "1" ]]; then
+  destroyed_urls+=("${phase10_artifact_url}")
+fi
 for url in "${destroyed_urls[@]}"; do
   status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"
   if [[ "${status}" != "404" ]]; then
@@ -223,3 +290,12 @@ for url in "${destroyed_urls[@]}"; do
     exit 1
   fi
 done
+
+remaining_compute_containers="$(docker ps -aq \
+  --filter "label=managed-by=minisky" \
+  --filter "label=minisky.profile=${profile}" \
+  --filter "label=minisky.service=compute-instance")"
+if [[ "${enable_phase10_resources}" == "1" && -n "${remaining_compute_containers}" ]]; then
+  echo "Phase-10 destroy left an owned Compute container behind." >&2
+  exit 1
+fi

@@ -82,6 +82,12 @@ func (i *Instance) DeepCopy() *Instance {
 	if i.Disks != nil {
 		newInst.Disks = make([]AttachedDisk, len(i.Disks))
 		copy(newInst.Disks, i.Disks)
+		for j := range newInst.Disks {
+			if newInst.Disks[j].InitializeParams != nil {
+				params := *newInst.Disks[j].InitializeParams
+				newInst.Disks[j].InitializeParams = &params
+			}
+		}
 	}
 	if i.HostPorts != nil {
 		newInst.HostPorts = append([]orchestrator.PortMapping{}, i.HostPorts...)
@@ -126,13 +132,42 @@ type AccessConfig struct {
 }
 
 type AttachedDisk struct {
-	Kind       string `json:"kind"`
-	Type       string `json:"type"` // PERSISTENT, SCRATCH
-	Mode       string `json:"mode"` // READ_WRITE, READ_ONLY
-	Source     string `json:"source,omitempty"`
-	DeviceName string `json:"deviceName"`
-	Boot       bool   `json:"boot"`
-	AutoDelete bool   `json:"autoDelete"`
+	Kind             string                `json:"kind"`
+	Type             string                `json:"type"` // PERSISTENT, SCRATCH
+	Mode             string                `json:"mode"` // READ_WRITE, READ_ONLY
+	Source           string                `json:"source,omitempty"`
+	InitializeParams *DiskInitializeParams `json:"initializeParams,omitempty"`
+	DeviceName       string                `json:"deviceName"`
+	Boot             bool                  `json:"boot"`
+	AutoDelete       bool                  `json:"autoDelete"`
+}
+
+type DiskInitializeParams struct {
+	SourceImage string `json:"sourceImage,omitempty"`
+	DiskSizeGB  string `json:"diskSizeGb,omitempty"`
+	DiskType    string `json:"diskType,omitempty"`
+}
+
+type NamedPort struct {
+	Name string `json:"name"`
+	Port int    `json:"port"`
+}
+
+// InstanceGroup is the bounded unmanaged zonal group used by the classic HTTP
+// load-balancer compatibility fixture. Managed and regional groups remain out
+// of scope.
+type InstanceGroup struct {
+	Kind              string      `json:"kind"`
+	ID                string      `json:"id"`
+	Name              string      `json:"name"`
+	Description       string      `json:"description,omitempty"`
+	Zone              string      `json:"zone"`
+	Network           string      `json:"network"`
+	NamedPorts        []NamedPort `json:"namedPorts"`
+	Instances         []string    `json:"instances"`
+	Size              int         `json:"size"`
+	SelfLink          string      `json:"selfLink"`
+	CreationTimestamp string      `json:"creationTimestamp"`
 }
 
 // Network represents a VPC network.
@@ -200,7 +235,6 @@ type FirewallAllow struct {
 
 const (
 	metadataOnlyStatus            = "METADATA_ONLY"
-	metadataOnlyDescription       = "Metadata resource; local packet proxying requires an explicit supported backend configuration."
 	rehydratedInstanceDescription = "Metadata restored from profile state; the Docker-backed VM has not been reconciled."
 )
 
@@ -253,6 +287,7 @@ type API struct {
 	networks         map[string]*Network        // key: project+":"+name
 	securityPolicies map[string]*SecurityPolicy // key: project+":"+name
 	firewalls        map[string]*FirewallRule   // key: project+":"+name
+	instanceGroups   map[string]*InstanceGroup  // key: project+":"+zone+":"+name
 	loadBalancers    map[string]map[string]interface{}
 	roundRobin       map[string]uint64
 	httpClient       *http.Client
@@ -282,6 +317,7 @@ func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 		networks:         make(map[string]*Network),
 		securityPolicies: make(map[string]*SecurityPolicy),
 		firewalls:        make(map[string]*FirewallRule),
+		instanceGroups:   make(map[string]*InstanceGroup),
 		loadBalancers:    make(map[string]map[string]interface{}),
 		roundRobin:       make(map[string]uint64),
 		httpClient:       &http.Client{Timeout: 2 * time.Second},
@@ -335,8 +371,18 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(path, "/instances") && strings.Contains(path, "/zones/"):
 		api.routeInstances(w, r, path)
+	case strings.Contains(path, "/instanceGroups") && strings.Contains(path, "/zones/"):
+		api.routeInstanceGroups(w, r, path)
 	case strings.Contains(path, "/operations/"):
 		api.routeOperations(w, r, path)
+	case strings.Contains(path, "/instanceGroupManagers") ||
+		(strings.Contains(path, "/regions/") && strings.Contains(path, "/instanceGroups")) ||
+		strings.Contains(path, "/targetHttpsProxies") ||
+		strings.Contains(path, "/targetTcpProxies") ||
+		strings.Contains(path, "/targetSslProxies"):
+		w.WriteHeader(http.StatusNotImplemented)
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"Managed or regional instance groups and HTTPS, TCP, or SSL proxies are outside the bounded classic global HTTP load-balancer surface")
 	case strings.Contains(path, "/zones/") && !strings.Contains(path, "/instances"):
 		api.routeZones(w, r, path)
 	case isUnsupportedAdvancedNetworkPath(path):
@@ -483,6 +529,28 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		}}
 	}
 
+	// Resolve only curated local backends from the provider's boot image. A
+	// Compute source image is never passed through as an arbitrary Docker image.
+	osImage := "ubuntu:26.04"
+	var dockerCommand []string
+	sourceImage := ""
+	for _, disk := range disks {
+		if disk.Boot && disk.InitializeParams != nil && disk.InitializeParams.SourceImage != "" {
+			sourceImage = disk.InitializeParams.SourceImage
+			break
+		}
+	}
+	if sourceImage != "" {
+		var supported bool
+		osImage, dockerCommand, supported = curatedComputeBackend(sourceImage)
+		if !supported {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+				"boot disk initializeParams.sourceImage is not supported by the curated local Compute backend")
+			return
+		}
+	}
+
 	inst := &Instance{
 		Kind:              "compute#instance",
 		ID:                randomNumericID(),
@@ -537,25 +605,6 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	}
 	op.Kind = "compute#operation"
 
-	// Resolve the docker image mapping from the boot disk source
-	osImage := "ubuntu:26.04" // Fallback to 2026 default
-	for _, disk := range disks {
-		if disk.Boot && disk.Source != "" {
-			osImage = disk.Source
-			break
-		}
-	}
-	// Legacy CentOS check for backward compatibility or direct API calls
-	if osImage == "ubuntu:26.04" {
-		lowerSource := strings.ToLower(machineType + " ")
-		for _, disk := range disks {
-			lowerSource += strings.ToLower(disk.Source)
-		}
-		if strings.Contains(lowerSource, "centos") {
-			osImage = "centos:latest"
-		}
-	}
-
 	containerName := fmt.Sprintf("minisky-vm-%s", name)
 	isGKE := body.Labels != nil && body.Labels["managed-by"] == "gke"
 	if isGKE {
@@ -581,7 +630,6 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			api.mu.Lock()
 			if i, ok := api.instances[key]; ok {
 				i.Status = "RUNNING"
-				i.Description = fmt.Sprintf("Docker Container ID mapping: %s", containerName)
 			}
 			api.mu.Unlock()
 			if err := api.persistMetadata(); err != nil {
@@ -615,7 +663,7 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		allowedPorts := api.getAllowedPortsForVPC(vpcName)
 
 		// Tell the Orchestrator to physically spin up the Docker container!
-		err := api.svcMgr.ProvisionComputeVM(context.Background(), containerName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
+		err := api.svcMgr.ProvisionComputeVM(context.Background(), containerName, osImage, vpcName, allowedPorts, []string{}, dockerCommand)
 
 		// Keep the simulated delay outside the metadata lock.
 		if err == nil {
@@ -634,7 +682,6 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			}
 
 			i.Status = "RUNNING"
-			i.Description = fmt.Sprintf("Docker Container ID mapping: %s", containerName)
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
@@ -644,7 +691,7 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 func (api *API) getInstance(w http.ResponseWriter, r *http.Request, project, zone, name string) {
@@ -774,7 +821,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 func (api *API) instanceAction(w http.ResponseWriter, r *http.Request, project, zone, name, action string) {
@@ -811,7 +858,253 @@ func (api *API) instanceAction(w http.ResponseWriter, r *http.Request, project, 
 	}
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unmanaged zonal instance groups
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (api *API) routeInstanceGroups(w http.ResponseWriter, r *http.Request, path string) {
+	project, zone := extractProjectZone(path)
+	name := extractSegmentAfter(path, "instanceGroups")
+	action := ""
+	for _, candidate := range []string{"addInstances", "setNamedPorts", "listInstances"} {
+		if strings.HasSuffix(strings.TrimRight(path, "/"), "/"+candidate) {
+			action = candidate
+			break
+		}
+	}
+	if action != "" {
+		name = extractSegmentBefore(path, "/"+action)
+		api.instanceGroupAction(w, r, project, zone, name, action)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		if name != "" {
+			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Unsupported instance-group route")
+			return
+		}
+		api.createInstanceGroup(w, r, project, zone)
+	case http.MethodGet:
+		if name == "" {
+			api.listInstanceGroups(w, project, zone)
+			return
+		}
+		api.getInstanceGroup(w, project, zone, name)
+	case http.MethodDelete:
+		api.deleteInstanceGroup(w, project, zone, name)
+	default:
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Unsupported instance-group method")
+	}
+}
+
+func (api *API) createInstanceGroup(w http.ResponseWriter, r *http.Request, project, zone string) {
+	var body struct {
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		Network     string      `json:"network"`
+		NamedPorts  []NamedPort `json:"namedPorts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Request body parse error: "+err.Error())
+		return
+	}
+	if body.Name == "" {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'name' is required")
+		return
+	}
+	if body.Network == "" {
+		body.Network = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project)
+	}
+	for _, namedPort := range body.NamedPorts {
+		if namedPort.Name == "" || namedPort.Port < 1 || namedPort.Port > 65535 {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Named ports require a name and port from 1 through 65535")
+			return
+		}
+	}
+	sort.Slice(body.NamedPorts, func(i, j int) bool { return body.NamedPorts[i].Name < body.NamedPorts[j].Name })
+	group := &InstanceGroup{
+		Kind:              "compute#instanceGroup",
+		ID:                randomNumericID(),
+		Name:              body.Name,
+		Description:       body.Description,
+		Zone:              computeZoneSelfLink(project, zone),
+		Network:           body.Network,
+		NamedPorts:        append([]NamedPort(nil), body.NamedPorts...),
+		Instances:         []string{},
+		SelfLink:          instanceGroupSelfLink(project, zone, body.Name),
+		CreationTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	key := instanceGroupKey(project, zone, body.Name)
+	api.mu.Lock()
+	if api.instanceGroups[key] != nil {
+		api.mu.Unlock()
+		writeErrorStatus(w, http.StatusConflict, "ALREADY_EXISTS", fmt.Sprintf("Instance group %q already exists", body.Name))
+		return
+	}
+	api.instanceGroups[key] = group
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist instance-group metadata: "+err.Error())
+		return
+	}
+	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", group.SelfLink, zone, "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, op)
+}
+
+func (api *API) getInstanceGroup(w http.ResponseWriter, project, zone, name string) {
+	api.mu.RLock()
+	group := cloneInstanceGroup(api.instanceGroups[instanceGroupKey(project, zone, name)])
+	api.mu.RUnlock()
+	if group == nil {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Instance group %q not found", name))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(group)
+}
+
+func (api *API) listInstanceGroups(w http.ResponseWriter, project, zone string) {
+	prefix := instanceGroupKey(project, zone, "")
+	api.mu.RLock()
+	items := make([]*InstanceGroup, 0)
+	for key, group := range api.instanceGroups {
+		if strings.HasPrefix(key, prefix) {
+			items = append(items, cloneInstanceGroup(group))
+		}
+	}
+	api.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"kind":  "compute#instanceGroupList",
+		"id":    fmt.Sprintf("projects/%s/zones/%s/instanceGroups", project, zone),
+		"items": items,
+	})
+}
+
+func (api *API) deleteInstanceGroup(w http.ResponseWriter, project, zone, name string) {
+	key := instanceGroupKey(project, zone, name)
+	api.mu.Lock()
+	group := api.instanceGroups[key]
+	if group != nil {
+		delete(api.instanceGroups, key)
+	}
+	api.mu.Unlock()
+	if group == nil {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Instance group %q not found", name))
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist instance-group deletion: "+err.Error())
+		return
+	}
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", group.SelfLink, zone, "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, op)
+}
+
+func (api *API) instanceGroupAction(w http.ResponseWriter, r *http.Request, project, zone, name, action string) {
+	if r.Method != http.MethodPost {
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Instance-group actions require POST")
+		return
+	}
+	key := instanceGroupKey(project, zone, name)
+	api.mu.Lock()
+	group := api.instanceGroups[key]
+	if group == nil {
+		api.mu.Unlock()
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Instance group %q not found", name))
+		return
+	}
+	if action == "listInstances" {
+		items := make([]map[string]string, 0, len(group.Instances))
+		for _, instance := range group.Instances {
+			items = append(items, map[string]string{"instance": instance, "status": "RUNNING"})
+		}
+		api.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"kind": "compute#instanceGroupsListInstances", "items": items})
+		return
+	}
+
+	switch action {
+	case "addInstances":
+		var body struct {
+			Instances []struct {
+				Instance string `json:"instance"`
+			} `json:"instances"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			api.mu.Unlock()
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Request body parse error: "+err.Error())
+			return
+		}
+		existing := make(map[string]bool, len(group.Instances))
+		for _, instance := range group.Instances {
+			existing[instance] = true
+		}
+		for _, member := range body.Instances {
+			memberProject, memberZone, _, ok := parseInstanceReference(member.Instance)
+			if !ok || memberProject != project || memberZone != zone {
+				api.mu.Unlock()
+				writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Instance-group members must be zonal Compute instance references")
+				return
+			}
+			if !existing[member.Instance] {
+				group.Instances = append(group.Instances, member.Instance)
+				existing[member.Instance] = true
+			}
+		}
+		sort.Strings(group.Instances)
+		group.Size = len(group.Instances)
+	case "setNamedPorts":
+		var body struct {
+			NamedPorts []NamedPort `json:"namedPorts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			api.mu.Unlock()
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Request body parse error: "+err.Error())
+			return
+		}
+		for _, namedPort := range body.NamedPorts {
+			if namedPort.Name == "" || namedPort.Port < 1 || namedPort.Port > 65535 {
+				api.mu.Unlock()
+				writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Named ports require a name and port from 1 through 65535")
+				return
+			}
+		}
+		group.NamedPorts = append([]NamedPort(nil), body.NamedPorts...)
+		sort.Slice(group.NamedPorts, func(i, j int) bool { return group.NamedPorts[i].Name < group.NamedPorts[j].Name })
+	}
+	targetLink := group.SelfLink
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist instance-group update: "+err.Error())
+		return
+	}
+	op, err := api.opMgr.RegisterDurable("compute#operation", action, targetLink, zone, "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, op)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -902,6 +1195,7 @@ func (api *API) routeImages(w http.ResponseWriter, r *http.Request, path string)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path string) {
+	project := extractProject(path)
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	// Find "operations" segment and take next segment as name
 	opName := ""
@@ -925,7 +1219,7 @@ func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path str
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -976,7 +1270,7 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(op)
+		writeComputeOperation(w, project, op)
 
 	case http.MethodGet:
 		if name != "" {
@@ -1066,7 +1360,7 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(op)
+		writeComputeOperation(w, project, op)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1129,7 +1423,7 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(op)
+		writeComputeOperation(w, project, op)
 
 	case http.MethodGet:
 		if name != "" {
@@ -1298,6 +1592,7 @@ func (api *API) resolveLoadBalancerBackends(
 		return nil, backendServiceName, fmt.Errorf("backend service %q uses unsupported protocol %q", backendServiceName, protocol)
 	}
 	rawBackends, hasBackends := backendService["backends"].([]interface{})
+	portName, _ := backendService["portName"].(string)
 	rawHealthChecks, _ := backendService["healthChecks"].([]interface{})
 	healthPath, healthErr := api.resolveHealthPathLocked(project, rawHealthChecks)
 	api.mu.RUnlock()
@@ -1312,12 +1607,12 @@ func (api *API) resolveLoadBalancerBackends(
 	backends := make([]loadBalancerBackend, 0, len(rawBackends))
 	var unsupported []string
 	for index, rawBackend := range rawBackends {
-		backend, err := api.resolveLoadBalancerBackend(project, rawBackend, healthPath)
+		resolved, err := api.resolveLoadBalancerBackend(project, rawBackend, portName, healthPath)
 		if err != nil {
 			unsupported = append(unsupported, fmt.Sprintf("backend %d: %v", index, err))
 			continue
 		}
-		backends = append(backends, backend)
+		backends = append(backends, resolved...)
 	}
 	if len(backends) == 0 {
 		return nil, backendServiceName, fmt.Errorf(
@@ -1360,25 +1655,74 @@ func (api *API) resolveHealthPathLocked(project string, references []interface{}
 func (api *API) resolveLoadBalancerBackend(
 	project string,
 	rawBackend interface{},
+	portName string,
 	healthPath string,
-) (loadBalancerBackend, error) {
+) ([]loadBalancerBackend, error) {
 	config, ok := rawBackend.(map[string]interface{})
 	if !ok {
-		return loadBalancerBackend{}, fmt.Errorf("configuration must be an object")
+		return nil, fmt.Errorf("configuration must be an object")
 	}
 	if rawURL, _ := config["url"].(string); rawURL != "" {
 		target, err := url.Parse(rawURL)
 		if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
-			return loadBalancerBackend{}, fmt.Errorf("'url' must be an absolute HTTP(S) URL")
+			return nil, fmt.Errorf("'url' must be an absolute HTTP(S) URL")
 		}
-		return loadBalancerBackend{target: target, healthPath: healthPath, description: rawURL}, nil
+		return []loadBalancerBackend{{target: target, healthPath: healthPath, description: rawURL}}, nil
+	}
+
+	if groupReference, _ := config["group"].(string); groupReference != "" {
+		groupProject, zone, groupName, ok := parseInstanceGroupReference(groupReference)
+		if !ok || groupProject != project {
+			return nil, fmt.Errorf("'group' must reference an unmanaged zonal instance group in project %q", project)
+		}
+		api.mu.RLock()
+		group := cloneInstanceGroup(api.instanceGroups[instanceGroupKey(project, zone, groupName)])
+		api.mu.RUnlock()
+		if group == nil {
+			return nil, fmt.Errorf("instance group %q was not found", groupName)
+		}
+		port := 0
+		for _, namedPort := range group.NamedPorts {
+			if namedPort.Name == portName || (portName == "" && namedPort.Name == "http") {
+				port = namedPort.Port
+				break
+			}
+		}
+		if port == 0 {
+			return nil, fmt.Errorf("instance group %q has no named port %q", groupName, portName)
+		}
+		resolved := make([]loadBalancerBackend, 0, len(group.Instances))
+		for _, member := range group.Instances {
+			instanceBackend, err := api.resolveInstanceBackend(project, member, port, healthPath)
+			if err != nil {
+				continue
+			}
+			resolved = append(resolved, instanceBackend)
+		}
+		if len(resolved) == 0 {
+			return nil, fmt.Errorf("instance group %q has no running member with a host mapping for port %d", groupName, port)
+		}
+		return resolved, nil
 	}
 
 	instanceReference, _ := config["instance"].(string)
 	port, err := numericBackendPort(config["port"])
 	if instanceReference == "" || err != nil {
-		return loadBalancerBackend{}, fmt.Errorf("missing explicit 'url' or valid Compute 'instance' and 'port'")
+		return nil, fmt.Errorf("missing explicit 'url', unmanaged zonal 'group', or valid Compute 'instance' and 'port'")
 	}
+	backend, err := api.resolveInstanceBackend(project, instanceReference, port, healthPath)
+	if err != nil {
+		return nil, err
+	}
+	return []loadBalancerBackend{backend}, nil
+}
+
+func (api *API) resolveInstanceBackend(
+	project string,
+	instanceReference string,
+	port int,
+	healthPath string,
+) (loadBalancerBackend, error) {
 	instanceProject, zone, instanceName, ok := parseInstanceReference(instanceReference)
 	if !ok || instanceProject != project {
 		return loadBalancerBackend{}, fmt.Errorf("'instance' must reference an instance in project %q", project)
@@ -1528,6 +1872,41 @@ func parseInstanceReference(reference string) (string, string, string, bool) {
 	return project, zone, instance, project != "" && zone != "" && instance != ""
 }
 
+func parseInstanceGroupReference(reference string) (string, string, string, bool) {
+	parsed, err := url.Parse(reference)
+	if err != nil {
+		return "", "", "", false
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	var project, zone, group string
+	for i := 0; i+1 < len(parts); i++ {
+		switch parts[i] {
+		case "projects":
+			project = parts[i+1]
+		case "zones":
+			zone = parts[i+1]
+		case "instanceGroups":
+			group = parts[i+1]
+		}
+	}
+	return project, zone, group, project != "" && zone != "" && group != ""
+}
+
+func curatedComputeBackend(sourceImage string) (string, []string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(sourceImage))
+	parsed, err := url.Parse(normalized)
+	if err == nil && parsed.Path != "" {
+		normalized = strings.Trim(parsed.Path, "/")
+	} else {
+		normalized = strings.Trim(normalized, "/")
+	}
+	if strings.Contains(normalized, "projects/debian-cloud/global/images/") &&
+		strings.Contains(normalized, "debian-12") {
+		return "nginx:1.27-alpine", nil, true
+	}
+	return "", nil, false
+}
+
 func healthPathJoin(basePath, healthPath string) string {
 	if basePath == "" || basePath == "/" {
 		return healthPath
@@ -1558,6 +1937,13 @@ func (api *API) createLoadBalancerResource(
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'name' is required")
 		return
 	}
+	if collection.canonical == "urlMaps" &&
+		(hasNonEmptyList(resource["hostRules"]) || hasNonEmptyList(resource["pathMatchers"])) {
+		w.WriteHeader(http.StatusNotImplemented)
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"Only URL map defaultService routing is supported; hostRules and pathMatchers are not implemented")
+		return
+	}
 
 	selfLink := loadBalancerSelfLink(project, collection.canonical, name)
 	key := loadBalancerKey(project, collection.canonical, name)
@@ -1566,12 +1952,6 @@ func (api *API) createLoadBalancerResource(
 	resource["name"] = name
 	resource["selfLink"] = selfLink
 	resource["creationTimestamp"] = time.Now().UTC().Format(time.RFC3339)
-	resource["status"] = metadataOnlyStatus
-	if description, _ := resource["description"].(string); description != "" {
-		resource["description"] = metadataOnlyDescription + " " + description
-	} else {
-		resource["description"] = metadataOnlyDescription
-	}
 
 	api.mu.Lock()
 	if _, exists := api.loadBalancers[key]; exists {
@@ -1596,7 +1976,7 @@ func (api *API) createLoadBalancerResource(
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 }
 
@@ -1679,7 +2059,7 @@ func (api *API) deleteLoadBalancerResource(
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 }
 
@@ -1772,6 +2152,29 @@ func instanceKey(project, zone, name string) string {
 	return project + ":" + zone + ":" + name
 }
 
+func instanceGroupKey(project, zone, name string) string {
+	return project + ":" + zone + ":" + name
+}
+
+func instanceGroupSelfLink(project, zone, name string) string {
+	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/instanceGroups/%s",
+		project, zone, name)
+}
+
+func computeZoneSelfLink(project, zone string) string {
+	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s", project, zone)
+}
+
+func cloneInstanceGroup(group *InstanceGroup) *InstanceGroup {
+	if group == nil {
+		return nil
+	}
+	clone := *group
+	clone.NamedPorts = append([]NamedPort(nil), group.NamedPorts...)
+	clone.Instances = append([]string(nil), group.Instances...)
+	return &clone
+}
+
 func selfLinkInstance(project, zone, name string) string {
 	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s",
 		project, zone, name)
@@ -1785,6 +2188,36 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 			"message": message,
 		},
 	})
+}
+
+func writeErrorStatus(w http.ResponseWriter, code int, status, message string) {
+	w.WriteHeader(code)
+	writeError(w, code, status, message)
+}
+
+func writeComputeOperation(w http.ResponseWriter, project string, operation *orchestrator.Operation) {
+	if operation == nil {
+		_ = json.NewEncoder(w).Encode(nil)
+		return
+	}
+	payload, _ := json.Marshal(operation)
+	var response map[string]interface{}
+	_ = json.Unmarshal(payload, &response)
+	scope := "global"
+	if operation.Zone != "" {
+		scope = "zones/" + operation.Zone
+		response["zone"] = computeZoneSelfLink(project, operation.Zone)
+	} else if operation.Region != "" {
+		scope = "regions/" + operation.Region
+		response["region"] = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s", project, operation.Region)
+	}
+	response["selfLink"] = fmt.Sprintf(
+		"https://www.googleapis.com/compute/v1/projects/%s/%s/operations/%s",
+		project,
+		scope,
+		operation.Name,
+	)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func randomNumericID() string {
@@ -1835,6 +2268,11 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 	if body.Direction == "" {
 		body.Direction = "INGRESS"
 	}
+	if len(body.Allowed) > 0 {
+		body.Action = "allow"
+	} else if len(body.Denied) > 0 {
+		body.Action = "deny"
+	}
 	if body.Network == "" {
 		body.Network = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project)
 	}
@@ -1874,7 +2312,7 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		return nil
 	})
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 func (api *API) getFirewall(w http.ResponseWriter, project, name string) {
@@ -1954,7 +2392,7 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		return nil
 	})
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
@@ -1989,7 +2427,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		return nil
 	})
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(op)
+	writeComputeOperation(w, project, op)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
