@@ -155,8 +155,9 @@ func (v *Validator) matchRule(svc *ServiceSchema, httpMethod, urlPath string) *M
 	return nil
 }
 
-// globMatch returns true if path matches glob where each "*" matches any single
-// URL path segment (non-empty, no slash).
+// globMatch returns true if path matches glob where each "*" matches a
+// non-empty portion of one URL path segment. This includes Google custom
+// methods such as "*:predict"; wildcards never cross a slash.
 func globMatch(glob, path string) bool {
 	gParts := strings.Split(strings.Trim(glob, "/"), "/")
 	pParts := strings.Split(strings.Trim(path, "/"), "/")
@@ -170,6 +171,15 @@ func globMatch(glob, path string) bool {
 				return false
 			}
 			continue // wildcard — match any segment
+		}
+		if prefix, suffix, ok := strings.Cut(g, "*"); ok {
+			if strings.Contains(suffix, "*") ||
+				len(pParts[i]) <= len(prefix)+len(suffix) ||
+				!strings.HasPrefix(pParts[i], prefix) ||
+				!strings.HasSuffix(pParts[i], suffix) {
+				return false
+			}
+			continue
 		}
 		if g != pParts[i] {
 			return false

@@ -23,6 +23,13 @@ var rootCmd = &cobra.Command{
 	Short: "MiniSky: A lightweight, Go-based High-Fidelity local GCP emulator",
 	Long: `MiniSky is a lightweight, high-performance emulator for Google Cloud Platform services written entirely in Go.
 It uses dynamic lazy-loading to ensure a sub-100ms startup, spinning up resources only when requested via API or the Dashboard.`,
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		projectFlag := cmd.Flags().Lookup("project")
+		if projectFlag == nil || projectFlag.Changed {
+			return nil
+		}
+		return projectFlag.Value.Set(activeProjectID())
+	},
 }
 
 func init() {

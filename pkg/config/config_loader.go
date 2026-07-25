@@ -34,6 +34,17 @@ func GetProfile() string {
 	return "default"
 }
 
+// GetProfileDir returns the active profile's metadata directory.
+func GetProfileDir() string {
+	return filepath.Join(GetStateDir(), "profiles", GetProfile())
+}
+
+// GetRuntimeDir returns the active profile's non-portable backend data root.
+// State export/import remains metadata-only and does not include this directory.
+func GetRuntimeDir() string {
+	return filepath.Join(GetProfileDir(), "runtime")
+}
+
 //go:embed images.json
 var embeddedImagesJSON []byte
 
@@ -50,11 +61,12 @@ type ImageRegistry struct {
 }
 
 type EmulatorConfig struct {
-	Name   string   `json:"name"`
-	Image  string   `json:"image"`
-	Port   string   `json:"port"`
-	Cmd    []string `json:"cmd"`
-	Volume string   `json:"volume,omitempty"`
+	Name            string   `json:"name"`
+	Image           string   `json:"image"`
+	Port            string   `json:"port"`
+	AdditionalPorts []string `json:"additional_ports,omitempty"`
+	Cmd             []string `json:"cmd"`
+	Volume          string   `json:"volume,omitempty"`
 }
 
 type ComputeConfig struct {

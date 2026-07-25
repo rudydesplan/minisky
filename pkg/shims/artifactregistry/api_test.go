@@ -150,6 +150,14 @@ func TestRegistryFailureIsExplicit(t *testing.T) {
 	}
 }
 
+func TestPackageMutationIsExplicitlyUnsupported(t *testing.T) {
+	api := newTestAPI("http://registry.invalid")
+	response := serve(t, api, http.MethodDelete, "/v1/projects/test/locations/us/repositories/apps/packages/api", "")
+	if response.Code != http.StatusNotImplemented || !strings.Contains(response.Body.String(), "digest") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func newTestAPI(registryURL string) *API {
 	index := NewDockerRegistryIndex(http.DefaultClient, registryURL)
 	return NewAPIWithRegistryIndex(orchestrator.NewOperationManager(), nil, index)

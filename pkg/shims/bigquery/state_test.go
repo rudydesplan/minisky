@@ -56,3 +56,31 @@ func TestMetadataRehydratesAfterRestart(t *testing.T) {
 		t.Fatalf("rehydrated table = %#v", table)
 	}
 }
+
+func TestSameNamedDatasetsAreIsolatedByProject(t *testing.T) {
+	api, err := NewAPIWithStore(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"datasetReference":{"datasetId":"shared-name"}}`
+	for _, project := range []string{"project-a", "project-b"} {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+			"/bigquery/v2/projects/"+project+"/datasets", strings.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("create %s: %d %s", project, response.Code, response.Body.String())
+		}
+	}
+	deleteResponse := httptest.NewRecorder()
+	api.ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodDelete,
+		"/bigquery/v2/projects/project-a/datasets/shared-name", nil))
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("delete project-a: %d", deleteResponse.Code)
+	}
+	getResponse := httptest.NewRecorder()
+	api.ServeHTTP(getResponse, httptest.NewRequest(http.MethodGet,
+		"/bigquery/v2/projects/project-b/datasets/shared-name", nil))
+	if getResponse.Code != http.StatusOK {
+		t.Fatalf("project-b resource collided: %d %s", getResponse.Code, getResponse.Body.String())
+	}
+}

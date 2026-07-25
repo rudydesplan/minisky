@@ -1,0 +1,15 @@
+{
+  "format": "minisky-plugin-catalog",
+  "version": 0,
+  "plugins": [
+    {
+      "name": "example",
+      "version": "0.1.0",
+      "protocolVersion": "minisky.plugin/v0",
+      "execution": "in-tree",
+      "domains": ["example.googleapis.com"],
+      "source": "pkg/shims/example",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

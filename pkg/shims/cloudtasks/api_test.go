@@ -1,16 +1,21 @@
 package cloudtasks
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"minisky/pkg/state"
 )
 
 func TestHTTPTaskDeliverySuccess(t *testing.T) {
@@ -33,7 +38,7 @@ func TestHTTPTaskDeliverySuccess(t *testing.T) {
 	}))
 	defer target.Close()
 
-	api := NewAPI()
+	api := newMemoryAPI(t)
 	defer api.Close()
 	queueName := createTestQueue(t, api, RetryConfig{MaxAttempts: 1})
 	taskName := createTestTask(t, api, queueName, &HTTPRequest{
@@ -69,7 +74,7 @@ func TestHTTPTaskRetriesTransientFailureThenSucceeds(t *testing.T) {
 	}))
 	defer target.Close()
 
-	api := NewAPI()
+	api := newMemoryAPI(t)
 	defer api.Close()
 	queueName := createTestQueue(t, api, RetryConfig{
 		MaxAttempts: 3,
@@ -98,7 +103,7 @@ func TestHTTPTaskTerminalFailure(t *testing.T) {
 	}))
 	defer target.Close()
 
-	api := NewAPI()
+	api := newMemoryAPI(t)
 	defer api.Close()
 	queueName := createTestQueue(t, api, RetryConfig{
 		MaxAttempts: 3,
@@ -122,6 +127,225 @@ func TestHTTPTaskTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestTaskStateSurvivesRestartWithoutReplay(t *testing.T) {
+	store := &memoryStateStore{}
+	var deliveries atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deliveries.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatalf("create API: %v", err)
+	}
+	queueName := createTestQueue(t, api, RetryConfig{MaxAttempts: 1})
+	taskName := createTestTask(t, api, queueName, &HTTPRequest{URL: target.URL})
+	waitForTaskStatus(t, api, queueName, taskName, "COMPLETED")
+	api.Close()
+
+	restarted, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatalf("restart API: %v", err)
+	}
+	defer restarted.Close()
+	task := waitForTaskStatus(t, restarted, queueName, taskName, "COMPLETED")
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt count after restart = %d, want 1", task.AttemptCount)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := deliveries.Load(); got != 1 {
+		t.Fatalf("terminal task replayed after restart: deliveries = %d", got)
+	}
+}
+
+func TestRestartMarksInterruptedTasksTerminal(t *testing.T) {
+	store := &memoryStateStore{}
+	if err := store.Save(cloudTasksStateEntry, cloudTasksMetadata{
+		Queues: map[string]*Queue{
+			"projects/test/locations/us-central1/queues/q": {
+				Name:  "projects/test/locations/us-central1/queues/q",
+				State: "RUNNING",
+			},
+		},
+		Tasks: map[string][]*Task{
+			"projects/test/locations/us-central1/queues/q": {
+				{Name: "pending", Status: "PENDING"},
+				{Name: "retrying", Status: "RETRYING", AttemptCount: 2},
+				{Name: "done", Status: "FAILED", AttemptCount: 3},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatalf("restart API: %v", err)
+	}
+	defer api.Close()
+
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	tasks := api.tasks["projects/test/locations/us-central1/queues/q"]
+	if tasks[0].Status != "FAILED" || !strings.Contains(tasks[0].LastError, "interrupted") {
+		t.Fatalf("pending task restart state = %+v", tasks[0])
+	}
+	if tasks[1].Status != "FAILED" || tasks[1].AttemptCount != 2 {
+		t.Fatalf("retrying task restart state = %+v", tasks[1])
+	}
+	if tasks[2].Status != "FAILED" || tasks[2].LastError != "" {
+		t.Fatalf("terminal task changed on restart = %+v", tasks[2])
+	}
+}
+
+func TestShutdownHonorsContextAndCompletesAfterWorkersExit(t *testing.T) {
+	api := newAPI(nil)
+	api.wg.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if err := api.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+	}
+	api.wg.Done()
+	if err := api.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown after worker exit: %v", err)
+	}
+	api.mu.RLock()
+	closed := api.closed
+	api.mu.RUnlock()
+	if !closed {
+		t.Fatal("shutdown did not close task delivery")
+	}
+}
+
+func TestCorruptStateDisablesCloudTasksInsteadOfOverwriting(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt-tasks")
+	store, err := state.New(root, "corrupt-tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(cloudTasksStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI()
+	defer api.Close()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/v2/projects/test/locations/us-central1/queues", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var persisted string
+	if err := store.Load(cloudTasksStateEntry, &persisted); err != nil || persisted != "corrupt" {
+		t.Fatalf("corrupt state changed: %q err=%v", persisted, err)
+	}
+}
+
+func TestQueueAndTaskDeletionRemainAtomicWithPersistence(t *testing.T) {
+	const queueName = "projects/test/locations/us-central1/queues/q"
+	const taskName = queueName + "/tasks/t"
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "queue", path: "/v2/" + queueName},
+		{name: "task", path: "/v2/" + taskName},
+	} {
+		t.Run(test.name+" rollback", func(t *testing.T) {
+			store := &deleteOrderStore{fail: true}
+			api := newAPI(store)
+			defer api.Close()
+			var canceled atomic.Bool
+			api.queues[queueName] = &Queue{Name: queueName}
+			api.tasks[queueName] = []*Task{{Name: taskName, Status: "PENDING"}}
+			api.jobs[taskName] = &deliveryJob{cancel: func() { canceled.Store(true) }}
+
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, test.path, nil))
+
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if canceled.Load() {
+				t.Fatal("worker was canceled before deletion persisted")
+			}
+			if api.queues[queueName] == nil || len(api.tasks[queueName]) != 1 || api.jobs[taskName] == nil {
+				t.Fatal("memory deletion was not rolled back")
+			}
+		})
+
+		t.Run(test.name+" persists before cancel", func(t *testing.T) {
+			store := &deleteOrderStore{}
+			api := newAPI(store)
+			defer api.Close()
+			var canceledBeforeSave atomic.Bool
+			api.queues[queueName] = &Queue{Name: queueName}
+			api.tasks[queueName] = []*Task{{Name: taskName, Status: "PENDING"}}
+			api.jobs[taskName] = &deliveryJob{cancel: func() {
+				if !store.saved.Load() {
+					canceledBeforeSave.Store(true)
+				}
+			}}
+
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, test.path, nil))
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if canceledBeforeSave.Load() {
+				t.Fatal("worker was canceled before deletion persisted")
+			}
+		})
+	}
+}
+
+type memoryStateStore struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+type deleteOrderStore struct {
+	fail  bool
+	saved atomic.Bool
+}
+
+func (s *deleteOrderStore) Load(string, any) error { return state.ErrNotFound }
+
+func (s *deleteOrderStore) Save(string, any) error {
+	if s.fail {
+		return errors.New("injected save failure")
+	}
+	s.saved.Store(true)
+	return nil
+}
+
+func (s *memoryStateStore) Load(_ string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(s.data, target)
+}
+
+func (s *memoryStateStore) Save(_ string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	s.data = data
+	return nil
+}
+
+var _ stateStore = (*memoryStateStore)(nil)
+
 func createTestQueue(t *testing.T, api *API, retryConfig RetryConfig) string {
 	t.Helper()
 	const queueName = "projects/test/locations/us-central1/queues/test-queue"
@@ -132,6 +356,15 @@ func createTestQueue(t *testing.T, api *API, retryConfig RetryConfig) string {
 		t.Fatalf("create queue returned %d: %s", rec.Code, rec.Body.String())
 	}
 	return queueName
+}
+
+func newMemoryAPI(t *testing.T) *API {
+	t.Helper()
+	api, err := NewAPIWithStore(nil)
+	if err != nil {
+		t.Fatalf("create in-memory API: %v", err)
+	}
+	return api
 }
 
 func createTestTask(t *testing.T, api *API, queueName string, request *HTTPRequest) string {

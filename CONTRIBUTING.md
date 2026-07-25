@@ -17,6 +17,19 @@ MiniSky consists of three main layers:
 
 MiniSky uses a **Dynamic Registry** system. To add a new GCP service (e.g., `translation.googleapis.com`), follow these steps:
 
+Start from the source-compiled SDK v0 scaffold:
+
+```bash
+go run ./cmd/minisky plugin scaffold ./pkg/shims/translation \
+  --name translation \
+  --domain translation.googleapis.com
+go test ./pkg/shims/translation
+```
+
+The generated handler returns `501 UNIMPLEMENTED` until real behavior and tests
+are added. SDK v0 is compiled in-tree; MiniSky has no runtime plugin installer
+or remote marketplace.
+
 ### 1. Create the Package
 Create a new directory in `pkg/shims/<service_name>/`.
 
@@ -34,7 +47,9 @@ import (
 type API struct {}
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    w.Write([]byte(`{"message": "Hello from MiniSky!"}`))
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusNotImplemented)
+    w.Write([]byte(`{"error":{"code":501,"message":"not implemented","status":"UNIMPLEMENTED"}}`))
 }
 ```
 
@@ -89,6 +104,13 @@ cd ui
 npm ci
 npm run lint
 npm run build
+```
+
+For the Phase 17 CI, plugin, control, offline-bundle, and Compose checks, run:
+
+```bash
+make test-phase17
+make benchmark
 ```
 
 ---

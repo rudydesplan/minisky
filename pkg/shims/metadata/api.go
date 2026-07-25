@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
+	localsecurity "minisky/pkg/security"
 )
 
 func init() {
@@ -33,14 +35,14 @@ type instanceMetadata struct {
 }
 
 var defaultMeta = instanceMetadata{
-	ProjectID:        "local-dev",
+	ProjectID:        "local-dev-project",
 	NumericProjectID: "123456789012",
 	InstanceName:     "minisky-local-vm",
 	InstanceID:       "1234567890123456789",
-	Zone:             "projects/local-dev/zones/us-central1-a",
-	MachineType:      "projects/local-dev/machineTypes/n1-standard-1",
-	Hostname:         "minisky-local-vm.us-central1-a.c.local-dev.internal",
-	ServiceAccount:   "default@local-dev.iam.gserviceaccount.com",
+	Zone:             "projects/local-dev-project/zones/us-central1-a",
+	MachineType:      "projects/local-dev-project/machineTypes/n1-standard-1",
+	Hostname:         "minisky-local-vm.us-central1-a.c.local-dev-project.internal",
+	ServiceAccount:   "default@local-dev-project.iam.gserviceaccount.com",
 	Attributes: map[string]string{
 		"startup-script": "#!/bin/bash\necho 'MiniSky VM started'",
 		"ssh-keys":       "user:ssh-rsa AAAA...localkey user@minisky",
@@ -53,11 +55,16 @@ var defaultMeta = instanceMetadata{
 //   - gcloud SDK (project discovery)
 //   - Terraform & Kubernetes (VM identity, zone, SA email)
 type API struct {
-	meta instanceMetadata
+	meta   instanceMetadata
+	issuer *localsecurity.Issuer
 }
 
 func NewAPI() *API {
-	return &API{meta: defaultMeta}
+	issuer, err := localsecurity.LoadIssuer(config.GetProfileDir())
+	if err != nil {
+		log.Printf("[Shim: Metadata Server] local credential issuer unavailable: %v", err)
+	}
+	return &API{meta: defaultMeta, issuer: issuer}
 }
 
 // ServeHTTP implements http.Handler.
@@ -169,39 +176,62 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleToken serves a fake OAuth2 access token.
+// handleToken serves a cryptographically authenticated local access token.
 // GCP SDKs use this path to authenticate before every API call.
 //
 // Real path: /computeMetadata/v1/instance/service-accounts/default/token
 // Real response: {"access_token":"...","expires_in":3599,"token_type":"Bearer"}
 func (api *API) handleToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 
-	// The value itself is intentionally fake — it only needs to look like a token
-	// so that GCP client libraries don't raise parsing errors.
-	// Services like fake-gcs-server accept any valid-looking bearer without verifying it.
-	fakeToken := map[string]interface{}{
-		"access_token": "minisky-dev-access-token-" + fmt.Sprintf("%d", time.Now().Unix()),
-		"expires_in":   3599,
+	if api.issuer == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "local credential issuer unavailable"})
+		return
+	}
+	scopes := []string{
+		"https://www.googleapis.com/auth/cloud-platform",
+		"https://www.googleapis.com/auth/devstorage.full_control",
+	}
+	token, claims, err := api.issuer.Issue(localsecurity.TokenRequest{
+		Subject: "serviceAccount:" + api.meta.ServiceAccount, Audience: "minisky-gateway",
+		Scopes: scopes, Lifetime: time.Hour,
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "local credential issuance failed"})
+		return
+	}
+	response := map[string]interface{}{
+		"access_token": token,
+		"expires_in":   int(time.Until(claims.ExpiresAt).Seconds()),
 		"token_type":   "Bearer",
 	}
-	json.NewEncoder(w).Encode(fakeToken)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
-// handleIdentityToken serves a minimal JWT-shaped OIDC token.
-// Used by Cloud Run audience checks, not cryptographically valid.
+// handleIdentityToken serves a locally signed opaque identity token.
+// It is intentionally not a Google OIDC JWT.
 func (api *API) handleIdentityToken(w http.ResponseWriter, r *http.Request) {
 	audience := r.URL.Query().Get("audience")
 	if audience == "" {
 		audience = "https://run.googleapis.com/"
 	}
-	// Return a fake (non-signed) JWT-like string. Client libs that only decode won't error.
-	// Real enforcement must be disabled in the calling service for local dev.
-	fakeJWT := "eyJhbGciOiJSUzI1NiJ9.minisky-identity-" + fmt.Sprintf("%d", time.Now().Unix())
+	if api.issuer == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	token, _, err := api.issuer.Issue(localsecurity.TokenRequest{
+		Subject: "serviceAccount:" + api.meta.ServiceAccount, Audience: audience, Lifetime: time.Hour,
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, fakeJWT)
+	fmt.Fprint(w, token)
 }
 
 // handleRoot returns the canonical directory listing for v1/ root.

@@ -40,13 +40,13 @@ func TestDependencyInstallerResolvesVerifiedReleaseAssets(t *testing.T) {
 		},
 		{
 			id: "pack", goos: "linux", goarch: "amd64", wantName: "pack",
-			wantURL:         "https://github.com/buildpacks/pack/releases/download/v0.34.2/pack-v0.34.2-linux.tgz",
-			wantChecksumURL: "https://github.com/buildpacks/pack/releases/download/v0.34.2/pack-v0.34.2-linux.tgz.sha256",
+			wantURL:         "https://github.com/buildpacks/pack/releases/download/v0.40.8/pack-v0.40.8-linux.tgz",
+			wantChecksumURL: "https://github.com/buildpacks/pack/releases/download/v0.40.8/pack-v0.40.8-linux.tgz.sha256",
 		},
 		{
 			id: "pack", goos: "windows", goarch: "amd64", wantName: "pack.exe",
-			wantURL:         "https://github.com/buildpacks/pack/releases/download/v0.34.2/pack-v0.34.2-windows.zip",
-			wantChecksumURL: "https://github.com/buildpacks/pack/releases/download/v0.34.2/pack-v0.34.2-windows.zip.sha256",
+			wantURL:         "https://github.com/buildpacks/pack/releases/download/v0.40.8/pack-v0.40.8-windows.zip",
+			wantChecksumURL: "https://github.com/buildpacks/pack/releases/download/v0.40.8/pack-v0.40.8-windows.zip.sha256",
 		},
 	}
 	for _, test := range tests {

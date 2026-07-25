@@ -1,6 +1,7 @@
 package cloudsql
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -295,11 +296,16 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 
 	// Register LRO and drive state transitions asynchronously
 	targetLink := selfLink
-	op := api.opMgr.Register("sql#operation", "CREATE", targetLink, "", region)
+	op, err := api.opMgr.RegisterDurable("sql#operation", "CREATE", targetLink, "", region)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Provision physical Docker container with standard "minisky" root password
-		internalURL, err := api.svcMgr.ProvisionCloudSQLVM(body.Name, dbVersion, "minisky")
+		internalURL, err := api.svcMgr.ProvisionCloudSQLVM(context.Background(), body.Name, dbVersion, "minisky")
 		if err != nil {
 			log.Printf("[Shim: Cloud SQL] Provisioning failed: %v", err)
 			return err
@@ -382,7 +388,12 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	}
 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, name)
-	op := api.opMgr.Register("sql#operation", "DELETE", selfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("sql#operation", "DELETE", selfLink, "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Simulate winding down time

@@ -13,6 +13,7 @@ import LocalFireDepartmentIcon from '@mui/icons-material/LocalFireDepartment';
 import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import ScheduleIcon from '@mui/icons-material/Schedule';
 import SecurityIcon from '@mui/icons-material/Security';
+import HttpIcon from '@mui/icons-material/Http';
 import Dashboard from './components/Dashboard';
 import StoragePage from './components/StoragePage';
 import ComputePage from './components/ComputePage';
@@ -26,6 +27,7 @@ import AppEnginePage from './components/AppEnginePage';
 import MemorystorePage from './components/MemorystorePage';
 import TasksAndSchedulingPage from './components/TasksAndSchedulingPage';
 import SecurityPage from './components/SecurityPage';
+import GatewayRequestsPage from './components/GatewayRequestsPage';
 
 const DRAWER_WIDTH = 280;
 
@@ -65,6 +67,7 @@ function NavigationContent() {
   const [pathname] = useLocation();
   const isLogging = pathname === '/logging';
   const isMonitoring = pathname === '/monitoring';
+  const isGatewayRequests = pathname === '/gateway-requests';
   const [version, setVersion] = useState('...');
 
   useEffect(() => {
@@ -101,6 +104,25 @@ function NavigationContent() {
           <Typography variant="caption" sx={{ px: 1, color: '#9aa0a6', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: '0.65rem' }}>
             Operations
           </Typography>
+
+          {/* Gateway request diagnostics */}
+          <ListItemButton
+            component={Link}
+            to="/gateway-requests"
+            sx={{
+              borderRadius: '8px', mt: 1,
+              backgroundColor: isGatewayRequests ? '#e8f0fe' : 'transparent',
+              '&:hover': { backgroundColor: isGatewayRequests ? '#e8f0fe' : '#f1f3f4' }
+            }}
+          >
+            <ListItemIcon sx={{ color: isGatewayRequests ? '#1a73e8' : '#5f6368', minWidth: 40 }}>
+              <HttpIcon />
+            </ListItemIcon>
+            <ListItemText
+              primary="Gateway Requests"
+              sx={{ color: isGatewayRequests ? '#1a73e8' : '#3c4043', '& span': { fontWeight: isGatewayRequests ? 500 : 400 } }}
+            />
+          </ListItemButton>
 
           {/* Cloud Logging */}
           <ListItemButton
@@ -146,10 +168,10 @@ function NavigationContent() {
       <Box component="main" sx={{
         flexGrow: 1,
         // Log Explorer gets full height with no padding
-        ...(isLogging || isMonitoring ? { p: 0, height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }
+        ...(isLogging || isMonitoring || isGatewayRequests ? { p: 0, height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }
                                           : { p: 6, position: 'relative' })
       }}>
-        {!isLogging && !isMonitoring && <ProjectSelector />}
+        {!isLogging && !isMonitoring && !isGatewayRequests && <ProjectSelector />}
         <Switch>
           <Route path="/" component={Dashboard} />
           <Route path="/compute" component={ComputePage} />
@@ -158,6 +180,7 @@ function NavigationContent() {
           <Route path="/network" component={NetworkPage} />
           <Route path="/logging" component={LogExplorer} />
           <Route path="/monitoring" component={MonitoringPage} />
+          <Route path="/gateway-requests" component={GatewayRequestsPage} />
           <Route path="/firebase" component={FirebasePage} />
           <Route path="/appengine" component={AppEnginePage} />
           <Route path="/security" component={SecurityPage} />

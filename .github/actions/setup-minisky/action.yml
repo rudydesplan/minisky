@@ -1,0 +1,40 @@
+name: Setup MiniSky
+description: Install a checksummed MiniSky release or supplied binary and start an isolated daemon
+inputs:
+  binary:
+    description: Path to a prebuilt MiniSky binary; skips release download
+    required: false
+  version:
+    description: Required stable vMAJOR.MINOR.PATCH release tag when binary is not supplied
+    required: false
+  repository:
+    description: GitHub repository containing MiniSky release assets
+    required: false
+    default: qamarudeenm/minisky
+  api-port:
+    description: Isolated API gateway port
+    required: false
+    default: "18080"
+  ui-port:
+    description: Isolated dashboard port
+    required: false
+    default: "18081"
+  profile:
+    description: Isolated MiniSky profile name
+    required: false
+    default: github-action
+  services:
+    description: Comma-separated service aliases or domains; empty exposes all
+    required: false
+    default: ""
+  timeout-seconds:
+    description: Readiness timeout in seconds
+    required: false
+    default: "60"
+outputs:
+  endpoint:
+    description: MiniSky API gateway URL
+runs:
+  using: node24
+  main: index.mjs
+  post: cleanup.mjs

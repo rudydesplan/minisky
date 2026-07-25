@@ -3,36 +3,44 @@ import { ProjectContext } from './projectContextValue';
 
 export { useProjectContext } from './projectContextValue';
 
+type ProjectResource = {
+  projectId: string;
+  state: string;
+};
+
+function isProjectList(value: unknown): value is { projects: ProjectResource[] } {
+  if (typeof value !== 'object' || value === null || !('projects' in value)) return false;
+  const projects = (value as { projects?: unknown }).projects;
+  return Array.isArray(projects) && projects.every(project =>
+    typeof project === 'object' && project !== null &&
+    typeof (project as ProjectResource).projectId === 'string' &&
+    typeof (project as ProjectResource).state === 'string'
+  );
+}
+
 const projectProvider = function ProjectProvider({ children }: { children: React.ReactNode }) {
   const [activeProject, setActiveProjectState] = useState<string>('local-dev-project');
   const [availableProjects, setAvailableProjects] = useState<string[]>(['local-dev-project']);
+  const [projectError, setProjectError] = useState<string | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem('minisky-active-project');
-    const savedList = localStorage.getItem('minisky-projects-list');
-    
-    if (saved) {
-      setActiveProjectState(saved);
-    }
-    
-    let baseList = ['local-dev-project', 'production'];
-    if (savedList) {
-      try {
-        baseList = Array.from(new Set([...baseList, ...JSON.parse(savedList)]));
-      } catch {
-        // Ignore malformed persisted data and use the default project list.
-      }
-    }
-
-    // Fetch discovered projects from backend
-    fetch('/api/projects')
-      .then(r => r.json())
-      .then(projects => {
-        const merged = Array.from(new Set([...baseList, ...projects]));
-        setAvailableProjects(merged);
-        localStorage.setItem('minisky-projects-list', JSON.stringify(merged));
+    const controller = new AbortController();
+    fetch('/api/projects', { signal: controller.signal })
+      .then(async response => {
+        if (!response.ok) throw new Error('Project registry is unavailable');
+        const value: unknown = await response.json();
+        if (!isProjectList(value)) throw new Error('Project registry returned an invalid response');
+        const projects = value.projects.filter(project => project.state === 'ACTIVE').map(project => project.projectId);
+        setAvailableProjects(projects);
+        setActiveProjectState(saved && projects.includes(saved) ? saved : 'local-dev-project');
+        setProjectError(null);
       })
-      .catch(() => setAvailableProjects(baseList));
+      .catch(error => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setProjectError(error instanceof Error ? error.message : 'Unable to load projects');
+      });
+    return () => controller.abort();
   }, []);
 
   const setActiveProject = (name: string) => {
@@ -40,17 +48,23 @@ const projectProvider = function ProjectProvider({ children }: { children: React
     localStorage.setItem('minisky-active-project', name);
   };
 
-  const addProject = (name: string) => {
-    if (!availableProjects.includes(name)) {
-      const newList = [...availableProjects, name];
-      setAvailableProjects(newList);
-      localStorage.setItem('minisky-projects-list', JSON.stringify(newList));
+  const addProject = async (name: string) => {
+    const response = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId: name, displayName: name }),
+    });
+    if (!response.ok) {
+      setProjectError('Project creation failed');
+      throw new Error('Project creation failed');
     }
+    setAvailableProjects(projects => projects.includes(name) ? projects : [...projects, name]);
+    setProjectError(null);
     setActiveProject(name);
   };
 
   return (
-    <ProjectContext.Provider value={{ activeProject, setActiveProject, availableProjects, addProject }}>
+    <ProjectContext.Provider value={{ activeProject, setActiveProject, availableProjects, addProject, projectError }}>
       {children}
     </ProjectContext.Provider>
   );

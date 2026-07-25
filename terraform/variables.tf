@@ -10,6 +10,12 @@ variable "dataset_id" {
   default     = "minisky_terraform"
 }
 
+variable "enable_phase15_resources" {
+  description = "Create the optional local Redis and Spanner Phase-15 resources"
+  type        = bool
+  default     = false
+}
+
 variable "local_access_token" {
   description = "Non-secret access token used only for the local MiniSky profile"
   type        = string
@@ -40,6 +46,12 @@ variable "project_id" {
   default     = "local-dev-project"
 }
 
+variable "secondary_project_id" {
+  description = "Second Google Cloud project used for isolation and cross-project acceptance"
+  type        = string
+  default     = "local-secondary-project"
+}
+
 variable "region" {
   description = "Default Google provider region"
   type        = string
@@ -50,6 +62,12 @@ variable "service_account_id" {
   description = "Account ID of the metadata-only IAM service account"
   type        = string
   default     = "minisky-terraform"
+}
+
+variable "storage_bucket_name" {
+  description = "Name of the Cloud Storage bucket created by the compatibility example"
+  type        = string
+  default     = "minisky-terraform-compatibility"
 }
 
 variable "table_id" {

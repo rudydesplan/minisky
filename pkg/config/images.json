@@ -16,7 +16,8 @@
       "name": "minisky-firestore",
       "image": "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators",
       "port": "8082/tcp",
-      "cmd": ["gcloud", "beta", "emulators", "firestore", "start", "--host-port=0.0.0.0:8082"]
+      "cmd": ["sh", "-c", "metadata=$(find /data -name '*.overall_export_metadata' -type f -print -quit); if [ -n \"$metadata\" ]; then exec gcloud beta emulators firestore start --host-port=0.0.0.0:8082 --import-data=\"$metadata\" --export-on-exit=/data; else exec gcloud beta emulators firestore start --host-port=0.0.0.0:8082 --export-on-exit=/data; fi"],
+      "volume": "./data/firestore:/data"
     },
     "bigtable.googleapis.com": {
       "name": "minisky-bigtable",
@@ -35,6 +36,13 @@
       "name": "minisky-spanner",
       "image": "gcr.io/cloud-spanner-emulator/emulator",
       "port": "9020/tcp",
+      "additional_ports": ["9010/tcp"],
+      "cmd": []
+    },
+    "artifactregistry.googleapis.com": {
+      "name": "minisky-artifact-registry",
+      "image": "registry:2",
+      "port": "5000/tcp",
       "cmd": []
     },
     "identitytoolkit.googleapis.com": {

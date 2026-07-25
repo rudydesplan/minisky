@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -61,6 +64,8 @@ type deliveryJob struct {
 
 type API struct {
 	mu        sync.RWMutex
+	persistMu sync.Mutex
+	store     stateStore
 	queues    map[string]*Queue
 	tasks     map[string][]*Task
 	jobs      map[string]*deliveryJob
@@ -71,11 +76,77 @@ type API struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closed    bool
+	initErr   error
+}
+
+type stateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+const cloudTasksStateEntry = "cloudtasks/metadata"
+
+type cloudTasksMetadata struct {
+	Queues map[string]*Queue  `json:"queues"`
+	Tasks  map[string][]*Task `json:"tasks"`
 }
 
 func NewAPI() *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Cloud Tasks] state disabled: %v", err)
+		return newAPI(nil)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		log.Printf("[Shim: Cloud Tasks] state rehydration failed: %v", err)
+		disabled := newAPI(nil)
+		disabled.initErr = err
+		return disabled
+	}
+	return api
+}
+
+func NewAPIWithStore(store stateStore) (*API, error) {
+	api := newAPI(store)
+	if store == nil {
+		return api, nil
+	}
+	var persisted cloudTasksMetadata
+	if err := store.Load(cloudTasksStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api, nil
+		}
+		return nil, fmt.Errorf("load Cloud Tasks metadata: %w", err)
+	}
+	if persisted.Queues != nil {
+		api.queues = persisted.Queues
+	}
+	if persisted.Tasks != nil {
+		api.tasks = persisted.Tasks
+	}
+	interrupted := false
+	for _, tasks := range api.tasks {
+		for _, task := range tasks {
+			if task.Status == "PENDING" || task.Status == "RETRYING" {
+				task.Status = "FAILED"
+				task.LastError = "delivery interrupted by MiniSky restart"
+				interrupted = true
+			}
+		}
+	}
+	if interrupted {
+		if err := api.persistMetadata(); err != nil {
+			return nil, fmt.Errorf("persist interrupted Cloud Tasks metadata: %w", err)
+		}
+	}
+	return api, nil
+}
+
+func newAPI(store stateStore) *API {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &API{
+		store:  store,
 		queues: make(map[string]*Queue),
 		tasks:  make(map[string][]*Task),
 		jobs:   make(map[string]*deliveryJob),
@@ -87,14 +158,55 @@ func NewAPI() *API {
 	}
 }
 
+func (api *API) persistMetadata() error {
+	if api.store == nil {
+		return nil
+	}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.RLock()
+	metadata := cloneMetadata(api.queues, api.tasks)
+	api.mu.RUnlock()
+	return api.store.Save(cloudTasksStateEntry, metadata)
+}
+
+func (api *API) persistOrError(w http.ResponseWriter) bool {
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: Cloud Tasks] persist metadata: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"code":500,"status":"INTERNAL","message":"Failed to persist Cloud Tasks metadata"}}`))
+		return false
+	}
+	return true
+}
+
 func (api *API) Close() {
+	_ = api.Shutdown(context.Background())
+}
+
+// Shutdown stops pending delivery workers, waits within the caller's deadline,
+// and persists the final task state.
+func (api *API) Shutdown(ctx context.Context) error {
 	api.closeOnce.Do(func() {
 		api.mu.Lock()
 		api.closed = true
 		api.cancel()
 		api.mu.Unlock()
-		api.wg.Wait()
 	})
+	done := make(chan struct{})
+	go func() {
+		api.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err := api.persistMetadata(); err != nil {
+			return fmt.Errorf("persist Cloud Tasks shutdown metadata: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -111,6 +223,12 @@ func (api *API) pushLog(projectId, severity, resourceName, text string) {
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if api.initErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":503,"status":"FAILED_PRECONDITION","message":"Cloud Tasks state is unavailable"}}`))
+		return
+	}
 
 	path := strings.Trim(r.URL.Path, "/")
 	parts := strings.Split(path, "/")
@@ -207,6 +325,12 @@ func (api *API) createQueue(w http.ResponseWriter, r *http.Request, project stri
 	api.queues[q.Name] = &q
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		api.mu.Lock()
+		delete(api.queues, q.Name)
+		api.mu.Unlock()
+		return
+	}
 	api.pushLog(project, "INFO", q.Name, "Created queue")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(q)
@@ -216,18 +340,43 @@ func (api *API) deleteQueue(w http.ResponseWriter, r *http.Request, project, que
 	name := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
 	log.Printf("[Shim: Cloud Tasks] Attempting to delete queue: %s", name)
 
+	api.persistMu.Lock()
 	api.mu.Lock()
-	_, exists := api.queues[name]
-	for _, task := range api.tasks[name] {
+	queue, exists := api.queues[name]
+	removedTasks := api.tasks[name]
+	delete(api.queues, name)
+	delete(api.tasks, name)
+	metadata := cloneMetadata(api.queues, api.tasks)
+	api.mu.Unlock()
+
+	var err error
+	if api.store != nil {
+		err = api.store.Save(cloudTasksStateEntry, metadata)
+	}
+	if err != nil {
+		api.mu.Lock()
+		if exists {
+			api.queues[name] = queue
+		}
+		if removedTasks != nil {
+			api.tasks[name] = removedTasks
+		}
+		api.mu.Unlock()
+		api.persistMu.Unlock()
+		log.Printf("[Shim: Cloud Tasks] persist queue deletion: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"code":500,"status":"INTERNAL","message":"Failed to persist Cloud Tasks metadata"}}`))
+		return
+	}
+	api.mu.Lock()
+	for _, task := range removedTasks {
 		if job := api.jobs[task.Name]; job != nil {
 			job.cancel()
 			delete(api.jobs, task.Name)
 		}
 	}
-	delete(api.queues, name)
-	delete(api.tasks, name)
 	api.mu.Unlock()
-
+	api.persistMu.Unlock()
 	if !exists {
 		log.Printf("[Shim WARNING: Cloud Tasks] Queue not found for deletion: %s", name)
 	} else {
@@ -278,7 +427,18 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 	api.tasks[queueName] = append(api.tasks[queueName], task)
 	createdTask := *task
 	queue := api.queues[queueName]
-	if task.HTTPRequest != nil && !api.closed {
+	shouldExecute := task.HTTPRequest != nil && !api.closed
+	api.mu.Unlock()
+
+	if !api.persistOrError(w) {
+		api.mu.Lock()
+		removeTaskLocked(api.tasks, queueName, task.Name)
+		api.mu.Unlock()
+		return
+	}
+
+	api.mu.Lock()
+	if shouldExecute && !api.closed {
 		ctx, cancel := context.WithCancel(api.ctx)
 		job := &deliveryJob{cancel: cancel}
 		api.jobs[task.Name] = job
@@ -439,7 +599,6 @@ func retryDelay(minBackoff, maxBackoff time.Duration, maxDoublings, attempt int)
 
 func (api *API) recordAttempt(queueName, taskName string, statusCode int, err error, terminal bool) {
 	api.mu.Lock()
-	defer api.mu.Unlock()
 	for _, task := range api.tasks[queueName] {
 		if task.Name != taskName {
 			continue
@@ -457,18 +616,25 @@ func (api *API) recordAttempt(queueName, taskName string, statusCode int, err er
 				task.Status = "RETRYING"
 			}
 		}
-		return
+		break
+	}
+	api.mu.Unlock()
+	if persistErr := api.persistMetadata(); persistErr != nil {
+		log.Printf("[Shim: Cloud Tasks] persist attempt metadata: %v", persistErr)
 	}
 }
 
 func (api *API) markCanceled(queueName, taskName string) {
 	api.mu.Lock()
-	defer api.mu.Unlock()
 	for _, task := range api.tasks[queueName] {
 		if task.Name == taskName {
 			task.Status = "CANCELED"
-			return
+			break
 		}
+	}
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: Cloud Tasks] persist canceled task: %v", err)
 	}
 }
 
@@ -477,24 +643,84 @@ func (api *API) deleteTask(w http.ResponseWriter, r *http.Request, project, queu
 	taskName := fmt.Sprintf("%s/tasks/%s", queueName, taskId)
 	log.Printf("[Shim: Cloud Tasks] Attempting to delete task: %s", taskName)
 
+	api.persistMu.Lock()
 	api.mu.Lock()
-	defer api.mu.Unlock()
-
 	tasks := api.tasks[queueName]
 	for i, t := range tasks {
 		if t.Name == taskName {
+			remaining := append([]*Task(nil), tasks[:i]...)
+			remaining = append(remaining, tasks[i+1:]...)
+			api.tasks[queueName] = remaining
+			metadata := cloneMetadata(api.queues, api.tasks)
+			api.mu.Unlock()
+			var err error
+			if api.store != nil {
+				err = api.store.Save(cloudTasksStateEntry, metadata)
+			}
+			if err != nil {
+				api.mu.Lock()
+				api.tasks[queueName] = tasks
+				api.mu.Unlock()
+				api.persistMu.Unlock()
+				log.Printf("[Shim: Cloud Tasks] persist task deletion: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":{"code":500,"status":"INTERNAL","message":"Failed to persist Cloud Tasks metadata"}}`))
+				return
+			}
+			api.mu.Lock()
 			if job := api.jobs[taskName]; job != nil {
 				job.cancel()
 				delete(api.jobs, taskName)
 			}
-			api.tasks[queueName] = append(tasks[:i], tasks[i+1:]...)
+			api.mu.Unlock()
+			api.persistMu.Unlock()
 			log.Printf("[Shim: Cloud Tasks] Successfully deleted task: %s", taskName)
 			api.pushLog(project, "INFO", queueName, "Task deleted: "+taskName)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}
+	api.mu.Unlock()
+	api.persistMu.Unlock()
 
 	log.Printf("[Shim WARNING: Cloud Tasks] Task not found for deletion: %s", taskName)
 	w.WriteHeader(http.StatusNotFound)
+}
+
+func cloneMetadata(queues map[string]*Queue, tasks map[string][]*Task) cloudTasksMetadata {
+	result := cloudTasksMetadata{
+		Queues: make(map[string]*Queue, len(queues)),
+		Tasks:  make(map[string][]*Task, len(tasks)),
+	}
+	for name, queue := range queues {
+		clone := *queue
+		result.Queues[name] = &clone
+	}
+	for queueName, queueTasks := range tasks {
+		clones := make([]*Task, len(queueTasks))
+		for i, task := range queueTasks {
+			clone := *task
+			if task.HTTPRequest != nil {
+				request := *task.HTTPRequest
+				request.Headers = make(map[string]string, len(task.HTTPRequest.Headers))
+				for name, value := range task.HTTPRequest.Headers {
+					request.Headers[name] = value
+				}
+				clone.HTTPRequest = &request
+			}
+			clones[i] = &clone
+		}
+		result.Tasks[queueName] = clones
+	}
+	return result
+}
+
+func removeTaskLocked(tasks map[string][]*Task, queueName, taskName string) {
+	queueTasks := tasks[queueName]
+	for i, task := range queueTasks {
+		if task.Name == taskName {
+			tasks[queueName] = append(queueTasks[:i], queueTasks[i+1:]...)
+			return
+		}
+	}
 }

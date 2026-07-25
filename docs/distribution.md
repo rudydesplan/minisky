@@ -12,6 +12,21 @@ The workflow validates each archive's integrity, rejects unsafe paths, checks
 for the binary, license, documentation, and readme files, and verifies the
 generated SHA-256 checksums before creating the release.
 
+Download the archive and `checksums.txt` as separate files, then run
+`sha256sum -c checksums.txt` on Linux or `shasum -a 256 -c checksums.txt` on
+macOS before extraction. MiniSky does not require executing a downloaded
+installer script.
+
+The repository-local action at `.github/actions/setup-minisky` applies the same
+release checksum requirement or accepts a caller-supplied binary. It is tested
+from a built artifact in CI but is not published as a separate
+`minisky/setup-minisky@v1` action. Release downloads require an explicit stable
+`vMAJOR.MINOR.PATCH` input; moving `latest` selection is rejected.
+
+For disconnected transfer, `scripts/airgap-bundle.sh` packages a supplied
+binary and optionally an already-present image, emits SHA-256 metadata, and
+verifies all files before optional `docker load`. It never publishes or pulls.
+
 ## GHCR
 
 The workflow publishes `ghcr.io/<owner>/<repository>` with these tags:
@@ -44,3 +59,23 @@ publisher requires all of the following before a workflow should be enabled:
 
 Until those repositories, credentials, and approval gates exist, releases must
 not claim to update a Homebrew tap or Scoop bucket automatically.
+
+The Compose example binds gateway and Dashboard ports to `127.0.0.1` by
+default. Exposing either listener remotely requires an explicit bind override,
+TLS, strict gateway authentication, host firewall policy, and a trusted reverse
+proxy. The mounted Docker socket must never be exposed remotely.
+
+## deb and rpm
+
+GoReleaser declares nFPM `deb` and `rpm` packages, but the native tag workflow
+does not invoke `goreleaser release` and therefore does not publish those
+packages. CI validates the GoReleaser v2 configuration and a host-native
+snapshot binary. Package build/install validation on native Linux runners is
+still required before deb/rpm files can become release assets.
+
+Local evidence from 2026-07-25 validates the GoReleaser v2 configuration,
+builds the macOS ARM64 snapshot, and runs both `minisky version` and
+`minisky doctor bigquery` from that artifact. The bundled Buildpacks CLI is
+Pack 0.40.8, which is compatible with Docker daemons that reject the legacy
+API level used by Pack 0.34.2. This evidence does not replace native Linux
+deb/rpm install tests or credentialed package publication.

@@ -1,6 +1,7 @@
 package dataproc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -247,7 +248,12 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 	targetLink := fmt.Sprintf(
 		"https://dataproc.googleapis.com/v1/projects/%s/regions/%s/clusters/%s",
 		project, region, body.ClusterName)
-	op := api.opMgr.Register("dataproc#operation", "CREATE", targetLink, "", region)
+	op, err := api.opMgr.RegisterDurable("dataproc#operation", "CREATE", targetLink, "", region)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		clusterStr := body.ClusterName
@@ -272,7 +278,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 
 		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterStr)
-		api.svcMgr.ProvisionComputeVM(masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+		api.svcMgr.ProvisionComputeVM(context.Background(), masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"})
 
 		// Provision Worker Nodes
 		numWorkers := 2
@@ -281,7 +287,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 		for i := 0; i < numWorkers; i++ {
 			workerName := fmt.Sprintf("minisky-dataproc-%s-w-%d", clusterStr, i)
-			api.svcMgr.ProvisionComputeVM(workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+			api.svcMgr.ProvisionComputeVM(context.Background(), workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"})
 		}
 
 		api.mu.Lock()
@@ -352,7 +358,12 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, r
 	targetLink := fmt.Sprintf(
 		"https://dataproc.googleapis.com/v1/projects/%s/regions/%s/clusters/%s",
 		project, region, name)
-	op := api.opMgr.Register("dataproc#operation", "DELETE", targetLink, "", region)
+	op, err := api.opMgr.RegisterDurable("dataproc#operation", "DELETE", targetLink, "", region)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Teardown physical containers

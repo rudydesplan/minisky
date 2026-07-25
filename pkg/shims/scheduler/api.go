@@ -188,6 +188,15 @@ func (api *API) Close() {
 	<-api.cron.Stop().Done()
 }
 
+// SetGatewayBaseURL wires the running daemon gateway used for cross-shim
+// Pub/Sub and App Engine delivery. Startup calls this after the actual listen
+// port is known, so Scheduler does not depend on a conventional port.
+func (api *API) SetGatewayBaseURL(baseURL string) {
+	api.mu.Lock()
+	api.gatewayBaseURL = strings.TrimRight(baseURL, "/")
+	api.mu.Unlock()
+}
+
 func (api *API) persistMetadata() error {
 	if api.store == nil {
 		return nil
@@ -221,7 +230,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud Scheduler] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 
-	path := r.URL.Path
+	path := canonicalSchedulerPath(r.URL.Path)
 
 	// Job verbs (run, pause, resume)
 	switch {
@@ -538,6 +547,11 @@ func extractJobName(path string) string {
 		return parts[0] + "/jobs/" + parts[1]
 	}
 	return ""
+}
+
+func canonicalSchedulerPath(path string) string {
+	path = strings.TrimPrefix(path, "/v1/")
+	return strings.TrimPrefix(path, "/")
 }
 
 func extractProject(path string) string {

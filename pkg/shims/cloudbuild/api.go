@@ -1,6 +1,7 @@
 package cloudbuild
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -156,7 +157,11 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 	build.Status = "QUEUED"
 	build.CreateTime = time.Now().UTC().Format(time.RFC3339)
 
-	op := api.opMgr.Register("cloudbuild#operation", "CREATE", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "CREATE", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	if err != nil {
+		http.Error(w, "failed to persist build operation", http.StatusInternalServerError)
+		return
+	}
 	api.opMgr.UpdateMetadata(op.Name, build)
 	api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Build %s queued with %d steps", build.Id, len(build.Steps)))
 
@@ -216,7 +221,7 @@ func (api *API) executeBuild(project string, build Build, opName string) {
 
 		cloneContainer := fmt.Sprintf("minisky-build-clone-%s", build.Id)
 		// We use a helper container to clone into a volume
-		err := api.svcMgr.ProvisionBuildStep(cloneContainer, "alpine/git:latest", []string{workspaceVol + ":/workspace"}, []string{}, []string{"clone", "-b", branch, repo, "/workspace"})
+		err := api.svcMgr.ProvisionBuildStep(context.Background(), cloneContainer, "alpine/git:latest", []string{workspaceVol + ":/workspace"}, []string{}, []string{"clone", "-b", branch, repo, "/workspace"})
 		if err != nil {
 			api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone failed: %v", err))
 			failed = true
@@ -244,7 +249,7 @@ func (api *API) executeBuild(project string, build Build, opName string) {
 
 			containerName := fmt.Sprintf("minisky-build-step-%s-%d", build.Id, i)
 			// Mount the workspace volume to all steps
-			err := api.svcMgr.ProvisionBuildStep(containerName, img, []string{workspaceVol + ":/workspace"}, step.Env, step.Args)
+			err := api.svcMgr.ProvisionBuildStep(context.Background(), containerName, img, []string{workspaceVol + ":/workspace"}, step.Env, step.Args)
 			if err != nil {
 				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d failed: %v", i, err))
 				failed = true
@@ -296,7 +301,11 @@ func (api *API) handleRunTrigger(w http.ResponseWriter, r *http.Request, project
 		},
 	}
 
-	op := api.opMgr.Register("cloudbuild#operation", "RUN_TRIGGER", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "RUN_TRIGGER", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	if err != nil {
+		http.Error(w, "failed to persist build operation", http.StatusInternalServerError)
+		return
+	}
 	api.opMgr.UpdateMetadata(op.Name, build)
 	go api.executeBuild(project, build, op.Name)
 

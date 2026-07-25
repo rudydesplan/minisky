@@ -19,6 +19,8 @@ func TestGlobMatch(t *testing.T) {
 	}{
 		{name: "exact", glob: "/v1/projects", path: "/v1/projects", want: true},
 		{name: "single segment wildcard", glob: "/v1/projects/*/instances", path: "/v1/projects/demo/instances", want: true},
+		{name: "method suffix wildcard", glob: "/v1/models/*:predict", path: "/v1/models/demo:predict", want: true},
+		{name: "method suffix required", glob: "/v1/models/*:predict", path: "/v1/models/demo", want: false},
 		{name: "wildcard cannot be empty", glob: "/v1/projects/*/instances", path: "/v1/projects//instances", want: false},
 		{name: "wildcard cannot cross slash", glob: "/v1/projects/*/instances", path: "/v1/projects/demo/zones/us/instances", want: false},
 		{name: "different literal", glob: "/v1/projects/*/instances", path: "/v1/folders/demo/instances", want: false},

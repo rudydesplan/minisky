@@ -2,7 +2,9 @@
 
 The tracked `terraform/` configuration is a reproducible compatibility example
 for the official Google provider. Its tested local scope is deliberately
-limited to BigQuery dataset/table metadata and an IAM service account.
+limited to BigQuery dataset/table metadata, an IAM service account, and a
+Docker-backed Storage bucket. The fixture also contains optional local
+Phase-15 Redis and Spanner resources, disabled by default.
 
 ## Local profile
 
@@ -55,8 +57,23 @@ MINISKY_TERRAFORM_INTEGRATION=1 ./scripts/terraform-integration.sh
 ```
 
 The script requires Docker because the current MiniSky daemon creates an
-isolated Docker network even though these resources use in-process shims. It
-refuses to run when existing MiniSky containers or networks are present.
+isolated Docker network and Storage uses `fake-gcs-server`. It refuses to run
+when existing MiniSky containers or networks are present.
+
+Set `MINISKY_TERRAFORM_PHASE15=1` to opt the guarded script into the Redis and
+Spanner Terraform resources. The separate Phase-15 emulator integration remains
+the authoritative data-plane gate.
+
+The metadata durability subset has a separate opt-in gate:
+
+```bash
+MINISKY_STATE_DURABILITY_INTEGRATION=1 \
+  ./scripts/state-durability-integration.sh
+```
+
+It covers persisted BigQuery and IAM resources across restart and clean-profile
+metadata export/import. It does not claim that Storage objects or other Docker
+data are included in snapshots.
 
 See [Terraform compatibility](terraform-compatibility.md) for exact endpoints,
 tested versions, CI gating, and unsupported resource families.

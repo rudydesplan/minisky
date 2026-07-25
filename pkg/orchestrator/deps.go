@@ -30,7 +30,7 @@ type Dependency struct {
 
 const (
 	KindVersion = "v0.22.0"
-	PackVersion = "v0.34.2"
+	PackVersion = "v0.40.8"
 
 	dependencyInstallTimeout = 2 * time.Minute
 	maxDependencySize        = 256 << 20
@@ -76,13 +76,13 @@ func InstallToolDependency(ctx context.Context, id string) error {
 }
 
 // InstallDependency installs a tool dependency or pulls a requested Docker image.
-func (sm *ServiceManager) InstallDependency(id string) error {
+func (sm *ServiceManager) InstallDependency(ctx context.Context, id string) error {
 	if strings.HasPrefix(id, "docker-image:") {
 		image := strings.TrimPrefix(id, "docker-image:")
 		log.Printf("[Deps] Pulling docker image: %s", image)
-		return sm.pullImageInternal(image)
+		return sm.pullImageInternal(ctx, image)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dependencyInstallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dependencyInstallTimeout)
 	defer cancel()
 	return InstallToolDependency(ctx, id)
 }

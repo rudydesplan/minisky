@@ -3,12 +3,15 @@ import { Box, Typography, Menu, MenuItem, Button, Divider, TextField } from '@mu
 import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { getDashboardToken, setDashboardToken } from '../apiClient';
 
 export default function ProjectSelector() {
-  const { activeProject, setActiveProject, availableProjects, addProject } = useProjectContext();
+  const { activeProject, setActiveProject, availableProjects, addProject, projectError } = useProjectContext();
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [sessionToken, setSessionToken] = useState(getDashboardToken);
 
   const handleClick = (event: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -25,10 +28,17 @@ export default function ProjectSelector() {
     handleClose();
   };
 
-  const handleCreate = () => {
+  const handleCreate = async () => {
     if (newProjectName.trim()) {
-      addProject(newProjectName.trim().toLowerCase().replace(/[^a-z0-9-]/g, ''));
-      handleClose();
+      setIsSubmitting(true);
+      try {
+        await addProject(newProjectName.trim().toLowerCase().replace(/[^a-z0-9-]/g, ''));
+        handleClose();
+      } catch {
+        // The context exposes a sanitized projectError for display.
+      } finally {
+        setIsSubmitting(false);
+      }
     }
   };
 
@@ -73,6 +83,36 @@ export default function ProjectSelector() {
 
         <Divider sx={{ my: 1 }} />
 
+        <Box sx={{ px: 2, pb: 1 }}>
+          <Typography variant="overline" sx={{ color: '#80868b' }}>Strict IAM session</Typography>
+          <TextField
+            size="small"
+            fullWidth
+            type="password"
+            autoComplete="off"
+            placeholder="Paste local dashboard token"
+            value={sessionToken}
+            onChange={(event) => setSessionToken(event.target.value)}
+            sx={{ mb: 1 }}
+          />
+          <Button
+            size="small"
+            variant="outlined"
+            fullWidth
+            onClick={() => {
+              setDashboardToken(sessionToken);
+              window.location.reload();
+            }}
+          >
+            Save for this tab
+          </Button>
+          <Typography variant="caption" sx={{ color: '#80868b' }}>
+            Stored in session storage and sent only to same-origin dashboard APIs.
+          </Typography>
+        </Box>
+
+        <Divider sx={{ my: 1 }} />
+
         {isCreating ? (
           <Box sx={{ px: 2, pb: 1 }}>
             <TextField 
@@ -85,9 +125,12 @@ export default function ProjectSelector() {
               sx={{ mb: 1 }}
             />
             <Box sx={{ display: 'flex', gap: 1 }}>
-              <Button size="small" variant="contained" fullWidth onClick={handleCreate}>Create</Button>
-              <Button size="small" variant="outlined" fullWidth onClick={() => setIsCreating(false)}>Cancel</Button>
+              <Button size="small" variant="contained" fullWidth disabled={isSubmitting} onClick={() => void handleCreate()}>
+                {isSubmitting ? 'Creating…' : 'Create'}
+              </Button>
+              <Button size="small" variant="outlined" fullWidth disabled={isSubmitting} onClick={() => setIsCreating(false)}>Cancel</Button>
             </Box>
+            {projectError && <Typography role="alert" variant="caption" color="error">{projectError}</Typography>}
           </Box>
         ) : (
           <MenuItem sx={{ borderRadius: '4px', color: '#1a73e8' }} onClick={() => setIsCreating(true)}>
