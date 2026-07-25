@@ -130,6 +130,19 @@ This guarded gate uses temporary profile state and dynamic loopback ports. It
 does not require Docker, and it leaves MQL, range queries, and broader PromQL
 grammar explicitly unsupported.
 
+To verify the generated Vertex AI Go client against MiniSky's bounded
+deterministic endpoint prediction path, including an exact response comparison
+across a clean daemon restart, run:
+
+```bash
+make test-phase16-vertex
+```
+
+This guarded gate uses an isolated temporary profile and response evidence file,
+dynamic loopback ports, and no Docker. It proves restart determinism for fixed
+inputs and parameters; predictions themselves are stateless and are not
+persisted.
+
 For the Phase 17 CI, plugin, control, offline-bundle, and Compose checks, run:
 
 ```bash

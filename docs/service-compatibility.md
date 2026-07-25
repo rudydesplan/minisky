@@ -173,10 +173,17 @@ SDK coverage.
   bounded `severity`, `logName`, and `resource.type` filters, and supports safe
   relative file sinks plus Pub/Sub sinks with a delivery-loop marker.
   Alerting and log-based metrics are `501 UNIMPLEMENTED`.
-- Vertex AI defaults to deterministic profile-configurable mock
-  `generateContent` and `predict` behavior. Optional Ollama calls are restricted
-  to loopback HTTP endpoints; API keys remain process-memory only. Streaming,
-  batch prediction, and feature stores are `501 UNIMPLEMENTED`.
+- Vertex AI supports the generated Go client's canonical endpoint `predict`
+  call with at most 100 instances, optional parameters, and ignored billing
+  labels. Its ordered `{instance,score}` predictions and model metadata are a
+  MiniSky-specific deterministic local simulation, not model-semantic parity or
+  real inference. Fixed requests remain byte-identical across restart because
+  prediction is stateless; no endpoint deployment or prediction persistence is
+  implied. The profile-configurable mock/Ollama settings apply to
+  `generateContent`, not deterministic endpoint prediction. Optional Ollama
+  calls are restricted to loopback HTTP endpoints; API keys remain
+  process-memory only. Streaming, batch prediction, and feature stores are
+  `501 UNIMPLEMENTED`.
 - Cloud DNS retains its persisted managed-zone/RRSet control plane and can run
   an opt-in loopback-only UDP resolver through `MINISKY_DNS_ADDR`. Ports below
   1024 and non-loopback binds are rejected. The resolver currently serves

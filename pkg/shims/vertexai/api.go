@@ -22,7 +22,11 @@ import (
 	"minisky/pkg/state"
 )
 
-const vertexStateEntry = "vertexai/config"
+const (
+	vertexStateEntry    = "vertexai/config"
+	maxVertexJSONBody   = 1 << 20
+	maxPredictInstances = 100
+)
 
 func init() {
 	registry.Register("aiplatform.googleapis.com", func(ctx *registry.Context) http.Handler {
@@ -136,6 +140,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	scope, predictPath := predictScopeFromPath(path)
 	switch {
 	case path == "/v1/internal/config" && r.Method == http.MethodPost:
 		api.handleConfigUpdate(w, r)
@@ -147,8 +152,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "streamGenerateContent is not implemented")
 	case strings.Contains(path, ":generateContent") && r.Method == http.MethodPost:
 		api.handleGenerateContent(w, r)
-	case strings.Contains(path, ":predict") && r.Method == http.MethodPost:
-		api.handlePredict(w, r)
+	case predictPath && r.Method == http.MethodPost:
+		api.handlePredict(w, r, scope)
 	case strings.Contains(path, "/batchPredictionJobs") || strings.Contains(path, "/featurestores"):
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Vertex AI batch prediction and feature store APIs are not implemented")
 	default:
@@ -254,10 +259,16 @@ func (api *API) handleGenerateContent(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func (api *API) handlePredict(w http.ResponseWriter, r *http.Request) {
+type predictScope struct {
+	project  string
+	location string
+}
+
+func (api *API) handlePredict(w http.ResponseWriter, r *http.Request, scope predictScope) {
 	var request struct {
 		Instances  []json.RawMessage `json:"instances"`
 		Parameters json.RawMessage   `json:"parameters,omitempty"`
+		Labels     map[string]string `json:"labels,omitempty"`
 	}
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid predict JSON")
@@ -267,22 +278,104 @@ func (api *API) handlePredict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "instances must contain at least one value")
 		return
 	}
-	predictions := make([]map[string]any, len(request.Instances))
+	if len(request.Instances) > maxPredictInstances {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "instances may contain at most 100 values")
+		return
+	}
+	var canonicalParameters []byte
+	if len(request.Parameters) > 0 {
+		var parameters any
+		if err := json.Unmarshal(request.Parameters, &parameters); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "parameters must contain a valid JSON value")
+			return
+		}
+		encodedParameters, err := json.Marshal(parameters)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "parameters must contain a valid JSON value")
+			return
+		}
+		canonicalParameters = encodedParameters
+	}
+	type prediction struct {
+		Instance any     `json:"instance"`
+		Score    float64 `json:"score"`
+	}
+	predictions := make([]prediction, len(request.Instances))
 	for i, instance := range request.Instances {
-		sum := sha256.Sum256(append(append([]byte(nil), instance...), request.Parameters...))
-		score := float64(binary.BigEndian.Uint32(sum[:4])) / float64(^uint32(0))
 		var decoded any
 		if err := json.Unmarshal(instance, &decoded); err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "instances must contain valid JSON values")
 			return
 		}
-		predictions[i] = map[string]any{"instance": decoded, "score": score}
+		canonicalInstance, err := json.Marshal(decoded)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "instances must contain valid JSON values")
+			return
+		}
+		score := deterministicPredictionScore(canonicalInstance, canonicalParameters)
+		predictions[i] = prediction{Instance: decoded, Score: score}
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"predictions":     predictions,
-		"deployedModelId": "minisky-mock",
-		"model":           "publishers/minisky/models/deterministic-mock",
-	})
+	response := struct {
+		Predictions      []prediction `json:"predictions"`
+		DeployedModelID  string       `json:"deployedModelId"`
+		Model            string       `json:"model"`
+		ModelDisplayName string       `json:"modelDisplayName"`
+		ModelVersionID   string       `json:"modelVersionId"`
+		Metadata         struct {
+			Simulation string `json:"simulation"`
+		} `json:"metadata"`
+	}{
+		Predictions:      predictions,
+		DeployedModelID:  "minisky-deterministic",
+		Model:            "projects/" + scope.project + "/locations/" + scope.location + "/models/minisky-deterministic",
+		ModelDisplayName: "MiniSky deterministic predictor",
+		ModelVersionID:   "1",
+	}
+	response.Metadata.Simulation = "deterministic-local"
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func deterministicPredictionScore(canonicalInstance, canonicalParameters []byte) float64 {
+	hash := sha256.New()
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(canonicalInstance)))
+	_, _ = hash.Write(length[:])
+	_, _ = hash.Write(canonicalInstance)
+	binary.BigEndian.PutUint64(length[:], uint64(len(canonicalParameters)))
+	_, _ = hash.Write(length[:])
+	_, _ = hash.Write(canonicalParameters)
+	sum := hash.Sum(nil)
+	return float64(binary.BigEndian.Uint32(sum[:4])) / float64(^uint32(0))
+}
+
+func predictScopeFromPath(path string) (predictScope, bool) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) < 5 ||
+		parts[0] != "v1" ||
+		parts[1] != "projects" || !validPredictPathSegment(parts[2]) ||
+		parts[3] != "locations" || !validPredictPathSegment(parts[4]) {
+		return predictScope{}, false
+	}
+	scope := predictScope{project: parts[2], location: parts[4]}
+	switch {
+	case len(parts) == 7 && parts[5] == "endpoints" && validPredictTarget(parts[6]):
+		return scope, true
+	case len(parts) == 9 &&
+		parts[5] == "publishers" && validPredictPathSegment(parts[6]) &&
+		parts[7] == "models" && validPredictTarget(parts[8]):
+		return scope, true
+	default:
+		return predictScope{}, false
+	}
+}
+
+func validPredictPathSegment(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "/:")
+}
+
+func validPredictTarget(value string) bool {
+	target, ok := strings.CutSuffix(value, ":predict")
+	return ok && validPredictPathSegment(target)
 }
 
 func (api *API) generateWithOllama(r *http.Request, current vertexConfig, request VertexRequest) (string, error) {
@@ -398,9 +491,26 @@ func tokenCount(value string) int {
 }
 
 func decodeJSON(r *http.Request, target any) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxVertexJSONBody+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxVertexJSONBody {
+		return fmt.Errorf("JSON body exceeds %d bytes", maxVertexJSONBody)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {
