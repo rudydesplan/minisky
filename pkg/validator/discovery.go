@@ -20,6 +20,26 @@ package validator
 // embeddedRules is the full set of Discovery-Doc-derived validation rules.
 // One entry per service domain.
 var embeddedRules = []ServiceSchema{
+	{
+		Domain: "cloudresourcemanager.googleapis.com",
+		Methods: []MethodSchema{{
+			HTTPMethod:  "POST",
+			PathGlob:    "/v3/projects",
+			ContentType: "application/json",
+			RequiredBody: []BodyField{{
+				Path: "projectId", Type: "string",
+				Message: "field 'projectId' is required for projects.create",
+			}},
+		}, {
+			HTTPMethod:  "POST",
+			PathGlob:    "/v3/folders",
+			ContentType: "application/json",
+			RequiredBody: []BodyField{{
+				Path: "parent", Type: "string",
+				Message: "field 'parent' is required for folders.create",
+			}},
+		}},
+	},
 
 	// ── Compute Engine ──────────────────────────────────────────────────────
 	{
@@ -468,6 +488,89 @@ var embeddedRules = []ServiceSchema{
 					{Path: "format", Type: "string",
 						Message: "field 'format' is required for repositories.create"},
 				},
+			},
+		},
+	},
+	{
+		Domain: "redis.googleapis.com",
+		Methods: []MethodSchema{{
+			HTTPMethod:    "POST",
+			PathGlob:      "/v1/projects/*/locations/*/instances",
+			ContentType:   "application/json",
+			RequiredQuery: []string{"instanceId"},
+			RequiredBody: []BodyField{{
+				Path: "memorySizeGb", Type: "integer",
+				Message: "field 'memorySizeGb' is required for instances.create",
+			}},
+		}},
+	},
+	{
+		Domain: "monitoring.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v3/projects/*/metricDescriptors",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "type", Type: "string", Message: "field 'type' is required for metricDescriptors.create"},
+					{Path: "metricKind", Type: "string", Message: "field 'metricKind' is required for metricDescriptors.create"},
+					{Path: "valueType", Type: "string", Message: "field 'valueType' is required for metricDescriptors.create"},
+				},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v3/projects/*/timeSeries",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "timeSeries", Type: "array",
+					Message: "field 'timeSeries' is required for timeSeries.create",
+				}},
+			},
+		},
+	},
+	{
+		Domain: "logging.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v2/entries:write",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "entries", Type: "array",
+					Message: "field 'entries' is required for entries.write",
+				}},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v2/projects/*/sinks",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "name", Type: "string", Message: "field 'name' is required for sinks.create"},
+					{Path: "destination", Type: "string", Message: "field 'destination' is required for sinks.create"},
+				},
+			},
+		},
+	},
+	{
+		Domain: "aiplatform.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/publishers/*/models/*:generateContent",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "contents", Type: "array",
+					Message: "field 'contents' is required for models.generateContent",
+				}},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/endpoints/*:predict",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "instances", Type: "array",
+					Message: "field 'instances' is required for endpoints.predict",
+				}},
 			},
 		},
 	},

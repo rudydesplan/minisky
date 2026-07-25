@@ -32,8 +32,24 @@ MiniSky requires the following tools installed and running on your local machine
 
 **Linux & macOS:**
 ```bash
-curl -sSL https://minisky.bmics.com.ng/install.sh | sh
+VERSION=v1.3.0
+OS=linux       # use darwin on macOS
+ARCH=amd64     # use arm64 where applicable
+ARCHIVE="minisky_${OS}_${ARCH}.tar.gz"
+BASE="https://github.com/qamarudeenm/minisky/releases/download/${VERSION}"
+curl --fail --location --output "$ARCHIVE" "$BASE/$ARCHIVE"
+curl --fail --location --output checksums.txt "$BASE/checksums.txt"
+
+# Linux:
+grep "  ${ARCHIVE}$" checksums.txt | sha256sum --check
+# macOS:
+# grep "  ${ARCHIVE}$" checksums.txt | shasum -a 256 --check
+
+tar -xzf "$ARCHIVE"
+install -m 0755 minisky "$HOME/.local/bin/minisky"
 ```
+
+This downloads data only; it never pipes unverified code to a shell.
 
 **Windows — Direct Download (Recommended):**
 
@@ -50,17 +66,9 @@ C:\minisky\minisky.exe start
 
 > MiniSky stores all data in `%USERPROFILE%\.minisky\` — never in your working directory.
 
-**Windows — Scoop (Alternative):**
-
-```powershell
-# Install Scoop if not already installed
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
-
-# Install MiniSky
-scoop bucket add minisky https://github.com/qamarudeenm/scoop-bucket
-scoop install minisky
-```
+**Windows — Scoop:** MiniSky does not currently publish or maintain a Scoop
+bucket. Use the checksummed direct-download flow above until an official bucket
+is announced in the distribution guide.
 
 ### Start the Daemon
 ```bash
@@ -79,20 +87,12 @@ This removes all containers, networks, and data from `~/.minisky`. Then delete t
 To upgrade an existing installation to the latest version, you just need to replace the binary. Your data in `~/.minisky` is persistent and will be preserved automatically.
 
 **Linux & macOS:**
-Simply run the install script again:
-```bash
-curl -sSL https://minisky.bmics.com.ng/install.sh | sh
-```
+Download the new archive and `checksums.txt`, verify the selected archive as
+shown above, stop MiniSky, and replace the binary.
 
 **Windows (Direct):**
 1. Stop the running daemon (`minisky stop` or close the terminal).
 2. Download the new `.zip` and overwrite your existing `minisky.exe`.
-
-**Windows (Scoop):**
-```powershell
-scoop update minisky
-```
-
 
 ## 🖥️ Platform Compatibility
 
@@ -143,7 +143,7 @@ docker run --rm \
   -e MINISKY_BQ_BACKEND=duckdb \
   -p 8080:8080 -p 8081:8081 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  minisky:latest
+  'ghcr.io/qamarudeenm/minisky@sha256:<verified-release-digest>'
 ```
 
 ---
@@ -192,37 +192,41 @@ and is not safe to invoke from standalone diagnostics.
 
 | Phase | Feature set | Verification | Status |
 | :--- | :--- | :--- | :---: |
-| 6 | Service fidelity baseline and compatibility matrices | Every registered domain has a documented fidelity tier, persistence model, and at least one contract test | 🔜 Planned |
-| 7 | Terraform and SDK compatibility | CI applies and destroys a multi-service Terraform stack through localhost endpoints with no unsupported routing or plan drift | 🔜 Planned |
-| 8 | Durable state, profiles, and snapshots | Supported resources survive restart; export/import round-trips into an isolated named profile | 🔜 Planned |
-| 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🔜 Planned |
-| 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | 🔜 Planned |
-| 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🔜 Planned |
-| 12 | Observability and request diagnostics | Structured logs, distributed traces, and metrics are queryable; request replay reproduces any prior API call | 🔜 Planned |
-| 13 | Security, authentication, and credential simulation | TLS/mTLS terminates locally; service account impersonation and credential rotation behave like production IAM | 🔜 Planned |
-| 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🔜 Planned |
-| 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🔜 Planned |
-| 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🔜 Planned |
-| 17 | CI/CD integration, plugin ecosystem, and enterprise | GitHub Actions and GitLab CI templates work out of the box; third-party shims install via a plugin SDK; enterprise audit and RBAC are enforceable | 🔜 Planned |
+| 6 | Service fidelity baseline and compatibility matrices | Every registered domain has manifest/docs coherence and an executable in-process or backend-gated contract | ✅ Baseline |
+| 7 | Terraform and SDK compatibility | The opt-in fixture covers BigQuery, IAM, Storage, cross-project Pub/Sub, Memorystore, and Spanner through canonical endpoints | ✅ Baseline |
+| 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
+| 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🚧 Local slice |
+| 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | 🚧 Local slice |
+| 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
+| 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
+| 13 | Security, authentication, and credential simulation | TLS protects both loopback listeners; optional client-certificate mTLS applies only to the gateway; local credentials remain non-production simulations | 🚧 Local simulation |
+| 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🚧 Metadata slice |
+| 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
+| 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🚧 Bounded slices |
+| 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | 🚧 Bounded local slice |
 
 ### Phase 6 — Fidelity baseline
 
-- Add `docs/service-compatibility.md` with a tier for every registered API:
-  **executable**, **emulator-backed**, **metadata-only**, or **experimental**.
+- Maintain `docs/service-compatibility.md` with the manifest vocabulary:
+  **high**, **standard**, or **passthrough** fidelity and **memory**, **file**,
+  **docker**, **hybrid**, or **static** persistence.
 - Add `docs/state-model.md` describing file, Docker volume, and in-memory state
   per service.
 - Standardize GCP error envelopes and request validation for Storage, Pub/Sub,
   Secret Manager, Cloud KMS, Scheduler, Cloud Tasks, Cloud Build, and Artifact
   Registry.
-- Add one create/get/delete contract test per registered domain. Stubbed
-  operations must return an explicit unsupported error instead of fake success.
+- Keep focused lifecycle/unsupported tests for in-process shims. Pure lazy
+  Docker passthroughs instead have deterministic cold-start/error contracts and
+  explicit backend-gated rationale; they do not claim Docker-free CRUD tests.
 
 ### Phase 7 — Terraform and SDK compatibility
 
 - Replace fixed localhost path mappings with a service-aware endpoint registry
   that covers every documented custom endpoint without ambiguous `/v1` routes.
-- Expand the Terraform example to Storage, Pub/Sub, BigQuery, Cloud SQL,
-  Compute, IAM, and a serverless service.
+- Expand the Terraform example only where the provider-visible lifecycle is
+  proven. The current fixture includes BigQuery, IAM, Storage, cross-project
+  Pub/Sub, Memorystore, and Spanner; Cloud SQL, Compute, and serverless remain
+  outside this fixture.
 - Run `terraform apply`, resource assertions, a no-drift plan, and
   `terraform destroy` in CI.
 - Publish `docs/terraform-compatibility.md` with provider resources, endpoint
@@ -234,13 +238,19 @@ and is not safe to invoke from standalone diagnostics.
 - Introduce a versioned state store with per-shim persistence adapters.
 - Rehydrate Compute, IAM, DNS, BigQuery metadata, Scheduler, Secret Manager,
   Cloud KMS, GKE metadata, and serverless resources on startup.
-- Reconcile persisted metadata with surviving Docker containers and volumes
-  after an unclean shutdown.
+- Keep restored Docker-backed resources metadata-only unless profile ownership
+  labels prove a resource is safe to reconcile or remove.
 - Add `minisky state export`, `minisky state import`, and named profiles under
-  `~/.minisky/profiles/`.
-- Verify create → restart → no-drift plan → export → clean import in CI.
+  `~/.minisky/state/profiles/`.
+- Verify create → restart → no-drift plan → metadata export → clean import →
+  destroy through the opt-in durability CI gate.
 
 ### Phase 9 — Serverless and event-driven workflows
+
+**Status (2026-07-25): local delivery slice implemented.** Cloud Tasks state,
+Scheduler gateway wiring, strict Buildpacks failure handling, and the guarded
+event-delivery harness have focused tests. The Docker/Pack end-to-end gate was
+not run while an existing MiniSky network was active.
 
 - [x] Add explicit `full` and backward-compatible `simulation` runtime profiles,
   dependency-aware real backends, and consistent doctor/dashboard state.
@@ -254,6 +264,11 @@ and is not safe to invoke from standalone diagnostics.
 
 ### Phase 10 — Networking and artifact workflows
 
+**Status (2026-07-25): local networking/artifact slice implemented.** Compute
+load-balancer metadata/proxying, narrow strict-IAM enforcement, and the owned
+Registry v2 index have focused tests. Terraform load-balancer and real
+push/list/delete integration remain guarded Docker acceptance work.
+
 - Persist backend services, health checks, URL maps, target proxies, and
   forwarding rules in the Compute shim.
 - Route local traffic through configured load-balancer resources to healthy
@@ -265,6 +280,11 @@ and is not safe to invoke from standalone diagnostics.
 - Verify Terraform-managed load balancing and push/list/delete artifact flows.
 
 ### Phase 11 — Developer experience and distribution
+
+**Status (2026-07-25): local tooling slice implemented.** Doctor, safe fixes,
+gateway-first delivery/artifact commands, Make targets, and release smoke
+validation are present. Homebrew, Scoop, deb, and rpm are not described as
+published until native install and credentialed publication gates exist.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.
@@ -283,15 +303,22 @@ and is not safe to invoke from standalone diagnostics.
   and Docker-backed services.
 - Expose a Prometheus-compatible `/metrics` endpoint for request rates, error
   rates, and resource counts.
-- Add a request replay system that captures and re-executes any prior API call
-  from the dashboard or CLI.
-- Surface trace and log data in the embedded dashboard with filtering and
-  search.
+- Provide opt-in replay for eligible same-gateway calls, with bounded JSON body
+  capture, sensitive-field rejection, and recursion prevention.
+- Surface gateway request and trace correlation data in a dedicated Dashboard
+  view and headless diagnostics CLI, separate from Cloud Logging.
 
 ### Phase 13 — Security, authentication, and credential simulation
 
-- Terminate TLS locally with auto-generated or user-provided certificates;
-  support mTLS between services.
+**Status (2026-07-25): local simulation slice implemented.** Go race tests
+cover TLS key permissions, mTLS gateway handshakes, token
+expiry/audience/scope, key disable/delete persistence, impersonation allow/deny,
+and redacted `401`/`403` responses. Provider-backed WIF and delegated
+impersonation remain explicit `501 UNIMPLEMENTED` boundaries.
+
+- Terminate TLS locally with auto-generated or user-provided certificates.
+  Optional client-certificate mTLS is enforced only by the public gateway;
+  MiniSky does not provide service-to-service mTLS.
 - Emulate service account impersonation, short-lived tokens, and workload
   identity federation flows.
 - Simulate credential rotation (key creation, expiry, and revocation) for
@@ -301,6 +328,14 @@ and is not safe to invoke from standalone diagnostics.
 - Document security simulation boundaries and differences from production GCP.
 
 ### Phase 14 — Multi-tenancy and organization emulation
+
+**Status (2026-07-25): metadata tenancy slice implemented.** Go race tests
+cover project CRUD, persistence/export/import, unknown-project enforcement,
+inherited IAM, same-name BigQuery isolation, and cross-project Pub/Sub
+permission denial. The two-project Terraform/Pub/Sub fixture validates
+statically; Docker-backed apply/no-drift/destroy remains an integration gate and
+does not establish isolation for shared passthrough backends. Shared VPC packet
+routing remains out of scope.
 
 - Support multiple GCP projects running concurrently with isolated resource
   namespaces.
@@ -315,6 +350,12 @@ and is not safe to invoke from standalone diagnostics.
 
 ### Phase 15 — Extended data services and caching
 
+**Status (2026-07-25): bounded emulator slices implemented.** Memorystore
+metadata and owned Redis lifecycle, profile-scoped Spanner/Firestore/Datastore
+backends, and SDK/Terraform fixtures have local contract and static validation.
+The guarded Docker data-plane suite was not run while an existing MiniSky
+network was active. Firestore listeners/rules remain unsupported.
+
 - Add a Spanner emulator with DDL support, read/write transactions, and
   query execution.
 - Promote Firestore beyond metadata-only to support document CRUD, queries,
@@ -327,6 +368,12 @@ and is not safe to invoke from standalone diagnostics.
   resource lifecycle.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
+
+**Status (2026-07-25): bounded service slices implemented.** Vertex mock
+prediction, Monitoring descriptors/time series, profile-scoped Logging and
+sinks, DNS resolution, and subnetwork/IPAM contracts have focused tests. MQL,
+log-based alerting, feature-store/batch prediction, and peering/NAT/PSC remain
+explicit `501 UNIMPLEMENTED` boundaries.
 
 - Emulate Vertex AI model deployment, online prediction endpoints, and batch
   prediction jobs with configurable mock responses.
@@ -343,23 +390,19 @@ and is not safe to invoke from standalone diagnostics.
 
 ### Phase 17 — CI/CD integration, plugin ecosystem, and enterprise
 
-- Publish a GitHub Actions action (`uses: minisky/setup-minisky@v1`) that
-  installs and starts MiniSky with configurable services.
-- Provide a GitLab CI template and pre-built Docker Compose stacks for
-  common multi-service topologies.
-- Release a third-party shim SDK with versioned plugin API, lifecycle hooks,
-  and a contribution scaffold generator.
-- Host a plugin marketplace (registry) for community-contributed service
-  shims with discoverability and version pinning.
-- Add a benchmarking suite for throughput, latency, and resource consumption
-  under concurrent load.
-- Emulate resource quotas and rate limits matching GCP defaults with
-  configurable overrides.
-- Provide interactive tutorials, video walkthroughs, and architecture
-  decision records in the documentation site.
-- Add enterprise features: audit logging for all mutations, compliance mode
-  with immutable logs, air-gapped installation support, and role-based
-  access control (RBAC) for team environments.
+**Status (2026-07-25): bounded local slice implemented.** The repository-local
+GitHub Action is tested with a built artifact; GitLab and Compose templates,
+source-compiled SDK v0 scaffolds, correctness-checked benchmarks, opt-in quotas,
+profile audit records with verifiable hash-chain consistency (not externally
+anchored tamper evidence), local RBAC, and checksummed offline bundles have
+executable checks. See
+[Phase 17 local operations](docs/phase17-local-operations.md).
+
+The SDK is intentionally not third-party installable: there is no runtime
+loader, protocol negotiation, process isolation, artifact signature
+verification, or failure supervisor. A remote marketplace, published
+`minisky/setup-minisky@v1` action, immutable/WORM compliance storage, external
+identity/SSO/SCIM, distributed quotas, and video assets remain deferred.
 
 ---
 
@@ -371,6 +414,8 @@ and is not safe to invoke from standalone diagnostics.
 - [State Model](docs/state-model.md)
 - [Terraform Compatibility](docs/terraform-compatibility.md)
 - [Distribution](docs/distribution.md)
+- [Phase 17 Local Operations](docs/phase17-local-operations.md)
+- [Architecture Decisions](docs/adr/README.md)
 - [Changelog](CHANGELOG.md)
 - [Contributor Guide](CONTRIBUTING.md)
 

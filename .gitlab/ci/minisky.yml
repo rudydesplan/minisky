@@ -1,0 +1,42 @@
+.minisky:
+  image: "$MINISKY_GO_IMAGE"
+  services:
+    - name: "$MINISKY_DIND_IMAGE"
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    MINISKY_PORT: "18080"
+    MINISKY_UI_PORT: "18081"
+    MINISKY_PROFILE: gitlab-ci
+    MINISKY_SERVICES: compute
+    MINISKY_STATE_DIR: "$CI_PROJECT_DIR/.minisky-ci/state"
+    MINISKY_ENDPOINT: http://127.0.0.1:18080
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends ca-certificates curl nodejs npm
+    - cd ui && npm ci && npm run build && cd ..
+    - mkdir -p "$CI_PROJECT_DIR/.minisky-ci/bin"
+    - go build -trimpath -o "$CI_PROJECT_DIR/.minisky-ci/bin/minisky" ./cmd/minisky
+    - '"$CI_PROJECT_DIR/.minisky-ci/bin/minisky" start --port "$MINISKY_PORT" --ui-port "$MINISKY_UI_PORT" --services "$MINISKY_SERVICES" >"$CI_PROJECT_DIR/.minisky-ci/minisky.log" 2>&1 &'
+    - 'echo "$!" >"$CI_PROJECT_DIR/.minisky-ci/minisky.pid"'
+    - |
+      ready=0
+      for attempt in $(seq 1 120); do
+        if curl --fail --silent --show-error "$MINISKY_ENDPOINT/healthz" >/dev/null; then
+          ready=1
+          break
+        fi
+        sleep 0.5
+      done
+      if [ "$ready" -ne 1 ]; then
+        cat "$CI_PROJECT_DIR/.minisky-ci/minisky.log"
+        exit 1
+      fi
+  after_script:
+    - 'if [ -f "$CI_PROJECT_DIR/.minisky-ci/minisky.pid" ]; then kill "$(cat "$CI_PROJECT_DIR/.minisky-ci/minisky.pid")" 2>/dev/null || true; fi'
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - .minisky-ci/minisky.log

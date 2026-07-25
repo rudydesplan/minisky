@@ -438,46 +438,75 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 
-	op := api.opMgr.Register("cloudfunctions#operation", "CREATE", fullName, "", location)
+	op, err := api.opMgr.RegisterDurable("cloudfunctions#operation", "CREATE", fullName, "", location)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		// 1. Build Image
-		image := "gcr.io/google.com/cloudsdktool/cloud-sdk:latest" // fallback
+		if !api.backend.Enabled() {
+			if api.backend.Requested() {
+				err := fmt.Errorf("Buildpacks execution was requested but is unavailable: %s", api.backend.Status().Diagnostic)
+				api.mu.Lock()
+				fn.State = "FAILED"
+				fn.StateMessages = []StateMessage{{Severity: "ERROR", Type: "BUILD", Message: err.Error()}}
+				api.mu.Unlock()
+				_ = api.persistMetadata()
+				return err
+			}
+			api.mu.Lock()
+			fn.State = "ACTIVE"
+			fn.Url = ""
+			fn.ServiceConfig.Uri = ""
+			fn.StateMessages = []StateMessage{{
+				Severity: "WARNING",
+				Type:     "SIMULATION",
+				Message:  "Simulation mode stores function metadata; user code was not built or started.",
+			}}
+			api.mu.Unlock()
+			return api.persistMetadata()
+		}
+
+		// 1. Build the requested user source. Executable mode never substitutes
+		// an unrelated utility image when source is absent.
+		image := ""
 		var err error
 
-		if api.backend.Enabled() {
-			sourcePath := ""
-			if fn.BuildConfig != nil && fn.BuildConfig.Source != nil && fn.BuildConfig.Source.StorageSource != nil {
-				src := fn.BuildConfig.Source.StorageSource
-				sourcePath, err = api.backend.DownloadSourceFromGCS(src.Bucket, src.Object)
-				if err != nil {
-					log.Printf("[Serverless] GCS Download failed: %v", err)
-					api.mu.Lock()
-					fn.State = "FAILED"
-					api.mu.Unlock()
-					if persistErr := api.persistMetadata(); persistErr != nil {
-						log.Printf("[Serverless] persist failed function: %v", persistErr)
-					}
-					return err
+		sourcePath := ""
+		if fn.BuildConfig != nil && fn.BuildConfig.Source != nil && fn.BuildConfig.Source.StorageSource != nil {
+			src := fn.BuildConfig.Source.StorageSource
+			sourcePath, err = api.backend.DownloadSourceFromGCS(src.Bucket, src.Object)
+			if err != nil {
+				log.Printf("[Serverless] GCS Download failed: %v", err)
+				api.mu.Lock()
+				fn.State = "FAILED"
+				api.mu.Unlock()
+				if persistErr := api.persistMetadata(); persistErr != nil {
+					log.Printf("[Serverless] persist failed function: %v", persistErr)
 				}
+				return err
 			}
+		}
 
-			if sourcePath != "" {
-				entryPoint := "handler"
-				if fn.BuildConfig != nil && fn.BuildConfig.EntryPoint != "" {
-					entryPoint = fn.BuildConfig.EntryPoint
-				}
-				image, err = api.backend.BuildFunction(functionId, sourcePath, entryPoint)
-				if err != nil {
-					log.Printf("[Serverless] Build failed: %v", err)
-					api.mu.Lock()
-					fn.State = "FAILED"
-					api.mu.Unlock()
-					if persistErr := api.persistMetadata(); persistErr != nil {
-						log.Printf("[Serverless] persist failed function: %v", persistErr)
-					}
-					return err
-				}
+		if sourcePath == "" {
+			err = fmt.Errorf("Buildpacks execution requires buildConfig.source.storageSource")
+		} else {
+			entryPoint := "handler"
+			if fn.BuildConfig != nil && fn.BuildConfig.EntryPoint != "" {
+				entryPoint = fn.BuildConfig.EntryPoint
 			}
+			image, err = api.backend.BuildFunction(functionId, sourcePath, entryPoint)
+		}
+		if err != nil {
+			log.Printf("[Serverless] Build failed: %v", err)
+			api.mu.Lock()
+			fn.State = "FAILED"
+			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				log.Printf("[Serverless] persist failed function: %v", persistErr)
+			}
+			return err
 		}
 
 		// 2. Provision Container
@@ -564,7 +593,12 @@ func (api *API) deleteFunction(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", project, location, name)
-	op := api.opMgr.Register("cloudfunctions#operation", "DELETE", fullName, "", location)
+	op, err := api.opMgr.RegisterDurable("cloudfunctions#operation", "DELETE", fullName, "", location)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.svcMgr.DeleteComputeVM("minisky-serverless-" + sanitizeImageName(name))
 		return nil
@@ -647,12 +681,49 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 		return
 	}
 
-	op := api.opMgr.Register("run#operation", "CREATE", fullName, "", location)
+	op, err := api.opMgr.RegisterDurable("run#operation", "CREATE", fullName, "", location)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		// 1. Build Image
-		image := "gcr.io/google.com/cloudsdktool/cloud-sdk:latest" // fallback
+		if !api.backend.Enabled() {
+			if api.backend.Requested() {
+				err := fmt.Errorf("serverless execution was requested but Buildpacks is unavailable: %s", api.backend.Status().Diagnostic)
+				api.mu.Lock()
+				svc.Reconciling = false
+				svc.Conditions = []Condition{{Type: "Ready", State: "CONDITION_FAILED", Message: err.Error(), LastTransitionTime: time.Now().UTC().Format(time.RFC3339)}}
+				api.mu.Unlock()
+				_ = api.persistMetadata()
+				return err
+			}
+			api.mu.Lock()
+			svc.Reconciling = false
+			svc.Uri = ""
+			svc.Conditions = []Condition{{
+				Type: "Ready", State: "CONDITION_SUCCEEDED",
+				Message:            "Simulation mode stores service metadata; user code was not started.",
+				LastTransitionTime: time.Now().UTC().Format(time.RFC3339),
+			}}
+			api.mu.Unlock()
+			return api.persistMetadata()
+		}
+
+		// 1. Use the caller's container image. Executable mode has no utility
+		// image fallback because that would report success without running code.
+		image := ""
 		if body.Template != nil && len(body.Template.Containers) > 0 {
 			image = body.Template.Containers[0].Image
+		}
+		if image == "" {
+			err := fmt.Errorf("Cloud Run execution requires template.containers[0].image")
+			api.mu.Lock()
+			svc.Reconciling = false
+			svc.Conditions = []Condition{{Type: "Ready", State: "CONDITION_FAILED", Message: err.Error(), LastTransitionTime: time.Now().UTC().Format(time.RFC3339)}}
+			api.mu.Unlock()
+			_ = api.persistMetadata()
+			return err
 		}
 
 		// 2. Provision Container
@@ -751,7 +822,12 @@ func (api *API) deleteService(w http.ResponseWriter, r *http.Request, project, l
 		return
 	}
 	fullName := fmt.Sprintf("projects/%s/locations/%s/services/%s", project, location, name)
-	op := api.opMgr.Register("run#operation", "DELETE", fullName, "", location)
+	op, err := api.opMgr.RegisterDurable("run#operation", "DELETE", fullName, "", location)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.svcMgr.DeleteComputeVM("minisky-serverless-" + sanitizeImageName(name))
 		return nil
@@ -793,7 +869,12 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "service" {
 		opType = "run#operation"
 	}
-	op := api.opMgr.Register(opType, "CREATE", fullName, "", req.Location)
+	op, err := api.opMgr.RegisterDurable(opType, "CREATE", fullName, "", req.Location)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	// Register initial state
 	api.mu.Lock()

@@ -245,3 +245,17 @@ func assertAttempt(t *testing.T, job *Job, attemptTime time.Time, status int, la
 		t.Fatalf("unexpected job status: %+v", job.Status)
 	}
 }
+
+func TestSetGatewayBaseURLUsesDaemonAddress(t *testing.T) {
+	api := NewAPIWithConfig(nil, Config{GatewayBaseURL: "http://127.0.0.1:8080"})
+	defer api.Close()
+
+	api.SetGatewayBaseURL("http://127.0.0.1:39123/")
+
+	api.mu.RLock()
+	got := api.gatewayBaseURL
+	api.mu.RUnlock()
+	if got != "http://127.0.0.1:39123" {
+		t.Fatalf("gateway base URL = %q, want daemon address", got)
+	}
+}

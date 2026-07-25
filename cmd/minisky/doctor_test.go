@@ -296,6 +296,37 @@ func TestRunDoctorReportsOptionalFixFailure(t *testing.T) {
 	}
 }
 
+func TestRunDoctorChecksDiskAndPullsOnlyDeclaredImages(t *testing.T) {
+	dependencies := passingDoctorDependencies()
+	var checkedDisk int
+	dependencies.checkDiskSpace = func() error {
+		checkedDisk++
+		return nil
+	}
+	dependencies.requiredImages = []string{"registry:2"}
+	dependencies.checkImage = func(string) error { return errors.New("missing") }
+	var pulled []string
+	dependencies.pullImage = func(_ context.Context, image string) error {
+		pulled = append(pulled, image)
+		return nil
+	}
+	dependencies.checkImage = func(image string) error {
+		for _, value := range pulled {
+			if value == image {
+				return nil
+			}
+		}
+		return errors.New("missing")
+	}
+
+	if err := runDoctor(context.Background(), &bytes.Buffer{}, dependencies, true); err != nil {
+		t.Fatal(err)
+	}
+	if checkedDisk != 1 || strings.Join(pulled, ",") != "registry:2" {
+		t.Fatalf("disk checks = %d, pulled = %v", checkedDisk, pulled)
+	}
+}
+
 func passingDoctorDependencies() doctorDependencies {
 	return doctorDependencies{
 		checkDocker:        func() error { return nil },

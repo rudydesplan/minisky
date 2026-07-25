@@ -3,7 +3,9 @@ import { Drawer, Box, Typography, IconButton } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { getDashboardToken } from '../apiClient';
 import '@xterm/xterm/css/xterm.css';
+import { useProjectContext } from '../contexts/ProjectContext';
 
 type TerminalDrawerProps = {
   open: boolean;
@@ -12,6 +14,7 @@ type TerminalDrawerProps = {
 };
 
 export default function TerminalDrawer({ open, onClose, containerName }: TerminalDrawerProps) {
+  const { activeProject } = useProjectContext();
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -50,7 +53,10 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
       // Connect WebSocket
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/api/manage/compute/terminal?container=${containerName}`;
-      socket = new WebSocket(wsUrl);
+      const token = getDashboardToken();
+      socket = token
+        ? new WebSocket(wsUrl, ['minisky-auth', token, `minisky-project.${activeProject}`])
+        : new WebSocket(wsUrl);
       socketRef.current = socket;
 
       socket.onopen = () => {
@@ -92,14 +98,14 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
       term?.dispose();
       xtermRef.current = null;
     };
-  }, [open, containerName]);
+  }, [open, containerName, activeProject]);
 
   return (
     <Drawer anchor="bottom" open={open} onClose={onClose}>
       <Box sx={{ height: '60vh', bgcolor: '#1e1e1e', color: '#fff', display: 'flex', flexDirection: 'column' }}>
         <Box sx={{ p: 1, px: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #333' }}>
           <Typography variant="subtitle2" sx={{ fontFamily: 'monospace', opacity: 0.8 }}>
-            SSH: {containerName} (root@minisky-vm)
+            Terminal: {containerName} (container default user)
           </Typography>
           <IconButton onClick={onClose} size="small" sx={{ color: '#999' }}>
             <CloseIcon fontSize="small" />

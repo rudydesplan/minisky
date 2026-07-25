@@ -156,7 +156,11 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 	build.Status = "QUEUED"
 	build.CreateTime = time.Now().UTC().Format(time.RFC3339)
 
-	op := api.opMgr.Register("cloudbuild#operation", "CREATE", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "CREATE", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	if err != nil {
+		http.Error(w, "failed to persist build operation", http.StatusInternalServerError)
+		return
+	}
 	api.opMgr.UpdateMetadata(op.Name, build)
 	api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Build %s queued with %d steps", build.Id, len(build.Steps)))
 
@@ -296,7 +300,11 @@ func (api *API) handleRunTrigger(w http.ResponseWriter, r *http.Request, project
 		},
 	}
 
-	op := api.opMgr.Register("cloudbuild#operation", "RUN_TRIGGER", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "RUN_TRIGGER", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	if err != nil {
+		http.Error(w, "failed to persist build operation", http.StatusInternalServerError)
+		return
+	}
 	api.opMgr.UpdateMetadata(op.Name, build)
 	go api.executeBuild(project, build, op.Name)
 

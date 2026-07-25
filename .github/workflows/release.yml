@@ -284,11 +284,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
 
       - name: Run container conformance check
-        run: >-
-          docker run --rm
-          --entrypoint /app/minisky
-          "${{ matrix.image_tag }}"
-          doctor bigquery
+        run: |
+          docker run --rm --entrypoint /app/minisky "${{ matrix.image_tag }}" version
+          docker run --rm --entrypoint /app/minisky "${{ matrix.image_tag }}" doctor bigquery
 
   container-publish:
     name: Publish multi-architecture container

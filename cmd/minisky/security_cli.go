@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
+	"net/http"
 
 	"github.com/spf13/cobra"
 )
@@ -100,6 +102,36 @@ func init() {
 			for _, q := range data.Queues {
 				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", q.Name, q.State)
 			}
+		},
+	})
+	tasksCmd.AddCommand(&cobra.Command{
+		Use:  "queue-create QUEUE_ID",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			endpoint, err := miniskyAPIURL("cloudtasks", fmt.Sprintf("/v2/projects/%s/locations/%s/queues", tasksProject, tasksLocation))
+			if err != nil {
+				return err
+			}
+			name := fmt.Sprintf("projects/%s/locations/%s/queues/%s", tasksProject, tasksLocation, args[0])
+			return postJSON(endpoint, map[string]any{"name": name}, nil)
+		},
+	})
+	tasksCmd.AddCommand(&cobra.Command{
+		Use:  "enqueue QUEUE_ID URL [BODY]",
+		Args: cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			endpoint, err := miniskyAPIURL("cloudtasks", fmt.Sprintf(
+				"/v2/projects/%s/locations/%s/queues/%s/tasks", tasksProject, tasksLocation, args[0]))
+			if err != nil {
+				return err
+			}
+			body := ""
+			if len(args) == 3 {
+				body = base64.StdEncoding.EncodeToString([]byte(args[2]))
+			}
+			return postJSON(endpoint, map[string]any{"task": map[string]any{"httpRequest": map[string]any{
+				"url": args[1], "httpMethod": http.MethodPost, "body": body,
+			}}}, nil)
 		},
 	})
 

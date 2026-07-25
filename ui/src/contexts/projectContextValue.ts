@@ -4,7 +4,8 @@ export type ProjectContextType = {
   activeProject: string;
   setActiveProject: (name: string) => void;
   availableProjects: string[];
-  addProject: (name: string) => void;
+  addProject: (name: string) => Promise<void>;
+  projectError: string | null;
 };
 
 export const ProjectContext = createContext<ProjectContextType | undefined>(undefined);

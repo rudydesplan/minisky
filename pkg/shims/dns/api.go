@@ -92,10 +92,12 @@ type zoneStore struct {
 
 // API is the high-fidelity Cloud DNS v1 shim.
 type API struct {
-	mu      sync.RWMutex
-	store   stateStore
-	zones   map[string]*zoneStore // key: project:zoneName
-	zoneSeq uint64
+	mu         sync.RWMutex
+	mutationMu sync.Mutex
+	store      stateStore
+	zones      map[string]*zoneStore // key: project:zoneName
+	zoneSeq    uint64
+	initErr    error
 }
 
 type stateStore interface {
@@ -121,13 +123,18 @@ func NewAPI() *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
 		log.Printf("[Shim: Cloud DNS] state disabled: %v", err)
-		return newAPI(nil)
+		api := newAPI(nil)
+		startConfiguredResolver(api)
+		return api
 	}
 	api, err := NewAPIWithStore(store)
 	if err != nil {
 		log.Printf("[Shim: Cloud DNS] state rehydration failed: %v", err)
-		return newAPI(store)
+		api = newAPI(nil)
+		api.initErr = err
+		return api
 	}
+	startConfiguredResolver(api)
 	return api
 }
 
@@ -178,13 +185,30 @@ func (api *API) persistMetadata() error {
 	return api.store.Save(dnsStateEntry, metadata)
 }
 
-func (api *API) persistOrError(w http.ResponseWriter) bool {
+func (api *API) beginMutation() dnsMetadata {
+	api.mutationMu.Lock()
+	api.mu.RLock()
+	before := snapshotDNSMetadata(api.zones, api.zoneSeq)
+	api.mu.RUnlock()
+	return before
+}
+
+func (api *API) abortMutation() {
+	api.mutationMu.Unlock()
+}
+
+func (api *API) persistOrRollback(w http.ResponseWriter, before dnsMetadata) bool {
 	if err := api.persistMetadata(); err != nil {
 		log.Printf("[Shim: Cloud DNS] persist metadata: %v", err)
+		api.mu.Lock()
+		api.restoreMetadataLocked(before)
+		api.mu.Unlock()
+		api.mutationMu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist DNS metadata")
 		return false
 	}
+	api.mutationMu.Unlock()
 	return true
 }
 
@@ -204,6 +228,12 @@ func (api *API) persistOrError(w http.ResponseWriter) bool {
 //	GET    /dns/v1/projects/{project}/managedZones/{zone}/changes
 //	GET    /dns/v1/projects/{project}/managedZones/{zone}/changes/{changeId}
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if api.initErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION", "Cloud DNS state is unavailable")
+		return
+	}
 	log.Printf("[Shim: Cloud DNS] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 
@@ -282,6 +312,7 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 		visibility = "public"
 	}
 
+	before := api.beginMutation()
 	api.mu.Lock()
 	api.zoneSeq++
 	id := api.zoneSeq
@@ -336,7 +367,7 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 	api.zones[key] = store
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -383,10 +414,12 @@ func (api *API) listZones(w http.ResponseWriter, r *http.Request, project string
 
 func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	key := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	if !ok {
 		api.mu.Unlock()
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
@@ -403,7 +436,7 @@ func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneN
 	zone := store.zone
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -412,6 +445,7 @@ func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneN
 
 func (api *API) deleteZone(w http.ResponseWriter, project, zoneName string) {
 	key := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	if ok {
@@ -424,6 +458,7 @@ func (api *API) deleteZone(w http.ResponseWriter, project, zoneName string) {
 		}
 		if nonSystem > 0 {
 			api.mu.Unlock()
+			api.abortMutation()
 			w.WriteHeader(http.StatusBadRequest)
 			writeError(w, 400, "FAILED_PRECONDITION",
 				fmt.Sprintf("Zone '%s' cannot be deleted because it still contains non-NS/SOA resource record sets", zoneName))
@@ -434,11 +469,12 @@ func (api *API) deleteZone(w http.ResponseWriter, project, zoneName string) {
 	api.mu.Unlock()
 
 	if !ok {
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
 	}
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	// GCP returns 204 No Content on delete
@@ -476,10 +512,12 @@ func (api *API) routeRRSets(w http.ResponseWriter, r *http.Request, project, zon
 
 func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	key := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	api.mu.Unlock()
 	if !ok {
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
@@ -487,11 +525,13 @@ func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zon
 
 	var rr ResourceRecordSet
 	if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
+		api.abortMutation()
 		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 		return
 	}
 	if rr.Name == "" || rr.Type == "" {
+		api.abortMutation()
 		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "'name' and 'type' are required")
 		return
@@ -510,6 +550,7 @@ func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zon
 	// Check for duplicate
 	if _, exists := store.rrsets[rrk]; exists {
 		api.mu.Unlock()
+		api.abortMutation()
 		w.WriteHeader(http.StatusConflict)
 		writeError(w, 409, "ALREADY_EXISTS",
 			fmt.Sprintf("ResourceRecordSet '%s' of type '%s' already exists", rr.Name, rr.Type))
@@ -518,7 +559,7 @@ func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zon
 	store.rrsets[rrk] = &rr
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -568,6 +609,7 @@ func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrTy
 	}
 
 	key := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	if ok {
@@ -581,11 +623,12 @@ func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrTy
 	api.mu.Unlock()
 
 	if !ok {
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("ResourceRecordSet '%s/%s' not found in zone '%s'", name, rrType, zoneName))
 		return
 	}
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -593,10 +636,12 @@ func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrTy
 
 func (api *API) putRRSet(w http.ResponseWriter, r *http.Request, project, zoneName, name, rrType string) {
 	key := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	if !ok {
 		api.mu.Unlock()
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
@@ -611,7 +656,7 @@ func (api *API) putRRSet(w http.ResponseWriter, r *http.Request, project, zoneNa
 	store.rrsets[rrKey(rr.Name, rr.Type)] = &rr
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -643,10 +688,12 @@ func (api *API) routeChanges(w http.ResponseWriter, r *http.Request, project, zo
 // The GCP spec says: deletions are applied before additions in the same request.
 func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	zKey := zoneKey(project, zoneName)
+	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[zKey]
 	if !ok {
 		api.mu.Unlock()
+		api.abortMutation()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
@@ -655,6 +702,7 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 	var body Change
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		api.mu.Unlock()
+		api.abortMutation()
 		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 		return
@@ -669,6 +717,7 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 		rrk := rrKey(name, del.Type)
 		if _, exists := store.rrsets[rrk]; !exists {
 			api.mu.Unlock()
+			api.abortMutation()
 			w.WriteHeader(http.StatusNotFound)
 			writeError(w, 404, "NOT_FOUND",
 				fmt.Sprintf("Cannot delete non-existent ResourceRecordSet '%s' of type '%s'", del.Name, del.Type))
@@ -714,7 +763,7 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 	store.changes = append(store.changes, change)
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
+	if !api.persistOrRollback(w, before) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -842,6 +891,30 @@ func snapshotDNSMetadata(zones map[string]*zoneStore, zoneSeq uint64) dnsMetadat
 		metadata.Zones[key] = persisted
 	}
 	return metadata
+}
+
+func (api *API) restoreMetadataLocked(metadata dnsMetadata) {
+	api.zoneSeq = metadata.ZoneSeq
+	api.zones = make(map[string]*zoneStore, len(metadata.Zones))
+	for key, persisted := range metadata.Zones {
+		rrsets := make(map[string]*ResourceRecordSet, len(persisted.RRSets))
+		for rrKey, rrset := range persisted.RRSets {
+			rrsets[rrKey] = cloneRRSet(rrset)
+		}
+		changes := make([]*Change, len(persisted.Changes))
+		for i, change := range persisted.Changes {
+			clone := *change
+			clone.Additions = cloneRRSets(change.Additions)
+			clone.Deletions = cloneRRSets(change.Deletions)
+			changes[i] = &clone
+		}
+		api.zones[key] = &zoneStore{
+			zone:      cloneManagedZone(persisted.Zone),
+			rrsets:    rrsets,
+			changes:   changes,
+			changeSeq: persisted.ChangeSeq,
+		}
+	}
 }
 
 func cloneManagedZone(zone *ManagedZone) *ManagedZone {

@@ -67,6 +67,13 @@ docs/*
 !docs/state-model.md
 !docs/terraform-compatibility.md
 !docs/distribution.md
+!docs/security-simulation.md
+!docs/phase17-local-operations.md
+!docs/minisky-roadmap-completion-plan.canvas.tsx
+!docs/plugin-catalog.schema.json
+!docs/plugin-catalog.example.json
+!docs/adr/
+!docs/adr/**
 
 
 DESIGN.md

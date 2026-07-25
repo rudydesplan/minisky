@@ -17,13 +17,14 @@ Persistence categories describe where service state lives: **memory**, **file**,
 
 | Domain | Fidelity | Persistence |
 | --- | --- | --- |
-| `aiplatform.googleapis.com` | standard | memory |
+| `aiplatform.googleapis.com` | standard | file |
 | `appengine.googleapis.com` | standard | hybrid |
 | `artifactregistry.googleapis.com` | standard | memory |
 | `bigquery.googleapis.com` | standard | file |
 | `bigtable.googleapis.com` | standard | hybrid |
 | `bigtableadmin.googleapis.com` | standard | hybrid |
 | `cloudbuild.googleapis.com` | standard | hybrid |
+| `cloudresourcemanager.googleapis.com` | standard | file |
 | `cloudfunctions.googleapis.com` | standard | hybrid |
 | `cloudkms.googleapis.com` | standard | file |
 | `cloudscheduler.googleapis.com` | standard | file |
@@ -37,11 +38,12 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `firebaseio.com` | passthrough | docker |
 | `firestore.googleapis.com` | passthrough | docker |
 | `iam.googleapis.com` | standard | file |
+| `iamcredentials.googleapis.com` | standard | static |
 | `identitytoolkit.googleapis.com` | passthrough | docker |
 | `logging.googleapis.com` | standard | file |
 | `memcache.googleapis.com` | standard | hybrid |
 | `metadata.google.internal` | high | static |
-| `monitoring.googleapis.com` | standard | memory |
+| `monitoring.googleapis.com` | standard | file |
 | `pubsub.googleapis.com` | passthrough | docker |
 | `redis.googleapis.com` | standard | hybrid |
 | `run.googleapis.com` | standard | hybrid |
@@ -49,23 +51,104 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `spanner.googleapis.com` | passthrough | docker |
 | `sqladmin.googleapis.com` | standard | hybrid |
 | `storage.googleapis.com` | passthrough | docker |
+| `sts.googleapis.com` | standard | static |
+
+## Security and project boundaries
+
+- IAM Credentials supports direct, one-hour-or-shorter local
+  `generateAccessToken`; delegation chains are `501 UNIMPLEMENTED`.
+- Security Token Service exchanges only MiniSky-authenticated local access
+  tokens. External OIDC, SAML, AWS, workforce, and workload provider flows are
+  `501 UNIMPLEMENTED`.
+- Resource Manager persists project metadata and the
+  minimal local organization/folder parent chain. It does not claim complete
+  Resource Manager LRO, search, undelete, tag, lien, or org-policy parity.
+- Representative in-process state such as BigQuery datasets is keyed by
+  project. Docker passthrough services remain shared profile backends unless
+  their upstream emulator provides and the integration suite proves project
+  isolation.
 
 The unsupported-route contract uses
 `/__minisky_contract__/unsupported`. Probe-safe registered handlers must return
-HTTP 501 with a GCP JSON error envelope and `UNIMPLEMENTED` status. Services
-whose request path necessarily starts a lazy Docker backend are skipped through
-explicit manifest metadata; they remain covered by registration and
-documentation checks.
+HTTP 501 with a GCP JSON error envelope and `UNIMPLEMENTED` status. Docker
+wrappers can still execute that reserved probe without starting a container.
+The pure lazy domains—Datastore, Firestore, and Spanner—have explicit manifest
+rationale and a deterministic router contract: without an available backend
+manager they return HTTP 503 `UNAVAILABLE`; a real cold-start failure returns
+the same envelope. CRUD/data-plane claims remain backend-gated:
+
+- Datastore and Firestore require their Google emulators.
+- Firebase Auth, Realtime Database, and Hosting require Firebase emulators.
+- Pub/Sub requires the Google Pub/Sub emulator.
+- Spanner requires the Cloud Spanner emulator.
+- Storage requires `fake-gcs-server`.
 
 ## Evidence boundaries
 
 The manifest is a registration and unsupported-route contract, not a claim of
 complete method parity. BigQuery has the deepest native conformance coverage.
-The tracked Terraform and SDK smoke suites currently exercise BigQuery
-dataset/table resources and IAM service accounts; broader service compatibility
-must be supported by focused executable tests before its manifest fidelity is
-raised.
+The tracked Terraform and SDK smoke suites exercise BigQuery dataset/table
+resources, IAM service accounts, and a Docker-backed Storage bucket. The
+separate durability gate covers only persisted BigQuery/IAM metadata; Storage
+emulator data is outside metadata export/import. Broader compatibility must be
+supported by focused executable tests before its manifest fidelity is raised.
+
+## Phase 9–11 boundaries
+
+- Scheduler cross-shim delivery uses the daemon's configured gateway port.
+- Cloud Tasks terminal attempts survive restart. Persisted pending or retrying
+  deliveries become terminal interruption failures and are not replayed.
+- Simulation stores Serverless metadata without claiming to run code. Requested
+  Buildpacks execution fails explicitly when dependencies, source, or an image
+  are missing; no Cloud SDK utility image is substituted.
+- Strict IAM (`MINISKY_IAM_MODE=strict`) covers only Storage bucket/object,
+  Pub/Sub topic/subscription/publish, and Compute instance mutations. Callers
+  provide `X-MiniSky-Principal`; default mode remains permissive.
+- Artifact Registry package/version listing comes from a lazily started,
+  profile-owned `registry:2` container on a dynamic loopback port. GCP package
+  deletion is unsupported because Registry v2 deletion requires a digest.
+- The pinned Terraform fixture does not yet exercise Artifact Registry or
+  Compute load balancing; these remain deferred rather than returning synthetic
+  provider successes.
 
 See [State model](state-model.md) for restart and export behavior and
 [Terraform compatibility](terraform-compatibility.md) for tested provider and
 SDK coverage.
+
+## Phase 15–16 bounded slices
+
+- Memorystore for Redis validates create requests, exposes GCP-shaped
+  create/delete operations, persists profile metadata, reconciles only
+  profile-owned Docker containers, and publishes Redis on a Docker-assigned
+  loopback port. Redis uses an owned named volume with AOF enabled. Memcached,
+  failover, import/export, and upgrade APIs remain `501 UNIMPLEMENTED`.
+- Firestore and Datastore remain official Google emulator passthroughs.
+  Their data directories are profile-scoped under the non-portable runtime
+  tree. The guarded phase 15 SDK smoke covers Firestore document CRUD/query and
+  Datastore entity CRUD/ancestor query when Docker collision checks pass.
+  Firestore listeners and security rules are not claimed.
+- Spanner remains official emulator passthrough. MiniSky publishes both the
+  emulator REST/admin port and its gRPC data port on dynamic loopback ports.
+  The guarded SDK smoke covers instance/database creation, DDL, insert, read,
+  row delete, and database/instance cleanup. The emulator does not provide
+  production IAM, TLS, backups, multi-region replication, or production query
+  performance, and its data is not included in MiniSky state export.
+- Monitoring implements profile-persisted metric descriptor CRUD and a bounded
+  time-series write/list subset with `metric.type` equality filters. Monitoring
+  Query Language is `501 UNIMPLEMENTED`.
+- Logging migrates the legacy global log file into profile state, supports
+  bounded `severity`, `logName`, and `resource.type` filters, and supports safe
+  relative file sinks plus Pub/Sub sinks with a delivery-loop marker.
+  Alerting and log-based metrics are `501 UNIMPLEMENTED`.
+- Vertex AI defaults to deterministic profile-configurable mock
+  `generateContent` and `predict` behavior. Optional Ollama calls are restricted
+  to loopback HTTP endpoints; API keys remain process-memory only. Streaming,
+  batch prediction, and feature stores are `501 UNIMPLEMENTED`.
+- Cloud DNS retains its persisted managed-zone/RRSet control plane and can run
+  an opt-in loopback-only UDP resolver through `MINISKY_DNS_ADDR`. Ports below
+  1024 and non-loopback binds are rejected. The resolver currently serves
+  A, AAAA, and CNAME records with stored TTL/update/delete/restart behavior.
+- Advanced networking is limited to profile-owned Docker bridges and optional
+  IPv4 IPAM. MiniSky never installs host-global iptables rules. Cloud NAT,
+  peering, PSC service attachments, VPN, and interconnect data planes return
+  `501 UNIMPLEMENTED`.

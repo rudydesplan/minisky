@@ -32,6 +32,9 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | :--- | :--- | :--- |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
+| `redis_custom_endpoint` | `http://127.0.0.1:8080/_minisky/redis/v1/` | `redis.googleapis.com` |
+| `spanner_custom_endpoint` | `http://127.0.0.1:8080/_minisky/spanner/v1/` | `spanner.googleapis.com` |
+| `storage_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storage/storage/v1/` | `storage.googleapis.com` |
 
 The repeated `bigquery/bigquery` segments are intentional: the first is the
 MiniSky service selector and is removed by the router; the second is part of
@@ -43,21 +46,26 @@ the example overrides `iam_beta_custom_endpoint`.
 
 | Terraform resource | MiniSky behavior | Polling | Integration assertion |
 | :--- | :--- | :--- | :--- |
-| `google_bigquery_dataset` | In-memory dataset metadata CRUD | Synchronous | Dataset reference is read through the canonical endpoint |
-| `google_bigquery_table` | In-memory table and schema metadata CRUD | Synchronous | Table reference is read through the canonical endpoint |
-| `google_service_account` | In-memory service-account metadata CRUD | Synchronous | Account email is read through the canonical endpoint |
+| `google_bigquery_dataset` | Profile-persisted dataset metadata CRUD | Synchronous | Dataset reference is read through the canonical endpoint |
+| `google_bigquery_table` | Profile-persisted table and schema metadata CRUD | Synchronous | Table reference is read through the canonical endpoint |
+| `google_service_account` | Profile-persisted service-account metadata CRUD | Synchronous | Account email is read through the canonical endpoint |
+| `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
+| `google_redis_instance` | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint |
+| `google_spanner_instance` | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint |
+| `google_spanner_database` | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint |
 
 The table sets `deletion_protection = false`, and the dataset sets
 `delete_contents_on_destroy = true`, so the example can be destroyed
-reproducibly. MiniSky state is currently process-local and does not survive a
-daemon restart.
+reproducibly. BigQuery and IAM metadata survive daemon restart. Storage bucket
+data belongs to the Docker emulator and is not part of MiniSky state export.
 
-Resources not listed above are not claimed as Terraform-compatible. In
-particular, the tracked stack excludes Storage and Pub/Sub emulator pulls,
-Compute and Cloud SQL data-plane containers, serverless builds, GKE/Kind, and
-stateless Compute load-balancer stubs. See `docs/service-compatibility.md` for
-their implementation status; API routes alone do not establish provider
-compatibility.
+The Redis and Spanner resources are local-profile-only because
+`emulator-config` is not a production Spanner configuration. Resources not
+listed above are not claimed as Terraform-compatible. In particular, the
+tracked stack excludes Compute, Cloud SQL, serverless, GKE/Kind, and Compute
+load-balancer resources. See
+`docs/service-compatibility.md` for their implementation status; API routes
+alone do not establish provider compatibility.
 
 ## Go and Python SDK smoke suites
 
@@ -68,11 +76,11 @@ canonical gateway paths:
 
 - BigQuery: `${MINISKY_ENDPOINT}/_minisky/bigquery/bigquery/v2/`
 - IAM: `${MINISKY_ENDPOINT}/_minisky/iam/v1/`
+- Storage: `${MINISKY_ENDPOINT}/_minisky/storage/storage/v1/`
 
 Each program creates, reads, and deletes a uniquely named BigQuery dataset and
-table plus an IAM service account. The generated Go and Python clients both
-permit a full REST base-URL override, including the MiniSky path selector, so
-the IAM service-account flow is covered without application changes.
+table, IAM service account, and Storage bucket. Storage smoke execution requires
+Docker because the first request cold-starts `fake-gcs-server`.
 
 With MiniSky already running, execute the Go smoke:
 
@@ -106,6 +114,14 @@ The regular `sdk-smoke-validate` job installs the pinned Python requirement,
 compiles the Go smoke with `go test`, and byte-compiles the Python smoke on
 every pull request. It does not require a running MiniSky instance.
 
+The separate guarded `scripts/phase15-emulator-integration.sh` cold-starts the
+official Firestore, Datastore, and Spanner emulators, discovers their dynamic
+loopback ports, and runs `sdk-smoke/phase15`. That Go SDK smoke proves Firestore
+document CRUD/query, Datastore entity CRUD/ancestor query, and Spanner
+instance/database/DDL/insert/read/delete behavior. It requires
+`MINISKY_PHASE15_INTEGRATION=1` and refuses existing MiniSky container or
+network collisions.
+
 The Docker-backed `terraform-integration` job is opt-in because starting
 MiniSky requires a Docker network. It runs for:
 
@@ -116,10 +132,15 @@ MiniSky requires a Docker network. It runs for:
 `MINISKY_TERRAFORM_INTEGRATION=1`, refuses to disturb existing MiniSky
 containers or networks, uses isolated ports, home, provider data, and state,
 and installs cleanup traps. It then builds and starts MiniSky, runs
-`init`/`validate`/`apply`, asserts all three resources over canonical
+`init`/`validate`/`apply`, asserts the tracked resources over canonical
 `/_minisky` endpoints, runs both SDK smoke suites, requires a zero-exit
 no-drift plan, destroys the stack, and verifies that each resource returns
 `404`.
+
+The separate opt-in `state-durability-integration` workflow runs the persisted
+BigQuery/IAM subset through create → restart → no-drift → metadata export →
+clean-profile import → no-drift → destroy. It intentionally excludes Storage
+because metadata snapshots do not archive Docker emulator data.
 
 Run the same gate locally only on an otherwise idle MiniSky Docker environment:
 

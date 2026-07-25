@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/serverless"
@@ -81,7 +82,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Normal Proxy
 	target, _ := url.Parse(targetURL)
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := observability.NewReverseProxy(target)
 
 	// Ensure /v1 prefix for emulator compatibility
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -114,7 +115,7 @@ func (api *API) handlePublish(w http.ResponseWriter, r *http.Request, targetURL 
 
 	// Proxy the request
 	target, _ := url.Parse(targetURL)
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := observability.NewReverseProxy(target)
 
 	observers := api.eventObservers()
 	if len(observers) > 0 && topic != "" {

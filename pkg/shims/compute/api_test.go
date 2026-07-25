@@ -361,3 +361,16 @@ func assertComputeError(t *testing.T, response *httptest.ResponseRecorder, wantC
 		t.Fatalf("error status = %q, want %q", payload.Error.Status, wantStatus)
 	}
 }
+
+func TestAdvancedNetworkingUnrepresentableSurfacesReturn501(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	for _, path := range []string{
+		"/compute/v1/projects/test/regions/us-central1/routers",
+		"/compute/v1/projects/test/regions/us-central1/serviceAttachments",
+		"/compute/v1/projects/test/global/interconnects",
+		"/compute/v1/projects/test/global/networks/default/addPeering",
+	} {
+		response := performComputeRequest(api, http.MethodPost, path, `{}`)
+		assertComputeError(t, response, http.StatusNotImplemented, "UNIMPLEMENTED")
+	}
+}

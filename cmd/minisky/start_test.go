@@ -1,0 +1,71 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestSelectServiceDomainsFiltersByAliasAndRejectsUnknown(t *testing.T) {
+	shims := map[string]http.Handler{
+		"compute.googleapis.com": http.NotFoundHandler(),
+		"pubsub.googleapis.com":  http.NotFoundHandler(),
+	}
+	selected, lazy, err := selectServiceDomains(
+		shims,
+		[]string{"storage.googleapis.com"},
+		"compute,storage.googleapis.com",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected["compute.googleapis.com"] == nil {
+		t.Fatalf("selected shims = %#v", selected)
+	}
+	if len(lazy) != 1 || lazy[0] != "storage.googleapis.com" {
+		t.Fatalf("selected lazy domains = %#v", lazy)
+	}
+
+	if _, _, err := selectServiceDomains(shims, nil, "unknown"); err == nil {
+		t.Fatal("expected unknown service error")
+	}
+}
+
+func TestGatewayMuxExposesReadinessWithoutDispatching(t *testing.T) {
+	dispatched := false
+	handler := gatewayMux(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		dispatched = true
+	}))
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"ready"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dispatched {
+		t.Fatal("readiness request reached the public gateway")
+	}
+}
+
+type shutdownHandler struct {
+	http.Handler
+	called bool
+}
+
+func (h *shutdownHandler) Shutdown(context.Context) error {
+	h.called = true
+	return nil
+}
+
+func TestShutdownPluginsRunsLifecycleHook(t *testing.T) {
+	handler := &shutdownHandler{Handler: http.NotFoundHandler()}
+	if err := shutdownPlugins(context.Background(), map[string]http.Handler{"example.test": handler}); err != nil {
+		t.Fatal(err)
+	}
+	if !handler.called {
+		t.Fatal("shutdown hook was not called")
+	}
+}

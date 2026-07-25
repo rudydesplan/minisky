@@ -1,10 +1,10 @@
 package firebasertdb
 
 import (
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 )
 
@@ -31,6 +31,6 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target, _ := url.Parse(targetURL)
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := observability.NewReverseProxy(target)
 	proxy.ServeHTTP(w, r)
 }

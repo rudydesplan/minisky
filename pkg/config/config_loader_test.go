@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestEmbeddedImageRegistryLoads(t *testing.T) {
 	t.Parallel()
@@ -29,6 +33,20 @@ func TestEmbeddedImageRegistryLoads(t *testing.T) {
 	}
 }
 
+func TestFirestoreEmulatorUsesSupportedImportExportFlags(t *testing.T) {
+	t.Parallel()
+
+	command := strings.Join(loadRegistry().Emulators["firestore.googleapis.com"].Cmd, " ")
+	if strings.Contains(command, "--data-dir") {
+		t.Fatal("Firestore emulator does not support --data-dir")
+	}
+	for _, flag := range []string{"--import-data", "--export-on-exit"} {
+		if !strings.Contains(command, flag) {
+			t.Errorf("Firestore emulator command is missing %s", flag)
+		}
+	}
+}
+
 func TestNativeKMSDoesNotDeclareUnusedDockerEmulator(t *testing.T) {
 	t.Parallel()
 
@@ -50,5 +68,19 @@ func TestFallbackRegistryHasUsableDefaults(t *testing.T) {
 	}
 	if registry.Serverless.Builder == "" {
 		t.Error("fallback serverless builder is empty")
+	}
+}
+
+func TestProfilePathsAreStateRootScoped(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "restart")
+
+	wantProfile := filepath.Join(root, "profiles", "restart")
+	if got := GetProfileDir(); got != wantProfile {
+		t.Fatalf("profile dir = %q, want %q", got, wantProfile)
+	}
+	if got := GetRuntimeDir(); got != filepath.Join(wantProfile, "runtime") {
+		t.Fatalf("runtime dir = %q", got)
 	}
 }

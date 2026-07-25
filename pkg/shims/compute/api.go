@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"sort"
 	"strconv"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
@@ -338,6 +338,10 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.routeOperations(w, r, path)
 	case strings.Contains(path, "/zones/") && !strings.Contains(path, "/instances"):
 		api.routeZones(w, r, path)
+	case isUnsupportedAdvancedNetworkPath(path):
+		w.WriteHeader(http.StatusNotImplemented)
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"Cloud NAT, peering, PSC service attachments, VPN, and interconnect data planes are not representable safely in MiniSky")
 	case strings.Contains(path, "/global/networks"):
 		api.routeNetworks(w, r, path)
 	case strings.Contains(path, "/global/firewalls"):
@@ -357,6 +361,24 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Compute resource not found: "+path)
 	}
+}
+
+func isUnsupportedAdvancedNetworkPath(path string) bool {
+	for _, fragment := range []string{
+		"/routers",
+		"/serviceAttachments",
+		"/interconnects",
+		"/vpnGateways",
+		"/vpnTunnels",
+		"/addPeering",
+		"/removePeering",
+		"/updatePeering",
+	} {
+		if strings.Contains(path, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,7 +528,12 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	}
 
 	// Register LRO
-	op := api.opMgr.Register("compute#operation", "insert", targetLink, zone, "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", targetLink, zone, "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	op.Kind = "compute#operation"
 
 	// Resolve the docker image mapping from the boot disk source
@@ -721,8 +748,13 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	}
 
 	containerName := fmt.Sprintf("minisky-vm-%s", name)
-	op := api.opMgr.Register("compute#operation", "delete",
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete",
 		selfLinkInstance(project, zone, name), zone, "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Simulate winding down time
@@ -769,8 +801,13 @@ func (api *API) instanceAction(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 
-	op := api.opMgr.Register("compute#operation", action,
+	op, err := api.opMgr.RegisterDurable("compute#operation", action,
 		selfLinkInstance(project, zone, name), zone, "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
@@ -929,8 +966,13 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 			api.svcMgr.CreateVPCNetwork(r.Context(), body.Name)
 		}
 
-		op := api.opMgr.Register("compute#operation", "insert",
+		op, err := api.opMgr.RegisterDurable("compute#operation", "insert",
 			n.SelfLink, "", "")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+			return
+		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(op)
@@ -1015,7 +1057,12 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 			api.svcMgr.DeleteVPCNetwork(r.Context(), name)
 		}
 
-		op := api.opMgr.Register("compute#operation", "delete", "", "", "")
+		op, err := api.opMgr.RegisterDurable("compute#operation", "delete", "", "", "")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+			return
+		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(op)
@@ -1073,7 +1120,12 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 		api.securityPolicies[key] = sp
 		api.mu.Unlock()
 
-		op := api.opMgr.Register("compute#operation", "insert", sp.SelfLink, "", "")
+		op, err := api.opMgr.RegisterDurable("compute#operation", "insert", sp.SelfLink, "", "")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+			return
+		}
 		api.opMgr.RunAsync(op.Name, func() error { return nil })
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(op)
@@ -1196,7 +1248,7 @@ func (api *API) proxyLoadBalancerRequest(
 	outbound := r.Clone(r.Context())
 	outbound.URL.Path = proxyPath
 	outbound.URL.RawPath = ""
-	proxy := httputil.NewSingleHostReverseProxy(backend.target)
+	proxy := observability.NewReverseProxy(backend.target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
 		writeLoadBalancerUnavailable(w, fmt.Sprintf(
 			"backend %s became unavailable: %v",
@@ -1536,7 +1588,12 @@ func (api *API) createLoadBalancerResource(
 		return
 	}
 
-	op := api.opMgr.Register("compute#operation", "insert", selfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", selfLink, "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
@@ -1614,7 +1671,12 @@ func (api *API) deleteLoadBalancerResource(
 	}
 
 	selfLink := loadBalancerSelfLink(project, collection.canonical, name)
-	op := api.opMgr.Register("compute#operation", "delete", selfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", selfLink, "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
@@ -1800,7 +1862,12 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		Ranges:    append(body.SourceRanges, body.DestinationRanges...),
 	})
 
-	op := api.opMgr.Register("compute#operation", "insert", body.SelfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", body.SelfLink, "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(body.Network)
 		return nil
@@ -1875,7 +1942,12 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		return
 	}
 
-	op := api.opMgr.Register("compute#operation", "patch", result.SelfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "patch", result.SelfLink, "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(result.Network)
 		return nil
@@ -1905,7 +1977,12 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		return
 	}
 	api.svcMgr.RemoveFirewallRule(networkURL, name)
-	op := api.opMgr.Register("compute#operation", "delete", "", "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", "", "", "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(networkURL)
 		return nil

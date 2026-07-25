@@ -1,11 +1,18 @@
 package orchestrator
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
+
+	"minisky/pkg/state"
 )
+
+const operationStateEntry = "orchestrator/operations"
 
 // OperationStatus mirrors GCP's LRO status strings.
 type OperationStatus string
@@ -44,10 +51,18 @@ type OperationError struct {
 	Message string `json:"message"`
 }
 
-// OperationManager is a thread-safe in-memory registry for all active LROs.
+type operationStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+// OperationManager is a thread-safe LRO registry with optional profile state.
 type OperationManager struct {
-	mu  sync.RWMutex
-	ops map[string]*Operation
+	mu             sync.RWMutex
+	persistMu      sync.Mutex
+	ops            map[string]*Operation
+	store          operationStore
+	persistenceErr error
 }
 
 // NewOperationManager returns a ready-to-use OperationManager.
@@ -57,8 +72,63 @@ func NewOperationManager() *OperationManager {
 	}
 }
 
+// NewOperationManagerWithStore restores operation polling metadata. Operations
+// that were not terminal at shutdown become stable terminal interruption
+// results; their work functions are never replayed.
+func NewOperationManagerWithStore(store operationStore) (*OperationManager, error) {
+	manager := &OperationManager{
+		ops:   make(map[string]*Operation),
+		store: store,
+	}
+	if store == nil {
+		return manager, nil
+	}
+	if err := store.Load(operationStateEntry, &manager.ops); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return manager, nil
+		}
+		return nil, fmt.Errorf("load operations: %w", err)
+	}
+	if manager.ops == nil {
+		manager.ops = make(map[string]*Operation)
+	}
+
+	interrupted := false
+	for _, op := range manager.ops {
+		if op == nil || op.Done || op.Status == StatusDone {
+			continue
+		}
+		op.Status = StatusDone
+		op.Done = true
+		op.Progress = 100
+		op.EndTime = time.Now().UTC().Format(time.RFC3339)
+		op.Error = &OperationError{
+			Code:    500,
+			Message: "operation interrupted by MiniSky restart; side effects were not replayed",
+		}
+		interrupted = true
+	}
+	if interrupted {
+		if err := manager.persist(); err != nil {
+			return nil, fmt.Errorf("persist interrupted operations: %w", err)
+		}
+	}
+	return manager, nil
+}
+
 // Register creates a new operation and stores it. Returns the operation for immediate serialisation.
 func (om *OperationManager) Register(kind, operationType, targetLink, zone, region string) *Operation {
+	op, _ := om.register(kind, operationType, targetLink, zone, region, false)
+	return op
+}
+
+// RegisterDurable creates an operation only if its initial state can be saved.
+// A manager without a store remains intentionally memory-only and succeeds.
+func (om *OperationManager) RegisterDurable(kind, operationType, targetLink, zone, region string) (*Operation, error) {
+	return om.register(kind, operationType, targetLink, zone, region, true)
+}
+
+func (om *OperationManager) register(kind, operationType, targetLink, zone, region string, rollbackOnFailure bool) (*Operation, error) {
 	id := fmt.Sprintf("%d", rand.Int63())
 	name := fmt.Sprintf("operation-%d-%s", time.Now().Unix(), randomSuffix(8))
 
@@ -76,29 +146,54 @@ func (om *OperationManager) Register(kind, operationType, targetLink, zone, regi
 		Region:        region,
 	}
 
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+
 	om.mu.Lock()
 	om.ops[name] = op
 	om.mu.Unlock()
 
-	return op
+	if err := om.persistLocked(); err != nil {
+		if rollbackOnFailure {
+			om.mu.Lock()
+			delete(om.ops, name)
+			om.mu.Unlock()
+		}
+		om.recordPersistenceFailure(name, false, err)
+		if rollbackOnFailure {
+			return nil, err
+		}
+		return cloneOperation(op), nil
+	}
+	return cloneOperation(op), nil
 }
 
 // Get retrieves an operation by name. Returns nil if not found.
 func (om *OperationManager) Get(name string) *Operation {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
-	return om.ops[name]
+	return cloneOperation(om.ops[name])
 }
 
 // Advance moves the operation through the PENDING → RUNNING → DONE state machine.
 // It should be called from a background goroutine.
 func (om *OperationManager) Advance(name string, progress int, status OperationStatus) {
-	om.mu.Lock()
-	defer om.mu.Unlock()
+	_ = om.AdvanceDurable(name, progress, status)
+}
 
+// AdvanceDurable updates an operation and reports whether the resulting
+// snapshot was saved. A terminal save failure remains visible in-process on the
+// operation; after restart, the last durable non-terminal state is reported as
+// interrupted and no work is replayed.
+func (om *OperationManager) AdvanceDurable(name string, progress int, status OperationStatus) error {
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+
+	om.mu.Lock()
 	op, ok := om.ops[name]
 	if !ok {
-		return
+		om.mu.Unlock()
+		return nil
 	}
 
 	op.Progress = progress
@@ -113,15 +208,22 @@ func (om *OperationManager) Advance(name string, progress int, status OperationS
 		op.Progress = 100
 		op.EndTime = time.Now().UTC().Format(time.RFC3339)
 	}
+	om.mu.Unlock()
+	if err := om.persistLocked(); err != nil {
+		om.recordPersistenceFailure(name, status == StatusDone, err)
+		return err
+	}
+	return nil
 }
 
 // UpdateMetadata updates the metadata of an operation.
 func (om *OperationManager) UpdateMetadata(name string, metadata interface{}) {
 	om.mu.Lock()
-	defer om.mu.Unlock()
 	if op, ok := om.ops[name]; ok {
 		op.Metadata = metadata
 	}
+	om.mu.Unlock()
+	om.persistBestEffort()
 }
 
 // MarkDone marks the operation as successfully completed.
@@ -135,25 +237,39 @@ func (om *OperationManager) List() []*Operation {
 	defer om.mu.RUnlock()
 	res := make([]*Operation, 0, len(om.ops))
 	for _, op := range om.ops {
-		res = append(res, op)
+		res = append(res, cloneOperation(op))
 	}
 	return res
 }
 
 // Fail marks the operation as DONE with an error.
 func (om *OperationManager) Fail(name string, code int, message string) {
-	om.mu.Lock()
-	defer om.mu.Unlock()
+	_ = om.FailDurable(name, code, message)
+}
 
+// FailDurable marks an operation failed and reports whether the terminal state
+// was saved.
+func (om *OperationManager) FailDurable(name string, code int, message string) error {
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+
+	om.mu.Lock()
 	op, ok := om.ops[name]
 	if !ok {
-		return
+		om.mu.Unlock()
+		return nil
 	}
 	op.Status = StatusDone
 	op.Done = true
 	op.Progress = 100
 	op.EndTime = time.Now().UTC().Format(time.RFC3339)
 	op.Error = &OperationError{Code: code, Message: message}
+	om.mu.Unlock()
+	if err := om.persistLocked(); err != nil {
+		om.recordPersistenceFailure(name, true, err)
+		return err
+	}
+	return nil
 }
 
 // RunAsync drives a standard 3-phase LRO lifecycle in a goroutine.
@@ -185,6 +301,75 @@ func (om *OperationManager) RunAsync(name string, workFn func() error) {
 		// 6. Transition RUNNING → DONE
 		om.Advance(name, 100, StatusDone)
 	}()
+}
+
+func (om *OperationManager) persistBestEffort() {
+	if err := om.persist(); err != nil {
+		om.recordPersistenceFailure("", false, err)
+	}
+}
+
+func (om *OperationManager) persist() error {
+	if om.store == nil {
+		return nil
+	}
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+	return om.persistLocked()
+}
+
+func (om *OperationManager) persistLocked() error {
+	if om.store == nil {
+		return nil
+	}
+	om.mu.RLock()
+	payload, err := json.Marshal(om.ops)
+	om.mu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("snapshot operations: %w", err)
+	}
+	if err := om.store.Save(operationStateEntry, json.RawMessage(payload)); err != nil {
+		return fmt.Errorf("save operations: %w", err)
+	}
+	return nil
+}
+
+// PersistenceError returns the latest durable state failure observed by this
+// manager. It remains set so health and polling surfaces can report degradation.
+func (om *OperationManager) PersistenceError() error {
+	om.mu.RLock()
+	defer om.mu.RUnlock()
+	return om.persistenceErr
+}
+
+func (om *OperationManager) recordPersistenceFailure(name string, terminal bool, err error) {
+	wrapped := fmt.Errorf("operation persistence degraded: %w", err)
+	om.mu.Lock()
+	om.persistenceErr = wrapped
+	if terminal {
+		if op := om.ops[name]; op != nil {
+			const limitation = "terminal state persistence failed; after restart this operation may be reported as interrupted"
+			if op.Error == nil {
+				op.Error = &OperationError{Code: 500, Message: limitation}
+			} else {
+				op.Error.Message += "; " + limitation
+			}
+		}
+	}
+	om.mu.Unlock()
+	log.Printf("[OperationManager] %v", wrapped)
+}
+
+func cloneOperation(op *Operation) *Operation {
+	if op == nil {
+		return nil
+	}
+	clone := *op
+	if op.Error != nil {
+		operationError := *op.Error
+		clone.Error = &operationError
+	}
+	return &clone
 }
 
 func randomSuffix(n int) string {

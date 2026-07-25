@@ -40,6 +40,7 @@ type Service struct {
 	Persistence      PersistenceCategory
 	LazyDocker       bool
 	ProbeUnsupported bool
+	BackendContract  string
 }
 
 type serviceMetadata struct {
@@ -49,38 +50,50 @@ type serviceMetadata struct {
 }
 
 var serviceManifest = map[string]serviceMetadata{
-	"aiplatform.googleapis.com":       {FidelityStandard, PersistenceMemory, true},
-	"appengine.googleapis.com":        {FidelityStandard, PersistenceHybrid, true},
-	"artifactregistry.googleapis.com": {FidelityStandard, PersistenceMemory, true},
-	"bigquery.googleapis.com":         {FidelityStandard, PersistenceFile, true},
-	"bigtable.googleapis.com":         {FidelityStandard, PersistenceHybrid, true},
-	"bigtableadmin.googleapis.com":    {FidelityStandard, PersistenceHybrid, true},
-	"cloudbuild.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
-	"cloudfunctions.googleapis.com":   {FidelityStandard, PersistenceHybrid, true},
-	"cloudkms.googleapis.com":         {FidelityStandard, PersistenceFile, true},
-	"cloudscheduler.googleapis.com":   {FidelityStandard, PersistenceFile, true},
-	"cloudtasks.googleapis.com":       {FidelityStandard, PersistenceMemory, true},
-	"compute.googleapis.com":          {FidelityStandard, PersistenceHybrid, true},
-	"container.googleapis.com":        {FidelityStandard, PersistenceFile, true},
-	"dataproc.googleapis.com":         {FidelityStandard, PersistenceHybrid, true},
-	"datastore.googleapis.com":        {FidelityPassthrough, PersistenceDocker, false},
-	"dns.googleapis.com":              {FidelityStandard, PersistenceFile, true},
-	"firebasehosting.googleapis.com":  {FidelityPassthrough, PersistenceDocker, false},
-	"firebaseio.com":                  {FidelityPassthrough, PersistenceDocker, false},
-	"firestore.googleapis.com":        {FidelityPassthrough, PersistenceDocker, false},
-	"iam.googleapis.com":              {FidelityStandard, PersistenceFile, true},
-	"identitytoolkit.googleapis.com":  {FidelityPassthrough, PersistenceDocker, false},
-	"logging.googleapis.com":          {FidelityStandard, PersistenceFile, true},
-	"memcache.googleapis.com":         {FidelityStandard, PersistenceHybrid, true},
-	"metadata.google.internal":        {FidelityHigh, PersistenceStatic, true},
-	"monitoring.googleapis.com":       {FidelityStandard, PersistenceMemory, true},
-	"pubsub.googleapis.com":           {FidelityPassthrough, PersistenceDocker, false},
-	"redis.googleapis.com":            {FidelityStandard, PersistenceHybrid, true},
-	"run.googleapis.com":              {FidelityStandard, PersistenceHybrid, true},
-	"secretmanager.googleapis.com":    {FidelityStandard, PersistenceFile, true},
-	"spanner.googleapis.com":          {FidelityPassthrough, PersistenceDocker, false},
-	"sqladmin.googleapis.com":         {FidelityStandard, PersistenceHybrid, true},
-	"storage.googleapis.com":          {FidelityPassthrough, PersistenceDocker, false},
+	"aiplatform.googleapis.com":           {FidelityStandard, PersistenceFile, true},
+	"appengine.googleapis.com":            {FidelityStandard, PersistenceHybrid, true},
+	"artifactregistry.googleapis.com":     {FidelityStandard, PersistenceMemory, true},
+	"bigquery.googleapis.com":             {FidelityStandard, PersistenceFile, true},
+	"bigtable.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
+	"bigtableadmin.googleapis.com":        {FidelityStandard, PersistenceHybrid, true},
+	"cloudbuild.googleapis.com":           {FidelityStandard, PersistenceHybrid, true},
+	"cloudresourcemanager.googleapis.com": {FidelityStandard, PersistenceFile, true},
+	"cloudfunctions.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
+	"cloudkms.googleapis.com":             {FidelityStandard, PersistenceFile, true},
+	"cloudscheduler.googleapis.com":       {FidelityStandard, PersistenceFile, true},
+	"cloudtasks.googleapis.com":           {FidelityStandard, PersistenceMemory, true},
+	"compute.googleapis.com":              {FidelityStandard, PersistenceHybrid, true},
+	"container.googleapis.com":            {FidelityStandard, PersistenceFile, true},
+	"dataproc.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
+	"datastore.googleapis.com":            {FidelityPassthrough, PersistenceDocker, false},
+	"dns.googleapis.com":                  {FidelityStandard, PersistenceFile, true},
+	"firebasehosting.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
+	"firebaseio.com":                      {FidelityPassthrough, PersistenceDocker, true},
+	"firestore.googleapis.com":            {FidelityPassthrough, PersistenceDocker, false},
+	"iam.googleapis.com":                  {FidelityStandard, PersistenceFile, true},
+	"iamcredentials.googleapis.com":       {FidelityStandard, PersistenceStatic, true},
+	"identitytoolkit.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
+	"logging.googleapis.com":              {FidelityStandard, PersistenceFile, true},
+	"memcache.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
+	"metadata.google.internal":            {FidelityHigh, PersistenceStatic, true},
+	"monitoring.googleapis.com":           {FidelityStandard, PersistenceFile, true},
+	"pubsub.googleapis.com":               {FidelityPassthrough, PersistenceDocker, true},
+	"redis.googleapis.com":                {FidelityStandard, PersistenceHybrid, true},
+	"run.googleapis.com":                  {FidelityStandard, PersistenceHybrid, true},
+	"secretmanager.googleapis.com":        {FidelityStandard, PersistenceFile, true},
+	"spanner.googleapis.com":              {FidelityPassthrough, PersistenceDocker, false},
+	"sqladmin.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
+	"storage.googleapis.com":              {FidelityPassthrough, PersistenceDocker, true},
+	"sts.googleapis.com":                  {FidelityStandard, PersistenceStatic, true},
+}
+
+// lazyBackendContracts records why these domains use backend-gated coverage
+// instead of in-process CRUD probes. Their API behavior belongs to the named
+// emulator and is executable only after a successful Docker cold start.
+var lazyBackendContracts = map[string]string{
+	"datastore.googleapis.com": "Google Cloud Datastore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
+	"firestore.googleapis.com": "Google Cloud Firestore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
+	"spanner.googleapis.com":   "Cloud Spanner emulator; cold-start and backend errors are deterministic, database behavior requires Docker",
 }
 
 // Services returns a stable manifest derived from current factory and lazy
@@ -124,6 +137,7 @@ func Services() ([]Service, error) {
 			Persistence:      metadata.persistence,
 			LazyDocker:       lazy,
 			ProbeUnsupported: metadata.probeUnsupported,
+			BackendContract:  lazyBackendContracts[domain],
 		})
 	}
 	sort.Slice(services, func(i, j int) bool {

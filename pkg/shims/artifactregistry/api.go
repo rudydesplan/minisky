@@ -138,11 +138,14 @@ type API struct {
 
 func NewAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager) *API {
 	registryURL := os.Getenv("MINISKY_ARTIFACT_REGISTRY_URL")
-	if registryURL == "" {
-		registryURL = defaultRegistryURL
+	var index RegistryIndex
+	if registryURL != "" {
+		client := &http.Client{Timeout: 5 * time.Second}
+		index = NewDockerRegistryIndex(client, registryURL)
+	} else if sm == nil {
+		index = NewDockerRegistryIndex(&http.Client{Timeout: 5 * time.Second}, defaultRegistryURL)
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	return NewAPIWithRegistryIndex(opMgr, sm, NewDockerRegistryIndex(client, registryURL))
+	return NewAPIWithRegistryIndex(opMgr, sm, index)
 }
 
 // NewAPIWithRegistryIndex allows callers to inject a registry index.
@@ -161,7 +164,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(path, "/repositories") {
 		if strings.Contains(path, "/packages") {
 			if r.Method != http.MethodGet {
-				w.WriteHeader(http.StatusMethodNotAllowed)
+				writeError(w, http.StatusNotImplemented, "package and version mutation is not supported; use the Docker Registry v2 API with a manifest digest")
 				return
 			}
 			if strings.HasSuffix(strings.TrimRight(path, "/"), "/versions") {
@@ -250,7 +253,14 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(repo)
 		return
 	}
-	op := api.opMgr.Register("artifactregistry#operation", "CREATE", repo.Name, "", location)
+	op, err := api.opMgr.RegisterDurable("artifactregistry#operation", "CREATE", repo.Name, "", location)
+	if err != nil {
+		api.mu.Lock()
+		delete(api.repos, repo.Name)
+		api.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "failed to persist repository operation")
+		return
+	}
 	_ = json.NewEncoder(w).Encode(op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 }
@@ -261,7 +271,12 @@ func (api *API) handleListPackages(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	repositories, err := api.index.Repositories(r.Context())
+	index, err := api.registryIndex(r.Context())
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	repositories, err := index.Repositories(r.Context())
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -299,7 +314,12 @@ func (api *API) handleListVersions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tags, err := api.index.Tags(r.Context(), packageID)
+	index, err := api.registryIndex(r.Context())
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	tags, err := index.Tags(r.Context(), packageID)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -316,6 +336,31 @@ func (api *API) handleListVersions(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"versions": versions,
 	})
+}
+
+func (api *API) registryIndex(ctx context.Context) (RegistryIndex, error) {
+	api.mu.RLock()
+	index := api.index
+	api.mu.RUnlock()
+	if index != nil {
+		return index, nil
+	}
+	if api.svcMgr == nil {
+		return nil, fmt.Errorf("Docker Registry backend is not configured")
+	}
+	baseURL, err := api.svcMgr.EnsureServiceRunning(ctx, "artifactregistry.googleapis.com")
+	if err != nil {
+		return nil, fmt.Errorf("start owned registry backend: %w", err)
+	}
+	index = NewDockerRegistryIndex(&http.Client{Timeout: 5 * time.Second}, baseURL)
+	api.mu.Lock()
+	if api.index == nil {
+		api.index = index
+	} else {
+		index = api.index
+	}
+	api.mu.Unlock()
+	return index, nil
 }
 
 func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
@@ -342,7 +387,14 @@ func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	location := locationFromResource(repo.Name)
-	op := api.opMgr.Register("artifactregistry#operation", "DELETE", repo.Name, "", location)
+	op, err := api.opMgr.RegisterDurable("artifactregistry#operation", "DELETE", repo.Name, "", location)
+	if err != nil {
+		api.mu.Lock()
+		api.repos[name] = repo
+		api.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "failed to persist repository operation")
+		return
+	}
 	_ = json.NewEncoder(w).Encode(op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 }

@@ -9,11 +9,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
+	"minisky/pkg/router"
+	localsecurity "minisky/pkg/security"
 	"minisky/pkg/shims/bigquery"
 	"minisky/pkg/shims/gke"
 	"minisky/pkg/shims/serverless"
@@ -57,6 +60,13 @@ type doctorDependencies struct {
 	installTool        func(context.Context, string) error
 	checkPortAvailable func(string) error
 	checkDataDir       func() error
+	checkDiskSpace     func() error
+	checkTLS           func() error
+	checkQuotas        func() error
+	checkAudit         func() error
+	requiredImages     []string
+	checkImage         func(string) error
+	pullImage          func(context.Context, string) error
 	backendStates      func() []namedBackendState
 	apiPort            string
 	uiPort             string
@@ -82,6 +92,13 @@ func defaultDoctorDependencies() doctorDependencies {
 		installTool:        orchestrator.InstallToolDependency,
 		checkPortAvailable: checkDoctorPort,
 		checkDataDir:       checkDoctorDataDir,
+		checkDiskSpace:     checkDoctorDiskSpace,
+		checkTLS:           checkDoctorTLS,
+		checkQuotas:        checkDoctorQuotas,
+		checkAudit:         checkDoctorAudit,
+		requiredImages:     requiredDoctorImages(),
+		checkImage:         checkDoctorImage,
+		pullImage:          pullDoctorImage,
 		backendStates:      effectiveBackendStates,
 		apiPort:            environmentOrDefault("MINISKY_PORT", "8080"),
 		uiPort:             environmentOrDefault("MINISKY_UI_PORT", "8081"),
@@ -124,6 +141,33 @@ func runDoctor(ctx context.Context, output io.Writer, dependencies doctorDepende
 		}},
 		{name: "data directory writable", required: true, run: dependencies.checkDataDir},
 	}
+	if dependencies.checkDiskSpace != nil {
+		checks = append(checks, doctorCheck{name: "disk space", required: true, run: dependencies.checkDiskSpace})
+	}
+	if dependencies.checkTLS != nil {
+		checks = append(checks, doctorCheck{name: "TLS configuration", required: true, run: dependencies.checkTLS})
+	}
+	if dependencies.checkQuotas != nil {
+		checks = append(checks, doctorCheck{name: "quota configuration", required: true, run: dependencies.checkQuotas})
+	}
+	if dependencies.checkAudit != nil {
+		checks = append(checks, doctorCheck{name: "audit hash chain", required: true, run: dependencies.checkAudit})
+	}
+	if dependencies.checkImage != nil {
+		for _, image := range dependencies.requiredImages {
+			image := image
+			checks = append(checks, doctorCheck{
+				name: "required image " + image,
+				run:  func() error { return dependencies.checkImage(image) },
+				fix: func(ctx context.Context) error {
+					if dependencies.pullImage == nil {
+						return fmt.Errorf("image pull is unavailable")
+					}
+					return dependencies.pullImage(ctx, image)
+				},
+			})
+		}
+	}
 
 	requiredFailures := 0
 	for _, check := range checks {
@@ -156,6 +200,37 @@ func runDoctor(ctx context.Context, output io.Writer, dependencies doctorDepende
 		return fmt.Errorf("doctor found %d required failure(s)", requiredFailures)
 	}
 	return nil
+}
+
+func checkDoctorTLS() error {
+	_, _, err := localsecurity.PrepareTLS(localsecurity.TLSOptions{
+		Mode:       localsecurity.TLSMode(os.Getenv("MINISKY_TLS_MODE")),
+		ProfileDir: config.GetProfileDir(),
+		CertFile:   os.Getenv("MINISKY_TLS_CERT"),
+		KeyFile:    os.Getenv("MINISKY_TLS_KEY"),
+		ClientCA:   os.Getenv("MINISKY_TLS_CLIENT_CA"),
+		ServerName: "localhost",
+	})
+	return err
+}
+
+func checkDoctorQuotas() error {
+	_, err := router.ParseQuotaConfigJSON(os.Getenv("MINISKY_QUOTAS_JSON"), time.Now)
+	return err
+}
+
+func checkDoctorAudit() error {
+	enabled, _ := strconv.ParseBool(os.Getenv("MINISKY_AUDIT_ENABLED"))
+	strict, _ := strconv.ParseBool(os.Getenv("MINISKY_AUDIT_STRICT"))
+	if !enabled && !strict {
+		return nil
+	}
+	audit, err := localsecurity.OpenAuditLog(config.GetProfileDir(), config.GetProfile(), strict)
+	if err != nil {
+		return err
+	}
+	defer audit.Close()
+	return audit.Verify()
 }
 
 func effectiveBackendStates() []namedBackendState {
@@ -243,6 +318,100 @@ func checkDoctorDataDir() error {
 		return fmt.Errorf("%s: %w", dataDir, err)
 	}
 	return nil
+}
+
+func checkDoctorDiskSpace() error {
+	if runtime.GOOS == "windows" {
+		output, err := exec.Command("powershell", "-NoProfile", "-Command",
+			"(Get-PSDrive -Name ([IO.Path]::GetPathRoot($env:USERPROFILE).TrimEnd(':'))).Free").Output()
+		if err != nil {
+			return fmt.Errorf("query free space: %w", err)
+		}
+		free, err := strconv.ParseUint(strings.TrimSpace(string(output)), 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse free space: %w", err)
+		}
+		if free < 512<<20 {
+			return fmt.Errorf("less than 512 MiB available")
+		}
+		return nil
+	}
+	output, err := exec.Command("df", "-Pk", config.GetMiniskyDir()).Output()
+	if err != nil {
+		// The directory may not exist until the writable-data check runs.
+		output, err = exec.Command("df", "-Pk", filepath.Dir(config.GetMiniskyDir())).Output()
+	}
+	if err != nil {
+		return fmt.Errorf("query free space: %w", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 4 {
+		return fmt.Errorf("unexpected disk-space output")
+	}
+	availableKB, err := strconv.ParseUint(fields[len(fields)-3], 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse available disk space: %w", err)
+	}
+	if availableKB < 512*1024 {
+		return fmt.Errorf("less than 512 MiB available")
+	}
+	return nil
+}
+
+func requiredDoctorImages() []string {
+	registry := config.GetImageRegistry()
+	seen := make(map[string]struct{})
+	images := make([]string, 0, len(registry.Emulators)+1)
+	for _, emulator := range registry.Emulators {
+		if emulator.Image == "" {
+			continue
+		}
+		if _, ok := seen[emulator.Image]; ok {
+			continue
+		}
+		seen[emulator.Image] = struct{}{}
+		images = append(images, emulator.Image)
+	}
+	if image := registry.ArtifactRegistry.Image; image != "" {
+		if _, ok := seen[image]; !ok {
+			seen[image] = struct{}{}
+			images = append(images, image)
+		}
+	}
+	if image := registry.Memorystore.Redis.DefaultImage; image != "" {
+		if _, ok := seen[image]; !ok {
+			images = append(images, image)
+		}
+	}
+	return images
+}
+
+func checkDoctorImage(image string) error {
+	if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
+		return fmt.Errorf("not present locally")
+	}
+	return nil
+}
+
+func pullDoctorImage(ctx context.Context, image string) error {
+	if !containsImage(requiredDoctorImages(), image) {
+		return fmt.Errorf("refusing to pull undeclared image %q", image)
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	if output, err := exec.CommandContext(commandCtx, "docker", "pull", image).CombinedOutput(); err != nil {
+		return fmt.Errorf("pull %s: %s", image, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func containsImage(images []string, target string) bool {
+	for _, image := range images {
+		if image == target {
+			return true
+		}
+	}
+	return false
 }
 
 func environmentOrDefault(name, fallback string) string {

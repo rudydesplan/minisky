@@ -243,7 +243,12 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 	}
 
 	targetLink := cl.SelfLink
-	op := api.opMgr.Register("container#operation", "CREATE_CLUSTER", targetLink, zone, "")
+	op, err := api.opMgr.RegisterDurable("container#operation", "CREATE_CLUSTER", targetLink, zone, "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		if api.backend.Enabled() {
@@ -359,7 +364,12 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		return
 	}
 
-	op := api.opMgr.Register("container#operation", "DELETE_CLUSTER", cl.SelfLink, zone, "")
+	op, err := api.opMgr.RegisterDurable("container#operation", "DELETE_CLUSTER", cl.SelfLink, zone, "")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Simulate winding down time
 		time.Sleep(3 * time.Second)

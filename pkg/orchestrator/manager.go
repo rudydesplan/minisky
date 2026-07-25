@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"minisky/pkg/config"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,12 +34,13 @@ type ServiceManager struct {
 
 // ContainerConfig describes one backend emulator container.
 type ContainerConfig struct {
-	Name          string
-	Image         string
-	ContainerPort string // e.g. "4443/tcp"
-	Cmd           []string
-	Volume        string
-	Env           []string
+	Name            string
+	Image           string
+	ContainerPort   string // e.g. "4443/tcp"
+	AdditionalPorts []string
+	Cmd             []string
+	Volume          string
+	Env             []string
 }
 
 // PortMapping tracks a host:container port pair for a VM.
@@ -85,15 +89,27 @@ func (sm *ServiceManager) EnsureNetwork(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
+		var network struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&network); err != nil {
+			return fmt.Errorf("inspect existing network ownership: %w", err)
+		}
+		if !isOwnedDockerResource(network.Labels) {
+			return fmt.Errorf("network %q exists but is not owned by active MiniSky profile", networkName)
+		}
 		log.Printf("[Orchestrator] Network '%s' already exists.", networkName)
 		return nil
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("network inspect failed with status %d", resp.StatusCode)
 	}
 
 	// Create isolated bridge network
 	payload := map[string]interface{}{
 		"Name":   networkName,
 		"Driver": "bridge",
-		"Labels": map[string]string{"managed-by": "minisky"},
+		"Labels": ownedDockerLabels(),
 	}
 	data, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/networks/create", bytes.NewBuffer(data))
@@ -122,17 +138,26 @@ func (sm *ServiceManager) EnsureServiceRunning(ctx context.Context, domain strin
 
 	// Map config to internal ContainerConfig
 	iconfig := ContainerConfig{
-		Name:          cfg.Name,
-		Image:         cfg.Image,
-		ContainerPort: cfg.Port,
-		Cmd:           cfg.Cmd,
-		Volume:        cfg.Volume,
-		Env:           env,
+		Name:            cfg.Name,
+		Image:           cfg.Image,
+		ContainerPort:   cfg.Port,
+		AdditionalPorts: cfg.AdditionalPorts,
+		Cmd:             cfg.Cmd,
+		Volume:          cfg.Volume,
+		Env:             env,
 	}
+	volume, err := resolveEmulatorVolume(domain, iconfig.Volume)
+	if err != nil {
+		return "", err
+	}
+	iconfig.Volume = volume
 
-	status, err := sm.checkStatus(cfg.Name)
+	status, labels, err := sm.inspectContainer(cfg.Name)
 	if err != nil {
 		return "", fmt.Errorf("status check failed: %v", err)
+	}
+	if status != "not_found" && !isOwnedDockerResource(labels) {
+		return "", fmt.Errorf("container %q exists but is not owned by active MiniSky profile", cfg.Name)
 	}
 
 	if status != "running" {
@@ -293,10 +318,15 @@ func (sm *ServiceManager) GetContainerHostPort(containerName string, containerPo
 	return bindings[0].HostPort, nil
 }
 
-// Teardown stops and removes all minisky-* containers and the minisky-net network.
+// Teardown stops and removes only resources whose labels prove ownership by the
+// active profile. Name matches alone are never sufficient for destructive work.
 func (sm *ServiceManager) Teardown(ctx context.Context) {
 	reg := config.GetImageRegistry()
 	for _, cfg := range reg.Emulators {
+		status, labels, err := sm.inspectContainer(cfg.Name)
+		if err != nil || status == "not_found" || !isOwnedDockerResource(labels) {
+			continue
+		}
 		stopURL := fmt.Sprintf("http://localhost/containers/%s/stop", cfg.Name)
 		req, _ := http.NewRequestWithContext(ctx, "POST", stopURL, nil)
 		sm.dockerClient.Do(req)
@@ -306,13 +336,23 @@ func (sm *ServiceManager) Teardown(ctx context.Context) {
 		sm.dockerClient.Do(req)
 		log.Printf("[Orchestrator] Removed container '%s'", cfg.Name)
 	}
-	rmNetURL := "http://localhost/networks/" + networkName
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", rmNetURL, nil)
-	sm.dockerClient.Do(req)
-	log.Printf("[Orchestrator] Removed network '%s'", networkName)
+	resp, err := sm.dockerClient.Get("http://localhost/networks/" + networkName)
+	if err == nil {
+		defer resp.Body.Close()
+		var network struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		if resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&network) == nil &&
+			isOwnedDockerResource(network.Labels) {
+			rmNetURL := "http://localhost/networks/" + networkName
+			req, _ := http.NewRequestWithContext(ctx, "DELETE", rmNetURL, nil)
+			sm.dockerClient.Do(req)
+			log.Printf("[Orchestrator] Removed network '%s'", networkName)
+		}
+	}
 }
 
-// PruneExitedContainers removes all containers that are not running.
+// PruneExitedContainers removes exited containers owned by the active profile.
 func (sm *ServiceManager) PruneExitedContainers(ctx context.Context) error {
 	resp, err := sm.dockerClient.Get("http://localhost/containers/json?all=true&filters={\"status\":[\"exited\",\"created\",\"dead\"]}")
 	if err != nil {
@@ -321,14 +361,18 @@ func (sm *ServiceManager) PruneExitedContainers(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	var containers []struct {
-		Id    string
-		Names []string
+		Id     string
+		Names  []string
+		Labels map[string]string
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
 		return err
 	}
 
 	for _, c := range containers {
+		if !isOwnedDockerResource(c.Labels) {
+			continue
+		}
 		name := "unknown"
 		if len(c.Names) > 0 {
 			name = c.Names[0]
@@ -407,21 +451,34 @@ func (sm *ServiceManager) PruneUnusedImages(ctx context.Context) error {
 }
 
 func (sm *ServiceManager) checkStatus(name string) (string, error) {
+	status, _, err := sm.inspectContainer(name)
+	return status, err
+}
+
+func (sm *ServiceManager) inspectContainer(name string) (string, map[string]string, error) {
 	resp, err := sm.dockerClient.Get(fmt.Sprintf("http://localhost/containers/%s/json", name))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return "not_found", nil
+		return "not_found", nil, nil
 	}
-	var state struct {
-		State struct{ Status string }
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("container inspect failed with status %d", resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return "", err
+	var inspected struct {
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
 	}
-	return state.State.Status, nil
+	if err := json.NewDecoder(resp.Body).Decode(&inspected); err != nil {
+		return "", nil, err
+	}
+	return inspected.State.Status, inspected.Config.Labels, nil
 }
 
 // CheckStatusPublic allows external packages to see if a container is running.
@@ -495,6 +552,7 @@ func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage strin
 		"Image":        osImage,
 		"Env":          append(sm.standardEnv(), env...),
 		"ExposedPorts": exposedPorts,
+		"Labels":       ownedDockerLabels(),
 		"HostConfig": map[string]interface{}{
 			"NetworkMode":  netMode,
 			"PortBindings": portBindings,
@@ -524,6 +582,216 @@ func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage strin
 	}
 
 	return sm.updatePortRegistry(containerName)
+}
+
+// ProvisionRedis creates or reconciles an owned Redis container with an owned
+// named volume. The only published endpoint is a Docker-assigned loopback port.
+func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image string) (string, error) {
+	containerName, volumeName := redisDockerNames(resourceID)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return "", err
+	}
+	if status != "not_found" {
+		if !isOwnedRedisResource(labels, resourceID) {
+			return "", fmt.Errorf("Redis container %q exists but is not owned by this profile and resource", containerName)
+		}
+		if status != "running" {
+			if err := sm.startContainer(containerName); err != nil {
+				return "", err
+			}
+		}
+		return sm.redisEndpoint(containerName)
+	}
+
+	exists, err := sm.ImageExistsPublic(image)
+	if err != nil {
+		return "", fmt.Errorf("inspect Redis image: %w", err)
+	}
+	if !exists {
+		if err := sm.pullImageInternal(image); err != nil {
+			return "", fmt.Errorf("pull Redis image: %w", err)
+		}
+	}
+	resourceLabels := ownedDockerLabels()
+	resourceLabels["minisky.service"] = "memorystore-redis"
+	resourceLabels["minisky.resource"] = resourceID
+	volumeInspect, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	if err != nil {
+		return "", fmt.Errorf("inspect Redis volume: %w", err)
+	}
+	if volumeInspect.StatusCode == http.StatusOK {
+		var existing struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		decodeErr := json.NewDecoder(volumeInspect.Body).Decode(&existing)
+		volumeInspect.Body.Close()
+		if decodeErr != nil {
+			return "", fmt.Errorf("decode Redis volume ownership: %w", decodeErr)
+		}
+		if !isOwnedRedisResource(existing.Labels, resourceID) {
+			return "", fmt.Errorf("Redis volume %q exists but is not owned by this profile and resource", volumeName)
+		}
+	} else {
+		statusCode := volumeInspect.StatusCode
+		volumeInspect.Body.Close()
+		if statusCode != http.StatusNotFound {
+			return "", fmt.Errorf("inspect Redis volume returned %d", statusCode)
+		}
+		volumePayload, _ := json.Marshal(map[string]any{"Name": volumeName, "Labels": resourceLabels})
+		volumeRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			"http://localhost/volumes/create", bytes.NewReader(volumePayload))
+		volumeRequest.Header.Set("Content-Type", "application/json")
+		volumeResponse, err := sm.dockerClient.Do(volumeRequest)
+		if err != nil {
+			return "", fmt.Errorf("create Redis volume: %w", err)
+		}
+		defer volumeResponse.Body.Close()
+		if volumeResponse.StatusCode != http.StatusCreated && volumeResponse.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(volumeResponse.Body)
+			return "", fmt.Errorf("create Redis volume returned %d: %s", volumeResponse.StatusCode, body)
+		}
+	}
+
+	const containerPort = "6379/tcp"
+	payload := map[string]any{
+		"Image":        image,
+		"Cmd":          []string{"redis-server", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"},
+		"ExposedPorts": map[string]any{containerPort: struct{}{}},
+		"HostConfig": map[string]any{
+			"NetworkMode": networkName,
+			"PortBindings": map[string]any{
+				containerPort: []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "0"}},
+			},
+			"Binds": []string{volumeName + ":/data"},
+		},
+		"Labels": resourceLabels,
+	}
+	encoded, _ := json.Marshal(payload)
+	createRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/create?name="+url.QueryEscape(containerName), bytes.NewReader(encoded))
+	createRequest.Header.Set("Content-Type", "application/json")
+	createResponse, err := sm.dockerClient.Do(createRequest)
+	if err != nil {
+		return "", fmt.Errorf("create Redis container: %w", err)
+	}
+	defer createResponse.Body.Close()
+	if createResponse.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createResponse.Body)
+		return "", fmt.Errorf("create Redis container returned %d: %s", createResponse.StatusCode, body)
+	}
+	if err := sm.startContainer(containerName); err != nil {
+		return "", err
+	}
+	endpoint, err := sm.redisEndpoint(containerName)
+	if err != nil {
+		return "", err
+	}
+	if err := sm.waitUntilReady(endpoint, 30*time.Second); err != nil {
+		return "", err
+	}
+	return endpoint, nil
+}
+
+// ReconcileRedis returns the loopback endpoint only when the existing backend
+// has exact profile and resource ownership labels.
+func (sm *ServiceManager) ReconcileRedis(_ context.Context, resourceID string) (string, bool, error) {
+	containerName, _ := redisDockerNames(resourceID)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return "", false, err
+	}
+	if status == "not_found" {
+		return "", false, nil
+	}
+	if !isOwnedRedisResource(labels, resourceID) {
+		return "", false, nil
+	}
+	if status != "running" {
+		return "", true, fmt.Errorf("owned Redis container is %s", status)
+	}
+	endpoint, err := sm.redisEndpoint(containerName)
+	return endpoint, true, err
+}
+
+// DeleteRedis removes only the exactly owned container and volume.
+func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) error {
+	containerName, volumeName := redisDockerNames(resourceID)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status != "not_found" {
+		if !isOwnedRedisResource(labels, resourceID) {
+			return fmt.Errorf("refusing to delete unowned Redis container %q", containerName)
+		}
+		request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+		response, err := sm.dockerClient.Do(request)
+		if err != nil {
+			return err
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("delete Redis container returned %d", response.StatusCode)
+		}
+	}
+
+	inspectResponse, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	if err != nil {
+		return err
+	}
+	if inspectResponse.StatusCode == http.StatusNotFound {
+		inspectResponse.Body.Close()
+		return nil
+	}
+	if inspectResponse.StatusCode != http.StatusOK {
+		statusCode := inspectResponse.StatusCode
+		inspectResponse.Body.Close()
+		return fmt.Errorf("inspect Redis volume returned %d", statusCode)
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	decodeErr := json.NewDecoder(inspectResponse.Body).Decode(&volume)
+	inspectResponse.Body.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	if !isOwnedRedisResource(volume.Labels, resourceID) {
+		return fmt.Errorf("refusing to delete unowned Redis volume %q", volumeName)
+	}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
+	response, err := sm.dockerClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete Redis volume returned %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (sm *ServiceManager) redisEndpoint(containerName string) (string, error) {
+	port, err := sm.GetContainerHostPort(containerName, "6379/tcp")
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort("127.0.0.1", port), nil
+}
+
+func redisDockerNames(resourceID string) (string, string) {
+	hash := sha256.Sum256([]byte(config.GetProfile() + "\x00" + resourceID))
+	suffix := fmt.Sprintf("%x", hash[:8])
+	return "minisky-redis-" + suffix, "minisky-redis-data-" + suffix
+}
+
+func isOwnedRedisResource(labels map[string]string, resourceID string) bool {
+	return isOwnedDockerResource(labels) &&
+		labels["minisky.service"] == "memorystore-redis" &&
+		labels["minisky.resource"] == resourceID
 }
 
 // ProvisionCloudSQLVM starts a fully-interactive PostgreSQL or MySQL docker database data plane.
@@ -914,13 +1182,21 @@ func (sm *ServiceManager) RunCommandInContainer(name string, cmd []string) (stri
 func (sm *ServiceManager) createContainer(c ContainerConfig) error {
 	// Bind container port to a random localhost port — works with Docker Desktop
 	// (which runs in a VM where internal bridge IPs aren't host-reachable).
-	hostCfg := map[string]interface{}{
-		"NetworkMode": networkName,
-		"PortBindings": map[string]interface{}{
-			c.ContainerPort: []map[string]string{
-				{"HostIp": "127.0.0.1", "HostPort": "0"},
-			},
+	exposedPorts := map[string]interface{}{c.ContainerPort: struct{}{}}
+	portBindings := map[string]interface{}{
+		c.ContainerPort: []map[string]string{
+			{"HostIp": "127.0.0.1", "HostPort": "0"},
 		},
+	}
+	for _, port := range c.AdditionalPorts {
+		exposedPorts[port] = struct{}{}
+		portBindings[port] = []map[string]string{
+			{"HostIp": "127.0.0.1", "HostPort": "0"},
+		}
+	}
+	hostCfg := map[string]interface{}{
+		"NetworkMode":  networkName,
+		"PortBindings": portBindings,
 	}
 	if c.Volume != "" {
 		vol := c.Volume
@@ -942,9 +1218,10 @@ func (sm *ServiceManager) createContainer(c ContainerConfig) error {
 	payload := map[string]interface{}{
 		"Image":        c.Image,
 		"Cmd":          c.Cmd,
-		"ExposedPorts": map[string]interface{}{c.ContainerPort: struct{}{}},
+		"ExposedPorts": exposedPorts,
 		"HostConfig":   hostCfg,
 		"Env":          c.Env,
+		"Labels":       ownedDockerLabels(),
 	}
 	data, _ := json.Marshal(payload)
 	url := fmt.Sprintf("http://localhost/containers/create?name=%s", c.Name)
@@ -960,6 +1237,39 @@ func (sm *ServiceManager) createContainer(c ContainerConfig) error {
 		return fmt.Errorf("create rejected %d: %s", resp.StatusCode, b)
 	}
 	return nil
+}
+
+func resolveEmulatorVolume(domain, configured string) (string, error) {
+	runtimeName := ""
+	switch domain {
+	case "datastore.googleapis.com":
+		runtimeName = "datastore"
+	case "firestore.googleapis.com":
+		runtimeName = "firestore"
+	default:
+		return configured, nil
+	}
+
+	containerPath := "/data"
+	if separator := strings.LastIndex(configured, ":"); separator >= 0 {
+		containerPath = configured[separator+1:]
+	}
+	hostPath := filepath.Join(config.GetRuntimeDir(), runtimeName)
+	if err := os.MkdirAll(hostPath, 0o700); err != nil {
+		return "", fmt.Errorf("create Datastore profile runtime directory: %w", err)
+	}
+	return hostPath + ":" + containerPath, nil
+}
+
+func ownedDockerLabels() map[string]string {
+	return map[string]string{
+		"managed-by":      "minisky",
+		"minisky.profile": config.GetProfile(),
+	}
+}
+
+func isOwnedDockerResource(labels map[string]string) bool {
+	return labels["managed-by"] == "minisky" && labels["minisky.profile"] == config.GetProfile()
 }
 
 func (sm *ServiceManager) startContainer(name string) error {
@@ -997,12 +1307,62 @@ func (sm *ServiceManager) waitUntilReady(addr string, timeout time.Duration) err
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (sm *ServiceManager) CreateVPCNetwork(ctx context.Context, name string) error {
+	return sm.CreateVPCNetworkWithSubnet(ctx, name, "")
+}
+
+// CreateVPCNetworkWithSubnet maps one bounded GCP subnetwork/IPAM slice to an
+// owned Docker bridge. Docker remains the enforcement boundary; no host-global
+// routes or iptables rules are modified.
+func (sm *ServiceManager) CreateVPCNetworkWithSubnet(ctx context.Context, name, cidr string) error {
+	if !validDockerResourceName(name) {
+		return fmt.Errorf("invalid VPC network name")
+	}
+	if cidr != "" {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil || !prefix.Addr().Is4() || prefix.Bits() < 8 ||
+			prefix.Addr().IsLoopback() || prefix.Addr().IsMulticast() ||
+			prefix.Addr().IsUnspecified() {
+			return fmt.Errorf("invalid IPv4 subnetwork CIDR %q", cidr)
+		}
+		cidr = prefix.Masked().String()
+	}
 	netName := "minisky-vpc-" + name
 	log.Printf("[Orchestrator] Creating VPC Docker network '%s'", netName)
+	inspect, err := sm.dockerClient.Get("http://localhost/networks/" + url.PathEscape(netName))
+	if err != nil {
+		return err
+	}
+	if inspect.StatusCode == http.StatusOK {
+		var existing struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		decodeErr := json.NewDecoder(inspect.Body).Decode(&existing)
+		inspect.Body.Close()
+		if decodeErr != nil {
+			return fmt.Errorf("inspect existing VPC network: %w", decodeErr)
+		}
+		if !isOwnedVPCNetwork(existing.Labels, name) {
+			return fmt.Errorf("VPC network %q exists but is not owned by the active MiniSky profile", netName)
+		}
+		return nil
+	}
+	inspect.Body.Close()
+	if inspect.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("inspect VPC network returned %d", inspect.StatusCode)
+	}
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "compute-network"
+	labels["minisky.resource"] = name
 	payload := map[string]interface{}{
 		"Name":   netName,
 		"Driver": "bridge",
-		"Labels": map[string]string{"managed-by": "minisky-vpc"},
+		"Labels": labels,
+	}
+	if cidr != "" {
+		payload["IPAM"] = map[string]any{
+			"Driver": "default",
+			"Config": []map[string]string{{"Subnet": cidr}},
+		}
 	}
 	data, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/networks/create", bytes.NewBuffer(data))
@@ -1012,7 +1372,7 @@ func (sm *ServiceManager) CreateVPCNetwork(ctx context.Context, name string) err
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict { // 409
+	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("vpc network create failed %d: %s", resp.StatusCode, b)
 	}
@@ -1020,9 +1380,35 @@ func (sm *ServiceManager) CreateVPCNetwork(ctx context.Context, name string) err
 }
 
 func (sm *ServiceManager) DeleteVPCNetwork(ctx context.Context, name string) error {
+	if !validDockerResourceName(name) {
+		return fmt.Errorf("invalid VPC network name")
+	}
 	netName := "minisky-vpc-" + name
 	log.Printf("[Orchestrator] Deleting VPC Docker network '%s'", netName)
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", "http://localhost/networks/"+netName, nil)
+	inspect, err := sm.dockerClient.Get("http://localhost/networks/" + url.PathEscape(netName))
+	if err != nil {
+		return err
+	}
+	if inspect.StatusCode == http.StatusNotFound {
+		inspect.Body.Close()
+		return nil
+	}
+	if inspect.StatusCode != http.StatusOK {
+		inspect.Body.Close()
+		return fmt.Errorf("inspect VPC network returned %d", inspect.StatusCode)
+	}
+	var existing struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	decodeErr := json.NewDecoder(inspect.Body).Decode(&existing)
+	inspect.Body.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	if !isOwnedVPCNetwork(existing.Labels, name) {
+		return fmt.Errorf("refusing to delete unowned VPC network %q", netName)
+	}
+	req, _ := http.NewRequestWithContext(ctx, "DELETE", "http://localhost/networks/"+url.PathEscape(netName), nil)
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
@@ -1032,6 +1418,26 @@ func (sm *ServiceManager) DeleteVPCNetwork(ctx context.Context, name string) err
 		return fmt.Errorf("vpc network delete failed %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func isOwnedVPCNetwork(labels map[string]string, name string) bool {
+	return isOwnedDockerResource(labels) &&
+		labels["minisky.service"] == "compute-network" &&
+		labels["minisky.resource"] == name
+}
+
+func validDockerResourceName(name string) bool {
+	if name == "" || len(name) > 63 {
+		return false
+	}
+	for index, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') ||
+			(char == '-' && index > 0) {
+			continue
+		}
+		return false
+	}
+	return name[len(name)-1] != '-'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1172,7 +1578,13 @@ func (sm *ServiceManager) CheckFirewallAllows(vpcName, protocol, port, sourceIP 
 
 // StreamContainerExec initiates an interactive session with a container.
 // It returns a hijacked physical connection to the Docker daemon.
-func (sm *ServiceManager) StreamContainerExec(name string) (net.Conn, error) {
+func (sm *ServiceManager) StreamContainerExec(name, user string) (net.Conn, error) {
+	if err := sm.validateExecTarget(name); err != nil {
+		return nil, err
+	}
+	if user != "" && !validExecUser(user) {
+		return nil, fmt.Errorf("invalid exec user")
+	}
 	// 1. Create the exec instance
 	// We try bash first, falling back to sh if needed
 	payload := map[string]interface{}{
@@ -1181,10 +1593,12 @@ func (sm *ServiceManager) StreamContainerExec(name string) (net.Conn, error) {
 		"AttachStderr": true,
 		"Tty":          true,
 		"Cmd":          []string{"/bin/bash"},
-		"User":         "root",
+	}
+	if user != "" {
+		payload["User"] = user
 	}
 	body, _ := json.Marshal(payload)
-	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", name)
+	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", url.PathEscape(name))
 	resp, err := sm.dockerClient.Post(createURL, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -1240,6 +1654,37 @@ func (sm *ServiceManager) StreamContainerExec(name string) (net.Conn, error) {
 	}
 
 	return &bufferedConn{Conn: conn, r: bufReader}, nil
+}
+
+func (sm *ServiceManager) validateExecTarget(name string) error {
+	if !validDockerResourceName(name) {
+		return fmt.Errorf("invalid container name")
+	}
+	status, labels, err := sm.inspectContainer(name)
+	if err != nil {
+		return fmt.Errorf("inspect terminal target: %w", err)
+	}
+	if status != "running" {
+		return fmt.Errorf("terminal target is not running")
+	}
+	if !isOwnedDockerResource(labels) {
+		return fmt.Errorf("terminal target is not owned by the active MiniSky profile")
+	}
+	return nil
+}
+
+func validExecUser(user string) bool {
+	if user == "" || len(user) > 64 {
+		return false
+	}
+	for _, char := range user {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type bufferedConn struct {

@@ -188,6 +188,15 @@ func (api *API) Close() {
 	<-api.cron.Stop().Done()
 }
 
+// SetGatewayBaseURL wires the running daemon gateway used for cross-shim
+// Pub/Sub and App Engine delivery. Startup calls this after the actual listen
+// port is known, so Scheduler does not depend on a conventional port.
+func (api *API) SetGatewayBaseURL(baseURL string) {
+	api.mu.Lock()
+	api.gatewayBaseURL = strings.TrimRight(baseURL, "/")
+	api.mu.Unlock()
+}
+
 func (api *API) persistMetadata() error {
 	if api.store == nil {
 		return nil

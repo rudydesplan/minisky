@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"minisky/pkg/config"
 	"minisky/pkg/registry"
+	localsecurity "minisky/pkg/security"
 	"minisky/pkg/state"
 )
 
@@ -52,6 +54,7 @@ type ServiceAccountKey struct {
 	PrivateKeyData  string `json:"privateKeyData"` // base64 JSON
 	ValidAfterTime  string `json:"validAfterTime"`
 	ValidBeforeTime string `json:"validBeforeTime"`
+	Disabled        bool   `json:"disabled,omitempty"`
 }
 
 // IamPolicy mirrors the GCP IAM Policy binding structure.
@@ -75,11 +78,18 @@ type Binding struct {
 // It handles service account CRUD, key generation, and IAM policy management.
 type API struct {
 	mu              sync.RWMutex
+	persistMu       sync.Mutex
 	store           stateStore
 	serviceAccounts map[string]*ServiceAccount      // key: "project:email"
 	keys            map[string][]*ServiceAccountKey // key: "project:email"
 	policies        map[string]*IamPolicy           // key: resource full name
 	strict          bool
+	issuer          *localsecurity.Issuer
+	hierarchy       hierarchyResolver
+}
+
+type hierarchyResolver interface {
+	Ancestors(resource string) []string
 }
 
 type stateStore interface {
@@ -105,6 +115,11 @@ func NewAPI() *API {
 	if err != nil {
 		log.Printf("[Shim: IAM] state rehydration failed: %v", err)
 		return newAPI(store)
+	}
+	if issuer, issuerErr := localsecurity.LoadIssuer(config.GetProfileDir()); issuerErr != nil {
+		log.Printf("[Shim: IAM] local credential issuer unavailable: %v", issuerErr)
+	} else {
+		api.issuer = issuer
 	}
 	return api
 }
@@ -136,12 +151,21 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 }
 
 func newAPI(store stateStore) *API {
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
 	return &API{
 		store:           store,
 		serviceAccounts: make(map[string]*ServiceAccount),
 		keys:            make(map[string][]*ServiceAccountKey),
 		policies:        make(map[string]*IamPolicy),
 		strict:          strings.EqualFold(strings.TrimSpace(os.Getenv("MINISKY_IAM_MODE")), "strict"),
+		issuer:          localsecurity.NewIssuer(key, time.Now),
+	}
+}
+
+func (api *API) OnPostBoot(ctx *registry.Context) {
+	if hierarchy, ok := ctx.GetShim("cloudresourcemanager.googleapis.com").(hierarchyResolver); ok {
+		api.hierarchy = hierarchy
 	}
 }
 
@@ -149,10 +173,90 @@ func (api *API) persistMetadata() error {
 	if api.store == nil {
 		return nil
 	}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	api.mu.RLock()
 	metadata := cloneIAMMetadata(api.serviceAccounts, api.keys, api.policies)
 	api.mu.RUnlock()
 	return api.store.Save(iamStateEntry, metadata)
+}
+
+// EnforcementEnabled reports whether cross-shim mutation checks are active.
+func (api *API) EnforcementEnabled() bool {
+	return api.strict
+}
+
+// Authorize evaluates one permission against the policy stored for resource.
+// Callers supply the explicit local principal from X-MiniSky-Principal.
+func (api *API) Authorize(resource, principal, permission string) bool {
+	if !api.strict {
+		return true
+	}
+	if strings.TrimSpace(principal) == "" {
+		return false
+	}
+	canonical := strings.TrimPrefix(resource, "/v1/")
+	resources := []string{canonical}
+	parts := strings.Split(strings.Trim(canonical, "/"), "/")
+	projectResource := ""
+	for index, part := range parts {
+		if part == "projects" && index+1 < len(parts) {
+			projectResource = "projects/" + strings.TrimSuffix(parts[index+1], ":")
+			break
+		}
+	}
+	if projectResource != "" && projectResource != canonical {
+		resources = append(resources, projectResource)
+	}
+	if api.hierarchy != nil {
+		ancestorRoot := canonical
+		if projectResource != "" {
+			ancestorRoot = projectResource
+		}
+		for _, ancestor := range api.hierarchy.Ancestors(ancestorRoot) {
+			if !containsString(resources, ancestor) {
+				resources = append(resources, ancestor)
+			}
+		}
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	for _, candidate := range resources {
+		policy := api.policies[candidate]
+		if policy == nil {
+			policy = api.policies["/v1/"+strings.TrimPrefix(candidate, "/")]
+		}
+		if _, allowed := permissionsForPrincipal(policy, principal)[permission]; allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (api *API) IssueLocalToken(subject, audience string, scopes []string, lifetime time.Duration) (string, time.Time, error) {
+	api.mu.RLock()
+	disabled := false
+	if strings.HasPrefix(subject, "serviceAccount:") {
+		email := strings.TrimPrefix(subject, "serviceAccount:")
+		for _, account := range api.serviceAccounts {
+			if account.Email == email {
+				disabled = account.Disabled
+				break
+			}
+		}
+	}
+	api.mu.RUnlock()
+	if disabled {
+		return "", time.Time{}, errors.New("service account is disabled")
+	}
+	token, claims, err := api.issuer.Issue(localsecurity.TokenRequest{
+		Subject: subject, Audience: audience, Scopes: scopes, Lifetime: lifetime,
+	})
+	return token, claims.ExpiresAt, err
+}
+
+func (api *API) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
+	return api.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
 }
 
 func (api *API) persistOrError(w http.ResponseWriter) bool {
@@ -186,6 +290,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Policy verbs come as path suffixes after a colon
 	switch {
+	case strings.HasSuffix(path, ":disable") && strings.Contains(path, "/keys/"):
+		api.disableKey(w, strings.TrimSuffix(path, ":disable"))
+		return
 	case strings.HasSuffix(path, ":setIamPolicy"):
 		api.setIamPolicy(w, r, strings.TrimSuffix(path, ":setIamPolicy"))
 		return
@@ -342,14 +449,91 @@ func (api *API) deleteServiceAccount(w http.ResponseWriter, project, email strin
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) routeKeys(w http.ResponseWriter, r *http.Request, project, email string) {
+	keyID := extractSegmentAfter(r.URL.Path, "keys")
 	switch r.Method {
 	case http.MethodPost:
 		api.createKey(w, project, email)
 	case http.MethodGet:
 		api.listKeys(w, project, email)
+	case http.MethodDelete:
+		api.deleteKey(w, project, email, keyID)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (api *API) disableKey(w http.ResponseWriter, path string) {
+	project := extractSegmentAfter(path, "projects")
+	email := extractSegmentAfter(path, "serviceAccounts")
+	keyID := extractSegmentAfter(path, "keys")
+	api.mu.Lock()
+	key := api.findKeyLocked(project, email, keyID)
+	if key != nil {
+		key.Disabled = true
+	}
+	api.mu.Unlock()
+	if key == nil {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Service account key not found")
+		return
+	}
+	if !api.persistOrError(w) {
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{})
+}
+
+func (api *API) deleteKey(w http.ResponseWriter, project, email, keyID string) {
+	accountKey := project + ":" + email
+	api.mu.Lock()
+	keys := api.keys[accountKey]
+	found := false
+	for index, key := range keys {
+		if strings.HasSuffix(key.Name, "/keys/"+keyID) {
+			api.keys[accountKey] = append(keys[:index], keys[index+1:]...)
+			found = true
+			break
+		}
+	}
+	api.mu.Unlock()
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Service account key not found")
+		return
+	}
+	if !api.persistOrError(w) {
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{})
+}
+
+func (api *API) findKeyLocked(project, email, keyID string) *ServiceAccountKey {
+	for _, key := range api.keys[project+":"+email] {
+		if strings.HasSuffix(key.Name, "/keys/"+keyID) {
+			return key
+		}
+	}
+	return nil
+}
+
+// KeyUsable reports whether persisted local key metadata is enabled and within
+// its validity window. MiniSky never treats these keys as Google credentials.
+func (api *API) KeyUsable(name string, now time.Time) bool {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	for _, keys := range api.keys {
+		for _, key := range keys {
+			if key.Name != name || key.Disabled {
+				continue
+			}
+			after, afterErr := time.Parse(time.RFC3339, key.ValidAfterTime)
+			before, beforeErr := time.Parse(time.RFC3339, key.ValidBeforeTime)
+			return afterErr == nil && beforeErr == nil && !now.Before(after) && now.Before(before)
+		}
+	}
+	return false
 }
 
 func (api *API) createKey(w http.ResponseWriter, project, email string) {
@@ -545,6 +729,86 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 }
 
 var rolePermissions = map[string][]string{
+	"roles/minisky.viewer": {
+		"minisky.dashboard.view",
+		"bigquery.datasets.get",
+		"compute.instances.get",
+		"compute.instances.list",
+		"pubsub.subscriptions.get",
+		"pubsub.subscriptions.list",
+		"pubsub.topics.get",
+		"pubsub.topics.list",
+		"storage.objects.get",
+		"storage.objects.list",
+	},
+	"roles/minisky.editor": {
+		"minisky.dashboard.view",
+		"minisky.dashboard.manage",
+		"bigquery.datasets.get",
+		"bigquery.datasets.update",
+		"compute.instances.get",
+		"compute.instances.list",
+		"compute.instances.create",
+		"compute.instances.start",
+		"compute.instances.stop",
+		"pubsub.subscriptions.get",
+		"pubsub.subscriptions.list",
+		"pubsub.subscriptions.create",
+		"pubsub.topics.get",
+		"pubsub.topics.list",
+		"pubsub.topics.create",
+		"pubsub.topics.publish",
+		"storage.objects.get",
+		"storage.objects.list",
+		"storage.objects.create",
+		"storage.objects.update",
+	},
+	"roles/minisky.admin": {
+		"minisky.dashboard.view",
+		"minisky.dashboard.manage",
+		"minisky.dashboard.terminal",
+		"resourcemanager.projects.create",
+		"iam.serviceAccounts.create",
+		"iam.serviceAccounts.delete",
+		"iam.serviceAccountKeys.create",
+		"iam.serviceAccountKeys.delete",
+		"iam.serviceAccountKeys.disable",
+		"iam.serviceAccounts.setIamPolicy",
+		"bigquery.datasets.get",
+		"bigquery.datasets.update",
+		"compute.disks.create",
+		"compute.disks.delete",
+		"compute.disks.get",
+		"compute.instances.create",
+		"compute.instances.delete",
+		"compute.instances.get",
+		"compute.instances.list",
+		"compute.instances.start",
+		"compute.instances.stop",
+		"pubsub.subscriptions.consume",
+		"pubsub.subscriptions.create",
+		"pubsub.subscriptions.delete",
+		"pubsub.subscriptions.get",
+		"pubsub.subscriptions.list",
+		"pubsub.topics.create",
+		"pubsub.topics.delete",
+		"pubsub.topics.get",
+		"pubsub.topics.list",
+		"pubsub.topics.publish",
+		"storage.buckets.create",
+		"storage.buckets.delete",
+		"storage.buckets.get",
+		"storage.buckets.list",
+		"storage.buckets.update",
+		"storage.objects.create",
+		"storage.objects.delete",
+		"storage.objects.get",
+		"storage.objects.list",
+		"storage.objects.update",
+	},
+	"roles/iam.serviceAccountTokenCreator": {
+		"iam.serviceAccounts.getAccessToken",
+	},
 	"roles/storage.admin": {
 		"storage.buckets.create",
 		"storage.buckets.delete",
@@ -596,6 +860,7 @@ var rolePermissions = map[string][]string{
 		"pubsub.topics.get",
 		"pubsub.topics.list",
 		"pubsub.topics.publish",
+		"pubsub.topics.attachSubscription",
 	},
 	"roles/pubsub.viewer": {
 		"pubsub.subscriptions.get",

@@ -242,7 +242,11 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fullName := fmt.Sprintf("apps/%s/services/%s/versions/%s", req.Project, req.Service, req.Version)
-	op := api.opMgr.Register("appengine#operation", "CREATE", fullName, "", "us-central1")
+	op, err := api.opMgr.RegisterDurable("appengine#operation", "CREATE", fullName, "", "us-central1")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	api.pushLog(req.Project, "INFO", req.Service, fmt.Sprintf("Starting deployment of version %s (runtime: %s)", req.Version, req.Runtime))
 

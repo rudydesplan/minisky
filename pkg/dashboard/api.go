@@ -23,6 +23,7 @@ import (
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/shims/memorystore"
 	"minisky/pkg/shims/monitoring"
+	"minisky/pkg/shims/resourcemanager"
 	"minisky/pkg/shims/scheduler"
 	"minisky/pkg/shims/serverless"
 	"minisky/pkg/version"
@@ -31,7 +32,23 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: dashboardSameOrigin,
+}
+
+func dashboardSameOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Host, r.Host) {
+		return false
+	}
+	expectedScheme := "http"
+	if r.TLS != nil {
+		expectedScheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, expectedScheme)
 }
 
 type API struct {
@@ -45,6 +62,8 @@ type API struct {
 	memoAPI      *memorystore.API
 	schedulerAPI *scheduler.API
 	computeAPI   *compute.API
+	projectAPI   *resourcemanager.API
+	gatewayURL   string
 }
 
 func NewAPIHandler(
@@ -58,6 +77,11 @@ func NewAPIHandler(
 	memoAPI *memorystore.API,
 	schedulerAPI *scheduler.API,
 	computeAPI *compute.API,
+	projectAPI *resourcemanager.API,
+	gatewayURL string,
+	diagnostics http.Handler,
+	authorizer dashboardAuthorizer,
+	tokenAudience string,
 ) http.Handler {
 	api := &API{
 		svcMgr:       svcMgr,
@@ -70,6 +94,8 @@ func NewAPIHandler(
 		memoAPI:      memoAPI,
 		schedulerAPI: schedulerAPI,
 		computeAPI:   computeAPI,
+		projectAPI:   projectAPI,
+		gatewayURL:   strings.TrimRight(gatewayURL, "/"),
 	}
 
 	mux := http.NewServeMux()
@@ -83,6 +109,9 @@ func NewAPIHandler(
 	mux.HandleFunc("/api/manage/system/prune-containers", api.handlePruneContainers)
 	mux.HandleFunc("/api/system/info", api.handleSystemInfo)
 	mux.HandleFunc("/api/projects", api.handleProjects)
+	if diagnostics != nil {
+		mux.Handle("/api/diagnostics/", diagnostics)
+	}
 
 	// Add reverse proxy for management APIs
 	mux.Handle("/api/manage/storage/", api.handleManageStorage())
@@ -112,7 +141,7 @@ func NewAPIHandler(
 	mux.Handle("/api/manage/cloudbuild/", api.handleManageCloudBuild())
 	mux.Handle("/api/manage/artifactregistry/", api.handleManageArtifactRegistry())
 	mux.Handle("/api/manage/vertexai/", api.handleManageVertexAi())
-	return mux
+	return withDashboardRBAC(mux, authorizer, tokenAudience)
 }
 
 // ServiceStatus matches the UI's expected schema
@@ -228,41 +257,15 @@ func (api *API) handleServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleProjects(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if api.projectAPI == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "project registry unavailable"})
 		return
 	}
-
-	projects := make(map[string]bool)
-	// Default projects that should always be there
-	projects["production"] = true
-	projects["local-dev-project"] = true
-
-	// Ask the shims — we don't have a direct link to all shims here,
-	// but we can add them to the API struct or use the registry.
-	// Actually, let's just use the ones we have in the API struct.
-
-	// Logging
-	if api.logAPI != nil {
-		for _, p := range api.logAPI.ListProjects() {
-			projects[p] = true
-		}
-	}
-
-	// Compute
-	if api.computeAPI != nil {
-		for _, p := range api.computeAPI.ListProjects() {
-			projects[p] = true
-		}
-	}
-
-	res := []string{}
-	for p := range projects {
-		res = append(res, p)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+	clone := r.Clone(r.Context())
+	clone.URL.Path = "/v3/projects"
+	api.projectAPI.ServeHTTP(w, clone)
 }
 
 func (api *API) handleServiceAction(w http.ResponseWriter, r *http.Request) {
@@ -744,18 +747,23 @@ func (api *API) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing container", http.StatusBadRequest)
 		return
 	}
+	user := strings.TrimSpace(r.URL.Query().Get("user"))
 
-	ws, err := upgrader.Upgrade(w, r, nil)
+	responseHeaders := http.Header{}
+	if dashboardWebSocketToken(r) != "" {
+		responseHeaders.Set("Sec-WebSocket-Protocol", "minisky-auth")
+	}
+	ws, err := upgrader.Upgrade(w, r, responseHeaders)
 	if err != nil {
 		log.Printf("[Terminal] Upgrade error: %v", err)
 		return
 	}
 	defer ws.Close()
 
-	conn, err := api.svcMgr.StreamContainerExec(container)
+	conn, err := api.svcMgr.StreamContainerExec(container, user)
 	if err != nil {
 		log.Printf("[Terminal] Failed to connect to container %s: %v", container, err)
-		ws.WriteMessage(websocket.TextMessage, []byte("\r\n[Error] Failed to connect to container: "+err.Error()+"\r\n"))
+		_ = ws.WriteMessage(websocket.TextMessage, []byte("\r\n[Error] Failed to connect to authorized container\r\n"))
 		return
 	}
 	defer conn.Close()
@@ -1060,7 +1068,7 @@ func (api *API) handleManageMemorystore() http.Handler {
 
 func (api *API) handleManageArtifactRegistry() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target, _ := url.Parse("http://localhost:8080")
+		target, _ := url.Parse(api.gatewayURL)
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		origDir := proxy.Director
 		proxy.Director = func(req *http.Request) {

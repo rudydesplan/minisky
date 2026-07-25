@@ -31,8 +31,8 @@ func TestBuildpacksBackendFallsBackWhenDependencyMissing(t *testing.T) {
 
 	backend := NewBuildpacksBackend()
 	state := backend.Status()
-	if backend.Enabled() || state.Backend != "simulation" || state.Diagnostic == "" {
-		t.Fatalf("backend state = %#v, want diagnosed simulation fallback", state)
+	if backend.Enabled() || !backend.Requested() || state.Backend != "simulation" || state.Diagnostic == "" {
+		t.Fatalf("backend state = %#v, want unavailable requested execution", state)
 	}
 }
 

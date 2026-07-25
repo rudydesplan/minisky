@@ -41,18 +41,22 @@ fi
 
 work_dir="$(mktemp -d)"
 minisky_pid=""
-applied=0
+terraform_initialized=0
 
 cleanup() {
   exit_code=$?
   trap - EXIT INT TERM
 
-  if [[ "${applied}" == "1" && -n "${api_port:-}" ]]; then
-    TF_DATA_DIR="${work_dir}/terraform-data" terraform -chdir="${terraform_dir}" destroy \
-      -auto-approve \
-      -input=false \
-      -var="minisky_endpoint=http://127.0.0.1:${api_port}" \
-      -var="profile=local" >/dev/null 2>&1 || true
+  if [[ "${terraform_initialized}" == "1" && -n "${api_port:-}" ]]; then
+    state_resources="$(TF_DATA_DIR="${work_dir}/terraform-data" terraform -chdir="${terraform_dir}" state list 2>/dev/null || true)"
+    if [[ -n "${state_resources}" ]]; then
+      TF_DATA_DIR="${work_dir}/terraform-data" terraform -chdir="${terraform_dir}" destroy \
+        -auto-approve \
+        -input=false \
+        -var="minisky_endpoint=http://127.0.0.1:${api_port}" \
+        -var="storage_bucket_name=${storage_bucket_name}" \
+        -var="profile=local" >/dev/null 2>&1 || true
+    fi
   fi
 
   if [[ -n "${minisky_pid}" ]] && kill -0 "${minisky_pid}" 2>/dev/null; then
@@ -80,10 +84,12 @@ api_port="${MINISKY_TERRAFORM_API_PORT:-$(free_port)}"
 ui_port="${MINISKY_TERRAFORM_UI_PORT:-$(free_port)}"
 gateway="http://127.0.0.1:${api_port}"
 project_id="local-dev-project"
+secondary_project_id="local-secondary-project"
 dataset_id="minisky_terraform"
 table_id="events"
 service_account_id="minisky-terraform"
 service_account_email="${service_account_id}@${project_id}.iam.gserviceaccount.com"
+storage_bucket_name="minisky-terraform-$$"
 
 mkdir -p "${work_dir}/home"
 go build -trimpath -o "${work_dir}/minisky" ./cmd/minisky
@@ -106,19 +112,24 @@ for _ in {1..60}; do
   sleep 1
 done
 curl --fail --silent --show-error "${ready_url}" >/dev/null
+curl --fail --silent --show-error \
+  -H 'Content-Type: application/json' \
+  -d "{\"projectId\":\"${secondary_project_id}\",\"displayName\":\"MiniSky integration secondary\"}" \
+  "${gateway}/_minisky/cloudresourcemanager/v3/projects" >/dev/null
 
 export TF_DATA_DIR="${work_dir}/terraform-data"
 terraform -chdir="${terraform_dir}" init \
   -backend-config="path=${work_dir}/terraform.tfstate" \
   -input=false \
   -lockfile=readonly
+terraform_initialized=1
 terraform -chdir="${terraform_dir}" validate
 terraform -chdir="${terraform_dir}" apply \
   -auto-approve \
   -input=false \
   -var="minisky_endpoint=${gateway}" \
+  -var="storage_bucket_name=${storage_bucket_name}" \
   -var="profile=local"
-applied=1
 
 assert_json_value() {
   local url=$1
@@ -148,15 +159,26 @@ PY
 }
 
 dataset_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${project_id}/datasets/${dataset_id}"
+secondary_dataset_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${secondary_project_id}/datasets/${dataset_id}"
 table_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${project_id}/datasets/${dataset_id}/tables/${table_id}"
 service_account_url="${gateway}/_minisky/iam/v1/projects/${project_id}/serviceAccounts/${service_account_email}"
+storage_bucket_url="${gateway}/_minisky/storage/storage/v1/b/${storage_bucket_name}"
+redis_instance_url="${gateway}/_minisky/redis/v1/projects/${project_id}/locations/us-central1/instances/minisky-terraform"
+spanner_instance_url="${gateway}/_minisky/spanner/v1/projects/${project_id}/instances/minisky-terraform"
+spanner_database_url="${spanner_instance_url}/databases/minisky-terraform"
 
 assert_json_value "${dataset_url}" "datasetReference.datasetId" "${dataset_id}"
+assert_json_value "${secondary_dataset_url}" "datasetReference.projectId" "${secondary_project_id}"
 assert_json_value "${table_url}" "tableReference.tableId" "${table_id}"
 assert_json_value "${service_account_url}" "email" "${service_account_email}"
+assert_json_value "${storage_bucket_url}" "name" "${storage_bucket_name}"
+assert_json_value "${redis_instance_url}" "name" "projects/${project_id}/locations/us-central1/instances/minisky-terraform"
+assert_json_value "${spanner_instance_url}" "name" "projects/${project_id}/instances/minisky-terraform"
+assert_json_value "${spanner_database_url}" "name" "projects/${project_id}/instances/minisky-terraform/databases/minisky-terraform"
 
 export MINISKY_ENDPOINT="${gateway}"
 export MINISKY_PROJECT_ID="${project_id}"
+export MINISKY_SECONDARY_PROJECT_ID="${secondary_project_id}"
 (cd "${repository_root}" && go run ./sdk-smoke/go)
 python3 "${repository_root}/sdk-smoke/python/smoke.py"
 
@@ -165,6 +187,7 @@ terraform -chdir="${terraform_dir}" plan \
   -detailed-exitcode \
   -input=false \
   -var="minisky_endpoint=${gateway}" \
+  -var="storage_bucket_name=${storage_bucket_name}" \
   -var="profile=local"
 plan_exit=$?
 set -e
@@ -177,10 +200,11 @@ terraform -chdir="${terraform_dir}" destroy \
   -auto-approve \
   -input=false \
   -var="minisky_endpoint=${gateway}" \
+  -var="storage_bucket_name=${storage_bucket_name}" \
   -var="profile=local"
-applied=0
 
-for url in "${table_url}" "${dataset_url}" "${service_account_url}"; do
+for url in "${table_url}" "${dataset_url}" "${secondary_dataset_url}" "${service_account_url}" "${storage_bucket_url}" \
+  "${redis_instance_url}" "${spanner_database_url}" "${spanner_instance_url}"; do
   status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"
   if [[ "${status}" != "404" ]]; then
     echo "Expected destroyed resource ${url} to return HTTP 404, received ${status}." >&2

@@ -20,15 +20,18 @@ import (
 	_ "minisky/pkg/shims/firebasertdb"
 	_ "minisky/pkg/shims/gke"
 	_ "minisky/pkg/shims/iam"
+	_ "minisky/pkg/shims/iamcredentials"
 	_ "minisky/pkg/shims/logging"
 	_ "minisky/pkg/shims/memorystore"
 	_ "minisky/pkg/shims/metadata"
 	_ "minisky/pkg/shims/monitoring"
 	_ "minisky/pkg/shims/pubsub"
+	_ "minisky/pkg/shims/resourcemanager"
 	_ "minisky/pkg/shims/scheduler"
 	_ "minisky/pkg/shims/secretmanager"
 	_ "minisky/pkg/shims/serverless"
 	_ "minisky/pkg/shims/storage"
+	_ "minisky/pkg/shims/sts"
 	_ "minisky/pkg/shims/vertexai"
 )
 

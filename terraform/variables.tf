@@ -40,6 +40,12 @@ variable "project_id" {
   default     = "local-dev-project"
 }
 
+variable "secondary_project_id" {
+  description = "Second Google Cloud project used for isolation and cross-project acceptance"
+  type        = string
+  default     = "local-secondary-project"
+}
+
 variable "region" {
   description = "Default Google provider region"
   type        = string
@@ -50,6 +56,12 @@ variable "service_account_id" {
   description = "Account ID of the metadata-only IAM service account"
   type        = string
   default     = "minisky-terraform"
+}
+
+variable "storage_bucket_name" {
+  description = "Name of the Cloud Storage bucket created by the compatibility example"
+  type        = string
+  default     = "minisky-terraform-compatibility"
 }
 
 variable "table_id" {

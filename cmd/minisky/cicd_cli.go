@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/spf13/cobra"
 )
@@ -49,6 +50,53 @@ func init() {
 			for _, r := range data.Repositories {
 				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", r.Name)
 			}
+		},
+	})
+	arCmd.AddCommand(&cobra.Command{
+		Use:  "repository-create REPOSITORY_ID",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			endpoint, err := miniskyAPIURL("artifactregistry", fmt.Sprintf(
+				"/v1/projects/%s/locations/%s/repositories?repositoryId=%s", artifactProject, artifactLocation, args[0]))
+			if err != nil {
+				return err
+			}
+			return postJSON(endpoint, map[string]any{"format": "DOCKER"}, nil)
+		},
+	})
+	arCmd.AddCommand(&cobra.Command{
+		Use:  "repository-delete REPOSITORY_ID",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			endpoint, err := miniskyAPIURL("artifactregistry", fmt.Sprintf(
+				"/v1/projects/%s/locations/%s/repositories/%s", artifactProject, artifactLocation, args[0]))
+			if err != nil {
+				return err
+			}
+			return requestJSON(http.MethodDelete, endpoint, nil, nil)
+		},
+	})
+	arCmd.AddCommand(&cobra.Command{
+		Use:  "packages REPOSITORY_ID",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			endpoint, err := miniskyAPIURL("artifactregistry", fmt.Sprintf(
+				"/v1/projects/%s/locations/%s/repositories/%s/packages", artifactProject, artifactLocation, args[0]))
+			if err != nil {
+				return err
+			}
+			var response struct {
+				Packages []struct {
+					Name string `json:"name"`
+				} `json:"packages"`
+			}
+			if err := getJSON(endpoint, &response); err != nil {
+				return err
+			}
+			for _, pkg := range response.Packages {
+				fmt.Fprintln(cmd.OutOrStdout(), pkg.Name)
+			}
+			return nil
 		},
 	})
 

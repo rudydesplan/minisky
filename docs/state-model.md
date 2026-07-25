@@ -1,15 +1,15 @@
 # State model
 
 MiniSky has a shared, versioned, profile-scoped state store. Adoption is
-incremental: shims without an adapter still hold maps in process memory, the
-operation manager remains in memory, and Docker-backed services keep whatever
-survives in their containers or configured mounts.
+incremental: shims without an adapter still hold maps in process memory, while
+Docker-backed services keep whatever survives in their containers or configured
+mounts.
 
-Secret Manager, Cloud KMS, GKE, Compute Engine, Cloud SQL, and Serverless
-(Cloud Functions and Cloud Run) now persist resource metadata through this
-store. Docker-backed Compute, Cloud SQL, GKE, and Serverless resources restore
-as metadata without implicitly creating missing containers; reconciliation
-remains an explicit lifecycle action.
+BigQuery, IAM, Cloud DNS, Scheduler, Secret Manager, Cloud KMS, GKE, Compute
+Engine, Cloud SQL, and Serverless (Cloud Functions and Cloud Run) persist
+resource metadata through this store. Docker-backed resources restore as
+metadata without implicitly creating missing containers. Docker adoption and
+cleanup require both MiniSky ownership and active-profile labels.
 
 > **Sensitive data warning:** profile state files and exported snapshots can
 > contain local Secret Manager payloads, Cloud KMS AES key material, Serverless
@@ -27,9 +27,17 @@ remains an explicit lifecycle action.
 - **Bind mount**: data is stored at a host path configured for the emulator.
 - **External**: state belongs to another local or remote process.
 
-The shared LRO manager is memory-only for every service that uses it. A durable
-adapter must save enough operation identity and terminal state for clients to
-resume polling after a restart; it must not replay completed side effects.
+The shared LRO manager persists polling metadata. On restart, any saved
+`PENDING` or `RUNNING` operation becomes a stable terminal error stating that
+the operation was interrupted; MiniSky never replays its side effects.
+Durability-dependent handlers reject a new operation when its initial
+`PENDING` snapshot cannot be saved, before starting asynchronous work. If a
+terminal save fails after work has run, the live manager logs and exposes a
+persistence-degraded error and polling reports a terminal in-process error.
+The exact restart limitation is that only the last successful snapshot is
+available: restart polling therefore reports the operation as interrupted and
+cannot determine whether the already-executed side effect succeeded. MiniSky
+does not replay that side effect.
 
 ## Per-service behavior
 
@@ -37,36 +45,37 @@ resume polling after a restart; it must not replay completed side effects.
 | :--- | :--- | :--- |
 | App Engine (`appengine.googleapis.com`) | Apps, services, versions, and LROs in memory; deployment containers may survive | Persist the resource graph and deployment identity; reconcile each version with its container/image and mark missing workloads failed rather than silently recreating them. |
 | Artifact Registry (`artifactregistry.googleapis.com`) | Repository map and LROs in memory; package/version responses are static | Persist repositories first; replace static package data with a backend-derived index before including packages and versions in snapshots. |
-| BigQuery (`bigquery.googleapis.com`) | Dataset/table/job metadata in memory; optional DuckDB data in `~/.minisky/data/bigquery.duckdb`; uploads in `~/.minisky/uploads` | Persist metadata and stable job results beside the DuckDB file, validate schema/version on load, and include both metadata and database data in export/import. |
+| BigQuery (`bigquery.googleapis.com`) | Dataset/table/job metadata in profile state; optional DuckDB data in `~/.minisky/data/bigquery.duckdb`; uploads in `~/.minisky/uploads` | Metadata survives restart and metadata-only export/import. DuckDB rows and uploaded files are deliberately excluded. |
 | Bigtable Admin (`bigtableadmin.googleapis.com`) | Instance, cluster, and table metadata in memory | Persist Admin resources and reconcile them with the emulator; do not claim table data durability unless the emulator data directory is also mounted and exported. |
 | Bigtable Data (`bigtable.googleapis.com`) | Data belongs to an unmounted emulator container | Add a profile-scoped emulator data mount and lifecycle hooks for clean export/import; share identity with the Bigtable Admin adapter. |
 | Cloud Build (`cloudbuild.googleapis.com`) | Build and trigger state is held through the in-memory LRO manager; temporary Docker workspace volumes | Persist build metadata, trigger definitions, and final logs/status; treat active builds as interrupted after restart and garbage-collect orphan workspaces. |
 | Cloud KMS (`cloudkms.googleapis.com`) | Key hierarchy and AES key bytes in profile state | Key material and version metadata survive restart. Snapshots contain local AES key bytes and must be handled as sensitive files. |
 | Cloud SQL (`sqladmin.googleapis.com`) | Instance, database, and user metadata in profile state; LROs remain in memory; database files live only in containers | Rehydrated instances report `SUSPENDED` with `backendStatus: METADATA_ONLY` and omit stale endpoints until explicitly reconciled. Add profile-scoped named volumes for database data before claiming data durability. |
-| Cloud Tasks (`cloudtasks.googleapis.com`) | Queues, tasks, and delivery state in memory | Persist queues and tasks with schedule/attempt timestamps; on rehydrate, resume only eligible unfinished tasks with idempotent attempt accounting. |
+| Cloud Tasks (`cloudtasks.googleapis.com`) | Queues, tasks, retry attempts, and terminal delivery state in profile state | Terminal tasks are never replayed. Tasks persisted as `PENDING` or `RETRYING` are marked `FAILED` with an interruption diagnostic after restart; automatic at-least-once resumption is not implemented. |
 | Compute Engine (`compute.googleapis.com`) | Instances, networks, firewall rules, and load-balancer metadata in profile state; security policies and LROs remain in memory; Docker containers/networks may survive | Rehydrated VMs report `METADATA_ONLY`, clear stale host-port mappings, and are never recreated implicitly. Explicit-URL load-balancer backends continue to proxy after restart; Docker-backed instance endpoints require reconciliation. |
 | Dataproc (`dataproc.googleapis.com`) | Cluster/job metadata and LROs in memory; master/worker containers may survive | Persist clusters and terminal jobs, reconcile expected node containers, and mark in-flight jobs interrupted unless backend evidence proves completion. |
-| Cloud DNS (`dns.googleapis.com`) | Zones, records, and changes in memory | Persist zones and record sets atomically; reconstruct derived SOA/NS records and retain completed change IDs without replaying changes. |
+| Cloud DNS (`dns.googleapis.com`) | Zones, records, and changes in profile state | Persisted metadata survives restart; derived records are reconstructed without replaying changes. |
 | Firebase Auth (`identitytoolkit.googleapis.com`) | Data belongs to an unmounted Firebase emulator container | Configure profile-scoped Firebase export/import storage and let the adapter coordinate emulator shutdown/startup rather than duplicating user state. |
 | Firebase Hosting (`firebasehosting.googleapis.com`) | Files/configuration belong to an unmounted Firebase emulator container | Mount a profile-scoped hosting workspace and snapshot deploy metadata plus assets; validate that restored files match the recorded release. |
 | Firebase Realtime Database (`firebaseio.com`) | Data belongs to an unmounted Firebase emulator container | Use Firebase emulator export/import in a profile directory and persist the project-to-emulator mapping. |
 | GKE (`container.googleapis.com`) | Cluster metadata and backend mode in profile state; LROs in memory; optional Kind containers and kubeconfig under `/tmp` | Rehydrate metadata only. Missing Kind containers are not silently recreated; Docker reconciliation remains explicit. |
-| IAM (`iam.googleapis.com`) | Service accounts, fake keys, and policies in memory | Persist accounts and policies; regenerate or securely wrap local key material, and version policy representation for future enforcement semantics. |
-| Cloud Logging (`logging.googleapis.com`) | Up to 5,000 entries in `~/.minisky/cloud_logs.json` | Move the existing file behind a versioned adapter with atomic writes, profile isolation, validation, and bounded export behavior. |
-| Memorystore for Redis (`redis.googleapis.com`) | Instance metadata/LROs in memory; Redis/Valkey data in an unmounted container | Persist instance metadata and use a profile-scoped data volume where the selected engine supports it; reconcile endpoint/port changes on startup. |
-| Memorystore for Memcached (`memcache.googleapis.com`) | Instance metadata/LROs in memory; cache data is ephemeral | Persist only control-plane metadata and explicitly restore an empty cache; reconcile the container and publish a new endpoint if necessary. |
+| IAM (`iam.googleapis.com`) | Service accounts, key lifecycle metadata, and policies in profile state; the local token HMAC secret is a separate `0600` profile file | IAM metadata survives restart and metadata-only export/import. Credential signing material is deliberately excluded. |
+| Resource Manager (`cloudresourcemanager.googleapis.com`) | Projects plus the minimal organization/folder hierarchy in profile state | Registry metadata survives restart and export/import; `local-dev-project` is seeded when absent. |
+| Cloud Logging (`logging.googleapis.com`) | Up to 5,000 entries and sink metadata in profile state | The legacy `~/.minisky/cloud_logs.json` file is imported once and renamed with a `.migrated` suffix. File sink output lives in the profile runtime tree and is excluded from metadata export. |
+| Memorystore for Redis (`redis.googleapis.com`) | Instance metadata in profile state; Redis AOF data in an owned named Docker volume | Startup reconciles only exact profile/resource ownership labels. Missing or unowned backends become `REPAIRING` with no stale endpoint. Docker volumes are excluded from metadata export. |
+| Memorystore for Memcached (`memcache.googleapis.com`) | Not implemented; requests return `501 UNIMPLEMENTED` | Cache persistence and control-plane behavior remain deferred. |
 | Metadata server (`metadata.google.internal`) | Static defaults compiled into the process | Derive per-workload metadata from persisted Compute/Serverless identity; no independent snapshot should be required beyond optional local overrides. |
-| Cloud Monitoring (`monitoring.googleapis.com`) | Rolling CPU/memory samples in memory | Keep metrics ephemeral by default; optionally persist bounded profile-scoped samples, never treat them as authoritative resource state. |
+| Cloud Monitoring (`monitoring.googleapis.com`) | Metric descriptors and bounded time-series samples in profile state | Samples are local test data and are never authoritative production telemetry. |
 | Pub/Sub (`pubsub.googleapis.com`) | Topics, subscriptions, and messages belong to an unmounted emulator container | Add a profile-scoped emulator data/export path if supported, persist event-bridge configuration separately, and avoid replaying already delivered observer events. |
-| Cloud Scheduler (`cloudscheduler.googleapis.com`) | Jobs and cron entry IDs in memory | Persist job definitions and delivery metadata; rebuild cron registrations on startup without firing missed jobs unless an explicit catch-up policy allows it. |
+| Cloud Scheduler (`cloudscheduler.googleapis.com`) | Job definitions and delivery metadata in profile state | Persisted jobs survive restart; missed executions are not replayed implicitly. |
 | Secret Manager (`secretmanager.googleapis.com`) | Secret metadata, version state, and base64 payloads in profile state | Rehydrate complete local secrets. State and snapshots are sensitive even though the active file is protected by `0600` permissions. |
 | Cloud Functions (`cloudfunctions.googleapis.com`) | Function/build/trigger metadata and local source in profile state; LROs in memory; built images and containers may survive | Rehydrate metadata only and never start a missing container during load. |
 | Cloud Run (`run.googleapis.com`) | Service/template/traffic metadata in profile state; LROs in memory; image containers may survive | Rehydrate metadata only and keep container reconciliation explicit. |
 | Cloud Storage (`storage.googleapis.com`) | Buckets/objects live in an unmounted `fake-gcs-server` container | Add a profile-scoped data mount, snapshot emulator data with object metadata, and persist event-delivery checkpoints separately. |
-| Vertex AI (`aiplatform.googleapis.com`) | Provider, endpoint, API key, and model selection in memory; model data is external | Persist non-secret provider/model settings; store credentials through a secret facility or omit them from export, and only reference external model stores. |
-| Firestore (`firestore.googleapis.com`) | Data lives in an unmounted Google emulator container | Configure a profile-scoped emulator data/export directory and persist project/database routing metadata. |
-| Datastore (`datastore.googleapis.com`) | Emulator data bind-mounted from `./data/datastore` | Replace the working-directory-relative mount with a profile-scoped absolute path, then version and include that directory in export/import. |
-| Spanner (`spanner.googleapis.com`) | Data lives in an unmounted emulator container | Add a profile-scoped durable backend where supported; otherwise explicitly classify restart/import as destructive and persist only routing metadata. |
+| Vertex AI (`aiplatform.googleapis.com`) | Non-secret mock/Ollama provider settings in profile state; API keys in process memory only | External model data remains outside snapshots. Ollama endpoints are restricted to loopback HTTP origins. |
+| Firestore (`firestore.googleapis.com`) | Emulator data bind-mounted from `<state-root>/profiles/<profile>/runtime/firestore` | Runtime data is profile-scoped and excluded from metadata export/import. Listener and security-rule fidelity is not claimed. |
+| Datastore (`datastore.googleapis.com`) | Emulator data bind-mounted from `<state-root>/profiles/<profile>/runtime/datastore` | Runtime data is profile-scoped and independent of the daemon working directory. It is not included in metadata export/import. |
+| Spanner (`spanner.googleapis.com`) | Data belongs to the official in-memory emulator container | The REST/admin and gRPC ports are loopback-published. Emulator data does not survive container deletion and is excluded from export/import. |
 
 ## Adapter lifecycle contract
 
@@ -76,10 +85,10 @@ A future adapter should expose these behaviors consistently:
    requests.
 2. **Save atomically** after a successful mutation; partially written state
    must never replace the last valid snapshot.
-3. **Reconcile** saved control-plane records with Docker containers, volumes,
-   files, and external backends.
-4. **Export** a portable manifest plus service-owned data, excluding or
-   encrypting secrets.
+3. **Reconcile** saved control-plane records only with Docker resources whose
+   ownership and profile labels are proven; otherwise remain metadata-only.
+4. **Export** a portable JSON metadata snapshot. Runtime directories, Docker
+   volumes, containers, DuckDB files, and uploaded objects are excluded.
 5. **Import** into an empty, isolated profile, validating paths and versions
    before any side effect.
 6. **Migrate** older schemas explicitly and fail safely on newer unknown

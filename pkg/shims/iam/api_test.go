@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"minisky/pkg/state"
 )
 
 const testResource = "/v1/projects/test-project"
@@ -119,6 +123,59 @@ func TestStrictModeDirectPermissionRole(t *testing.T) {
 	}
 }
 
+func TestMiniSkyLocalRolesCoverDashboardAndGatewayPermissions(t *testing.T) {
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+	api := newAPI(nil)
+	api.policies["projects/team-project"] = &IamPolicy{Bindings: []Binding{
+		{Role: "roles/minisky.viewer", Members: []string{"user:viewer@example.com"}},
+		{Role: "roles/minisky.editor", Members: []string{"user:editor@example.com"}},
+		{Role: "roles/minisky.admin", Members: []string{"user:admin@example.com"}},
+	}}
+	api.policies["organizations/100000000000"] = &IamPolicy{Bindings: []Binding{
+		{Role: "roles/minisky.editor", Members: []string{"user:editor@example.com"}},
+		{Role: "roles/minisky.admin", Members: []string{"user:admin@example.com"}},
+	}}
+	if !api.Authorize("projects/team-project", "user:viewer@example.com", "minisky.dashboard.view") {
+		t.Fatal("viewer lacks dashboard view")
+	}
+	if api.Authorize("projects/team-project", "user:viewer@example.com", "minisky.dashboard.manage") {
+		t.Fatal("viewer unexpectedly manages dashboard")
+	}
+	if api.Authorize("projects/team-project", "user:viewer@example.com", "minisky.dashboard.terminal") {
+		t.Fatal("viewer unexpectedly has terminal access")
+	}
+	if !api.Authorize("projects/team-project", "user:editor@example.com", "compute.instances.create") {
+		t.Fatal("editor lacks gateway mutation")
+	}
+	if !api.Authorize("projects/team-project", "user:admin@example.com", "storage.objects.delete") {
+		t.Fatal("admin lacks destructive gateway permission")
+	}
+	if !api.Authorize("projects/team-project", "user:admin@example.com", "minisky.dashboard.terminal") {
+		t.Fatal("admin lacks dedicated terminal permission")
+	}
+	if !api.Authorize("organizations/100000000000", "user:admin@example.com", "resourcemanager.projects.create") {
+		t.Fatal("admin lacks dedicated project-create permission")
+	}
+	if api.Authorize("organizations/100000000000", "user:editor@example.com", "resourcemanager.projects.create") {
+		t.Fatal("editor unexpectedly has project-create permission")
+	}
+}
+
+func TestAuthorizeNestedChildResourceUsesProjectPolicy(t *testing.T) {
+	api := newAPI(nil)
+	api.strict = true
+	api.policies["projects/team-project"] = &IamPolicy{Bindings: []Binding{{
+		Role: "roles/compute.viewer", Members: []string{"user:alice@example.com"},
+	}}}
+	if !api.Authorize(
+		"projects/team-project/zones/us-central1-a/instances/vm-1",
+		"user:alice@example.com",
+		"compute.instances.get",
+	) {
+		t.Fatal("project policy did not authorize a nested child resource")
+	}
+}
+
 func TestPolicyCRUDConcurrentAccess(t *testing.T) {
 	t.Setenv("MINISKY_IAM_MODE", "strict")
 	api := newAPI(nil)
@@ -144,6 +201,91 @@ func TestPolicyCRUDConcurrentAccess(t *testing.T) {
 		}(worker)
 	}
 	wg.Wait()
+}
+
+type testHierarchy struct{}
+
+func (testHierarchy) Ancestors(resource string) []string {
+	return []string{resource, "folders/200", "organizations/100"}
+}
+
+func TestAuthorizeUsesInheritedPolicy(t *testing.T) {
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+	api := newAPI(nil)
+	api.hierarchy = testHierarchy{}
+	api.policies["organizations/100"] = &IamPolicy{Bindings: []Binding{{
+		Role: "roles/pubsub.admin", Members: []string{"user:alice@example.com"},
+	}}}
+	if !api.Authorize("projects/child-project", "user:alice@example.com", "pubsub.topics.publish") {
+		t.Fatal("organization policy was not inherited")
+	}
+	if api.Authorize("projects/child-project", "user:bob@example.com", "pubsub.topics.publish") {
+		t.Fatal("unbound principal inherited permission")
+	}
+}
+
+func TestServiceAccountKeyDisableDeletePersists(t *testing.T) {
+	store, err := state.New(t.TempDir(), "key-lifecycle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createAccount := httptest.NewRequest(http.MethodPost, "/v1/projects/test-project/serviceAccounts",
+		bytes.NewBufferString(`{"accountId":"worker"}`))
+	accountResponse := httptest.NewRecorder()
+	api.ServeHTTP(accountResponse, createAccount)
+	if accountResponse.Code != http.StatusOK {
+		t.Fatalf("create account: %s", accountResponse.Body.String())
+	}
+	email := "worker@test-project.iam.gserviceaccount.com"
+	keyResponse := httptest.NewRecorder()
+	api.ServeHTTP(keyResponse, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test-project/serviceAccounts/"+email+"/keys", nil))
+	var key ServiceAccountKey
+	decodeResponse(t, keyResponse, &key)
+	keyID := key.Name[strings.LastIndex(key.Name, "/")+1:]
+
+	disableResponse := httptest.NewRecorder()
+	api.ServeHTTP(disableResponse, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test-project/serviceAccounts/"+email+"/keys/"+keyID+":disable", nil))
+	if disableResponse.Code != http.StatusOK {
+		t.Fatalf("disable key: %s", disableResponse.Body.String())
+	}
+	restarted, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.mu.RLock()
+	disabled := restarted.findKeyLocked("test-project", email, keyID)
+	restarted.mu.RUnlock()
+	if disabled == nil || !disabled.Disabled {
+		t.Fatalf("disabled key was not restored: %#v", disabled)
+	}
+	deleteResponse := httptest.NewRecorder()
+	restarted.ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodDelete,
+		"/v1/projects/test-project/serviceAccounts/"+email+"/keys/"+keyID, nil))
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("delete key: %s", deleteResponse.Body.String())
+	}
+}
+
+func TestServiceAccountKeyExpiry(t *testing.T) {
+	api := newAPI(nil)
+	now := time.Now().UTC()
+	name := "projects/test/serviceAccounts/worker@example.com/keys/key-1"
+	api.keys["test:worker@example.com"] = []*ServiceAccountKey{{
+		Name: name, ValidAfterTime: now.Add(-time.Hour).Format(time.RFC3339),
+		ValidBeforeTime: now.Add(time.Hour).Format(time.RFC3339),
+	}}
+	if !api.KeyUsable(name, now) {
+		t.Fatal("key should be usable inside validity window")
+	}
+	if api.KeyUsable(name, now.Add(2*time.Hour)) {
+		t.Fatal("expired key remained usable")
+	}
 }
 
 func setTestPolicy(t *testing.T, api *API, bindings []Binding) {

@@ -37,11 +37,12 @@ import (
 
 // BuildpacksBackend manages local container builds via Google Cloud Buildpacks.
 type BuildpacksBackend struct {
-	enabled  bool
-	builder  string // Buildpacks builder image to use
-	logStore map[string]*bytes.Buffer
-	logMu    sync.RWMutex
-	status   config.BackendState
+	enabled   bool
+	requested bool
+	builder   string // Buildpacks builder image to use
+	logStore  map[string]*bytes.Buffer
+	logMu     sync.RWMutex
+	status    config.BackendState
 }
 
 // DefaultBuilder is the Google-24 stack builder that mirrors GCP's latest build environment.
@@ -57,10 +58,11 @@ func NewBuildpacksBackend() *BuildpacksBackend {
 	}
 
 	b := &BuildpacksBackend{
-		enabled:  selection.Requested,
-		builder:  builder,
-		logStore: make(map[string]*bytes.Buffer),
-		status:   selection.Effective(selection.Requested, ""),
+		enabled:   selection.Requested,
+		requested: selection.Requested,
+		builder:   builder,
+		logStore:  make(map[string]*bytes.Buffer),
+		status:    selection.Effective(selection.Requested, ""),
 	}
 
 	if selection.Requested {
@@ -83,6 +85,10 @@ func NewBuildpacksBackend() *BuildpacksBackend {
 // Enabled reports whether Buildpacks backend is active.
 func (b *BuildpacksBackend) Enabled() bool { return b.enabled }
 
+// Requested reports whether the runtime profile or explicit override requires
+// executable Buildpacks behavior, even if a dependency check prevented startup.
+func (b *BuildpacksBackend) Requested() bool { return b.requested }
+
 // Status reports the effective backend selected after dependency checks.
 func (b *BuildpacksBackend) Status() config.BackendState { return b.status }
 
@@ -98,12 +104,14 @@ func (b *BuildpacksBackend) SetEnabled(enabled bool) error {
 			return fmt.Errorf("missing Buildpacks dependencies: %s", strings.Join(missing, ", "))
 		}
 		b.enabled = true
+		b.requested = true
 		b.status = config.BackendState{
 			Profile: config.GetRuntimeProfile().Name, Backend: "buildpacks", Enabled: true, Source: "dashboard",
 		}
 		log.Printf("[Buildpacks] dynamically ENABLED via UI")
 	} else {
 		b.enabled = false
+		b.requested = false
 		b.status = config.BackendState{
 			Profile: config.GetRuntimeProfile().Name, Backend: config.RuntimeProfileSimulation, Source: "dashboard",
 		}
@@ -154,8 +162,9 @@ func (b *BuildpacksBackend) BuildFunction(functionName, sourcePath, entryPoint s
 	// Force shell to see the version and allow internet access for dependencies
 	// Crucially, we pass GOOGLE_FUNCTION_TARGET at build time so the buildpacks
 	// can generate the correct entrypoint metadata.
-	cmdArgs := []string{"-c", fmt.Sprintf("DOCKER_API_VERSION=1.44 %s build %s --path %s --builder %s --trust-builder --network host --env GOOGLE_FUNCTION_TARGET=%s --env GOOGLE_FUNCTION_SIGNATURE_TYPE=http", binPath, imageRef, sourcePath, b.builder, entryPoint)}
-	cmd := exec.Command("sh", cmdArgs...)
+	cmd := exec.Command(binPath, "build", imageRef, "--path", sourcePath, "--builder", b.builder,
+		"--trust-builder", "--network", "host", "--env", "GOOGLE_FUNCTION_TARGET="+entryPoint,
+		"--env", "GOOGLE_FUNCTION_SIGNATURE_TYPE=http")
 	cmd.Env = os.Environ()
 	if os.Getenv("DOCKER_API_VERSION") == "" {
 		cmd.Env = append(cmd.Env, "DOCKER_API_VERSION=1.44")
@@ -191,8 +200,8 @@ func (b *BuildpacksBackend) BuildService(serviceName, sourcePath string) (imageR
 		binPath = localPack
 	}
 
-	cmdArgs := []string{"-c", fmt.Sprintf("DOCKER_API_VERSION=1.44 %s build %s --path %s --builder %s --trust-builder --network host --env PORT=8080", binPath, imageRef, sourcePath, b.builder)}
-	cmd := exec.Command("sh", cmdArgs...)
+	cmd := exec.Command(binPath, "build", imageRef, "--path", sourcePath, "--builder", b.builder,
+		"--trust-builder", "--network", "host", "--env", "PORT=8080")
 	cmd.Env = os.Environ()
 	if os.Getenv("DOCKER_API_VERSION") == "" {
 		cmd.Env = append(cmd.Env, "DOCKER_API_VERSION=1.44")

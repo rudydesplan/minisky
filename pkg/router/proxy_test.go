@@ -1,11 +1,267 @@
 package router
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"minisky/pkg/registry"
+	localsecurity "minisky/pkg/security"
+	_ "minisky/pkg/shims"
 )
+
+type testAuthorizer struct {
+	issuer *localsecurity.Issuer
+	allow  bool
+}
+
+type permissionAuthorizer struct {
+	issuer  *localsecurity.Issuer
+	allowed map[string]bool
+}
+
+func (a permissionAuthorizer) EnforcementEnabled() bool { return true }
+func (a permissionAuthorizer) Authorize(_ string, _ string, permission string) bool {
+	return a.allowed[permission]
+}
+func (a permissionAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
+	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
+}
+
+func (a testAuthorizer) EnforcementEnabled() bool { return true }
+func (a testAuthorizer) Authorize(string, string, string) bool {
+	return a.allow
+}
+func (a testAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
+	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
+}
+
+type testProjects map[string]bool
+
+func (p testProjects) Exists(id string) bool { return p[id] }
+
+func TestStrictAuthorizationReturnsRedacted401And403(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("compute.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: false}, testProjects{"demo-project": true}, true, "gateway")
+
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/_minisky/compute/compute/v1/projects/demo-project/zones/us/instances/vm", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"UNAUTHENTICATED"`) {
+		t.Fatalf("missing token response=%d body=%s", response.Code, response.Body.String())
+	}
+
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:alice@example.com", Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://localhost/_minisky/compute/compute/v1/projects/demo-project/zones/us/instances/vm", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), token) {
+		t.Fatalf("denied response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestUnknownProjectEnforcementIsOptional(t *testing.T) {
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("bigquery.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(nil, testProjects{"known-project": true}, true, "")
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/_minisky/bigquery/bigquery/v2/projects/unknown-project/datasets", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"NOT_FOUND"`) {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStrictAuthorizationDefaultDeniesUnmappedMutations(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:admin@example.com", Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/logging/v2/entries:write",
+		bytes.NewBufferString(`{"entries":[{"logName":"projects/demo/logs/app","textPayload":"denied"}]}`),
+	)
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "unmapped mutation") {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestIAMMutationsHaveExplicitProjectScopedPermissions(t *testing.T) {
+	tests := []struct {
+		method, path, permission string
+	}{
+		{http.MethodPost, "/v1/projects/demo/serviceAccounts", "iam.serviceAccounts.create"},
+		{http.MethodDelete, "/v1/projects/demo/serviceAccounts/account@example.test", "iam.serviceAccounts.delete"},
+		{http.MethodPost, "/v1/projects/demo/serviceAccounts/account@example.test/keys", "iam.serviceAccountKeys.create"},
+		{http.MethodDelete, "/v1/projects/demo/serviceAccounts/account@example.test/keys/key-1", "iam.serviceAccountKeys.delete"},
+		{http.MethodPost, "/v1/projects/demo/serviceAccounts/account@example.test/keys/key-1:disable", "iam.serviceAccountKeys.disable"},
+		{http.MethodPost, "/v1/projects/demo/serviceAccounts/account@example.test:setIamPolicy", "iam.serviceAccounts.setIamPolicy"},
+	}
+	for _, test := range tests {
+		t.Run(test.permission, func(t *testing.T) {
+			permission, resource := routePermission("iam.googleapis.com", httptest.NewRequest(test.method, test.path, nil))
+			if permission != test.permission || resource != "projects/demo" {
+				t.Fatalf("permission=%q resource=%q", permission, resource)
+			}
+		})
+	}
+}
+
+func TestEnforceProjectsChecksLoggingBodyBeforeDispatch(t *testing.T) {
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(nil, testProjects{"known-project": true}, true, "")
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/logging/v2/entries:write",
+		bytes.NewBufferString(`{"entries":[{"logName":"projects/unknown-project/logs/app"}]}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "unknown-project") {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestProjectInspectionPreservesExactLimitBody(t *testing.T) {
+	const limit = 1 << 20
+	base := `{"projectId":"known-project","entries":[]}`
+	body := base + strings.Repeat(" ", limit-len(base))
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read accepted body: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("accepted body length=%d, want %d", len(got), len(body))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	router.ConfigureSecurity(nil, testProjects{"known-project": true}, true, "")
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/logging/v2/entries:write",
+		strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestProjectInspectionRejectsOversizedBodyWithoutDispatch(t *testing.T) {
+	const limit = 1 << 20
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized request reached shim")
+	}))
+	router.ConfigureSecurity(nil, testProjects{"known-project": true}, true, "")
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/logging/v2/entries:write",
+		strings.NewReader(strings.Repeat("x", limit+1)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(response.Body.String(), `"RESOURCE_EXHAUSTED"`) {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestOversizedBodyIsPreservedWhenProjectInspectionIsDisabled(t *testing.T) {
+	const size = (1 << 20) + 1
+	body := strings.Repeat("x", size)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("body length=%d, want %d", len(got), len(body))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/logging/unvalidated",
+		strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestGatewayAloneEnforcesCrossProjectPubSubAttachment(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("pubsub.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("denied request reached Pub/Sub shim")
+	}))
+	router.ConfigureSecurity(permissionAuthorizer{
+		issuer: issuer,
+		allowed: map[string]bool{
+			"pubsub.subscriptions.create": true,
+		},
+	}, nil, false, "gateway")
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:subscriber@example.com", Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut,
+		"http://localhost/_minisky/pubsub/v1/projects/subscriber-project/subscriptions/events",
+		bytes.NewBufferString(`{"topic":"projects/publisher-project/topics/events"}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden ||
+		!strings.Contains(response.Body.String(), "pubsub.topics.attachSubscription") {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
 
 func TestServeHTTPRoutesCanonicalLocalServiceEndpoints(t *testing.T) {
 	t.Parallel()
@@ -95,6 +351,24 @@ func TestServeHTTPRoutesCanonicalLocalServiceEndpoints(t *testing.T) {
 	}
 }
 
+func TestClassifyRequestUsesCanonicalDomainAndBoundedRoute(t *testing.T) {
+	t.Parallel()
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("compute.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost:8080/_minisky/compute/v1/projects/demo/zones/us-central1-a/instances/vm-1",
+		nil,
+	)
+	labels := router.ClassifyRequest(request)
+	if labels.Service != "compute.googleapis.com" {
+		t.Fatalf("service = %q", labels.Service)
+	}
+	if labels.Route != "/v1/projects/{id}/zones/{id}/instances/{id}" {
+		t.Fatalf("route = %q", labels.Route)
+	}
+}
+
 func TestServeHTTPRoutesCanonicalEndpointByRegisteredDomain(t *testing.T) {
 	t.Parallel()
 
@@ -116,6 +390,54 @@ func TestServeHTTPRoutesCanonicalEndpointByRegisteredDomain(t *testing.T) {
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+}
+
+func TestServeHTTPRoutesEveryRegisteredCanonicalSelectorAndAlias(t *testing.T) {
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router := NewProxyRouterWithManager(nil)
+	for _, service := range services {
+		domain := service.Domain
+		router.RegisterShim(domain, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Routed-Domain", domain)
+			w.Header().Set("X-Routed-Path", r.URL.Path)
+			w.Header().Set("X-Routed-Query", r.URL.RawQuery)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+	}
+
+	for _, service := range services {
+		service := service
+		alias, _, _ := strings.Cut(service.Domain, ".")
+		for _, selector := range []string{service.Domain, alias} {
+			selector := selector
+			t.Run(service.Domain+"/"+selector, func(t *testing.T) {
+				request := httptest.NewRequest(
+					http.MethodGet,
+					"http://127.0.0.1:8080/_minisky/"+selector+"/v1/projects/demo/resources?pageToken=next",
+					nil,
+				)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				if response.Code != http.StatusNoContent {
+					t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusNoContent, response.Body.String())
+				}
+				if got := response.Header().Get("X-Routed-Domain"); got != service.Domain {
+					t.Fatalf("domain = %q, want %q", got, service.Domain)
+				}
+				if got := response.Header().Get("X-Routed-Path"); got != "/v1/projects/demo/resources" {
+					t.Fatalf("path = %q", got)
+				}
+				if got := response.Header().Get("X-Routed-Query"); got != "pageToken=next" {
+					t.Fatalf("query = %q", got)
+				}
+			})
+		}
 	}
 }
 
