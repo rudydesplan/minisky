@@ -2,6 +2,9 @@
 
 set -Eeuo pipefail
 
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repository_root}"
+
 if [[ "${MINISKY_LINUX_PACKAGE_INTEGRATION:-}" != "1" ]]; then
   echo "Refusing to modify the host package database without MINISKY_LINUX_PACKAGE_INTEGRATION=1." >&2
   exit 2
@@ -64,6 +67,10 @@ if [[ -e /usr/bin/minisky || -L /usr/bin/minisky ]]; then
   echo "Refusing to replace an existing /usr/bin/minisky." >&2
   exit 1
 fi
+if [[ -e dist || -L dist ]]; then
+  echo "Refusing to replace an existing GoReleaser dist path." >&2
+  exit 1
+fi
 
 lock_dir="${TMPDIR:-/tmp}/minisky-linux-package-integration.lock"
 if ! mkdir "${lock_dir}" 2>/dev/null; then
@@ -73,6 +80,7 @@ fi
 
 work_dir="$(mktemp -d)"
 installed_format=""
+owns_dist=0
 
 cleanup() {
   local exit_code=$?
@@ -82,6 +90,9 @@ cleanup() {
   elif [[ "${installed_format}" == "rpm" ]]; then
     as_root rpm --erase minisky >/dev/null 2>&1 || true
   fi
+  if [[ "${owns_dist}" == "1" ]]; then
+    rm -rf "${repository_root}/dist"
+  fi
   rm -rf "${work_dir}"
   rmdir "${lock_dir}" 2>/dev/null || true
   exit "${exit_code}"
@@ -89,21 +100,22 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-MINISKY_GORELEASER_DIST="${work_dir}/dist" \
+owns_dist=1
 MINISKY_GORELEASER_TARGET="linux-${goarch}" \
   goreleaser release \
     --snapshot \
     --clean \
     --skip=announce,publish,archive,before,homebrew,scoop
 
-artifacts_file="${work_dir}/dist/artifacts.json"
+dist_dir="${repository_root}/dist"
+artifacts_file="${dist_dir}/artifacts.json"
 if [[ ! -s "${artifacts_file}" ]]; then
   echo "GoReleaser did not emit artifact metadata." >&2
   exit 1
 fi
 
 mapfile -t packages < <(
-  python3 - "${artifacts_file}" "${work_dir}/dist" "${goarch}" <<'PY'
+  python3 - "${artifacts_file}" "${dist_dir}" "${goarch}" <<'PY'
 import json
 import os
 import pathlib
