@@ -9,9 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -46,18 +48,35 @@ type secret struct {
 // ---------------------------------------------------------------------------
 
 type API struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	persistMu sync.Mutex
 	// map[project] -> map[secretId] -> *secret
-	store  map[string]map[string]*secret
-	svcMgr *orchestrator.ServiceManager
-	logAPI *logging.API
+	store      map[string]map[string]*secret
+	svcMgr     *orchestrator.ServiceManager
+	logAPI     *logging.API
+	stateStore *state.Store
 }
 
 func NewAPI(sm *orchestrator.ServiceManager, logAPI *logging.API) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Secret Manager] state disabled: %v", err)
+		return newAPI(sm, logAPI, nil)
+	}
+	api, err := NewAPIWithStore(sm, logAPI, store)
+	if err != nil {
+		log.Printf("[Shim: Secret Manager] state rehydration failed: %v", err)
+		return newAPI(sm, logAPI, nil)
+	}
+	return api
+}
+
+func newAPI(sm *orchestrator.ServiceManager, logAPI *logging.API, store *state.Store) *API {
 	return &API{
-		store:  make(map[string]map[string]*secret),
-		svcMgr: sm,
-		logAPI: logAPI,
+		store:      make(map[string]map[string]*secret),
+		svcMgr:     sm,
+		logAPI:     logAPI,
+		stateStore: store,
 	}
 }
 
@@ -217,6 +236,10 @@ func (api *API) createSecret(w http.ResponseWriter, r *http.Request, project str
 	}
 	ps[secretId] = s
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonError(w, http.StatusInternalServerError, "persist secret: "+err.Error())
+		return
+	}
 
 	api.pushLog(project, "INFO", secretId, "Secret created: "+name)
 	w.WriteHeader(http.StatusOK)
@@ -273,6 +296,10 @@ func (api *API) deleteSecret(w http.ResponseWriter, r *http.Request, project, se
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("Secret %s not found", secretId))
 		return
 	}
+	if err := api.persistMetadata(); err != nil {
+		jsonError(w, http.StatusInternalServerError, "persist secret deletion: "+err.Error())
+		return
+	}
 	api.pushLog(project, "INFO", secretId, "Secret deleted")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{})
@@ -310,6 +337,10 @@ func (api *API) addVersion(w http.ResponseWriter, r *http.Request, project, secr
 	}
 	s.versions = append(s.versions, v)
 	s.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonError(w, http.StatusInternalServerError, "persist secret version: "+err.Error())
+		return
+	}
 
 	api.pushLog(project, "INFO", secretId, fmt.Sprintf("Version %d added", versionNum))
 	jsonOK(w, map[string]any{

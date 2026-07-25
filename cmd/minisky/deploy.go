@@ -1,11 +1,7 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 
@@ -40,31 +36,21 @@ var deployCmd = &cobra.Command{
 			"entryPoint": deployEntryPoint,
 			"code":       string(code),
 		}
-		data, _ := json.Marshal(payload)
-
 		// 3. Send to MiniSky Gateway
-		port := os.Getenv("MINISKY_PORT")
-		if port == "" {
-			port = "8080"
-		}
-		url := fmt.Sprintf("http://localhost:%s/v2/deploy", port)
-
-		fmt.Printf("🚀 Deploying %s '%s' to MiniSky...\n", deployType, deployName)
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+		endpoint, err := miniskyAPIURL("cloudfunctions", "/v2/deploy")
 		if err != nil {
-			fmt.Printf("❌ Connection failed: %v (Is MiniSky running?)\n", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			fmt.Printf("❌ Deployment failed (%s): %s\n", resp.Status, string(body))
+			fmt.Fprintf(cmd.ErrOrStderr(), "❌ Invalid API endpoint: %v\n", err)
 			return
 		}
 
-		fmt.Printf("✅ Successfully deployed '%s'!\n", deployName)
-		fmt.Printf("🔗 Local URL: http://localhost:5500x (Check Dashboard for exact port)\n")
+		fmt.Fprintf(cmd.OutOrStdout(), "🚀 Deploying %s '%s' to MiniSky...\n", deployType, deployName)
+		if err := postJSON(endpoint, payload, nil); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "❌ Deployment failed: %v\n", err)
+			return
+		}
+
+		fmt.Fprintf(cmd.OutOrStdout(), "✅ Successfully deployed '%s'!\n", deployName)
+		fmt.Fprintln(cmd.OutOrStdout(), "Run 'minisky list' to inspect the deployed resource.")
 	},
 }
 
@@ -72,34 +58,36 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List resources in MiniSky",
 	Run: func(cmd *cobra.Command, args []string) {
-		port := os.Getenv("MINISKY_PORT")
-		if port == "" {
-			port = "8080"
+		functionsEndpoint, err := miniskyAPIURL("cloudfunctions", "/v2/functions")
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+			return
+		}
+		servicesEndpoint, err := miniskyAPIURL("run", "/v2/services")
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+			return
 		}
 
 		// Fetch Functions
-		fmt.Println("--- Cloud Functions v2 ---")
-		printResources(fmt.Sprintf("http://localhost:%s/v2/functions", port))
+		fmt.Fprintln(cmd.OutOrStdout(), "--- Cloud Functions v2 ---")
+		printResources(cmd, functionsEndpoint)
 
 		// Fetch Services
-		fmt.Println("\n--- Cloud Run Services ---")
-		printResources(fmt.Sprintf("http://localhost:%s/v2/services", port))
+		fmt.Fprintln(cmd.OutOrStdout(), "\n--- Cloud Run Services ---")
+		printResources(cmd, servicesEndpoint)
 	},
 }
 
-func printResources(url string) {
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
+func printResources(cmd *cobra.Command, endpoint string) {
 	var data struct {
 		Functions []interface{} `json:"functions"`
 		Services  []interface{} `json:"services"`
 	}
-	json.NewDecoder(resp.Body).Decode(&data)
+	if err := getJSON(endpoint, &data); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+		return
+	}
 
 	list := data.Functions
 	if list == nil {
@@ -107,7 +95,7 @@ func printResources(url string) {
 	}
 
 	if len(list) == 0 {
-		fmt.Println("  (None)")
+		fmt.Fprintln(cmd.OutOrStdout(), "  (None)")
 		return
 	}
 
@@ -115,7 +103,7 @@ func printResources(url string) {
 		m := item.(map[string]interface{})
 		name := m["name"].(string)
 		state := m["state"].(string)
-		fmt.Printf("  - %s [%s]\n", last(strings.Split(name, "/")), state)
+		fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", last(strings.Split(name, "/")), state)
 	}
 }
 

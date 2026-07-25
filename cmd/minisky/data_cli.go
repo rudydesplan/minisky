@@ -2,9 +2,14 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	dataprocProject string
+	dataprocRegion  string
+	bigtableProject string
 )
 
 var dataprocCmd = &cobra.Command{
@@ -22,23 +27,23 @@ func init() {
 	dataprocCmd.AddCommand(&cobra.Command{
 		Use: "clusters list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Clusters []struct {
 					Name   string                 `json:"clusterName"`
 					Status struct{ State string } `json:"status"`
 				} `json:"clusters"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/dataproc/clusters", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("dataproc", fmt.Sprintf("/v1/projects/%s/regions/%s/clusters", dataprocProject, dataprocRegion))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("DATAPROC CLUSTERS:")
+			fmt.Fprintln(cmd.OutOrStdout(), "DATAPROC CLUSTERS:")
 			for _, c := range data.Clusters {
-				fmt.Printf("  - %s [%s]\n", c.Name, c.Status.State)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", c.Name, c.Status.State)
 			}
 		},
 	})
@@ -47,27 +52,30 @@ func init() {
 	bigtableCmd.AddCommand(&cobra.Command{
 		Use: "instances list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Instances []struct {
 					Name  string `json:"name"`
 					State string `json:"state"`
 				} `json:"instances"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/bigtable/instances", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("bigtableadmin", fmt.Sprintf("/v2/projects/%s/instances", bigtableProject))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("BIGTABLE INSTANCES:")
+			fmt.Fprintln(cmd.OutOrStdout(), "BIGTABLE INSTANCES:")
 			for _, i := range data.Instances {
-				fmt.Printf("  - %s [%s]\n", i.Name, i.State)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", i.Name, i.State)
 			}
 		},
 	})
 
+	dataprocCmd.PersistentFlags().StringVar(&dataprocProject, "project", "local-dev-project", "GCP project ID")
+	dataprocCmd.PersistentFlags().StringVar(&dataprocRegion, "region", "us-central1", "Dataproc region")
+	bigtableCmd.PersistentFlags().StringVar(&bigtableProject, "project", "local-dev-project", "GCP project ID")
 	rootCmd.AddCommand(dataprocCmd)
 	rootCmd.AddCommand(bigtableCmd)
 }

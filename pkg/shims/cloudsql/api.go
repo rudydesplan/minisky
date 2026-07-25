@@ -9,8 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -38,6 +40,7 @@ type DatabaseInstance struct {
 	ServerCaCert    *SslCert         `json:"serverCaCert,omitempty"`
 	CreateTime      string           `json:"createTime,omitempty"`
 	Etag            string           `json:"etag"`
+	BackendStatus   string           `json:"backendStatus,omitempty"`
 }
 
 type InstanceSettings struct {
@@ -115,21 +118,38 @@ type SqlOperation struct {
 
 // API is the high-fidelity Cloud SQL (sqladmin v1) shim.
 type API struct {
-	mu        sync.RWMutex
-	opMgr     *orchestrator.OperationManager
-	svcMgr    *orchestrator.ServiceManager
-	instances map[string]*DatabaseInstance // key: project:instanceName
-	databases map[string][]*Database       // key: project:instanceName
-	users     map[string][]*User           // key: project:instanceName
+	mu         sync.RWMutex
+	persistMu  sync.Mutex
+	opMgr      *orchestrator.OperationManager
+	svcMgr     *orchestrator.ServiceManager
+	stateStore *state.Store
+	instances  map[string]*DatabaseInstance // key: project:instanceName
+	databases  map[string][]*Database       // key: project:instanceName
+	users      map[string][]*User           // key: project:instanceName
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Cloud SQL] state disabled: %v", err)
+		return newAPI(opMgr, svcMgr, nil)
+	}
+	api, err := NewAPIWithStore(opMgr, svcMgr, store)
+	if err != nil {
+		log.Printf("[Shim: Cloud SQL] state rehydration failed: %v", err)
+		return newAPI(opMgr, svcMgr, store)
+	}
+	return api
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store *state.Store) *API {
 	return &API{
-		opMgr:     opMgr,
-		svcMgr:    svcMgr,
-		instances: make(map[string]*DatabaseInstance),
-		databases: make(map[string][]*Database),
-		users:     make(map[string][]*User),
+		opMgr:      opMgr,
+		svcMgr:     svcMgr,
+		stateStore: store,
+		instances:  make(map[string]*DatabaseInstance),
+		databases:  make(map[string][]*Database),
+		users:      make(map[string][]*User),
 	}
 }
 
@@ -267,6 +287,11 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	api.mu.Lock()
 	api.instances[iKey] = inst
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist Cloud SQL instance metadata: "+err.Error())
+		return
+	}
 
 	// Register LRO and drive state transitions asynchronously
 	targetLink := selfLink
@@ -283,6 +308,7 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 		api.mu.Lock()
 		if i, ok := api.instances[iKey]; ok {
 			i.State = "RUNNABLE"
+			i.BackendStatus = ""
 			// Extract ip:port from 'http://127.0.0.1:xxx'
 			addr := strings.TrimPrefix(internalURL, "http://")
 			i.IpAddresses = []IpMapping{
@@ -290,6 +316,9 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 			}
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Cloud SQL] persist runnable instance: %v", err)
+		}
 		return nil
 	})
 
@@ -346,6 +375,11 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	// Mark as DELETED to simulate winding down in the UI
 	inst.State = "DELETED"
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist deleting Cloud SQL instance: "+err.Error())
+		return
+	}
 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, name)
 	op := api.opMgr.Register("sql#operation", "DELETE", selfLink, "", "")
@@ -362,6 +396,9 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		delete(api.databases, key)
 		delete(api.users, key)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Cloud SQL] persist deleted instance: %v", err)
+		}
 		return nil
 	})
 
@@ -411,6 +448,11 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 		api.mu.Lock()
 		api.databases[iKey] = append(api.databases[iKey], db)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist Cloud SQL database metadata: "+err.Error())
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -481,6 +523,11 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 		api.mu.Lock()
 		api.users[iKey] = append(api.users[iKey], user)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist Cloud SQL user metadata: "+err.Error())
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{

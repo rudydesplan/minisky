@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_terraform_integration:
+        description: Run the Docker-backed Terraform acceptance stack
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -67,6 +74,102 @@ jobs:
 
       - name: Build MiniSky
         run: go build -trimpath ./cmd/minisky
+
+  terraform-validate:
+    name: Validate Terraform example
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize pinned providers
+        working-directory: terraform
+        run: terraform init -backend=false -input=false -lockfile=readonly
+
+      - name: Validate Terraform configuration
+        working-directory: terraform
+        run: terraform validate
+
+  sdk-smoke-validate:
+    name: Compile SDK smoke suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: sdk-smoke/python/requirements.txt
+
+      - name: Install pinned Python SDK dependency
+        run: python -m pip install --requirement sdk-smoke/python/requirements.txt
+
+      - name: Compile Go SDK smoke
+        run: go test ./sdk-smoke/go
+
+      - name: Compile Python SDK smoke
+        run: python -m compileall -q sdk-smoke/python
+
+  terraform-integration:
+    name: Terraform apply, no-drift, and destroy
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.run_terraform_integration ||
+      github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'terraform-integration')
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - terraform-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: sdk-smoke/python/requirements.txt
+
+      - name: Install pinned Python SDK dependency
+        run: python -m pip install --requirement sdk-smoke/python/requirements.txt
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Run Terraform integration
+        env:
+          MINISKY_TERRAFORM_INTEGRATION: "1"
+        run: ./scripts/terraform-integration.sh
 
   release-snapshot:
     name: Validate release configuration

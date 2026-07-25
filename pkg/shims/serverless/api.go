@@ -1,7 +1,6 @@
 package serverless
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
+	"minisky/pkg/state"
 )
 
 var (
@@ -121,6 +122,7 @@ type Service struct {
 	ObservedGeneration string            `json:"observedGeneration"`
 	SourceCode         string            `json:"sourceCode,omitempty"`
 	Runtime            string            `json:"runtime,omitempty"`
+	EventTrigger       *EventTrigger     `json:"eventTrigger,omitempty"`
 }
 
 type RevisionTemplate struct {
@@ -175,13 +177,16 @@ type Condition struct {
 
 // API handles both cloudfunctions.googleapis.com and run.googleapis.com traffic.
 type API struct {
-	mu        sync.RWMutex
-	opMgr     *orchestrator.OperationManager
-	svcMgr    *orchestrator.ServiceManager
-	logger    *logging.API
-	backend   *BuildpacksBackend
-	functions map[string]*Function // key: project:location:name
-	services  map[string]*Service  // key: project:location:name
+	mu         sync.RWMutex
+	persistMu  sync.Mutex
+	opMgr      *orchestrator.OperationManager
+	svcMgr     *orchestrator.ServiceManager
+	logger     *logging.API
+	backend    *BuildpacksBackend
+	client     *http.Client
+	stateStore *state.Store
+	functions  map[string]*Function // key: project:location:name
+	services   map[string]*Service  // key: project:location:name
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -191,13 +196,29 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, logger *logging.API) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Serverless] state disabled: %v", err)
+		return newAPI(opMgr, sm, logger, nil)
+	}
+	api, err := NewAPIWithStore(opMgr, sm, logger, store)
+	if err != nil {
+		log.Printf("[Shim: Serverless] state rehydration failed: %v", err)
+		return newAPI(opMgr, sm, logger, nil)
+	}
+	return api
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, logger *logging.API, store *state.Store) *API {
 	return &API{
-		opMgr:     opMgr,
-		svcMgr:    sm,
-		logger:    logger,
-		backend:   NewBuildpacksBackend(),
-		functions: make(map[string]*Function),
-		services:  make(map[string]*Service),
+		opMgr:      opMgr,
+		svcMgr:     sm,
+		logger:     logger,
+		backend:    NewBuildpacksBackend(),
+		client:     http.DefaultClient,
+		stateStore: store,
+		functions:  make(map[string]*Function),
+		services:   make(map[string]*Service),
 	}
 }
 
@@ -206,33 +227,106 @@ func (api *API) GetBackend() *BuildpacksBackend {
 	return api.backend
 }
 
+// SetHTTPClient replaces the client used for event delivery.
+func (api *API) SetHTTPClient(client *http.Client) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	api.mu.Lock()
+	api.client = client
+	api.mu.Unlock()
+}
+
 // HandleEvent is called by other shims (Shim-to-Shim) to trigger functions.
 func (api *API) HandleEvent(eventType, resource, payload string) {
 	api.mu.RLock()
-	defer api.mu.RUnlock()
-
+	targets := make([]eventTarget, 0)
 	for _, fn := range api.functions {
 		if fn.State != "ACTIVE" || fn.EventTrigger == nil || fn.Url == "" {
 			continue
 		}
-
-		// Check if trigger matches
-		match := false
-		if eventType == "google.cloud.pubsub.topic.v1.messagePublished" &&
-			strings.Contains(fn.EventTrigger.PubsubTopic, resource) {
-			match = true
-		} else if fn.EventTrigger.Trigger == resource {
-			match = true
-		}
-
-		if match {
-			log.Printf("[Serverless] ⚡ Triggering function %s due to %s event on %s", fn.Name, eventType, resource)
-			go func(url string) {
-				// Simple POST invocation
-				http.Post(url, "application/json", strings.NewReader(payload))
-			}(fn.Url)
+		if triggerMatches(fn.EventTrigger, eventType, resource) {
+			targets = append(targets, eventTarget{name: fn.Name, url: fn.Url})
 		}
 	}
+	for _, service := range api.services {
+		if service.Reconciling || service.EventTrigger == nil || service.Uri == "" {
+			continue
+		}
+		if triggerMatches(service.EventTrigger, eventType, resource) {
+			targets = append(targets, eventTarget{name: service.Name, url: service.Uri})
+		}
+	}
+	client := api.client
+	api.mu.RUnlock()
+
+	for _, target := range targets {
+		log.Printf("[Serverless] ⚡ Triggering %s due to %s event on %s", target.name, eventType, resource)
+		go deliverEvent(client, target.url, payload)
+	}
+}
+
+type eventTarget struct {
+	name string
+	url  string
+}
+
+func deliverEvent(client *http.Client, targetURL, payload string) {
+	resp, err := client.Post(targetURL, "application/json", strings.NewReader(payload))
+	if err != nil {
+		log.Printf("[Serverless] ❌ Trigger failed for %s: %v", targetURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("[Serverless] ✅ Trigger success for %s: %s", targetURL, resp.Status)
+}
+
+func triggerMatches(trigger *EventTrigger, eventType, resource string) bool {
+	if trigger == nil || (trigger.EventType != "" && trigger.EventType != eventType) {
+		return false
+	}
+
+	switch eventType {
+	case "google.cloud.pubsub.topic.v1.messagePublished":
+		source := trigger.PubsubTopic
+		if source == "" {
+			source = trigger.Resource
+		}
+		return resourceMatches(source, resource, "topics")
+	case "google.storage.object.finalize", "google.storage.object.delete",
+		"google.cloud.storage.object.v1.finalized", "google.cloud.storage.object.v1.deleted":
+		return resourceMatches(trigger.Resource, resource, "buckets")
+	default:
+		return trigger.Resource != "" && trigger.Resource == resource
+	}
+}
+
+func resourceMatches(configured, actual, kind string) bool {
+	if configured == "" || actual == "" {
+		return false
+	}
+	if configured == actual {
+		return true
+	}
+	configuredBare := !strings.Contains(strings.Trim(configured, "/"), "/")
+	actualBare := !strings.Contains(strings.Trim(actual, "/"), "/")
+	if configuredBare == actualBare {
+		return false
+	}
+	return resourceLeaf(configured, kind) == resourceLeaf(actual, kind)
+}
+
+func resourceLeaf(resource, kind string) string {
+	parts := strings.Split(strings.Trim(resource, "/"), "/")
+	for i, part := range parts {
+		if part == kind && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return ""
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +413,10 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 		UpdateTime:    time.Now().UTC().Format(time.RFC3339),
 		Labels:        body.Labels,
 		Url:           serviceUri,
+		EventTrigger:  body.EventTrigger,
+	}
+	if fn.EventTrigger == nil && fn.BuildConfig != nil {
+		fn.EventTrigger = fn.BuildConfig.EventTrigger
 	}
 	if fn.ServiceConfig == nil {
 		fn.ServiceConfig = &ServiceConfig{
@@ -334,6 +432,11 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 	api.mu.Lock()
 	api.functions[key] = fn
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist function metadata: "+err.Error())
+		return
+	}
 
 	op := api.opMgr.Register("cloudfunctions#operation", "CREATE", fullName, "", location)
 	api.opMgr.RunAsync(op.Name, func() error {
@@ -351,6 +454,9 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 					api.mu.Lock()
 					fn.State = "FAILED"
 					api.mu.Unlock()
+					if persistErr := api.persistMetadata(); persistErr != nil {
+						log.Printf("[Serverless] persist failed function: %v", persistErr)
+					}
 					return err
 				}
 			}
@@ -366,6 +472,9 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 					api.mu.Lock()
 					fn.State = "FAILED"
 					api.mu.Unlock()
+					if persistErr := api.persistMetadata(); persistErr != nil {
+						log.Printf("[Serverless] persist failed function: %v", persistErr)
+					}
 					return err
 				}
 			}
@@ -385,6 +494,9 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 			api.mu.Lock()
 			fn.State = "FAILED"
 			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				log.Printf("[Serverless] persist failed function: %v", persistErr)
+			}
 			return err
 		}
 
@@ -392,6 +504,9 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 		fn.State = "ACTIVE"
 		fn.Url = url
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			return fmt.Errorf("persist active function: %w", err)
+		}
 		return nil
 	})
 
@@ -441,6 +556,11 @@ func (api *API) deleteFunction(w http.ResponseWriter, r *http.Request, project, 
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Function "+name+" not found")
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist function deletion: "+err.Error())
 		return
 	}
 	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", project, location, name)
@@ -511,6 +631,7 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 		Ingress:            firstOf(body.Ingress, "INGRESS_TRAFFIC_ALL"),
 		LaunchStage:        "GA",
 		Template:           body.Template,
+		EventTrigger:       body.EventTrigger,
 		Reconciling:        true,
 		Uri:                svcUri,
 		ObservedGeneration: "0",
@@ -520,6 +641,11 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 	api.mu.Lock()
 	api.services[key] = svc
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist service metadata: "+err.Error())
+		return
+	}
 
 	op := api.opMgr.Register("run#operation", "CREATE", fullName, "", location)
 	api.opMgr.RunAsync(op.Name, func() error {
@@ -549,6 +675,9 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 				LastTransitionTime: time.Now().UTC().Format(time.RFC3339),
 			}}
 			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				log.Printf("[Serverless] persist failed service: %v", persistErr)
+			}
 			return err
 		}
 
@@ -565,6 +694,9 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 			{Type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", Percent: 100},
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			return fmt.Errorf("persist ready service: %w", err)
+		}
 		return nil
 	})
 
@@ -611,6 +743,11 @@ func (api *API) deleteService(w http.ResponseWriter, r *http.Request, project, l
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Service "+name+" not found")
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist service deletion: "+err.Error())
 		return
 	}
 	fullName := fmt.Sprintf("projects/%s/locations/%s/services/%s", project, location, name)
@@ -669,10 +806,14 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 	} else {
 		api.services[serverlessKey(req.Project, req.Location, req.Name)] = &Service{
 			Name: fullName, Reconciling: true, UpdateTime: time.Now().Format(time.RFC3339),
-			SourceCode: req.Code, Runtime: req.Runtime,
+			SourceCode: req.Code, Runtime: req.Runtime, EventTrigger: req.EventTrigger,
 		}
 	}
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		http.Error(w, "persist deployment metadata: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
 		// 1. Create source directory
@@ -707,6 +848,9 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 				f.State = "FAILED"
 			}
 			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				log.Printf("[Serverless] persist failed deployment: %v", persistErr)
+			}
 			return err
 		}
 
@@ -740,6 +884,9 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 				f.State = "FAILED"
 			}
 			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				log.Printf("[Serverless] persist failed deployment: %v", persistErr)
+			}
 			return err
 		}
 
@@ -757,6 +904,9 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			return fmt.Errorf("persist deployed resource: %w", err)
+		}
 		return nil
 	})
 
@@ -783,8 +933,6 @@ func (api *API) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Serverless] Deleting %s: %s", resType, shortName)
 
 	api.mu.Lock()
-	defer api.mu.Unlock()
-
 	project := extractSegmentAfter(r.URL.Path, "projects")
 	if project == "" {
 		project = r.URL.Query().Get("project")
@@ -799,6 +947,11 @@ func (api *API) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
 		delete(api.functions, key)
 	} else {
 		delete(api.services, key)
+	}
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		http.Error(w, "persist deletion: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	// Force cleanup Docker container
@@ -875,38 +1028,8 @@ func toRunLRO(op *orchestrator.Operation, project, location string) map[string]i
 }
 
 func (api *API) OnStorageEvent(bucket, object, eventType string) {
-	log.Printf("[Serverless] ⚡ Processing Storage Event: %s on %s/%s", eventType, bucket, object)
-
-	api.mu.RLock()
-	defer api.mu.RUnlock()
-
-	for _, f := range api.functions {
-		if f.EventTrigger != nil && strings.Contains(f.EventTrigger.Resource, bucket) {
-			log.Printf("[Serverless] 🎯 Triggering function: %s", f.Name)
-
-			// Prepare CloudEvent payload
-			payload := map[string]interface{}{
-				"name":           object,
-				"bucket":         bucket,
-				"contentType":    "application/octet-stream",
-				"metageneration": "1",
-				"timeCreated":    time.Now().Format(time.RFC3339),
-				"updated":        time.Now().Format(time.RFC3339),
-			}
-			data, _ := json.Marshal(payload)
-
-			// Async invocation
-			go func(url string, body []byte) {
-				resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
-				if err != nil {
-					log.Printf("[Serverless] ❌ Trigger failed for %s: %v", url, err)
-					return
-				}
-				defer resp.Body.Close()
-				log.Printf("[Serverless] ✅ Trigger success for %s: %s", url, resp.Status)
-			}(f.Url, data)
-		}
-	}
+	payload, _ := json.Marshal(map[string]string{"bucket": bucket, "name": object})
+	api.HandleEvent(eventType, bucket, string(payload))
 }
 
 func serverlessKey(project, location, name string) string {

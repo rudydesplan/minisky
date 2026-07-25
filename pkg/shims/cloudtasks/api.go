@@ -1,8 +1,12 @@
 package cloudtasks
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -20,11 +24,14 @@ func init() {
 }
 
 type Task struct {
-	Name         string       `json:"name"`
-	HTTPRequest  *HTTPRequest `json:"httpRequest,omitempty"`
-	CreateTime   string       `json:"createTime"`
-	ScheduleTime string       `json:"scheduleTime,omitempty"`
-	Status       string       `json:"status"` // Internal use
+	Name           string       `json:"name"`
+	HTTPRequest    *HTTPRequest `json:"httpRequest,omitempty"`
+	CreateTime     string       `json:"createTime"`
+	ScheduleTime   string       `json:"scheduleTime,omitempty"`
+	Status         string       `json:"status"` // Internal use
+	AttemptCount   int          `json:"attemptCount,omitempty"`
+	LastStatusCode int          `json:"lastStatusCode,omitempty"`
+	LastError      string       `json:"lastError,omitempty"`
 }
 
 type HTTPRequest struct {
@@ -35,22 +42,59 @@ type HTTPRequest struct {
 }
 
 type Queue struct {
-	Name  string `json:"name"`
-	State string `json:"state"`
+	Name        string      `json:"name"`
+	State       string      `json:"state"`
+	RetryConfig RetryConfig `json:"retryConfig,omitempty"`
+}
+
+type RetryConfig struct {
+	MaxAttempts      int    `json:"maxAttempts,omitempty"`
+	MaxRetryDuration string `json:"maxRetryDuration,omitempty"`
+	MinBackoff       string `json:"minBackoff,omitempty"`
+	MaxBackoff       string `json:"maxBackoff,omitempty"`
+	MaxDoublings     int    `json:"maxDoublings,omitempty"`
+}
+
+type deliveryJob struct {
+	cancel context.CancelFunc
 }
 
 type API struct {
-	mu     sync.RWMutex
-	queues map[string]*Queue
-	tasks  map[string][]*Task
-	logAPI *logging.API
+	mu        sync.RWMutex
+	queues    map[string]*Queue
+	tasks     map[string][]*Task
+	jobs      map[string]*deliveryJob
+	logAPI    *logging.API
+	client    *http.Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closed    bool
 }
 
 func NewAPI() *API {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &API{
 		queues: make(map[string]*Queue),
 		tasks:  make(map[string][]*Task),
+		jobs:   make(map[string]*deliveryJob),
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+		ctx:    ctx,
+		cancel: cancel,
 	}
+}
+
+func (api *API) Close() {
+	api.closeOnce.Do(func() {
+		api.mu.Lock()
+		api.closed = true
+		api.cancel()
+		api.mu.Unlock()
+		api.wg.Wait()
+	})
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -174,6 +218,12 @@ func (api *API) deleteQueue(w http.ResponseWriter, r *http.Request, project, que
 
 	api.mu.Lock()
 	_, exists := api.queues[name]
+	for _, task := range api.tasks[name] {
+		if job := api.jobs[task.Name]; job != nil {
+			job.cancel()
+			delete(api.jobs, task.Name)
+		}
+	}
 	delete(api.queues, name)
 	delete(api.tasks, name)
 	api.mu.Unlock()
@@ -190,12 +240,14 @@ func (api *API) listTasks(w http.ResponseWriter, r *http.Request, project, queue
 	name := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
 
 	api.mu.RLock()
-	tasks := api.tasks[name]
+	storedTasks := api.tasks[name]
+	tasks := make([]*Task, 0, len(storedTasks))
+	for _, task := range storedTasks {
+		taskCopy := *task
+		tasks = append(tasks, &taskCopy)
+	}
 	api.mu.RUnlock()
 
-	if tasks == nil {
-		tasks = []*Task{}
-	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"tasks": tasks})
 }
 
@@ -224,38 +276,200 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 
 	api.mu.Lock()
 	api.tasks[queueName] = append(api.tasks[queueName], task)
+	createdTask := *task
+	queue := api.queues[queueName]
+	if task.HTTPRequest != nil && !api.closed {
+		ctx, cancel := context.WithCancel(api.ctx)
+		job := &deliveryJob{cancel: cancel}
+		api.jobs[task.Name] = job
+		api.wg.Add(1)
+		retryConfig := RetryConfig{}
+		if queue != nil {
+			retryConfig = queue.RetryConfig
+		}
+		go api.executeTask(ctx, project, queueName, task, retryConfig, job)
+	}
 	api.mu.Unlock()
 
 	api.pushLog(project, "INFO", queueName, "Task created: "+task.Name)
 
-	// Background: Simulate task execution if it's an HTTP task
-	if task.HTTPRequest != nil {
-		go api.executeTask(project, queueName, task)
-	}
-
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(task)
+	json.NewEncoder(w).Encode(createdTask)
 }
 
-func (api *API) executeTask(project, queueName string, task *Task) {
-	// Wait a bit to simulate asynchronous processing
-	time.Sleep(2 * time.Second)
+func (api *API) executeTask(ctx context.Context, project, queueName string, task *Task, config RetryConfig, job *deliveryJob) {
+	defer api.wg.Done()
+	defer func() {
+		api.mu.Lock()
+		if api.jobs[task.Name] == job {
+			delete(api.jobs, task.Name)
+		}
+		api.mu.Unlock()
+	}()
 
-	log.Printf("[Shim: Cloud Tasks] Executing task %s -> %s %s", task.Name, task.HTTPRequest.HTTPMethod, task.HTTPRequest.URL)
+	body, err := base64.StdEncoding.DecodeString(task.HTTPRequest.Body)
+	if err != nil {
+		api.recordAttempt(queueName, task.Name, 0, fmt.Errorf("decode HTTP body: %w", err), true)
+		return
+	}
 
-	// In a real emulator, we would make the HTTP call here.
-	// For now, we'll just log it in MiniSky's logs.
-	api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", task.Name, task.HTTPRequest.URL))
+	maxAttempts, minBackoff, maxBackoff, maxRetryDuration := normalizedRetryConfig(config)
+	started := time.Now()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			api.markCanceled(queueName, task.Name)
+			return
+		}
 
-	// Update task status
-	api.mu.Lock()
-	for _, t := range api.tasks[queueName] {
-		if t.Name == task.Name {
-			t.Status = "COMPLETED"
-			break
+		method := task.HTTPRequest.HTTPMethod
+		if method == "" {
+			method = http.MethodPost
+		}
+		req, err := http.NewRequestWithContext(ctx, method, task.HTTPRequest.URL, bytes.NewReader(body))
+		if err == nil {
+			for name, value := range task.HTTPRequest.Headers {
+				req.Header.Set(name, value)
+			}
+		}
+
+		statusCode := 0
+		if err == nil {
+			log.Printf("[Shim: Cloud Tasks] Executing task %s -> %s %s (attempt %d)", task.Name, method, task.HTTPRequest.URL, attempt)
+			var response *http.Response
+			response, err = api.client.Do(req)
+			if response != nil {
+				statusCode = response.StatusCode
+				_, _ = io.Copy(io.Discard, response.Body)
+				_ = response.Body.Close()
+				if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+					err = fmt.Errorf("HTTP status %d", statusCode)
+				}
+			}
+		}
+
+		if err == nil {
+			api.recordAttempt(queueName, task.Name, statusCode, nil, true)
+			api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", task.Name, task.HTTPRequest.URL))
+			return
+		}
+
+		delay := retryDelay(minBackoff, maxBackoff, config.MaxDoublings, attempt)
+		retryDurationExpired := maxRetryDuration > 0 && time.Since(started)+delay >= maxRetryDuration
+		terminal := attempt >= maxAttempts || retryDurationExpired
+		api.recordAttempt(queueName, task.Name, statusCode, err, terminal)
+		if terminal {
+			api.pushLog(project, "ERROR", queueName, fmt.Sprintf("Task failed after %d attempts: %s (%v)", attempt, task.Name, err))
+			return
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			api.markCanceled(queueName, task.Name)
+			return
+		case <-timer.C:
 		}
 	}
-	api.mu.Unlock()
+}
+
+func normalizedRetryConfig(config RetryConfig) (int, time.Duration, time.Duration, time.Duration) {
+	maxAttempts := config.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	if maxAttempts > 100 {
+		maxAttempts = 100
+	}
+
+	minBackoff := parseBoundedDuration(config.MinBackoff, 100*time.Millisecond, 5*time.Second)
+	maxBackoff := parseBoundedDuration(config.MaxBackoff, time.Second, 5*time.Second)
+	if maxBackoff < minBackoff {
+		maxBackoff = minBackoff
+	}
+	maxRetryDuration := parseBoundedDuration(config.MaxRetryDuration, 0, 30*time.Second)
+	return maxAttempts, minBackoff, maxBackoff, maxRetryDuration
+}
+
+func parseBoundedDuration(value string, fallback, maximum time.Duration) time.Duration {
+	if value == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return fallback
+	}
+	if duration > maximum {
+		return maximum
+	}
+	return duration
+}
+
+func retryDelay(minBackoff, maxBackoff time.Duration, maxDoublings, attempt int) time.Duration {
+	if maxDoublings < 0 {
+		maxDoublings = 0
+	}
+	delay := minBackoff
+	doublings := attempt - 1
+	if doublings > maxDoublings {
+		doublings = maxDoublings
+	}
+	for i := 0; i < doublings && delay < maxBackoff; i++ {
+		if delay > maxBackoff/2 {
+			return maxBackoff
+		}
+		delay *= 2
+	}
+	if attempt-1 > maxDoublings {
+		multiplier := attempt - maxDoublings
+		if multiplier > 1 {
+			if delay > maxBackoff/time.Duration(multiplier) {
+				return maxBackoff
+			}
+			delay *= time.Duration(multiplier)
+		}
+	}
+	if delay > maxBackoff {
+		return maxBackoff
+	}
+	return delay
+}
+
+func (api *API) recordAttempt(queueName, taskName string, statusCode int, err error, terminal bool) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, task := range api.tasks[queueName] {
+		if task.Name != taskName {
+			continue
+		}
+		task.AttemptCount++
+		task.LastStatusCode = statusCode
+		if err == nil {
+			task.Status = "COMPLETED"
+			task.LastError = ""
+		} else {
+			task.LastError = err.Error()
+			if terminal {
+				task.Status = "FAILED"
+			} else {
+				task.Status = "RETRYING"
+			}
+		}
+		return
+	}
+}
+
+func (api *API) markCanceled(queueName, taskName string) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, task := range api.tasks[queueName] {
+		if task.Name == taskName {
+			task.Status = "CANCELED"
+			return
+		}
+	}
 }
 
 func (api *API) deleteTask(w http.ResponseWriter, r *http.Request, project, queueId, taskId string) {
@@ -269,6 +483,10 @@ func (api *API) deleteTask(w http.ResponseWriter, r *http.Request, project, queu
 	tasks := api.tasks[queueName]
 	for i, t := range tasks {
 		if t.Name == taskName {
+			if job := api.jobs[taskName]; job != nil {
+				job.cancel()
+				delete(api.jobs, taskName)
+			}
 			api.tasks[queueName] = append(tasks[:i], tasks[i+1:]...)
 			log.Printf("[Shim: Cloud Tasks] Successfully deleted task: %s", taskName)
 			api.pushLog(project, "INFO", queueName, "Task deleted: "+taskName)

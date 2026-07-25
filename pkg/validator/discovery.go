@@ -299,4 +299,176 @@ var embeddedRules = []ServiceSchema{
 			},
 		},
 	},
+
+	// ── Cloud Storage ────────────────────────────────────────────────────────
+	{
+		Domain: "storage.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/storage/v1/b",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "name", Type: "string",
+						Message: "field 'name' is required for buckets.insert"},
+				},
+			},
+		},
+	},
+
+	// ── Pub/Sub ──────────────────────────────────────────────────────────────
+	{
+		Domain: "pubsub.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "PUT",
+				PathGlob:    "/v1/projects/*/subscriptions/*",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "topic", Type: "string",
+						Message: "field 'topic' is required for subscriptions.create"},
+				},
+			},
+			// The Pub/Sub shim also accepts the emulator-style path and adds /v1.
+			{
+				HTTPMethod:  "PUT",
+				PathGlob:    "/projects/*/subscriptions/*",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "topic", Type: "string",
+						Message: "field 'topic' is required for subscriptions.create"},
+				},
+			},
+		},
+	},
+
+	// ── Secret Manager ───────────────────────────────────────────────────────
+	{
+		Domain: "secretmanager.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:    "POST",
+				PathGlob:      "/v1/projects/*/secrets",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"secretId"},
+				RequiredBody: []BodyField{
+					{Path: "replication", Type: "object",
+						Message: "field 'replication' is required for secrets.create"},
+				},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/secrets/*",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "payload.data", Type: "string",
+						Message: "field 'payload.data' is required for secretVersions.add"},
+				},
+			},
+		},
+	},
+
+	// ── Cloud KMS ────────────────────────────────────────────────────────────
+	{
+		Domain: "cloudkms.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:    "POST",
+				PathGlob:      "/v1/projects/*/locations/*/keyRings",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"keyRingId"},
+			},
+			{
+				HTTPMethod:    "POST",
+				PathGlob:      "/v1/projects/*/locations/*/keyRings/*/cryptoKeys",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"cryptoKeyId"},
+			},
+		},
+	},
+
+	// ── Cloud Scheduler ──────────────────────────────────────────────────────
+	{
+		Domain: "cloudscheduler.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/jobs",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "name", Type: "string",
+						Message: "field 'name' is required for jobs.create"},
+					{Path: "schedule", Type: "string",
+						Message: "field 'schedule' is required for jobs.create"},
+				},
+			},
+		},
+	},
+
+	// ── Cloud Tasks ──────────────────────────────────────────────────────────
+	{
+		Domain: "cloudtasks.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v2/projects/*/locations/*/queues",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "name", Type: "string",
+						Message: "field 'name' is required for queues.create"},
+				},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v2/projects/*/locations/*/queues/*/tasks",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "task", Type: "object",
+						Message: "field 'task' is required for tasks.create"},
+				},
+			},
+		},
+	},
+
+	// ── Cloud Build ──────────────────────────────────────────────────────────
+	{
+		Domain: "cloudbuild.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/builds",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "steps", Type: "array",
+						Message: "field 'steps' is required for builds.create"},
+				},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/builds",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{
+					{Path: "steps", Type: "array",
+						Message: "field 'steps' is required for builds.create"},
+				},
+			},
+		},
+	},
+
+	// ── Artifact Registry ────────────────────────────────────────────────────
+	{
+		Domain: "artifactregistry.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:    "POST",
+				PathGlob:      "/v1/projects/*/locations/*/repositories",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"repositoryId"},
+				RequiredBody: []BodyField{
+					{Path: "format", Type: "string",
+						Message: "field 'format' is required for repositories.create"},
+				},
+			},
+		},
+	},
 }

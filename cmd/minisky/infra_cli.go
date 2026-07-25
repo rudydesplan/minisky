@@ -2,9 +2,14 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	gkeProject  string
+	gkeLocation string
+	sqlProject  string
 )
 
 var gkeCmd = &cobra.Command{
@@ -22,23 +27,23 @@ func init() {
 	gkeCmd.AddCommand(&cobra.Command{
 		Use: "clusters list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Clusters []struct {
 					Name   string `json:"name"`
 					Status string `json:"status"`
 				} `json:"clusters"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/gke/clusters", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("container", fmt.Sprintf("/v1/projects/%s/locations/%s/clusters", gkeProject, gkeLocation))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("GKE CLUSTERS:")
+			fmt.Fprintln(cmd.OutOrStdout(), "GKE CLUSTERS:")
 			for _, c := range data.Clusters {
-				fmt.Printf("  - %s [%s]\n", c.Name, c.Status)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", c.Name, c.Status)
 			}
 		},
 	})
@@ -47,27 +52,30 @@ func init() {
 	sqlCmd.AddCommand(&cobra.Command{
 		Use: "instances list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
 			var data struct {
 				Items []struct {
 					Name  string `json:"name"`
 					State string `json:"state"`
 				} `json:"items"`
 			}
-			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/cloudsql/instances", port), &data); err != nil {
+			endpoint, err := miniskyAPIURL("sqladmin", fmt.Sprintf("/v1/projects/%s/instances", sqlProject))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
 				return
 			}
-			fmt.Println("CLOUDSQL INSTANCES:")
+			fmt.Fprintln(cmd.OutOrStdout(), "CLOUDSQL INSTANCES:")
 			for _, i := range data.Items {
-				fmt.Printf("  - %s [%s]\n", i.Name, i.State)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s [%s]\n", i.Name, i.State)
 			}
 		},
 	})
 
+	gkeCmd.PersistentFlags().StringVar(&gkeProject, "project", "local-dev-project", "GCP project ID")
+	gkeCmd.PersistentFlags().StringVar(&gkeLocation, "location", "us-central1-a", "GKE location")
+	sqlCmd.PersistentFlags().StringVar(&sqlProject, "project", "local-dev-project", "GCP project ID")
 	rootCmd.AddCommand(gkeCmd)
 	rootCmd.AddCommand(sqlCmd)
 }

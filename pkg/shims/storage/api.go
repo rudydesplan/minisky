@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
 	"strings"
+	"sync"
 
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
@@ -20,12 +23,13 @@ func init() {
 
 // EventObserver is implemented by shims that want to receive GCS events (like Serverless).
 type EventObserver interface {
-	OnStorageEvent(bucket, object, eventType string)
+	HandleEvent(eventType, resource, payload string)
 }
 
 type API struct {
-	svcMgr   *orchestrator.ServiceManager
-	observer EventObserver
+	svcMgr    *orchestrator.ServiceManager
+	mu        sync.RWMutex
+	observers []EventObserver
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -39,7 +43,23 @@ func NewAPI(sm *orchestrator.ServiceManager) *API {
 }
 
 func (api *API) SetObserver(o EventObserver) {
-	api.observer = o
+	api.AddObserver(o)
+}
+
+// AddObserver registers an event recipient without replacing existing recipients.
+// Registering the same observer more than once is a no-op.
+func (api *API) AddObserver(observer EventObserver) {
+	if observer == nil {
+		return
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, existing := range api.observers {
+		if sameObserver(existing, observer) {
+			return
+		}
+	}
+	api.observers = append(api.observers, observer)
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +85,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
-	if api.observer == nil {
+	observers := api.eventObservers()
+	if len(observers) == 0 {
 		return
 	}
 
@@ -77,7 +98,7 @@ func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
 
 		if object != "" {
 			log.Printf("[Storage Event] File finalized: gs://%s/%s", bucket, object)
-			go api.observer.OnStorageEvent(bucket, object, "google.storage.object.finalize")
+			api.notify(observers, bucket, object, "google.storage.object.finalize")
 		}
 	}
 
@@ -86,7 +107,42 @@ func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
 		bucket := extractSegmentAfter(path, "b")
 		object := extractSegmentAfter(path, "o")
 		log.Printf("[Storage Event] File deleted: gs://%s/%s", bucket, object)
-		go api.observer.OnStorageEvent(bucket, object, "google.storage.object.delete")
+		api.notify(observers, bucket, object, "google.storage.object.delete")
+	}
+}
+
+func (api *API) notify(observers []EventObserver, bucket, object, eventType string) {
+	payload, err := json.Marshal(map[string]string{
+		"bucket": bucket,
+		"name":   object,
+	})
+	if err != nil {
+		return
+	}
+	for _, observer := range observers {
+		observer.HandleEvent(eventType, bucket, string(payload))
+	}
+}
+
+func (api *API) eventObservers() []EventObserver {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]EventObserver(nil), api.observers...)
+}
+
+func sameObserver(a, b EventObserver) bool {
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	if av.Type() != bv.Type() {
+		return false
+	}
+	if av.Type().Comparable() {
+		return av.Interface() == bv.Interface()
+	}
+	switch av.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.Slice:
+		return av.Pointer() == bv.Pointer()
+	default:
+		return false
 	}
 }
 

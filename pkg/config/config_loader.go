@@ -18,6 +18,22 @@ func GetMiniskyDir() string {
 	return ".minisky"
 }
 
+// GetStateDir returns the root for profile-scoped persistent metadata.
+func GetStateDir() string {
+	if dir := os.Getenv("MINISKY_STATE_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(GetMiniskyDir(), "state")
+}
+
+// GetProfile returns the active state profile.
+func GetProfile() string {
+	if profile := os.Getenv("MINISKY_PROFILE"); profile != "" {
+		return profile
+	}
+	return "default"
+}
+
 //go:embed images.json
 var embeddedImagesJSON []byte
 

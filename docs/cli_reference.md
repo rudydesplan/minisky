@@ -1,110 +1,141 @@
-# MiniSky CLI Reference Manual
+# MiniSky CLI reference
 
-**Website:** [minisky.bmics.com.ng](https://minisky.bmics.com.ng)
+The `minisky` binary controls the local daemon and talks directly to the public
+API gateway. Service commands do not require the Dashboard to be running.
 
-The `minisky` binary is a unified command-line tool designed to manage your local Google Cloud environment. It mirrors many common `gcloud` patterns while providing direct control over the emulator's lifecycle.
+## API endpoint
 
-## Table of Contents
-1. [Core Control](#core-control)
-2. [Compute & Serverless](#compute--serverless)
-3. [Data Storage](#data-storage)
-4. [Messaging & Events](#messaging--events)
-5. [Infrastructure & Databases](#infrastructure--databases)
-6. [Observability](#observability)
+All gateway-backed service commands use this precedence:
 
----
+1. `--endpoint`
+2. `MINISKY_ENDPOINT`
+3. `http://localhost:8080`
 
-## Core Control
+The value is the API gateway base URL, not a Dashboard URL. MiniSky appends a
+canonical route in the form `/_minisky/{service}/{service-path}`.
 
-Commands to manage the MiniSky daemon.
-
-### `minisky start`
-Starts the API Gateway (port 8080) and the Dashboard UI (port 8081).
-- **Flags**:
-  - `--port`: API Gateway port (default: 8080)
-  - `--ui-port`: Dashboard port (default: 8081)
-
-### `minisky stop`
-Safely shuts down all emulators, stops managed Docker containers, and tears down the isolated network.
-
-### `minisky restart`
-A shorthand for `stop` followed by `start`. Useful for clearing in-memory state.
-
----
-
-## Compute & Serverless
-
-### `minisky deploy`
-Deploys a Cloud Function or Cloud Run service.
-- **Example**: `./minisky deploy --name my-func --runtime python312 --source main.py`
-- **Flags**:
-  - `--name`: Name of the resource (Required)
-  - `--source`: Path to code file (Required)
-  - `--runtime`: `python312`, `nodejs22`, `go122`
-  - `--entry-point`: Function name (default: `handler`)
-  - `--type`: `function` or `service`
-
-### `minisky list`
-Lists all active serverless resources.
 ```bash
-./minisky list
+export MINISKY_ENDPOINT=http://127.0.0.1:8080
+minisky storage buckets list --project local-dev-project
+
+# A flag overrides the environment variable.
+minisky --endpoint http://minisky.internal:8080 tasks queues list
 ```
 
-### `minisky compute instances list`
-Lists all emulated GCE instances (Docker VMs).
+Non-2xx responses are reported as errors, including the HTTP status and any
+response message. `MINISKY_UI_PORT` remains a Dashboard/startup setting and is
+not used by headless service commands.
 
----
+## Lifecycle and diagnostics
 
-## Data Storage
+- `minisky start` starts the API gateway and Dashboard.
+  - `--port` sets the gateway port (default `8080`).
+  - `--ui-port` sets the Dashboard port (default `8081`).
+- `minisky stop` sends the daemon a graceful stop signal.
+- `minisky restart` stops and starts the daemon.
+- `minisky doctor` checks local requirements and MiniSky dependencies.
+  - `--fix` installs dependencies that MiniSky can safely install.
+- `minisky version` prints the installed version.
+- `minisky uninstall` removes managed containers, networks, and local data.
 
-### `minisky storage buckets list`
-Lists all buckets in the Storage emulator.
+## Headless service commands
 
----
+These commands use the public API gateway and canonical routes:
 
-## Messaging & Events
+- `minisky artifact-registry repositories list`
+  - `--project` (default `local-dev-project`)
+  - `--location` (default `us-central1`)
+  - Route: `/_minisky/artifactregistry/v1/projects/{project}/locations/{location}/repositories`
+- `minisky cloud-build builds list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/cloudbuild/v1/projects/{project}/builds`
+- `minisky vertex-ai models list`
+  - Route: `/_minisky/aiplatform/v1/internal/models`
+- `minisky kms keyrings list`
+  - `--project` (default `local-dev-project`)
+  - `--location` (default `global`)
+  - Route: `/_minisky/cloudkms/v1/projects/{project}/locations/{location}/keyRings`
+- `minisky secrets list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/secretmanager/v1/projects/{project}/secrets`
+- `minisky tasks queues list`
+  - `--project` (default `local-dev-project`)
+  - `--location` (default `us-central1`)
+  - Route: `/_minisky/cloudtasks/v2/projects/{project}/locations/{location}/queues`
+- `minisky compute instances list`
+  - `--project` (default `local-dev-project`)
+  - `--zone` (default `us-central1-a`)
+  - Route: `/_minisky/compute/compute/v1/projects/{project}/zones/{zone}/instances`
+- `minisky storage buckets list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/storage/storage/v1/b?project={project}`
+- `minisky pubsub topics list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/pubsub/v1/projects/{project}/topics`
+- `minisky gke clusters list`
+  - `--project` (default `local-dev-project`)
+  - `--location` (default `us-central1-a`)
+  - Route: `/_minisky/container/v1/projects/{project}/locations/{location}/clusters`
+- `minisky sql instances list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/sqladmin/v1/projects/{project}/instances`
+- `minisky dataproc clusters list`
+  - `--project` (default `local-dev-project`)
+  - `--region` (default `us-central1`)
+  - Route: `/_minisky/dataproc/v1/projects/{project}/regions/{region}/clusters`
+- `minisky bigtable instances list`
+  - `--project` (default `local-dev-project`)
+  - Route: `/_minisky/bigtableadmin/v2/projects/{project}/instances`
+- `minisky logs tail`
+  - Polls `POST /_minisky/logging/v2/entries:list`.
 
-### `minisky pubsub topics list`
-Lists all Pub/Sub topics.
+### Unsupported headless commands
 
----
+The Spanner emulator is registered as a lazy Docker backend and has no public
+MiniSky HTTP shim route. Consequently, these commands return a clear
+unsupported message instead of contacting the Dashboard:
 
-## Infrastructure & Databases
+- `minisky spanner instances list`
+- `minisky spanner instances create [instance-id]`
 
-### `minisky sql instances list`
-Lists all Cloud SQL (MySQL/PostgreSQL) instances.
+The existing Spanner `--project` flag is retained for compatibility.
 
-### `minisky gke clusters list`
-Lists all Kubernetes clusters (managed via `kind`).
+## Serverless
 
-### `minisky bigtable instances list`
-Lists all Bigtable instances.
+`minisky deploy` deploys a Cloud Function or Cloud Run service.
 
-### `minisky spanner instances list`
-Lists all Spanner instances.
+```bash
+minisky deploy \
+  --name my-function \
+  --runtime python312 \
+  --entry-point handler \
+  --source main.py \
+  --type function
+```
 
-### `minisky spanner instances create [id]`
-Creates a new Spanner instance in the local emulator.
+Required flags are `--name` and `--source`. `--runtime` defaults to
+`python312`, `--entry-point` to `handler`, and `--type` to `function`. Deploy
+uses `POST /_minisky/cloudfunctions/v2/deploy`.
 
-### `minisky dataproc clusters list`
-Lists all Spark/Hadoop clusters.
+`minisky list` lists active Cloud Functions and Cloud Run services through
+`/_minisky/cloudfunctions/v2/functions` and `/_minisky/run/v2/services`.
 
----
+## State snapshots
 
-## Observability
+- `minisky state export [FILE]` exports portable metadata to a file, or stdout
+  when `FILE` is omitted.
+- `minisky state import [FILE]` atomically imports metadata from a file, or
+  stdin when `FILE` is omitted.
+- `--profile` selects a state profile; otherwise `MINISKY_PROFILE` or `default`
+  is used.
 
-### `minisky logs tail`
-Streams all MiniSky logs in real-time to your terminal.
-- **Features**:
-  - Color-coded severity levels.
-  - Automatic resource labeling.
-  - Streams logs from Serverless, Compute, and Database containers simultaneously.
+Snapshots intentionally exclude DuckDB files and other binary service data.
 
----
+## Environment variables
 
-## Environment Variables
-MiniSky respects the following environment variables if you want to avoid passing flags:
-- `MINISKY_PORT`: Sets the API gateway port.
-- `MINISKY_UI_PORT`: Sets the Dashboard port.
-- `STORAGE_EMULATOR_HOST`: Point `gsutil` to `http://localhost:8080`.
-- `PUBSUB_EMULATOR_HOST`: Point SDKs to `http://localhost:8080`.
+- `MINISKY_ENDPOINT`: API gateway base URL for headless service commands.
+- `MINISKY_PORT`: API gateway listen port used by `minisky start`.
+- `MINISKY_UI_PORT`: Dashboard listen port only.
+- `MINISKY_PROFILE`: state profile used by snapshot commands.
+- `STORAGE_EMULATOR_HOST`: SDK endpoint, typically `http://localhost:8080`.
+- `PUBSUB_EMULATOR_HOST`: SDK endpoint, typically `http://localhost:8080`.

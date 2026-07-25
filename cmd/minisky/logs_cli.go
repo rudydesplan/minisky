@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,32 +16,31 @@ var tailLogsCmd = &cobra.Command{
 	Use:   "tail",
 	Short: "Tail logs in real-time from MiniSky",
 	Run: func(cmd *cobra.Command, args []string) {
-		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" {
-			port = "8081"
+		endpoint, err := miniskyAPIURL("logging", "/v2/entries:list")
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+			return
 		}
 
-		fmt.Println("🛰️  Streaming MiniSky logs (Ctrl+C to stop)...")
+		fmt.Fprintln(cmd.OutOrStdout(), "🛰️  Streaming MiniSky logs (Ctrl+C to stop)...")
 		lastSeenId := ""
 
 		for {
-			url := fmt.Sprintf("http://localhost:%s/api/manage/logging/entries", port)
-			resp, err := http.Get(url)
+			var response struct {
+				Entries []map[string]interface{} `json:"entries"`
+			}
+			err := postJSON(endpoint, map[string]interface{}{}, &response)
 			if err != nil {
 				time.Sleep(2 * time.Second)
 				continue
 			}
 
-			var entries []map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&entries)
-			resp.Body.Close()
-
 			// Print new entries
 			foundLast := lastSeenId == ""
 			newLastSeen := lastSeenId
 
-			for i := len(entries) - 1; i >= 0; i-- {
-				e := entries[i]
+			for i := len(response.Entries) - 1; i >= 0; i-- {
+				e := response.Entries[i]
 				id := e["insertId"].(string)
 
 				if id == lastSeenId {
@@ -60,7 +56,7 @@ var tailLogsCmd = &cobra.Command{
 					labels := res["labels"].(map[string]interface{})
 					name := labels["name"].(string)
 
-					fmt.Printf("[%s] %s | %s: %s\n", ts, severity, name, text)
+					fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s | %s: %s\n", ts, severity, name, text)
 					newLastSeen = id
 				}
 			}

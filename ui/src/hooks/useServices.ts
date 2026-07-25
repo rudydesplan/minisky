@@ -10,9 +10,34 @@ export type Service = {
   missingDeps?: string[];
 };
 
+export type DashboardSettings = {
+  bq_duckdb: boolean;
+  gke_kind: boolean;
+  serverless_pack: boolean;
+};
+
+export type DashboardSettingKey = keyof DashboardSettings;
+
+const defaultSettings: DashboardSettings = {
+  bq_duckdb: false,
+  gke_kind: false,
+  serverless_pack: false,
+};
+
+function isDashboardSettings(value: unknown): value is DashboardSettings {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const settings = value as Record<string, unknown>;
+  return typeof settings.bq_duckdb === 'boolean'
+    && typeof settings.gke_kind === 'boolean'
+    && typeof settings.serverless_pack === 'boolean';
+}
+
 export function useServices() {
   const [services, setServices] = useState<Service[]>([]);
-  const [settings, setSettings] = useState<Record<string, unknown>>({});
+  const [settings, setSettings] = useState<DashboardSettings>(defaultSettings);
 
   const loadData = useCallback(async () => {
     try {
@@ -22,7 +47,12 @@ export function useServices() {
       }
       const setRes = await fetch('/api/settings');
       if (setRes.ok) {
-        setSettings(await setRes.json() as Record<string, unknown>);
+        const data: unknown = await setRes.json();
+        if (isDashboardSettings(data)) {
+          setSettings(data);
+        } else {
+          console.error('invalid settings response', data);
+        }
       }
     } catch (e) {
       console.error("error loading UI data", e);
@@ -49,7 +79,7 @@ export function useServices() {
     loadData();
   };
 
-  const toggleSetting = async (key: string, currentVal: boolean) => {
+  const toggleSetting = async (key: DashboardSettingKey, currentVal: boolean) => {
     try {
       const res = await fetch('/api/settings', {
         method: 'POST',

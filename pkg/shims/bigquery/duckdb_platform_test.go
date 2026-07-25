@@ -8,9 +8,15 @@ import (
 )
 
 func TestDuckDBUnavailableWithoutCGO(t *testing.T) {
+	t.Setenv("MINISKY_RUNTIME_PROFILE", "full")
+	t.Setenv("MINISKY_BQ_BACKEND", "")
+
 	backend := NewDuckDBBackend()
 	if backend.Enabled() {
 		t.Fatal("DuckDB backend is enabled without CGO")
+	}
+	if state := backend.Status(); state.Backend != "simulation" || state.Diagnostic == "" {
+		t.Fatalf("backend state = %#v, want diagnosed simulation fallback", state)
 	}
 
 	if err := backend.SetEnabled(true); err == nil || !strings.Contains(err.Error(), "requires CGO") {

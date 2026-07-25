@@ -20,7 +20,9 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/minisky-sa-key.json
-terraform/.terraform.*.hcl
+terraform/*.tfplan
+terraform/*.tfvars
+terraform/*.tfvars.json
 
 # Go
 vendor/
@@ -61,6 +63,10 @@ docs/*
 !docs/user-guide.md
 !docs/contribution-guide.md
 !docs/cli_reference.md
+!docs/service-compatibility.md
+!docs/state-model.md
+!docs/terraform-compatibility.md
+!docs/distribution.md
 
 
 DESIGN.md

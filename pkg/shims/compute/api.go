@@ -3,14 +3,21 @@ package compute
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -190,6 +197,46 @@ type FirewallAllow struct {
 	Ports      []string `json:"ports,omitempty"`
 }
 
+const (
+	metadataOnlyStatus            = "METADATA_ONLY"
+	metadataOnlyDescription       = "Metadata resource; local packet proxying requires an explicit supported backend configuration."
+	rehydratedInstanceDescription = "Metadata restored from profile state; the Docker-backed VM has not been reconciled."
+)
+
+type loadBalancerCollection struct {
+	path         string
+	canonical    string
+	resourceKind string
+	listKind     string
+}
+
+var loadBalancerCollections = map[string]loadBalancerCollection{
+	"backendServices": {
+		path: "backendServices", canonical: "backendServices",
+		resourceKind: "compute#backendService", listKind: "compute#backendServiceList",
+	},
+	"healthChecks": {
+		path: "healthChecks", canonical: "healthChecks",
+		resourceKind: "compute#healthCheck", listKind: "compute#healthCheckList",
+	},
+	"urlMaps": {
+		path: "urlMaps", canonical: "urlMaps",
+		resourceKind: "compute#urlMap", listKind: "compute#urlMapList",
+	},
+	"targetHttpProxies": {
+		path: "targetHttpProxies", canonical: "targetHttpProxies",
+		resourceKind: "compute#targetHttpProxy", listKind: "compute#targetHttpProxyList",
+	},
+	"forwardingRules": {
+		path: "forwardingRules", canonical: "forwardingRules",
+		resourceKind: "compute#forwardingRule", listKind: "compute#forwardingRuleList",
+	},
+	"globalForwardingRules": {
+		path: "globalForwardingRules", canonical: "forwardingRules",
+		resourceKind: "compute#forwardingRule", listKind: "compute#forwardingRuleList",
+	},
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // API shim struct
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,23 +244,46 @@ type FirewallAllow struct {
 // API is the high-fidelity Compute Engine v1 shim.
 type API struct {
 	mu               sync.RWMutex
+	persistMu        sync.Mutex
 	opMgr            *orchestrator.OperationManager
 	svcMgr           *orchestrator.ServiceManager
+	stateStore       *state.Store
 	instances        map[string]*Instance       // key: project+":"+zone+":"+name
 	networks         map[string]*Network        // key: project+":"+name
 	securityPolicies map[string]*SecurityPolicy // key: project+":"+name
 	firewalls        map[string]*FirewallRule   // key: project+":"+name
+	loadBalancers    map[string]map[string]interface{}
+	roundRobin       map[string]uint64
+	httpClient       *http.Client
 }
 
 // NewAPI builds the Compute shim with the shared LRO manager and service manager.
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Compute Engine] state disabled: %v", err)
+		return newAPI(opMgr, svcMgr, nil)
+	}
+	api, err := NewAPIWithStore(opMgr, svcMgr, store)
+	if err != nil {
+		log.Printf("[Shim: Compute Engine] state rehydration failed: %v", err)
+		return newAPI(opMgr, svcMgr, store)
+	}
+	return api
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store *state.Store) *API {
 	return &API{
 		opMgr:            opMgr,
 		svcMgr:           svcMgr,
+		stateStore:       store,
 		instances:        make(map[string]*Instance),
 		networks:         make(map[string]*Network),
 		securityPolicies: make(map[string]*SecurityPolicy),
 		firewalls:        make(map[string]*FirewallRule),
+		loadBalancers:    make(map[string]map[string]interface{}),
+		roundRobin:       make(map[string]uint64),
+		httpClient:       &http.Client{Timeout: 2 * time.Second},
 	}
 }
 
@@ -239,6 +309,10 @@ func (api *API) ListProjects() []string {
 		p := strings.Split(k, ":")[0]
 		projects[p] = true
 	}
+	for k := range api.loadBalancers {
+		p := strings.SplitN(k, ":", 2)[0]
+		projects[p] = true
+	}
 
 	res := []string{}
 	for p := range projects {
@@ -249,9 +323,13 @@ func (api *API) ListProjects() []string {
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Compute Engine] %s %s", r.Method, r.URL.Path)
-	w.Header().Set("Content-Type", "application/json")
 
 	path := r.URL.Path
+	if project, forwardingRule, proxyPath, ok := parseLoadBalancerProxyPath(path); ok {
+		api.proxyLoadBalancerRequest(w, r, project, forwardingRule, proxyPath)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 
 	switch {
 	case strings.Contains(path, "/instances") && strings.Contains(path, "/zones/"):
@@ -267,8 +345,10 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(path, "/global/securityPolicies"):
 		api.routeSecurityPolicies(w, r, path)
 	case strings.Contains(path, "/global/backendServices") ||
+		strings.Contains(path, "/global/healthChecks") ||
 		strings.Contains(path, "/global/urlMaps") ||
 		strings.Contains(path, "/global/forwardingRules") ||
+		strings.Contains(path, "/global/globalForwardingRules") ||
 		strings.Contains(path, "/global/targetHttpProxies"):
 		api.routeLoadBalancer(w, r, path)
 	case strings.Contains(path, "/global/images"):
@@ -419,6 +499,11 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	api.mu.Lock()
 	api.instances[key] = inst
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist instance metadata: "+err.Error())
+		return
+	}
 
 	// Register LRO
 	op := api.opMgr.Register("compute#operation", "insert", targetLink, zone, "")
@@ -458,6 +543,9 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			i.Status = "STAGING"
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Compute Engine] persist staging instance: %v", err)
+		}
 		time.Sleep(2 * time.Second)
 
 		if isGKE {
@@ -468,6 +556,9 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 				i.Description = fmt.Sprintf("Docker Container ID mapping: %s", containerName)
 			}
 			api.mu.Unlock()
+			if err := api.persistMetadata(); err != nil {
+				log.Printf("[Shim: Compute Engine] persist running instance: %v", err)
+			}
 			return nil
 		}
 
@@ -477,6 +568,9 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			i.Status = "PROVISIONING"
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Compute Engine] persist provisioning instance: %v", err)
+		}
 
 		vpcName := "default"
 		api.mu.RLock()
@@ -495,22 +589,29 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		// Tell the Orchestrator to physically spin up the Docker container!
 		err := api.svcMgr.ProvisionComputeVM(containerName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
 
+		// Keep the simulated delay outside the metadata lock.
+		if err == nil {
+			time.Sleep(1500 * time.Millisecond)
+		}
 		api.mu.Lock()
 		if i, ok := api.instances[key]; ok {
 			if err != nil {
 				i.Status = "TERMINATED"
 				i.Description = fmt.Sprintf("Failed to provision docker data plane: %v", err)
 				api.mu.Unlock()
+				if persistErr := api.persistMetadata(); persistErr != nil {
+					log.Printf("[Shim: Compute Engine] persist failed instance: %v", persistErr)
+				}
 				return err
 			}
-
-			// 3. Post-provisioning delay to ensure the UI catches the transition
-			time.Sleep(1500 * time.Millisecond)
 
 			i.Status = "RUNNING"
 			i.Description = fmt.Sprintf("Docker Container ID mapping: %s", containerName)
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Compute Engine] persist running instance: %v", err)
+		}
 		return nil
 	})
 
@@ -613,6 +714,11 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	// Mark as DELETING so the UI shows the "winding down" process
 	inst.Status = "DELETING"
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist deleting instance metadata: "+err.Error())
+		return
+	}
 
 	containerName := fmt.Sprintf("minisky-vm-%s", name)
 	op := api.opMgr.Register("compute#operation", "delete",
@@ -628,6 +734,9 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		api.mu.Lock()
 		delete(api.instances, key)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: Compute Engine] persist deleted instance: %v", err)
+		}
 		return nil
 	})
 
@@ -652,6 +761,11 @@ func (api *API) instanceAction(w http.ResponseWriter, r *http.Request, project, 
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("Instance '%s' not found", name))
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist instance action: "+err.Error())
 		return
 	}
 
@@ -805,6 +919,11 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 		api.mu.Lock()
 		api.networks[key] = n
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist network metadata: "+err.Error())
+			return
+		}
 
 		if body.Name != "default" {
 			api.svcMgr.CreateVPCNetwork(r.Context(), body.Name)
@@ -885,6 +1004,11 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			writeError(w, 404, "NOT_FOUND", "Network "+name+" not found")
+			return
+		}
+		if err := api.persistMetadata(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, 500, "INTERNAL", "persist network deletion: "+err.Error())
 			return
 		}
 		if name != "default" {
@@ -990,20 +1114,539 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Load Balancer stubs (stateless for now, return accepted LRO)
+// Load Balancer metadata resources
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) routeLoadBalancer(w http.ResponseWriter, r *http.Request, path string) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	project := extractProject(path)
+	collection, name, valid := parseLoadBalancerPath(path)
+	if !valid {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Unsupported Compute load-balancer route: "+path)
 		return
 	}
-	project := extractProject(path)
-	op := api.opMgr.Register("compute#operation", "insert",
-		"https://www.googleapis.com/compute/v1/projects/"+project+path, "", "")
-	api.opMgr.RunAsync(op.Name, func() error { return nil })
+
+	switch r.Method {
+	case http.MethodPost:
+		if name != "" {
+			w.WriteHeader(http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Unsupported Compute load-balancer route: "+path)
+			return
+		}
+		api.createLoadBalancerResource(w, r, project, collection)
+	case http.MethodGet:
+		if name == "" {
+			api.listLoadBalancerResources(w, project, collection)
+			return
+		}
+		api.getLoadBalancerResource(w, project, collection, name)
+	case http.MethodDelete:
+		if name == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "A resource name is required for delete")
+			return
+		}
+		api.deleteLoadBalancerResource(w, project, collection, name)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED",
+			fmt.Sprintf("Method %s is not supported for %s", r.Method, collection.path))
+	}
+}
+
+type loadBalancerBackend struct {
+	target      *url.URL
+	healthPath  string
+	description string
+}
+
+func (api *API) proxyLoadBalancerRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	project string,
+	forwardingRuleName string,
+	proxyPath string,
+) {
+	backends, backendService, err := api.resolveLoadBalancerBackends(project, forwardingRuleName)
+	if err != nil {
+		writeLoadBalancerUnavailable(w, err.Error())
+		return
+	}
+
+	healthy := make([]loadBalancerBackend, 0, len(backends))
+	for _, backend := range backends {
+		if api.backendIsHealthy(r, backend) {
+			healthy = append(healthy, backend)
+		}
+	}
+	if len(healthy) == 0 {
+		writeLoadBalancerUnavailable(w, fmt.Sprintf(
+			"backend service %q has no healthy resolvable backends",
+			backendService,
+		))
+		return
+	}
+
+	api.mu.Lock()
+	cursor := api.roundRobin[loadBalancerKey(project, "backendServices", backendService)]
+	api.roundRobin[loadBalancerKey(project, "backendServices", backendService)] = cursor + 1
+	api.mu.Unlock()
+	backend := healthy[cursor%uint64(len(healthy))]
+
+	outbound := r.Clone(r.Context())
+	outbound.URL.Path = proxyPath
+	outbound.URL.RawPath = ""
+	proxy := httputil.NewSingleHostReverseProxy(backend.target)
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+		writeLoadBalancerUnavailable(w, fmt.Sprintf(
+			"backend %s became unavailable: %v",
+			backend.description,
+			proxyErr,
+		))
+	}
+	proxy.ServeHTTP(w, outbound)
+}
+
+func (api *API) resolveLoadBalancerBackends(
+	project string,
+	forwardingRuleName string,
+) ([]loadBalancerBackend, string, error) {
+	api.mu.RLock()
+	forwardingRule := api.loadBalancers[loadBalancerKey(project, "forwardingRules", forwardingRuleName)]
+	if forwardingRule == nil {
+		api.mu.RUnlock()
+		return nil, "", fmt.Errorf("forwarding rule %q was not found", forwardingRuleName)
+	}
+	targetProxyName := resourceReferenceName(forwardingRule["target"])
+	targetProxy := api.loadBalancers[loadBalancerKey(project, "targetHttpProxies", targetProxyName)]
+	if targetProxy == nil {
+		api.mu.RUnlock()
+		return nil, "", fmt.Errorf("forwarding rule %q does not resolve to a target HTTP proxy", forwardingRuleName)
+	}
+	urlMapName := resourceReferenceName(targetProxy["urlMap"])
+	urlMap := api.loadBalancers[loadBalancerKey(project, "urlMaps", urlMapName)]
+	if urlMap == nil {
+		api.mu.RUnlock()
+		return nil, "", fmt.Errorf("target HTTP proxy %q does not resolve to a URL map", targetProxyName)
+	}
+	if hasNonEmptyList(urlMap["hostRules"]) || hasNonEmptyList(urlMap["pathMatchers"]) {
+		api.mu.RUnlock()
+		return nil, "", fmt.Errorf("URL map %q uses unsupported host or path rules; only defaultService routing is supported", urlMapName)
+	}
+	backendServiceName := resourceReferenceName(urlMap["defaultService"])
+	backendService := api.loadBalancers[loadBalancerKey(project, "backendServices", backendServiceName)]
+	if backendService == nil {
+		api.mu.RUnlock()
+		return nil, "", fmt.Errorf("URL map %q does not resolve to a default backend service", urlMapName)
+	}
+	if protocol, _ := backendService["protocol"].(string); protocol != "" &&
+		!strings.EqualFold(protocol, "HTTP") && !strings.EqualFold(protocol, "HTTPS") {
+		api.mu.RUnlock()
+		return nil, backendServiceName, fmt.Errorf("backend service %q uses unsupported protocol %q", backendServiceName, protocol)
+	}
+	rawBackends, hasBackends := backendService["backends"].([]interface{})
+	rawHealthChecks, _ := backendService["healthChecks"].([]interface{})
+	healthPath, healthErr := api.resolveHealthPathLocked(project, rawHealthChecks)
+	api.mu.RUnlock()
+
+	if healthErr != nil {
+		return nil, backendServiceName, healthErr
+	}
+	if !hasBackends || len(rawBackends) == 0 {
+		return nil, backendServiceName, fmt.Errorf("backend service %q has no backends", backendServiceName)
+	}
+
+	backends := make([]loadBalancerBackend, 0, len(rawBackends))
+	var unsupported []string
+	for index, rawBackend := range rawBackends {
+		backend, err := api.resolveLoadBalancerBackend(project, rawBackend, healthPath)
+		if err != nil {
+			unsupported = append(unsupported, fmt.Sprintf("backend %d: %v", index, err))
+			continue
+		}
+		backends = append(backends, backend)
+	}
+	if len(backends) == 0 {
+		return nil, backendServiceName, fmt.Errorf(
+			"backend service %q has only unsupported backends (%s); supported forms require an explicit HTTP(S) 'url' or a Compute 'instance' plus 'port'",
+			backendServiceName,
+			strings.Join(unsupported, "; "),
+		)
+	}
+	return backends, backendServiceName, nil
+}
+
+func (api *API) resolveHealthPathLocked(project string, references []interface{}) (string, error) {
+	if len(references) == 0 {
+		return "", nil
+	}
+	if len(references) > 1 {
+		return "", fmt.Errorf("multiple health checks are unsupported")
+	}
+	name := resourceReferenceName(references[0])
+	healthCheck := api.loadBalancers[loadBalancerKey(project, "healthChecks", name)]
+	if healthCheck == nil {
+		return "", fmt.Errorf("health check %q was not found", name)
+	}
+	for _, field := range []string{"httpHealthCheck", "httpsHealthCheck"} {
+		config, ok := healthCheck[field].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if requestPath, _ := config["requestPath"].(string); requestPath != "" {
+			if !strings.HasPrefix(requestPath, "/") {
+				return "", fmt.Errorf("health check %q has an invalid requestPath", name)
+			}
+			return requestPath, nil
+		}
+		return "/", nil
+	}
+	return "", fmt.Errorf("health check %q uses an unsupported type; only HTTP(S) health checks are supported", name)
+}
+
+func (api *API) resolveLoadBalancerBackend(
+	project string,
+	rawBackend interface{},
+	healthPath string,
+) (loadBalancerBackend, error) {
+	config, ok := rawBackend.(map[string]interface{})
+	if !ok {
+		return loadBalancerBackend{}, fmt.Errorf("configuration must be an object")
+	}
+	if rawURL, _ := config["url"].(string); rawURL != "" {
+		target, err := url.Parse(rawURL)
+		if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
+			return loadBalancerBackend{}, fmt.Errorf("'url' must be an absolute HTTP(S) URL")
+		}
+		return loadBalancerBackend{target: target, healthPath: healthPath, description: rawURL}, nil
+	}
+
+	instanceReference, _ := config["instance"].(string)
+	port, err := numericBackendPort(config["port"])
+	if instanceReference == "" || err != nil {
+		return loadBalancerBackend{}, fmt.Errorf("missing explicit 'url' or valid Compute 'instance' and 'port'")
+	}
+	instanceProject, zone, instanceName, ok := parseInstanceReference(instanceReference)
+	if !ok || instanceProject != project {
+		return loadBalancerBackend{}, fmt.Errorf("'instance' must reference an instance in project %q", project)
+	}
+
+	api.mu.RLock()
+	instance := api.instances[instanceKey(project, zone, instanceName)]
+	if instance == nil {
+		api.mu.RUnlock()
+		return loadBalancerBackend{}, fmt.Errorf("Compute instance %q was not found", instanceName)
+	}
+	status := instance.Status
+	containerName := "minisky-vm-" + instance.Name
+	if instance.Labels != nil && instance.Labels["managed-by"] == "gke" {
+		containerName = instance.Name
+	}
+	mappings := append([]orchestrator.PortMapping(nil), instance.HostPorts...)
+	api.mu.RUnlock()
+	if status != "" && status != "RUNNING" {
+		return loadBalancerBackend{}, fmt.Errorf("Compute instance %q is not running", instanceName)
+	}
+	if api.svcMgr != nil {
+		if current := api.svcMgr.GetVMPortMappings(containerName); len(current) > 0 {
+			mappings = current
+		}
+	}
+	for _, mapping := range mappings {
+		if mapping.ContainerPort == strconv.Itoa(port) && mapping.HostPort != "" {
+			target, _ := url.Parse("http://127.0.0.1:" + mapping.HostPort)
+			return loadBalancerBackend{
+				target:      target,
+				healthPath:  healthPath,
+				description: fmt.Sprintf("Compute instance %s port %d", instanceName, port),
+			}, nil
+		}
+	}
+	return loadBalancerBackend{}, fmt.Errorf("Compute instance %q has no host mapping for port %d", instanceName, port)
+}
+
+func (api *API) backendIsHealthy(r *http.Request, backend loadBalancerBackend) bool {
+	if backend.healthPath == "" {
+		return true
+	}
+	healthURL := *backend.target
+	healthURL.Path = healthPathJoin(backend.target.Path, backend.healthPath)
+	healthURL.RawQuery = ""
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, healthURL.String(), nil)
+	if err != nil {
+		return false
+	}
+	response, err := api.httpClient.Do(request)
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	return response.StatusCode >= 200 && response.StatusCode < 400
+}
+
+func writeLoadBalancerUnavailable(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Load balancer unresolved: "+message)
+}
+
+func parseLoadBalancerProxyPath(path string) (string, string, string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i := 0; i+3 < len(parts); i++ {
+		if parts[i] != "global" ||
+			(parts[i+1] != "forwardingRules" && parts[i+1] != "globalForwardingRules") ||
+			parts[i+2] == "" ||
+			parts[i+3] != "proxy" {
+			continue
+		}
+		project := ""
+		for j := 0; j+1 < i; j++ {
+			if parts[j] == "projects" {
+				project = parts[j+1]
+				break
+			}
+		}
+		if project == "" {
+			return "", "", "", false
+		}
+		proxyPath := "/"
+		if len(parts) > i+4 {
+			proxyPath += strings.Join(parts[i+4:], "/")
+		}
+		return project, parts[i+2], proxyPath, true
+	}
+	return "", "", "", false
+}
+
+func resourceReferenceName(value interface{}) string {
+	reference, _ := value.(string)
+	reference = strings.TrimRight(reference, "/")
+	if reference == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(reference); err == nil {
+		reference = parsed.Path
+	}
+	parts := strings.Split(strings.TrimRight(reference, "/"), "/")
+	return parts[len(parts)-1]
+}
+
+func numericBackendPort(value interface{}) (int, error) {
+	var port int
+	switch typed := value.(type) {
+	case float64:
+		port = int(typed)
+		if typed != float64(port) {
+			return 0, fmt.Errorf("port must be an integer")
+		}
+	case string:
+		parsed, err := strconv.Atoi(typed)
+		if err != nil {
+			return 0, err
+		}
+		port = parsed
+	default:
+		return 0, fmt.Errorf("port is required")
+	}
+	if port < 1 || port > 65535 {
+		return 0, fmt.Errorf("port must be between 1 and 65535")
+	}
+	return port, nil
+}
+
+func parseInstanceReference(reference string) (string, string, string, bool) {
+	parsed, err := url.Parse(reference)
+	if err != nil {
+		return "", "", "", false
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	var project, zone, instance string
+	for i := 0; i+1 < len(parts); i++ {
+		switch parts[i] {
+		case "projects":
+			project = parts[i+1]
+		case "zones":
+			zone = parts[i+1]
+		case "instances":
+			instance = parts[i+1]
+		}
+	}
+	return project, zone, instance, project != "" && zone != "" && instance != ""
+}
+
+func healthPathJoin(basePath, healthPath string) string {
+	if basePath == "" || basePath == "/" {
+		return healthPath
+	}
+	return strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(healthPath, "/")
+}
+
+func hasNonEmptyList(value interface{}) bool {
+	items, ok := value.([]interface{})
+	return ok && len(items) > 0
+}
+
+func (api *API) createLoadBalancerResource(
+	w http.ResponseWriter,
+	r *http.Request,
+	project string,
+	collection loadBalancerCollection,
+) {
+	var resource map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&resource); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Request body parse error: "+err.Error())
+		return
+	}
+	name, _ := resource["name"].(string)
+	if name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'name' is required")
+		return
+	}
+
+	selfLink := loadBalancerSelfLink(project, collection.canonical, name)
+	key := loadBalancerKey(project, collection.canonical, name)
+	resource["kind"] = collection.resourceKind
+	resource["id"] = randomNumericID()
+	resource["name"] = name
+	resource["selfLink"] = selfLink
+	resource["creationTimestamp"] = time.Now().UTC().Format(time.RFC3339)
+	resource["status"] = metadataOnlyStatus
+	if description, _ := resource["description"].(string); description != "" {
+		resource["description"] = metadataOnlyDescription + " " + description
+	} else {
+		resource["description"] = metadataOnlyDescription
+	}
+
+	api.mu.Lock()
+	if _, exists := api.loadBalancers[key]; exists {
+		api.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS",
+			fmt.Sprintf("%s %q already exists", collection.resourceKind, name))
+		return
+	}
+	api.loadBalancers[key] = resource
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist load-balancer metadata: "+err.Error())
+		return
+	}
+
+	op := api.opMgr.Register("compute#operation", "insert", selfLink, "", "")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
+	api.opMgr.RunAsync(op.Name, func() error { return nil })
+}
+
+func (api *API) getLoadBalancerResource(
+	w http.ResponseWriter,
+	project string,
+	collection loadBalancerCollection,
+	name string,
+) {
+	key := loadBalancerKey(project, collection.canonical, name)
+	api.mu.RLock()
+	resource, ok := api.loadBalancers[key]
+	api.mu.RUnlock()
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND",
+			fmt.Sprintf("%s %q not found", collection.resourceKind, name))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resource)
+}
+
+func (api *API) listLoadBalancerResources(
+	w http.ResponseWriter,
+	project string,
+	collection loadBalancerCollection,
+) {
+	prefix := loadBalancerKey(project, collection.canonical, "")
+	api.mu.RLock()
+	items := make([]map[string]interface{}, 0)
+	for key, resource := range api.loadBalancers {
+		if strings.HasPrefix(key, prefix) {
+			items = append(items, resource)
+		}
+	}
+	api.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool {
+		return items[i]["name"].(string) < items[j]["name"].(string)
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"kind":  collection.listKind,
+		"id":    fmt.Sprintf("projects/%s/global/%s", project, collection.canonical),
+		"items": items,
+	})
+}
+
+func (api *API) deleteLoadBalancerResource(
+	w http.ResponseWriter,
+	project string,
+	collection loadBalancerCollection,
+	name string,
+) {
+	key := loadBalancerKey(project, collection.canonical, name)
+	api.mu.Lock()
+	_, ok := api.loadBalancers[key]
+	if ok {
+		delete(api.loadBalancers, key)
+	}
+	api.mu.Unlock()
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND",
+			fmt.Sprintf("%s %q not found", collection.resourceKind, name))
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist load-balancer deletion: "+err.Error())
+		return
+	}
+
+	selfLink := loadBalancerSelfLink(project, collection.canonical, name)
+	op := api.opMgr.Register("compute#operation", "delete", selfLink, "", "")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(op)
+	api.opMgr.RunAsync(op.Name, func() error { return nil })
+}
+
+func parseLoadBalancerPath(path string) (loadBalancerCollection, string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		collection, ok := loadBalancerCollections[part]
+		if !ok || i == 0 || parts[i-1] != "global" {
+			continue
+		}
+		switch len(parts) - i {
+		case 1:
+			return collection, "", true
+		case 2:
+			if parts[i+1] != "" {
+				return collection, parts[i+1], true
+			}
+		}
+		return loadBalancerCollection{}, "", false
+	}
+	return loadBalancerCollection{}, "", false
+}
+
+func loadBalancerKey(project, collection, name string) string {
+	return project + ":" + collection + ":" + name
+}
+
+func loadBalancerSelfLink(project, collection, name string) string {
+	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/%s/%s",
+		project, collection, name)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1141,6 +1784,11 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 	api.mu.Lock()
 	api.firewalls[key] = &body
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist firewall metadata: "+err.Error())
+		return
+	}
 
 	api.svcMgr.RegisterFirewallRule(body.Network, orchestrator.FirewallEntry{
 		Name:      body.Name,
@@ -1221,6 +1869,11 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 	}
 	result := fw
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist firewall update: "+err.Error())
+		return
+	}
 
 	op := api.opMgr.Register("compute#operation", "patch", result.SelfLink, "", "")
 	api.opMgr.RunAsync(op.Name, func() error {
@@ -1244,6 +1897,11 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Firewall "+name+" not found")
+		return
+	}
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist firewall deletion: "+err.Error())
 		return
 	}
 	api.svcMgr.RemoveFirewallRule(networkURL, name)

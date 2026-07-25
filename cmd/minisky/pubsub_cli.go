@@ -1,13 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
 
 	"github.com/spf13/cobra"
 )
+
+var pubsubProject string
 
 var pubsubCmd = &cobra.Command{
 	Use:   "pubsub",
@@ -23,37 +22,33 @@ var listTopicsCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List Pub/Sub topics",
 	Run: func(cmd *cobra.Command, args []string) {
-		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" {
-			port = "8081"
-		}
-
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/pubsub/topics", port))
-		if err != nil {
-			fmt.Printf("❌ Error: %v\n", err)
-			return
-		}
-		defer resp.Body.Close()
-
 		var data struct {
 			Topics []struct {
 				Name string `json:"name"`
 			} `json:"topics"`
 		}
-		json.NewDecoder(resp.Body).Decode(&data)
+		endpoint, err := miniskyAPIURL("pubsub", fmt.Sprintf("/v1/projects/%s/topics", pubsubProject))
+		if err == nil {
+			err = getJSON(endpoint, &data)
+		}
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+			return
+		}
 
-		fmt.Println("PUB/SUB TOPICS:")
+		fmt.Fprintln(cmd.OutOrStdout(), "PUB/SUB TOPICS:")
 		if len(data.Topics) == 0 {
-			fmt.Println("  (None)")
+			fmt.Fprintln(cmd.OutOrStdout(), "  (None)")
 			return
 		}
 		for _, t := range data.Topics {
-			fmt.Printf("  - %s\n", t.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", t.Name)
 		}
 	},
 }
 
 func init() {
+	pubsubCmd.PersistentFlags().StringVar(&pubsubProject, "project", "local-dev-project", "GCP project ID")
 	topicsCmd.AddCommand(listTopicsCmd)
 	pubsubCmd.AddCommand(topicsCmd)
 	rootCmd.AddCommand(pubsubCmd)

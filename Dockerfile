@@ -5,9 +5,20 @@ COPY ui/package*.json ./
 RUN npm ci
 COPY ui/ ./
 RUN npm run build
-RUN wget -qO- \
-    https://github.com/buildpacks/pack/releases/download/v0.34.2/pack-v0.34.2-linux.tgz \
-    | tar -xz -C /usr/local/bin pack
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) pack_suffix="" ;; \
+        arm64) pack_suffix="-arm64" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    asset="pack-v0.34.2-linux${pack_suffix}.tgz"; \
+    cd /tmp; \
+    wget -q "https://github.com/buildpacks/pack/releases/download/v0.34.2/${asset}"; \
+    wget -q "https://github.com/buildpacks/pack/releases/download/v0.34.2/${asset}.sha256"; \
+    sha256sum -c "${asset}.sha256"; \
+    tar -xzf "${asset}" -C /usr/local/bin pack; \
+    rm "${asset}" "${asset}.sha256"
 
 # Stage 2: Build the Go Binary
 FROM golang:1.26.5-bookworm AS binary-builder

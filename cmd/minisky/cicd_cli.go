@@ -1,12 +1,15 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	artifactProject   string
+	artifactLocation  string
+	cloudBuildProject string
 )
 
 var arCmd = &cobra.Command{
@@ -29,25 +32,22 @@ func init() {
 	arCmd.AddCommand(&cobra.Command{
 		Use: "repositories list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/artifactregistry/repositories", port))
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				return
-			}
-			defer resp.Body.Close()
 			var data struct {
 				Repositories []struct {
 					Name string `json:"name"`
 				} `json:"repositories"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
-			fmt.Println("ARTIFACT REGISTRY REPOSITORIES:")
+			endpoint, err := miniskyAPIURL("artifactregistry", fmt.Sprintf("/v1/projects/%s/locations/%s/repositories", artifactProject, artifactLocation))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "ARTIFACT REGISTRY REPOSITORIES:")
 			for _, r := range data.Repositories {
-				fmt.Printf("  - %s\n", r.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", r.Name)
 			}
 		},
 	})
@@ -56,26 +56,23 @@ func init() {
 	cbCmd.AddCommand(&cobra.Command{
 		Use: "builds list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/cloudbuild/builds", port))
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				return
-			}
-			defer resp.Body.Close()
 			var data struct {
 				Builds []struct {
 					ID     string `json:"id"`
 					Status string `json:"status"`
 				} `json:"builds"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
-			fmt.Println("CLOUD BUILD HISTORY:")
+			endpoint, err := miniskyAPIURL("cloudbuild", fmt.Sprintf("/v1/projects/%s/builds", cloudBuildProject))
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "CLOUD BUILD HISTORY:")
 			for _, b := range data.Builds {
-				fmt.Printf("  - [%s] %s\n", b.Status, b.ID)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - [%s] %s\n", b.Status, b.ID)
 			}
 		},
 	})
@@ -84,27 +81,27 @@ func init() {
 	vertexCmd.AddCommand(&cobra.Command{
 		Use: "models list",
 		Run: func(cmd *cobra.Command, args []string) {
-			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" {
-				port = "8081"
-			}
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/vertexai/internal/models", port))
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				return
-			}
-			defer resp.Body.Close()
 			var data struct {
 				Models []string `json:"models"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
-			fmt.Println("AVAILABLE AI MODELS:")
+			endpoint, err := miniskyAPIURL("aiplatform", "/v1/internal/models")
+			if err == nil {
+				err = getJSON(endpoint, &data)
+			}
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "AVAILABLE AI MODELS:")
 			for _, m := range data.Models {
-				fmt.Printf("  - %s\n", m)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", m)
 			}
 		},
 	})
 
+	arCmd.PersistentFlags().StringVar(&artifactProject, "project", "local-dev-project", "GCP project ID")
+	arCmd.PersistentFlags().StringVar(&artifactLocation, "location", "us-central1", "Artifact Registry location")
+	cbCmd.PersistentFlags().StringVar(&cloudBuildProject, "project", "local-dev-project", "GCP project ID")
 	rootCmd.AddCommand(arCmd)
 	rootCmd.AddCommand(cbCmd)
 	rootCmd.AddCommand(vertexCmd)

@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -55,14 +57,30 @@ type KeyRing struct {
 }
 
 type API struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	persistMu sync.Mutex
 	// map[project/location] -> map[keyRingId] -> *KeyRing
-	store  map[string]map[string]*KeyRing
-	logAPI *logging.API
+	store      map[string]map[string]*KeyRing
+	logAPI     *logging.API
+	stateStore *state.Store
 }
 
 func NewAPI() *API {
-	return &API{store: make(map[string]map[string]*KeyRing)}
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Cloud KMS] state disabled: %v", err)
+		return newAPI(nil)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		log.Printf("[Shim: Cloud KMS] state rehydration failed: %v", err)
+		return newAPI(nil)
+	}
+	return api
+}
+
+func newAPI(store *state.Store) *API {
+	return &API{store: make(map[string]map[string]*KeyRing), stateStore: store}
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -247,6 +265,10 @@ func (api *API) createKeyRing(w http.ResponseWriter, r *http.Request, project, l
 	kr := &KeyRing{Name: name, CreateTime: nowStr(), keys: make(map[string]*CryptoKey)}
 	store[krId] = kr
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist KeyRing: "+err.Error())
+		return
+	}
 	api.pushLog(project, "INFO", name, "KeyRing created: "+name)
 	jsonOK(w, map[string]any{"name": kr.Name, "createTime": kr.CreateTime})
 }
@@ -332,6 +354,10 @@ func (api *API) createCryptoKey(w http.ResponseWriter, r *http.Request, project,
 	ck.versions = append(ck.versions, v)
 	kr.keys[ckId] = ck
 	kr.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist CryptoKey: "+err.Error())
+		return
+	}
 
 	api.pushLog(project, "INFO", name, fmt.Sprintf("CryptoKey created: %s (purpose: %s)", name, body.Purpose))
 	jsonOK(w, cryptoKeyPublicWithPrimary(ck))
@@ -377,6 +403,10 @@ func (api *API) updateCryptoKey(w http.ResponseWriter, r *http.Request, locKey, 
 		ck.VersionTemplate = body.VersionTemplate
 	}
 	ck.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist CryptoKey update: "+err.Error())
+		return
+	}
 	jsonOK(w, cryptoKeyPublicWithPrimary(ck))
 }
 
@@ -434,6 +464,10 @@ func (api *API) createCryptoKeyVersion(w http.ResponseWriter, project, locKey, k
 	v := newCryptoKeyVersion(ck.Name, num)
 	ck.versions = append(ck.versions, v)
 	ck.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist CryptoKeyVersion: "+err.Error())
+		return
+	}
 	api.pushLog(project, "INFO", ck.Name, fmt.Sprintf("Version %d created", num))
 	jsonOK(w, cryptoKeyVersionPublic(v))
 }
@@ -480,6 +514,10 @@ func (api *API) destroyCryptoKeyVersion(w http.ResponseWriter, r *http.Request, 
 	v.DestroyTime = nowStr()
 	v.aesKey = nil // Wipe key material
 	ck.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist destroyed CryptoKeyVersion: "+err.Error())
+		return
+	}
 	api.pushLog(project, "WARNING", ck.Name, "CryptoKeyVersion destroyed: "+v.Name)
 	jsonOK(w, cryptoKeyVersionPublic(v))
 }

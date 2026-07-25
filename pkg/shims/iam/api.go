@@ -2,15 +2,21 @@ package iam
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
+
+const principalHeader = "X-MiniSky-Principal"
 
 func init() {
 	registry.Register("iam.googleapis.com", func(ctx *registry.Context) http.Handler {
@@ -69,17 +75,94 @@ type Binding struct {
 // It handles service account CRUD, key generation, and IAM policy management.
 type API struct {
 	mu              sync.RWMutex
+	store           stateStore
 	serviceAccounts map[string]*ServiceAccount      // key: "project:email"
 	keys            map[string][]*ServiceAccountKey // key: "project:email"
 	policies        map[string]*IamPolicy           // key: resource full name
+	strict          bool
+}
+
+type stateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+const iamStateEntry = "iam/metadata"
+
+type iamMetadata struct {
+	ServiceAccounts map[string]*ServiceAccount      `json:"serviceAccounts"`
+	Keys            map[string][]*ServiceAccountKey `json:"keys"`
+	Policies        map[string]*IamPolicy           `json:"policies"`
 }
 
 func NewAPI() *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: IAM] state disabled: %v", err)
+		return newAPI(nil)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		log.Printf("[Shim: IAM] state rehydration failed: %v", err)
+		return newAPI(store)
+	}
+	return api
+}
+
+// NewAPIWithStore constructs an IAM shim backed by the supplied metadata store.
+// It reports unreadable state instead of silently replacing it.
+func NewAPIWithStore(store stateStore) (*API, error) {
+	api := newAPI(store)
+	if store == nil {
+		return api, nil
+	}
+	var persisted iamMetadata
+	if err := store.Load(iamStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api, nil
+		}
+		return nil, fmt.Errorf("load IAM metadata: %w", err)
+	}
+	if persisted.ServiceAccounts != nil {
+		api.serviceAccounts = persisted.ServiceAccounts
+	}
+	if persisted.Keys != nil {
+		api.keys = persisted.Keys
+	}
+	if persisted.Policies != nil {
+		api.policies = persisted.Policies
+	}
+	return api, nil
+}
+
+func newAPI(store stateStore) *API {
 	return &API{
+		store:           store,
 		serviceAccounts: make(map[string]*ServiceAccount),
 		keys:            make(map[string][]*ServiceAccountKey),
 		policies:        make(map[string]*IamPolicy),
+		strict:          strings.EqualFold(strings.TrimSpace(os.Getenv("MINISKY_IAM_MODE")), "strict"),
 	}
+}
+
+func (api *API) persistMetadata() error {
+	if api.store == nil {
+		return nil
+	}
+	api.mu.RLock()
+	metadata := cloneIAMMetadata(api.serviceAccounts, api.keys, api.policies)
+	api.mu.RUnlock()
+	return api.store.Save(iamStateEntry, metadata)
+}
+
+func (api *API) persistOrError(w http.ResponseWriter) bool {
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: IAM] persist metadata: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist IAM metadata")
+		return false
+	}
+	return true
 }
 
 // ServeHTTP dispatches based on path structure.
@@ -110,7 +193,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.getIamPolicy(w, r, strings.TrimSuffix(path, ":getIamPolicy"))
 		return
 	case strings.HasSuffix(path, ":testIamPermissions"):
-		api.testIamPermissions(w, r)
+		api.testIamPermissions(w, r, strings.TrimSuffix(path, ":testIamPermissions"))
 		return
 	}
 
@@ -191,6 +274,9 @@ func (api *API) createServiceAccount(w http.ResponseWriter, r *http.Request, pro
 	api.serviceAccounts[key] = sa
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(sa)
 }
@@ -241,6 +327,9 @@ func (api *API) deleteServiceAccount(w http.ResponseWriter, project, email strin
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("ServiceAccount '%s' not found", email))
+		return
+	}
+	if !api.persistOrError(w) {
 		return
 	}
 	// GCP returns empty 200 on successful delete
@@ -305,6 +394,9 @@ func (api *API) createKey(w http.ResponseWriter, project, email string) {
 	api.keys[saKey] = append(api.keys[saKey], key)
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(key)
 }
@@ -345,16 +437,20 @@ func (api *API) setIamPolicy(w http.ResponseWriter, r *http.Request, resource st
 	}
 
 	api.mu.Lock()
-	api.policies[resource] = &policy
+	api.policies[resource] = clonePolicy(&policy)
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(policy)
+	json.NewEncoder(w).Encode(clonePolicy(&policy))
 }
 
 func (api *API) getIamPolicy(w http.ResponseWriter, r *http.Request, resource string) {
 	api.mu.RLock()
 	policy, ok := api.policies[resource]
+	policy = clonePolicy(policy)
 	api.mu.RUnlock()
 
 	if !ok {
@@ -369,18 +465,53 @@ func (api *API) getIamPolicy(w http.ResponseWriter, r *http.Request, resource st
 	json.NewEncoder(w).Encode(policy)
 }
 
-// testIamPermissions checks which of the requested permissions are allowed.
-// In the local emulator context we grant all requested permissions unconditionally.
-func (api *API) testIamPermissions(w http.ResponseWriter, r *http.Request) {
+// testIamPermissions returns the subset of requested permissions granted to the
+// local caller. Permissive mode remains the default for backwards compatibility.
+func (api *API) testIamPermissions(w http.ResponseWriter, r *http.Request, resource string) {
 	var body struct {
 		Permissions []string `json:"permissions"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
+	if body.Permissions == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'permissions' is required")
+		return
+	}
+
+	if !api.strict {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"permissions": body.Permissions,
+		})
+		return
+	}
+
+	principal := strings.TrimSpace(r.Header.Get(principalHeader))
+	if principal == "" {
+		w.WriteHeader(http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "PERMISSION_DENIED", principalHeader+" is required in strict IAM mode")
+		return
+	}
+
+	api.mu.RLock()
+	policy := clonePolicy(api.policies[resource])
+	api.mu.RUnlock()
+
+	allowedSet := permissionsForPrincipal(policy, principal)
+	allowed := make([]string, 0, len(body.Permissions))
+	for _, permission := range body.Permissions {
+		if _, ok := allowedSet[permission]; ok {
+			allowed = append(allowed, permission)
+		}
+	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		// Echo all permissions back — everything is allowed locally
-		"permissions": body.Permissions,
+		"permissions": allowed,
 	})
 }
 
@@ -411,6 +542,137 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 			"message": message,
 		},
 	})
+}
+
+var rolePermissions = map[string][]string{
+	"roles/storage.admin": {
+		"storage.buckets.create",
+		"storage.buckets.delete",
+		"storage.buckets.get",
+		"storage.buckets.list",
+		"storage.buckets.update",
+		"storage.objects.create",
+		"storage.objects.delete",
+		"storage.objects.get",
+		"storage.objects.list",
+		"storage.objects.update",
+	},
+	"roles/storage.objectAdmin": {
+		"storage.objects.create",
+		"storage.objects.delete",
+		"storage.objects.get",
+		"storage.objects.list",
+		"storage.objects.update",
+	},
+	"roles/storage.objectViewer": {
+		"storage.objects.get",
+		"storage.objects.list",
+	},
+	"roles/compute.admin": {
+		"compute.disks.create",
+		"compute.disks.delete",
+		"compute.disks.get",
+		"compute.instances.create",
+		"compute.instances.delete",
+		"compute.instances.get",
+		"compute.instances.list",
+		"compute.instances.start",
+		"compute.instances.stop",
+	},
+	"roles/compute.viewer": {
+		"compute.disks.get",
+		"compute.disks.list",
+		"compute.instances.get",
+		"compute.instances.list",
+	},
+	"roles/pubsub.admin": {
+		"pubsub.subscriptions.consume",
+		"pubsub.subscriptions.create",
+		"pubsub.subscriptions.delete",
+		"pubsub.subscriptions.get",
+		"pubsub.subscriptions.list",
+		"pubsub.topics.create",
+		"pubsub.topics.delete",
+		"pubsub.topics.get",
+		"pubsub.topics.list",
+		"pubsub.topics.publish",
+	},
+	"roles/pubsub.viewer": {
+		"pubsub.subscriptions.get",
+		"pubsub.subscriptions.list",
+		"pubsub.topics.get",
+		"pubsub.topics.list",
+	},
+}
+
+func permissionsForPrincipal(policy *IamPolicy, principal string) map[string]struct{} {
+	permissions := make(map[string]struct{})
+	if policy == nil {
+		return permissions
+	}
+	for _, binding := range policy.Bindings {
+		if !containsString(binding.Members, principal) {
+			continue
+		}
+		if permission, ok := strings.CutPrefix(binding.Role, "permission:"); ok && permission != "" {
+			permissions[permission] = struct{}{}
+			continue
+		}
+		for _, permission := range rolePermissions[binding.Role] {
+			permissions[permission] = struct{}{}
+		}
+	}
+	return permissions
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func clonePolicy(policy *IamPolicy) *IamPolicy {
+	if policy == nil {
+		return nil
+	}
+	clone := *policy
+	clone.Bindings = make([]Binding, len(policy.Bindings))
+	for i, binding := range policy.Bindings {
+		clone.Bindings[i] = binding
+		clone.Bindings[i].Members = append([]string(nil), binding.Members...)
+	}
+	return &clone
+}
+
+func cloneIAMMetadata(
+	accounts map[string]*ServiceAccount,
+	keys map[string][]*ServiceAccountKey,
+	policies map[string]*IamPolicy,
+) iamMetadata {
+	result := iamMetadata{
+		ServiceAccounts: make(map[string]*ServiceAccount, len(accounts)),
+		Keys:            make(map[string][]*ServiceAccountKey, len(keys)),
+		Policies:        make(map[string]*IamPolicy, len(policies)),
+	}
+	for name, account := range accounts {
+		clone := *account
+		result.ServiceAccounts[name] = &clone
+	}
+	for name, accountKeys := range keys {
+		clones := make([]*ServiceAccountKey, len(accountKeys))
+		for i, key := range accountKeys {
+			clone := *key
+			clones[i] = &clone
+		}
+		result.Keys[name] = clones
+	}
+	for resource, policy := range policies {
+		result.Policies[resource] = clonePolicy(policy)
+	}
+	return result
 }
 
 func uniqueNumericID() string {

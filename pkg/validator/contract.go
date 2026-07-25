@@ -79,8 +79,8 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// ── 5. Required body fields ───────────────────────────────────────────────
-	if len(rule.RequiredBody) > 0 {
+	// ── 5. JSON body and required fields ─────────────────────────────────────
+	if len(rule.RequiredBody) > 0 || rule.ContentType == "application/json" {
 		// Read body once, then restore it so the downstream shim can read it too.
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -89,7 +89,7 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 
 		// Empty body when we expect one
-		if len(raw) == 0 {
+		if len(raw) == 0 && len(rule.RequiredBody) > 0 {
 			first := rule.RequiredBody[0]
 			msg := first.Message
 			if msg == "" {
@@ -99,12 +99,15 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 			return v.emitError(w, 400, "INVALID_ARGUMENT", msg)
 		}
 
-		// Parse JSON body
+		// Parse non-empty JSON bodies even when every resource field is optional.
+		// This keeps query-only create contracts from forwarding malformed JSON.
 		var body map[string]interface{}
-		if err := json.Unmarshal(raw, &body); err != nil {
-			log.Printf("[Validator] 400 for %s %s — body not valid JSON: %v", r.Method, r.URL.Path, err)
-			return v.emitError(w, 400, "INVALID_ARGUMENT",
-				"Request body is not valid JSON: "+err.Error())
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				log.Printf("[Validator] 400 for %s %s — body not valid JSON: %v", r.Method, r.URL.Path, err)
+				return v.emitError(w, 400, "INVALID_ARGUMENT",
+					"Request body is not valid JSON: "+err.Error())
+			}
 		}
 
 		// Check each required field

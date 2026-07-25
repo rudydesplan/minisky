@@ -1,16 +1,37 @@
-provider "google" {
-  project      = "local-dev-project"
-  region       = "us-central1"
-  access_token = "minisky-local-token"
+resource "google_bigquery_dataset" "compatibility" {
+  dataset_id                 = var.dataset_id
+  description                = "MiniSky Terraform compatibility dataset"
+  location                   = var.bigquery_location
+  delete_contents_on_destroy = true
 
-  # Redirect APIs to MiniSky Gateway
-  storage_custom_endpoint         = "http://localhost:8080/storage/v1/"
-  cloud_functions_custom_endpoint = "http://localhost:8080/v2/"
-  pubsub_custom_endpoint          = "http://localhost:8080/"
-  compute_custom_endpoint         = "http://localhost:8080/compute/v1/"
+  labels = {
+    environment = "minisky"
+    managed_by  = "terraform"
+  }
 }
 
-resource "google_storage_bucket" "test_bucket" {
-  name     = "terraform-managed-bucket"
-  location = "US"
+resource "google_bigquery_table" "events" {
+  dataset_id          = google_bigquery_dataset.compatibility.dataset_id
+  table_id            = var.table_id
+  deletion_protection = false
+  description         = "Events managed by the MiniSky compatibility example"
+
+  schema = jsonencode([
+    {
+      mode = "REQUIRED"
+      name = "event_id"
+      type = "STRING"
+    },
+    {
+      mode = "NULLABLE"
+      name = "created_at"
+      type = "TIMESTAMP"
+    },
+  ])
+}
+
+resource "google_service_account" "compatibility" {
+  account_id   = var.service_account_id
+  display_name = "MiniSky Terraform compatibility"
+  description  = "Metadata-only service account used by the compatibility stack"
 }

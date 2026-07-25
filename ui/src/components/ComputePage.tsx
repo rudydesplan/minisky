@@ -18,7 +18,7 @@ export default function ComputePage() {
   const [gkeDrawerOpen, setGkeDrawerOpen] = useState(false);
 
   const serverlessService = services.find(s => s.id === 'serverless');
-  const isBuildpacksEnabled = settings.MINISKY_SERVERLESS_BACKEND === 'buildpacks';
+  const isBuildpacksEnabled = settings.serverless_pack;
   const missingPack = serverlessService?.missingDeps?.includes('pack') || false;
 
   return (
@@ -49,7 +49,7 @@ export default function ComputePage() {
         open={serverlessDrawerOpen} 
         onClose={() => setServerlessDrawerOpen(false)} 
         isBuildpacksEnabled={isBuildpacksEnabled}
-        onEnableBuildpacks={() => toggleSetting('MINISKY_SERVERLESS_BACKEND_ENABLED', isBuildpacksEnabled)}
+        onEnableBuildpacks={() => toggleSetting('serverless_pack', isBuildpacksEnabled)}
         missingPack={missingPack}
         onInstallPack={() => handleInstallDependency('pack')}
       />
