@@ -111,9 +111,9 @@ metadata behavior but use mock query execution.
 \* DuckDB is currently opt-in. Set `MINISKY_BQ_BACKEND=duckdb` before starting
 MiniSky.
 
-Published v1.2.x macOS and Windows artifacts predate native CGO support. Until
-the next release is tagged, those users can run the Linux build through Docker
-Desktop or WSL2:
+Published v1.2.x macOS and Windows artifacts predate native CGO support.
+Upgrade to v1.3.0 or later for native DuckDB, or run the Linux build through
+Docker Desktop or WSL2:
 
 ```bash
 docker run --rm \
@@ -140,8 +140,8 @@ libraries.
 | 1 | Linux amd64 and arm64 release coverage | Native CI builds and executes the conformance suite on both architectures | ✅ Complete |
 | 2 | Native macOS arm64 CGO build using Apple Clang | M-series runner builds, packages, and executes real queries | ✅ Complete |
 | 3 | Native Windows amd64 support using MSYS2/UCRT GCC | Native CI passes conformance and confirms no non-system MinGW runtime DLLs | ✅ Complete |
-| 4 | Multi-runner release assembly | GitHub Actions publishes checksummed artifacts built and tested on native runners; GoReleaser validates package configuration | 🧪 Implemented; tag verification pending |
-| 5 | Installer and compatibility updates | Checksums are verified and installed CGO artifacts run `minisky doctor bigquery` | 🧪 Implemented; tag verification pending |
+| 4 | Multi-runner release assembly | GitHub Actions publishes checksummed artifacts built and tested on native runners; GoReleaser validates package configuration | ✅ Complete |
+| 5 | Installer and compatibility updates | Checksums are verified and installed CGO artifacts run `minisky doctor bigquery` | ✅ Complete |
 
 ### Platform strategy
 

@@ -44,7 +44,7 @@ jobs:
         run: npm run build
 
       - name: Share UI assets with native platform jobs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ui-dist
           path: ui/dist
@@ -127,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: ui-dist
           path: ui/dist
@@ -165,7 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: ui-dist
           path: ui/dist
@@ -217,7 +217,7 @@ jobs:
 
       - name: Upload feasibility evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-cgo-evidence
           path: |
