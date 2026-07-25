@@ -7,6 +7,11 @@ if [[ "${MINISKY_PHASE13_INTEGRATION:-}" != "1" ]]; then
   exit 2
 fi
 
+enterprise_controls=0
+if [[ "${MINISKY_PHASE13_ENTERPRISE_CONTROLS:-}" == "1" ]]; then
+  enterprise_controls=1
+fi
+
 for command in curl docker go openssl python3 terraform; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
@@ -30,17 +35,23 @@ done < <(docker ps -a --format '{{.Names}}')
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 terraform_dir="${repository_root}/terraform"
-lock_dir="${TMPDIR:-/tmp}/minisky-phase13-wif-integration.lock"
+phase_label="phase13"
+if [[ "${enterprise_controls}" == "1" ]]; then
+  phase_label="phase17-enterprise"
+fi
+lock_dir="${TMPDIR:-/tmp}/minisky-wif-integration.lock"
 if ! mkdir "${lock_dir}" 2>/dev/null; then
-  echo "Another MiniSky Phase-13 WIF integration run is active." >&2
+  echo "Another MiniSky ${phase_label} WIF integration run is active." >&2
   exit 1
 fi
 
 work_dir="$(mktemp -d)"
 state_root="${work_dir}/state"
-profile="phase13-wif-$$"
+profile="${phase_label}-wif-$$"
 minisky_pid=""
 active_log=""
+enterprise_audit_active=0
+enterprise_quota_json='{"routes":{"bigquery.googleapis.com /bigquery/v2/projects/{id}/datasets":{"limit":2,"window":"10m"}}}'
 
 cleanup_profile_docker() {
   while IFS= read -r container; do
@@ -90,9 +101,15 @@ with socket.socket() as sock:
 PY
 }
 
-api_port="${MINISKY_PHASE13_API_PORT:-$(free_port)}"
-ui_port="${MINISKY_PHASE13_UI_PORT:-$(free_port)}"
+if [[ "${enterprise_controls}" == "1" ]]; then
+  api_port="${MINISKY_PHASE17_API_PORT:-$(free_port)}"
+  ui_port="${MINISKY_PHASE17_UI_PORT:-$(free_port)}"
+else
+  api_port="${MINISKY_PHASE13_API_PORT:-$(free_port)}"
+  ui_port="${MINISKY_PHASE13_UI_PORT:-$(free_port)}"
+fi
 gateway="http://127.0.0.1:${api_port}"
+dashboard="http://127.0.0.1:${ui_port}"
 project_id="local-dev-project"
 pool_id="minisky-phase13"
 provider_id="minisky-oidc"
@@ -137,13 +154,27 @@ start_minisky() {
   local mode=$1
   active_log="${work_dir}/minisky-${mode}.log"
   if [[ "${mode}" == "strict" ]]; then
-    MINISKY_IAM_MODE=strict MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
-      HOME="${work_dir}/home" "${work_dir}/minisky" start \
-      --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    if [[ "${enterprise_controls}" == "1" && "${enterprise_audit_active}" == "1" ]]; then
+      MINISKY_IAM_MODE=strict MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
+        MINISKY_AUDIT_ENABLED=true MINISKY_AUDIT_STRICT=true MINISKY_QUOTAS_JSON="${enterprise_quota_json}" \
+        HOME="${work_dir}/home" "${work_dir}/minisky" start \
+        --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    else
+      MINISKY_IAM_MODE=strict MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
+        HOME="${work_dir}/home" "${work_dir}/minisky" start \
+        --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    fi
   else
-    MINISKY_IAM_MODE='' MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
-      HOME="${work_dir}/home" "${work_dir}/minisky" start \
-      --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    if [[ "${enterprise_controls}" == "1" && "${enterprise_audit_active}" == "1" ]]; then
+      MINISKY_IAM_MODE='' MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
+        MINISKY_AUDIT_ENABLED=true MINISKY_AUDIT_STRICT=true MINISKY_QUOTAS_JSON="${enterprise_quota_json}" \
+        HOME="${work_dir}/home" "${work_dir}/minisky" start \
+        --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    else
+      MINISKY_IAM_MODE='' MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
+        HOME="${work_dir}/home" "${work_dir}/minisky" start \
+        --port "${api_port}" --ui-port "${ui_port}" >"${active_log}" 2>&1 &
+    fi
   fi
   minisky_pid=$!
 
@@ -263,6 +294,18 @@ assert_get_value "${target_url}" email "${target_email}"
 federated_principal="principal://iam.googleapis.com/${pool_name}/subject/${subject}"
 assert_policy_binding "${delegate_url}" roles/iam.workloadIdentityUser "${federated_principal}"
 assert_policy_binding "${target_url}" roles/iam.serviceAccountTokenCreator "serviceAccount:${delegate_email}"
+project_policy_url="${gateway}/_minisky/iam/v1/projects/${project_id}"
+if [[ "${enterprise_controls}" == "1" ]]; then
+  project_policy_status="$(curl --silent --show-error --output "${work_dir}/project-policy-set.json" --write-out '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    --data "{\"policy\":{\"version\":1,\"bindings\":[{\"role\":\"roles/minisky.viewer\",\"members\":[\"${federated_principal}\"]}]}}" \
+    "${project_policy_url}:setIamPolicy")"
+  if [[ "${project_policy_status}" != "200" ]]; then
+    echo "Expected project viewer policy HTTP 200, received ${project_policy_status}." >&2
+    exit 1
+  fi
+  assert_policy_binding "${project_policy_url}" roles/minisky.viewer "${federated_principal}"
+fi
 
 set +e
 terraform -chdir="${terraform_dir}" plan -detailed-exitcode -input=false \
@@ -275,6 +318,9 @@ if [[ "${plan_exit}" != "0" ]]; then
 fi
 
 stop_minisky
+if [[ "${enterprise_controls}" == "1" ]]; then
+  enterprise_audit_active=1
+fi
 start_minisky strict
 curl --fail --silent --show-error -H "Authorization: Bearer invalid" "${pool_url}" >/dev/null 2>&1 || true
 
@@ -420,6 +466,72 @@ if [[ "${strict_read_status}" != "200" ]]; then
 fi
 assert_json_value "${work_dir}/strict-read.json" email "${target_email}"
 
+if [[ "${enterprise_controls}" == "1" ]]; then
+  dashboard_get_status="$(curl --silent --show-error --output "${work_dir}/dashboard-view.json" --write-out '%{http_code}' \
+    -H "Authorization: Bearer ${federated_token}" \
+    -H "X-MiniSky-Project: ${project_id}" \
+    "${dashboard}/api/services")"
+  if [[ "${dashboard_get_status}" != "200" ]]; then
+    echo "Expected federated Dashboard view HTTP 200, received ${dashboard_get_status}." >&2
+    exit 1
+  fi
+
+  sensitive_body_marker="phase17-sensitive-body-${profile}-${RANDOM}${RANDOM}"
+  dashboard_manage_status="$(curl --silent --show-error --output "${work_dir}/dashboard-manage-denied.json" --write-out '%{http_code}' \
+    -X POST -H "Authorization: Bearer ${federated_token}" \
+    -H "X-MiniSky-Project: ${project_id}" \
+    -H 'Content-Type: application/json' \
+    --data "{\"marker\":\"${sensitive_body_marker}\"}" \
+    "${dashboard}/api/settings")"
+  if [[ "${dashboard_manage_status}" != "403" ]]; then
+    echo "Expected federated Dashboard manage denial HTTP 403, received ${dashboard_manage_status}." >&2
+    exit 1
+  fi
+
+  terminal_status="$(curl --silent --show-error --output "${work_dir}/dashboard-terminal-denied.json" --write-out '%{http_code}' \
+    -H "Authorization: Bearer ${federated_token}" \
+    -H "X-MiniSky-Project: ${project_id}" \
+    "${dashboard}/api/manage/compute/terminal")"
+  if [[ "${terminal_status}" != "403" ]]; then
+    echo "Expected federated Dashboard terminal denial HTTP 403, received ${terminal_status}." >&2
+    exit 1
+  fi
+
+  bigquery_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${project_id}/datasets"
+  unauthorized_bq_status="$(curl --silent --show-error --output "${work_dir}/bigquery-unauthorized.json" --write-out '%{http_code}' \
+    "${bigquery_url}")"
+  if [[ "${unauthorized_bq_status}" != "401" ]]; then
+    echo "Expected unauthenticated BigQuery request HTTP 401, received ${unauthorized_bq_status}." >&2
+    exit 1
+  fi
+  for read_number in 1 2; do
+    bigquery_status="$(curl --silent --show-error --output "${work_dir}/bigquery-read-${read_number}.json" --write-out '%{http_code}' \
+      -H "Authorization: Bearer ${federated_token}" "${bigquery_url}")"
+    if [[ "${bigquery_status}" != "200" ]]; then
+      echo "Expected authorized BigQuery read ${read_number} HTTP 200, received ${bigquery_status}." >&2
+      exit 1
+    fi
+  done
+  quota_status="$(curl --silent --show-error --dump-header "${work_dir}/bigquery-quota.headers" \
+    --output "${work_dir}/bigquery-quota.json" --write-out '%{http_code}' \
+    -H "Authorization: Bearer ${federated_token}" "${bigquery_url}")"
+  if [[ "${quota_status}" != "429" ]] || ! python3 - "${work_dir}/bigquery-quota.headers" "${work_dir}/bigquery-quota.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+headers = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+body = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+retry = re.search(r"(?im)^Retry-After:\s*([0-9]+)\s*$", headers)
+raise SystemExit(0 if retry and int(retry.group(1)) > 0 and body["error"]["status"] == "RESOURCE_EXHAUSTED" else 1)
+PY
+  then
+    echo "Expected numeric Retry-After and RESOURCE_EXHAUSTED from the third authorized BigQuery read." >&2
+    exit 1
+  fi
+fi
+
 python3 - "${work_dir}" "${state_root}" "${repository_root}" "${subject_token}" <<'PY'
 import os
 import pathlib
@@ -462,6 +574,108 @@ if not any(
     raise SystemExit("expected public JWKS is absent from MiniSky state")
 PY
 
+if [[ "${enterprise_controls}" == "1" ]]; then
+  stop_minisky
+  audit_export="${work_dir}/audit-export.json"
+  MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" HOME="${work_dir}/home" \
+    "${work_dir}/minisky" audit verify >/dev/null
+  MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" HOME="${work_dir}/home" \
+    "${work_dir}/minisky" audit export --limit 1000 "${audit_export}"
+  python3 - "${audit_export}" "${federated_principal}" "${project_id}" <<'PY'
+import json
+import pathlib
+import sys
+
+records = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+principal, project = sys.argv[2:]
+if not any(
+    record.get("phase") == "complete"
+    and record.get("status") == 403
+    and record.get("principal") == principal
+    and record.get("service") == "dashboard"
+    and record.get("route") == "/{id}/{id}"
+    and record.get("project") == project
+    for record in records
+):
+    dashboard_denials = [
+        {
+            key: record.get(key)
+            for key in ("phase", "status", "principal", "service", "route", "project")
+        }
+        for record in records
+        if record.get("service") == "dashboard" and record.get("status") == 403
+    ]
+    raise SystemExit(f"missing complete federated Dashboard 403 audit record; observed {dashboard_denials!r}")
+PY
+
+  rm -f \
+    "${work_dir}/subject-key.pem" \
+    "${work_dir}/jwt-input" \
+    "${work_dir}/jwt-signature" \
+    "${work_dir}/sts-response.json" \
+    "${work_dir}/credentials-response.json"
+  python3 - "${work_dir}" "${state_root}" "${subject_token}" "${federated_token}" "${target_token}" "${sensitive_body_marker}" <<'PY'
+import pathlib
+import sys
+
+work, state, subject, federated, target, marker = sys.argv[1:]
+generated_secrets = [
+    subject.encode(),
+    federated.encode(),
+    target.encode(),
+    marker.encode(),
+]
+forbidden_text = [
+    b"-----BEGIN PRIVATE KEY-----",
+    b"Authorization",
+    b"Cookie",
+]
+for root in (pathlib.Path(state), pathlib.Path(work)):
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        for needle in generated_secrets:
+            if needle and needle in data:
+                raise SystemExit(f"sensitive value leaked into {path}")
+        if b"\0" not in data[:8192]:
+            for needle in forbidden_text:
+                if needle in data:
+                    raise SystemExit(f"sensitive text leaked into {path}")
+PY
+
+  tampered_state="${work_dir}/tampered-state"
+  tampered_profile="${profile}-tampered"
+  mkdir -p "${tampered_state}/profiles/${tampered_profile}"
+  cp -R "${state_root}/profiles/${profile}/audit" "${tampered_state}/profiles/${tampered_profile}/audit"
+  python3 - "${tampered_state}/profiles/${tampered_profile}/audit/mutations.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+record = json.loads(lines[0])
+record["method"] = "TAMPERED"
+lines[0] = json.dumps(record, separators=(",", ":"))
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  set +e
+  MINISKY_STATE_DIR="${tampered_state}" MINISKY_PROFILE="${tampered_profile}" HOME="${work_dir}/home" \
+    "${work_dir}/minisky" audit verify >/dev/null 2>&1
+  tampered_verify_exit=$?
+  set -e
+  if [[ "${tampered_verify_exit}" == "0" ]]; then
+    echo "Tampered isolated audit chain unexpectedly verified." >&2
+    exit 1
+  fi
+
+  start_minisky permissive
+  stop_minisky
+  MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" HOME="${work_dir}/home" \
+    "${work_dir}/minisky" audit verify >/dev/null
+fi
+
 stop_minisky
 start_minisky permissive
 set +e
@@ -475,6 +689,17 @@ if [[ "${restart_plan_exit}" != "0" ]]; then
 fi
 terraform -chdir="${terraform_dir}" destroy -auto-approve -input=false \
   "${tf_targets[@]}" "${tf_vars[@]}"
+
+if [[ "${enterprise_controls}" == "1" ]]; then
+  project_policy_clear_status="$(curl --silent --show-error --output "${work_dir}/project-policy-clear.json" --write-out '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    --data '{"policy":{"version":1,"bindings":[]}}' \
+    "${project_policy_url}:setIamPolicy")"
+  if [[ "${project_policy_clear_status}" != "200" ]]; then
+    echo "Expected project viewer policy cleanup HTTP 200, received ${project_policy_clear_status}." >&2
+    exit 1
+  fi
+fi
 
 for url in "${provider_url}" "${pool_url}" "${delegate_url}" "${target_url}"; do
   status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"
@@ -504,4 +729,8 @@ if [[ "${network_manager}" == "minisky" && "${network_profile}" == "${profile}" 
   exit 1
 fi
 
-echo "Phase-13 WIF integration passed with public JWKS only in Terraform and MiniSky state."
+if [[ "${enterprise_controls}" == "1" ]]; then
+  echo "Phase-17 enterprise WIF integration passed with IAM, quota, Dashboard, and tamper-evident audit controls."
+else
+  echo "Phase-13 WIF integration passed with public JWKS only in Terraform and MiniSky state."
+fi

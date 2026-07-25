@@ -28,6 +28,7 @@ func withDashboardRBAC(next http.Handler, authorizer dashboardAuthorizer, audien
 			next.ServeHTTP(w, r)
 			return
 		}
+		r.Header.Del("X-MiniSky-Principal")
 		scheme, token, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
 		if websocketToken := dashboardWebSocketToken(r); websocketToken != "" {
 			scheme, token, ok = "Bearer", websocketToken, true
@@ -41,6 +42,7 @@ func withDashboardRBAC(next http.Handler, authorizer dashboardAuthorizer, audien
 			writeDashboardAuthError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Bearer credential is invalid or expired")
 			return
 		}
+		r.Header.Set("X-MiniSky-Principal", claims.Subject)
 		permission := "minisky.dashboard.manage"
 		resource := ""
 		if r.Method == http.MethodPost && r.URL.Path == "/api/projects" {
@@ -68,7 +70,6 @@ func withDashboardRBAC(next http.Handler, authorizer dashboardAuthorizer, audien
 			writeDashboardAuthError(w, http.StatusForbidden, "PERMISSION_DENIED", "Caller lacks permission "+permission)
 			return
 		}
-		r.Header.Set("X-MiniSky-Principal", claims.Subject)
 		next.ServeHTTP(w, r)
 	})
 }

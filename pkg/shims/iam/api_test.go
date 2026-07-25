@@ -199,6 +199,45 @@ func TestMiniSkyLocalRolesCoverDashboardAndGatewayPermissions(t *testing.T) {
 	}
 }
 
+func TestFederatedPrincipalViewerRoleUsesExactMemberMatching(t *testing.T) {
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+	api := newAPI(nil)
+	const principal = "principal://iam.googleapis.com/projects/local-dev-project/locations/global/workloadIdentityPools/ci-pool/subject/repository:minisky"
+	api.policies["projects/local-dev-project"] = &IamPolicy{Bindings: []Binding{{
+		Role:    "roles/minisky.viewer",
+		Members: []string{principal},
+	}}}
+
+	for _, permission := range []string{
+		"minisky.dashboard.view",
+		"bigquery.datasets.get",
+	} {
+		if !api.Authorize("projects/local-dev-project", principal, permission) {
+			t.Errorf("federated viewer lacks %q", permission)
+		}
+	}
+	for _, permission := range []string{
+		"minisky.dashboard.manage",
+		"minisky.dashboard.terminal",
+		"bigquery.datasets.update",
+		"compute.instances.create",
+		"storage.objects.delete",
+	} {
+		if api.Authorize("projects/local-dev-project", principal, permission) {
+			t.Errorf("federated viewer unexpectedly has %q", permission)
+		}
+	}
+	for _, nearMatch := range []string{
+		strings.TrimSuffix(principal, "minisky"),
+		principal + ":admin",
+		"principalSet://iam.googleapis.com/projects/local-dev-project/locations/global/workloadIdentityPools/ci-pool/subject/repository:minisky",
+	} {
+		if api.Authorize("projects/local-dev-project", nearMatch, "minisky.dashboard.view") {
+			t.Errorf("near-match principal %q was authorized", nearMatch)
+		}
+	}
+}
+
 func TestAuthorizeNestedChildResourceUsesProjectPolicy(t *testing.T) {
 	api := newAPI(nil)
 	api.strict = true

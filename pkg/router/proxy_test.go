@@ -77,6 +77,153 @@ func TestStrictAuthorizationReturnsRedacted401And403(t *testing.T) {
 	}
 }
 
+func TestStrictGatewayAuditUsesOnlyVerifiedPrincipal(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	const principal = "user:alice@example.com"
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name              string
+		authorization     string
+		suppliedPrincipal string
+		wantStatus        int
+		wantComplete      string
+	}{
+		{
+			name:              "missing bearer with forged principal",
+			suppliedPrincipal: "user:attacker@example.com",
+			wantStatus:        http.StatusUnauthorized,
+		},
+		{
+			name:              "invalid bearer with forged principal",
+			authorization:     "Bearer invalid-token",
+			suppliedPrincipal: "user:attacker@example.com",
+			wantStatus:        http.StatusUnauthorized,
+		},
+		{
+			name:          "verified principal denied",
+			authorization: "Bearer " + token,
+			wantStatus:    http.StatusForbidden,
+			wantComplete:  principal,
+		},
+		{
+			name:              "conflicting supplied principal",
+			authorization:     "Bearer " + token,
+			suppliedPrincipal: "user:attacker@example.com",
+			wantStatus:        http.StatusUnauthorized,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim("bigquery.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("denied request reached BigQuery shim")
+			}))
+			router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: false}, nil, false, "gateway")
+			audit, err := localsecurity.OpenAuditLog(t.TempDir(), "gateway-auth", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer audit.Close()
+			handler := audit.Wrap(router, func(r *http.Request) localsecurity.AuditEvent {
+				return localsecurity.AuditEvent{
+					Principal: r.Header.Get("X-MiniSky-Principal"),
+					Service:   "bigquery.googleapis.com",
+					Route:     "/bigquery/v2/projects/{project}/datasets",
+					Project:   "demo",
+				}
+			})
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"http://localhost/_minisky/bigquery/bigquery/v2/projects/demo/datasets",
+				bytes.NewBufferString(`{"datasetReference":{"datasetId":"denied"}}`),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			if test.authorization != "" {
+				request.Header.Set("Authorization", test.authorization)
+			}
+			if test.suppliedPrincipal != "" {
+				request.Header.Set("X-MiniSky-Principal", test.suppliedPrincipal)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.wantComplete != "" && !strings.Contains(response.Body.String(), "bigquery.datasets.update") {
+				t.Fatalf("verified denial did not name mapped permission: %s", response.Body.String())
+			}
+			var exported bytes.Buffer
+			if err := audit.Export(&exported, 10); err != nil {
+				t.Fatal(err)
+			}
+			var records []localsecurity.AuditRecord
+			if err := json.Unmarshal(exported.Bytes(), &records); err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 2 ||
+				records[0].Phase != "attempt" || records[0].Principal != "" ||
+				records[1].Phase != "complete" || records[1].Principal != test.wantComplete {
+				t.Fatalf("audit records = %#v, want attempt principal empty and complete principal %q", records, test.wantComplete)
+			}
+		})
+	}
+}
+
+func TestStrictGatewayAuditClearsForgedPrincipalBeforeEarlyRejection(t *testing.T) {
+	const limit = 1 << 20
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized request reached Logging shim")
+	}))
+	router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: false}, nil, false, "gateway")
+	audit, err := localsecurity.OpenAuditLog(t.TempDir(), "gateway-early-rejection", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer audit.Close()
+	handler := audit.Wrap(router, func(r *http.Request) localsecurity.AuditEvent {
+		return localsecurity.AuditEvent{
+			Principal: r.Header.Get("X-MiniSky-Principal"),
+			Service:   "logging.googleapis.com",
+			Route:     "/v2/entries:write",
+			Project:   "demo",
+		}
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/logging/v2/entries:write",
+		strings.NewReader(strings.Repeat("x", limit+1)),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-MiniSky-Principal", "user:attacker@example.com")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusRequestEntityTooLarge, response.Body.String())
+	}
+	var exported bytes.Buffer
+	if err := audit.Export(&exported, 10); err != nil {
+		t.Fatal(err)
+	}
+	var records []localsecurity.AuditRecord
+	if err := json.Unmarshal(exported.Bytes(), &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 ||
+		records[0].Phase != "attempt" || records[0].Principal != "" ||
+		records[1].Phase != "complete" || records[1].Principal != "" {
+		t.Fatalf("audit records = %#v, want empty principal on attempt and early-rejection completion", records)
+	}
+}
+
 func TestUnknownProjectEnforcementIsOptional(t *testing.T) {
 	router := NewProxyRouterWithManager(nil)
 	router.RegisterShim("bigquery.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

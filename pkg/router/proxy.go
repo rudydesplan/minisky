@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -18,6 +19,10 @@ import (
 	localsecurity "minisky/pkg/security"
 	"minisky/pkg/validator"
 )
+
+type callerSuppliedPrincipalContextKey struct{}
+
+type callerSuppliedPrincipal string
 
 // ProxyRouter intercepts and routes all incoming GCP API requests.
 type ProxyRouter struct {
@@ -132,6 +137,10 @@ func (p *ProxyRouter) RegisterLazyDocker(domain string) {
 }
 
 func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	suppliedPrincipal := callerSuppliedPrincipal(strings.TrimSpace(r.Header.Get("X-MiniSky-Principal")))
+	r.Header.Del("X-MiniSky-Principal")
+	r = r.WithContext(context.WithValue(r.Context(), callerSuppliedPrincipalContextKey{}, suppliedPrincipal))
+
 	targetDomain := normalizeDomain(r.Host)
 
 	// 1. Support Path-based Routing for local requests (Terraform/CLI)
@@ -286,12 +295,12 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 	if authorizer == nil || !authorizer.EnforcementEnabled() {
 		return true
 	}
+	suppliedPrincipal, _ := r.Context().Value(callerSuppliedPrincipalContextKey{}).(callerSuppliedPrincipal)
 	if domain == "sts.googleapis.com" && r.Method == http.MethodPost && r.URL.Path == "/v1/token" {
 		return true
 	}
 
 	principal := ""
-	suppliedPrincipal := strings.TrimSpace(r.Header.Get("X-MiniSky-Principal"))
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authorization != "" {
 		scheme, token, ok := strings.Cut(authorization, " ")
@@ -305,7 +314,7 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 			return false
 		}
 		principal = strings.TrimSpace(claims.Subject)
-		if principal == "" || suppliedPrincipal != "" && suppliedPrincipal != principal {
+		if principal == "" || suppliedPrincipal != "" && string(suppliedPrincipal) != principal {
 			p.writeAuthError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Bearer identity conflicts with the supplied principal")
 			return false
 		}

@@ -29,7 +29,7 @@ const phases = [
   ["14", "Multi-tenancy", "Metadata slice", "Shared Docker backends are not project-isolated"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Bounded slices", "Advanced peering/NAT/PSC and broad query engines remain 501"],
-  ["17", "CI/CD, plugins, enterprise", "Bounded local slice", "Remote marketplace and compliance storage deferred"],
+  ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
 ];
 
 const waves = [
@@ -103,12 +103,12 @@ const waves = [
     title: "Wave 7 — Delivery ecosystem before enterprise",
     phases: "17",
     deliverables: [
-      "17.1 Publish and test setup-minisky, a GitLab template, and one Compose topology.",
-      "17.2 Add scaffold tooling and freeze an in-tree plugin API v0 before designing out-of-process loading.",
-      "17.3 Add reproducible benchmarks and configurable quota/rate-limit middleware.",
-      "17.4 Start audit/RBAC/air-gap work only after phases 12–14 define identity, tenancy, and audit foundations.",
+      "17.1 Keep the tested repository-local setup action, GitLab template, and Compose topology distinct from external publication.",
+      "17.2 Maintain scaffold tooling and the in-tree plugin API v0 without claiming an out-of-process runtime loader.",
+      "17.3 Maintain reproducible benchmarks and fixed-window, process-local quota middleware.",
+      "17.4 Preserve the guarded federated RBAC/quota/audit cross-gate and checksummed air-gap evidence.",
     ],
-    gate: "Fresh CI runners can install, start, test, and stop MiniSky; plugin and enterprise claims remain separate until independently gated.",
+    gate: "The bounded local slice is verified; CI pass evidence, external identity, distributed quotas, immutable audit storage, package publication, and runtime loading remain separate gates.",
   },
 ];
 
@@ -131,15 +131,16 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Callout tone="info" title="Implementation status">
         Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
-        delivery, and Phase-15 emulator gates. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs
-        also pass in read-only CI. Google credential portability and production-grade semantics remain explicit
-        external boundaries.
+        delivery, Phase-15 emulator, and Phase-17 federated RBAC/quota/audit integration gates. Seven guarded
+        local gates have passed. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs also pass in
+        read-only CI; the opt-in Phase-17 CI job is configured but has no CI pass evidence yet. Production-grade
+        semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>6 passed</H2><Text tone="secondary">Including Phase-13 WIF and delegation</Text></CardBody>
+          <CardBody><H2>7 passed</H2><Text tone="secondary">Including Phase-17 federated enterprise controls</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -166,7 +167,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Grid columns="2fr 1fr" gap={20}>
         <Stack gap={8}>
-          <H2>Phase 13 verified boundary</H2>
+          <H2>Phase 13 and 17 verified boundaries</H2>
           <Text>
             Google provider 7.41.0 passed apply → restart → no-drift → destroy for local project-ID WIF
             resources, static inline public JWKS, RS256 exchange, and one-delegate impersonation.
@@ -176,13 +177,18 @@ export default function MiniSkyRoadmapCompletionPlan() {
             preserved exactly for IAM matching; only <Code>google.subject=assertion.sub</Code> executes.
             Returned <Code>ms1</Code> tokens are local, not Google credentials.
           </Text>
+          <Text>
+            The Phase-17 cross-gate passed locally with the federated principal exercising Dashboard RBAC,
+            gateway authorization, route quota rejection, audit verification, redaction checks, and tamper
+            detection. This verifies a bounded local slice, not production-ready enterprise controls.
+          </Text>
         </Stack>
         <Stack gap={8}>
           <H3>Still unsupported</H3>
           <Text tone="secondary">
-            Project numbers; AWS, SAML, X.509, and workforce federation; remote discovery/JWKS; CEL or arbitrary
-            mappings; non-RS256; Google trust, portability, or revocation; undelete; more than four delegates;
-            generateIdToken, signJwt, and signBlob.
+            External IdPs, SSO, SCIM, distributed quotas, immutable/WORM/compliance audit storage, package
+            publication, and a remote marketplace or runtime plugin loader. Static-JWKS WIF limits and local
+            <Code>ms1</Code> credentials remain; quotas are fixed-window and process-local.
           </Text>
         </Stack>
       </Grid>
@@ -241,8 +247,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Homebrew, Scoop, deb, and rpm publication remains blocked until maintainer-owned repositories,
-        scoped credentials, protected approval environments, and native install-from-repository tests exist.
+        Next internal executable milestone: extend the Phase-9 Pack gate so Pub/Sub and Storage events invoke a
+        real Cloud Run handler. Homebrew, Scoop, deb, and rpm publication remains externally blocked until
+        maintainer-owned repositories, scoped credentials, protected approval environments, and native
+        install-from-repository tests exist.
       </Callout>
     </Stack>
   );

@@ -19,6 +19,7 @@ type dashboardTestAuthorizer struct {
 	permission string
 	resource   string
 	allow      bool
+	allowed    map[string]bool
 }
 
 func (a *dashboardTestAuthorizer) EnforcementEnabled() bool { return true }
@@ -28,6 +29,9 @@ func (a *dashboardTestAuthorizer) VerifyLocalToken(token, audience, scope string
 func (a *dashboardTestAuthorizer) Authorize(resource, _ string, permission string) bool {
 	a.resource = resource
 	a.permission = permission
+	if a.allowed != nil {
+		return a.allowed[permission]
+	}
 	return a.allow
 }
 
@@ -62,9 +66,16 @@ func TestDashboardRBACUsesTokenPrincipalProjectAndRolePermission(t *testing.T) {
 }
 
 func TestDashboardRBACDefaultPermissiveAndStrictDenial(t *testing.T) {
-	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if principal := r.Header.Get("X-MiniSky-Principal"); principal != "" && principal != "user:legacy@example.com" {
+			t.Fatalf("permissive principal = %q", principal)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	response := httptest.NewRecorder()
-	withDashboardRBAC(next, nil, "").ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost/api/services", nil))
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/api/services", nil)
+	request.Header.Set("X-MiniSky-Principal", "user:legacy@example.com")
+	withDashboardRBAC(next, nil, "").ServeHTTP(response, request)
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("permissive status = %d", response.Code)
 	}
@@ -134,6 +145,179 @@ func TestDashboardTerminalRequiresDedicatedPermission(t *testing.T) {
 
 	if response.Code != http.StatusForbidden || authorizer.permission != "minisky.dashboard.terminal" {
 		t.Fatalf("status=%d permission=%q body=%s", response.Code, authorizer.permission, response.Body.String())
+	}
+}
+
+func TestDashboardFederatedViewerCannotBeOverriddenOrElevated(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	authorizer := &dashboardTestAuthorizer{
+		issuer:  issuer,
+		allowed: map[string]bool{"minisky.dashboard.view": true},
+	}
+	const principal = "principal://iam.googleapis.com/projects/local-dev-project/locations/global/workloadIdentityPools/ci-pool/subject/repository:minisky"
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "dashboard",
+		Scopes: []string{dashboardOAuthScope}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := 0
+	handler := withDashboardRBAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatched++
+		if got := r.Header.Get("X-MiniSky-Principal"); got != principal {
+			t.Fatalf("downstream principal = %q, want token principal", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), authorizer, "dashboard")
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{
+			name:   "viewer GET",
+			method: http.MethodGet, path: "http://localhost/api/services",
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:   "manage denied",
+			method: http.MethodPost, path: "http://localhost/api/settings",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:   "terminal denied",
+			method: http.MethodGet, path: "http://localhost/api/manage/compute/terminal",
+			wantStatus: http.StatusForbidden,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("X-MiniSky-Principal", "user:attacker@example.com")
+			request.Header.Set("X-MiniSky-Project", "local-dev-project")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+		})
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatched = %d, want only viewer GET", dispatched)
+	}
+}
+
+func TestDashboardDeniedRequestRetainsVerifiedPrincipalForAudit(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	authorizer := &dashboardTestAuthorizer{issuer: issuer}
+	const principal = "principal://iam.googleapis.com/projects/local-dev-project/locations/global/workloadIdentityPools/ci-pool/subject/repository:minisky"
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "dashboard",
+		Scopes: []string{dashboardOAuthScope}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, err := localsecurity.OpenAuditLog(t.TempDir(), "dashboard-denial", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer audit.Close()
+	handler := audit.Wrap(
+		withDashboardRBAC(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("denied request reached dashboard handler")
+		}), authorizer, "dashboard"),
+		func(r *http.Request) localsecurity.AuditEvent {
+			return localsecurity.AuditEvent{
+				Principal: r.Header.Get("X-MiniSky-Principal"),
+				Service:   "dashboard",
+				Route:     "/api/settings",
+				Project:   r.Header.Get("X-MiniSky-Project"),
+			}
+		},
+	)
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/api/settings", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("X-MiniSky-Principal", "user:attacker@example.com")
+	request.Header.Set("X-MiniSky-Project", "local-dev-project")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var exported bytes.Buffer
+	if err := audit.Export(&exported, 10); err != nil {
+		t.Fatal(err)
+	}
+	var records []localsecurity.AuditRecord
+	if err := json.Unmarshal(exported.Bytes(), &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 ||
+		records[0].Phase != "attempt" || records[0].Principal != "" ||
+		records[1].Phase != "complete" || records[1].Principal != principal {
+		t.Fatalf("denied audit records = %#v, want complete record for %q", records, principal)
+	}
+}
+
+func TestDashboardUnauthenticatedAuditRejectsForgedPrincipal(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	for _, test := range []struct {
+		name          string
+		authorization string
+	}{
+		{name: "missing bearer"},
+		{name: "malformed bearer", authorization: "Basic forged"},
+		{name: "invalid bearer", authorization: "Bearer invalid-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			audit, err := localsecurity.OpenAuditLog(t.TempDir(), "dashboard-unauthenticated", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer audit.Close()
+			handler := audit.Wrap(
+				withDashboardRBAC(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("unauthenticated request reached dashboard handler")
+				}), &dashboardTestAuthorizer{issuer: issuer}, "dashboard"),
+				func(r *http.Request) localsecurity.AuditEvent {
+					return localsecurity.AuditEvent{
+						Principal: r.Header.Get("X-MiniSky-Principal"),
+						Service:   "dashboard",
+						Route:     "/api/settings",
+						Project:   r.Header.Get("X-MiniSky-Project"),
+					}
+				},
+			)
+			request := httptest.NewRequest(http.MethodPost, "http://localhost/api/settings", nil)
+			request.Header.Set("X-MiniSky-Principal", "user:attacker@example.com")
+			request.Header.Set("X-MiniSky-Project", "local-dev-project")
+			if test.authorization != "" {
+				request.Header.Set("Authorization", test.authorization)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var exported bytes.Buffer
+			if err := audit.Export(&exported, 10); err != nil {
+				t.Fatal(err)
+			}
+			var records []localsecurity.AuditRecord
+			if err := json.Unmarshal(exported.Bytes(), &records); err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 2 ||
+				records[0].Phase != "attempt" || records[0].Principal != "" ||
+				records[1].Phase != "complete" || records[1].Principal != "" {
+				t.Fatalf("unauthenticated audit records = %#v, want empty principals", records)
+			}
+		})
 	}
 }
 

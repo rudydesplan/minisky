@@ -273,7 +273,7 @@ var startCmd = &cobra.Command{
 						Method:    r.Method,
 						Service:   "dashboard",
 						Route:     observability.NormalizeRoute(r.URL.Path),
-						Project:   router.ProjectFromRequest(r),
+						Project:   dashboardAuditProject(r),
 					}
 				})
 			}
@@ -312,6 +312,13 @@ var startCmd = &cobra.Command{
 			log.Fatalf("Failed to start router: %v", serveErr)
 		}
 	},
+}
+
+func dashboardAuditProject(r *http.Request) string {
+	if project := router.ProjectFromRequest(r); project != "" {
+		return project
+	}
+	return strings.TrimSpace(r.Header.Get("X-MiniSky-Project"))
 }
 
 func init() {
