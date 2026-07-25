@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 )
 
@@ -30,45 +31,75 @@ import (
 type KindBackend struct {
 	enabled         bool
 	pendingClusters sync.Map
+	status          config.BackendState
 }
 
-// NewKindBackend returns a KindBackend. It is only active when
-// the MINISKY_GKE_BACKEND environment variable is set to "kind".
+// NewKindBackend returns a backend selected by the runtime profile or an
+// explicit MINISKY_GKE_BACKEND override.
 func NewKindBackend() *KindBackend {
-	enabled := strings.EqualFold(os.Getenv("MINISKY_GKE_BACKEND"), "kind")
-	if enabled {
-		localKind := filepath.Join(orchestrator.GetLocalBinPath(), orchestrator.GetKindBinaryName())
-		if _, err := os.Stat(localKind); err == nil {
-			log.Printf("[KindBackend] ✅ Found local 'kind' binary at %s", localKind)
-		} else if _, err := exec.LookPath(orchestrator.GetKindBinaryName()); err != nil {
-			log.Printf("[KindBackend] WARNING: MINISKY_GKE_BACKEND=kind but 'kind' CLI not found. Falling back to in-memory simulation.")
-			enabled = false
-		} else {
-			log.Printf("[KindBackend] ✅ Kind integration ENABLED — using system binary.")
-		}
+	selection := config.ResolveBackend("MINISKY_GKE_BACKEND", "kind")
+	backend := &KindBackend{
+		enabled: selection.Requested,
+		status:  selection.Effective(selection.Requested, ""),
 	}
-	return &KindBackend{enabled: enabled}
+	if selection.Requested {
+		if missing := missingKindDependencies(); len(missing) > 0 {
+			diagnostic := fmt.Sprintf("Kind dependencies missing (%s); using simulation", strings.Join(missing, ", "))
+			log.Printf("[KindBackend] WARNING: %s", diagnostic)
+			backend.enabled = false
+			backend.status = selection.Effective(false, diagnostic)
+		} else {
+			log.Printf("[KindBackend] ✅ Kind integration ENABLED")
+		}
+	} else if backend.status.Diagnostic != "" {
+		log.Printf("[KindBackend] WARNING: %s", backend.status.Diagnostic)
+	}
+	return backend
 }
 
 // Enabled reports whether Kind backend is active.
 func (k *KindBackend) Enabled() bool { return k.enabled }
 
+// Status reports the effective backend selected after dependency checks.
+func (k *KindBackend) Status() config.BackendState { return k.status }
+
 // SetEnabled toggles the Kind backend dynamically.
 func (k *KindBackend) SetEnabled(enabled bool) error {
 	if enabled {
-		localKind := filepath.Join(orchestrator.GetLocalBinPath(), orchestrator.GetKindBinaryName())
-		_, localErr := os.Stat(localKind)
-		_, sysErr := exec.LookPath(orchestrator.GetKindBinaryName())
-
-		if localErr != nil && sysErr != nil {
-			return fmt.Errorf("'kind' CLI not found, cannot enable")
+		if missing := missingKindDependencies(); len(missing) > 0 {
+			k.status = config.BackendState{
+				Profile: config.GetRuntimeProfile().Name, Backend: config.RuntimeProfileSimulation,
+				Source: "dashboard", Diagnostic: fmt.Sprintf("Kind dependencies missing (%s); using simulation", strings.Join(missing, ", ")),
+			}
+			return fmt.Errorf("missing Kind dependencies: %s", strings.Join(missing, ", "))
+		}
+		k.status = config.BackendState{
+			Profile: config.GetRuntimeProfile().Name, Backend: "kind", Enabled: true, Source: "dashboard",
 		}
 		log.Printf("[KindBackend] dynamically ENABLED via UI")
 	} else {
+		k.status = config.BackendState{
+			Profile: config.GetRuntimeProfile().Name, Backend: config.RuntimeProfileSimulation, Source: "dashboard",
+		}
 		log.Printf("[KindBackend] dynamically DISABLED via UI")
 	}
 	k.enabled = enabled
 	return nil
+}
+
+func missingKindDependencies() []string {
+	var missing []string
+	kindName := orchestrator.GetKindBinaryName()
+	localKind := filepath.Join(orchestrator.GetLocalBinPath(), kindName)
+	if _, err := os.Stat(localKind); err != nil {
+		if _, err := exec.LookPath(kindName); err != nil {
+			missing = append(missing, "kind")
+		}
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		missing = append(missing, "docker")
+	}
+	return missing
 }
 
 // CreateCluster runs `kind create cluster --name <name>`.

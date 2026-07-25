@@ -9,8 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -81,17 +83,34 @@ type GkeOperation struct {
 
 // API is the high-fidelity GKE container.v1 shim.
 type API struct {
-	mu       sync.RWMutex
-	opMgr    *orchestrator.OperationManager
-	backend  *KindBackend
-	clusters map[string]*Cluster // key: project:zone:name
+	mu         sync.RWMutex
+	persistMu  sync.Mutex
+	opMgr      *orchestrator.OperationManager
+	backend    *KindBackend
+	stateStore *state.Store
+	clusters   map[string]*Cluster // key: project:zone:name
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: GKE] state disabled: %v", err)
+		return newAPI(opMgr, nil)
+	}
+	api, err := NewAPIWithStore(opMgr, store)
+	if err != nil {
+		log.Printf("[Shim: GKE] state rehydration failed: %v", err)
+		return newAPI(opMgr, nil)
+	}
+	return api
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, store *state.Store) *API {
 	return &API{
-		opMgr:    opMgr,
-		backend:  NewKindBackend(),
-		clusters: make(map[string]*Cluster),
+		opMgr:      opMgr,
+		backend:    NewKindBackend(),
+		stateStore: store,
+		clusters:   make(map[string]*Cluster),
 	}
 }
 
@@ -217,6 +236,11 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 	api.mu.Lock()
 	api.clusters[key] = &cl
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist cluster metadata: "+err.Error())
+		return
+	}
 
 	targetLink := cl.SelfLink
 	op := api.opMgr.Register("container#operation", "CREATE_CLUSTER", targetLink, zone, "")
@@ -234,6 +258,9 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 			c.Status = "RUNNING"
 		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: GKE] persist completed cluster: %v", err)
+		}
 
 		// Loopback execution to register nodes in Compute API
 		go func() {
@@ -326,6 +353,11 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 	// Mark as STOPPING to simulate winding down in the UI
 	cl.Status = "STOPPING"
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist cluster metadata: "+err.Error())
+		return
+	}
 
 	op := api.opMgr.Register("container#operation", "DELETE_CLUSTER", cl.SelfLink, zone, "")
 	api.opMgr.RunAsync(op.Name, func() error {
@@ -367,6 +399,9 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		api.mu.Lock()
 		delete(api.clusters, key)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			log.Printf("[Shim: GKE] persist deleted cluster: %v", err)
+		}
 
 		return nil
 	})

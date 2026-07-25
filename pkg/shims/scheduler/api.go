@@ -3,16 +3,21 @@ package scheduler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
+	configpkg "minisky/pkg/config"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -30,18 +35,20 @@ func init() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Job struct {
-	Name            string           `json:"name"`
-	Description     string           `json:"description,omitempty"`
-	Target          *Target          `json:"target,omitempty"` // One of httpTarget, pubsubTarget, appEngineHttpTarget
-	HttpTarget      *HttpTarget      `json:"httpTarget,omitempty"`
-	PubsubTarget    *PubsubTarget    `json:"pubsubTarget,omitempty"`
-	AppEngineTarget *AppEngineTarget `json:"appEngineHttpTarget,omitempty"`
-	Schedule        string           `json:"schedule"`
-	TimeZone        string           `json:"timeZone,omitempty"`
-	State           string           `json:"state"` // ENABLED, PAUSED, DISABLED
-	Status          *Status          `json:"status,omitempty"`
-	LastAttemptTime string           `json:"lastAttemptTime,omitempty"`
-	NextRunTime     string           `json:"nextRunTime,omitempty"`
+	Name              string           `json:"name"`
+	Description       string           `json:"description,omitempty"`
+	Target            *Target          `json:"target,omitempty"` // One of httpTarget, pubsubTarget, appEngineHttpTarget
+	HttpTarget        *HttpTarget      `json:"httpTarget,omitempty"`
+	PubsubTarget      *PubsubTarget    `json:"pubsubTarget,omitempty"`
+	AppEngineTarget   *AppEngineTarget `json:"appEngineHttpTarget,omitempty"`
+	Schedule          string           `json:"schedule"`
+	TimeZone          string           `json:"timeZone,omitempty"`
+	State             string           `json:"state"` // ENABLED, PAUSED, DISABLED
+	Status            *Status          `json:"status,omitempty"`
+	LastAttemptTime   string           `json:"lastAttemptTime,omitempty"`
+	LastAttemptStatus int              `json:"lastAttemptStatus,omitempty"`
+	LastAttemptError  string           `json:"lastAttemptError,omitempty"`
+	NextRunTime       string           `json:"nextRunTime,omitempty"`
 }
 
 type Target struct{}
@@ -76,22 +83,131 @@ type Status struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type API struct {
-	mu      sync.RWMutex
-	jobs    map[string]*Job // key: projects/{p}/locations/{l}/jobs/{j}
-	cron    *cron.Cron
-	cronIDs map[string]cron.EntryID
-	logAPI  *logging.API
+	mu             sync.RWMutex
+	store          stateStore
+	jobs           map[string]*Job // key: projects/{p}/locations/{l}/jobs/{j}
+	cron           *cron.Cron
+	cronIDs        map[string]cron.EntryID
+	logAPI         *logging.API
+	client         *http.Client
+	gatewayBaseURL string
+	now            func() time.Time
+}
+
+type stateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+const schedulerStateEntry = "scheduler/metadata"
+
+type schedulerMetadata struct {
+	Jobs map[string]*Job `json:"jobs"`
+}
+
+type Config struct {
+	GatewayBaseURL string
+	HTTPClient     *http.Client
+	Now            func() time.Time
 }
 
 func NewAPI(logAPI *logging.API) *API {
-	api := &API{
-		jobs:    make(map[string]*Job),
-		cron:    cron.New(),
-		cronIDs: make(map[string]cron.EntryID),
-		logAPI:  logAPI,
+	config := Config{
+		GatewayBaseURL: os.Getenv("MINISKY_GATEWAY_URL"),
 	}
+	store, err := state.New(configpkg.GetStateDir(), configpkg.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Cloud Scheduler] state disabled: %v", err)
+		return startScheduler(newAPI(logAPI, config, nil))
+	}
+	api, err := NewAPIWithConfigAndStore(logAPI, config, store)
+	if err != nil {
+		log.Printf("[Shim: Cloud Scheduler] state rehydration failed: %v", err)
+		return startScheduler(newAPI(logAPI, config, store))
+	}
+	return api
+}
+
+func NewAPIWithConfig(logAPI *logging.API, config Config) *API {
+	api, _ := NewAPIWithConfigAndStore(logAPI, config, nil)
+	return api
+}
+
+// NewAPIWithConfigAndStore constructs a Scheduler shim backed by the supplied
+// metadata store. It reports unreadable state instead of silently replacing it.
+func NewAPIWithConfigAndStore(logAPI *logging.API, config Config, store stateStore) (*API, error) {
+	api := newAPI(logAPI, config, store)
+	if store != nil {
+		var persisted schedulerMetadata
+		if err := store.Load(schedulerStateEntry, &persisted); err != nil {
+			if !errors.Is(err, state.ErrNotFound) {
+				return nil, fmt.Errorf("load Scheduler metadata: %w", err)
+			}
+		} else if persisted.Jobs != nil {
+			api.jobs = persisted.Jobs
+		}
+	}
+	for _, job := range api.jobs {
+		api.scheduleJobLocked(job)
+	}
+	return startScheduler(api), nil
+}
+
+func newAPI(logAPI *logging.API, config Config, store stateStore) *API {
+	client := config.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	clientCopy := *client
+	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
+	api := &API{
+		store:          store,
+		jobs:           make(map[string]*Job),
+		cron:           cron.New(),
+		cronIDs:        make(map[string]cron.EntryID),
+		logAPI:         logAPI,
+		client:         &clientCopy,
+		gatewayBaseURL: strings.TrimRight(config.GatewayBaseURL, "/"),
+		now:            now,
+	}
+	return api
+}
+
+func startScheduler(api *API) *API {
 	api.cron.Start()
 	return api
+}
+
+func (api *API) Close() {
+	<-api.cron.Stop().Done()
+}
+
+func (api *API) persistMetadata() error {
+	if api.store == nil {
+		return nil
+	}
+	api.mu.RLock()
+	jobs := make(map[string]*Job, len(api.jobs))
+	for name, job := range api.jobs {
+		jobs[name] = cloneJob(job)
+	}
+	api.mu.RUnlock()
+	return api.store.Save(schedulerStateEntry, schedulerMetadata{Jobs: jobs})
+}
+
+func (api *API) persistOrError(w http.ResponseWriter) bool {
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: Cloud Scheduler] persist metadata: %v", err)
+		http.Error(w, "Failed to persist Scheduler metadata", http.StatusInternalServerError)
+		return false
+	}
+	return true
 }
 
 func (api *API) pushLog(projectId, severity, jobId, text string) {
@@ -166,33 +282,41 @@ func (api *API) createJob(w http.ResponseWriter, r *http.Request, path string) {
 	api.mu.Lock()
 	api.jobs[job.Name] = &job
 	api.scheduleJobLocked(&job)
+	result := job
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	project := extractProject(job.Name)
 	api.pushLog(project, "INFO", job.Name, "Job created: "+job.Schedule)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(job)
+	json.NewEncoder(w).Encode(result)
 }
 
 func (api *API) getJob(w http.ResponseWriter, name string) {
 	api.mu.RLock()
 	job, ok := api.jobs[name]
+	var result Job
+	if ok {
+		result = *job
+	}
 	api.mu.RUnlock()
 
 	if !ok {
 		http.Error(w, "Job not found", http.StatusNotFound)
 		return
 	}
-	json.NewEncoder(w).Encode(job)
+	json.NewEncoder(w).Encode(result)
 }
 
 func (api *API) listJobs(w http.ResponseWriter, r *http.Request, path string) {
 	prefix := strings.TrimSuffix(path, "/jobs") + "/jobs/"
 	api.mu.RLock()
-	var items []*Job
+	var items []Job
 	for k, v := range api.jobs {
 		if strings.HasPrefix(k, prefix) {
-			items = append(items, v)
+			items = append(items, *v)
 		}
 	}
 	api.mu.RUnlock()
@@ -211,6 +335,9 @@ func (api *API) deleteJob(w http.ResponseWriter, name string) {
 	delete(api.jobs, name)
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	project := extractProject(name)
 	api.pushLog(project, "INFO", name, "Job deleted")
 	w.WriteHeader(http.StatusOK)
@@ -220,6 +347,10 @@ func (api *API) deleteJob(w http.ResponseWriter, name string) {
 func (api *API) runJob(w http.ResponseWriter, r *http.Request, name string) {
 	api.mu.RLock()
 	job, ok := api.jobs[name]
+	var result Job
+	if ok {
+		result = *job
+	}
 	api.mu.RUnlock()
 
 	if !ok {
@@ -230,7 +361,7 @@ func (api *API) runJob(w http.ResponseWriter, r *http.Request, name string) {
 	go api.executeJob(job)
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(job)
+	json.NewEncoder(w).Encode(result)
 }
 
 func (api *API) pauseJob(w http.ResponseWriter, r *http.Request, name string) {
@@ -243,6 +374,9 @@ func (api *API) pauseJob(w http.ResponseWriter, r *http.Request, name string) {
 		}
 	}
 	api.mu.Unlock()
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -253,6 +387,9 @@ func (api *API) resumeJob(w http.ResponseWriter, r *http.Request, name string) {
 		api.scheduleJobLocked(job)
 	}
 	api.mu.Unlock()
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -284,55 +421,56 @@ func (api *API) scheduleJobLocked(job *Job) {
 func (api *API) executeJob(job *Job) {
 	project := extractProject(job.Name)
 	api.pushLog(project, "INFO", job.Name, "Job started")
-	startTime := time.Now()
+	startTime := api.now()
 
+	statusCode := 0
 	var err error
 	if job.HttpTarget != nil {
-		err = api.executeHttp(job.HttpTarget)
+		statusCode, err = api.executeHttp(job.HttpTarget)
 	} else if job.PubsubTarget != nil {
-		err = api.executePubsub(job.PubsubTarget)
+		statusCode, err = api.executePubsub(job.PubsubTarget)
 	} else if job.AppEngineTarget != nil {
-		err = api.executeAppEngine(job.AppEngineTarget)
+		statusCode, err = api.executeAppEngine(job.AppEngineTarget)
+	} else {
+		err = fmt.Errorf("job has no delivery target")
 	}
 
 	api.mu.Lock()
-	job.LastAttemptTime = startTime.Format(time.RFC3339)
+	job.LastAttemptTime = startTime.Format(time.RFC3339Nano)
+	job.LastAttemptStatus = statusCode
 	if err != nil {
 		job.Status = &Status{Code: 13, Message: err.Error()}
-		api.pushLog(project, "ERROR", job.Name, "Job failed: "+err.Error())
+		job.LastAttemptError = err.Error()
 	} else {
 		job.Status = &Status{Code: 0, Message: "Success"}
-		api.pushLog(project, "INFO", job.Name, "Job finished successfully")
+		job.LastAttemptError = ""
 	}
 	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: Cloud Scheduler] persist execution metadata: %v", err)
+	}
+
+	if err != nil {
+		api.pushLog(project, "ERROR", job.Name, "Job failed: "+err.Error())
+	} else {
+		api.pushLog(project, "INFO", job.Name, "Job finished successfully")
+	}
 }
 
-func (api *API) executeHttp(target *HttpTarget) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(target.HttpMethod, target.Uri, bytes.NewBufferString(target.Body))
+func (api *API) executeHttp(target *HttpTarget) (int, error) {
+	req, err := newTargetRequest(target.HttpMethod, target.Uri, target.Headers, target.Body)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	for k, v := range target.Headers {
-		req.Header.Set(k, v)
-	}
-	// Add MiniSky metadata
 	req.Header.Set("User-Agent", "MiniSky-Cloud-Scheduler")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("HTTP error: %s", resp.Status)
-	}
-	return nil
+	return api.deliver(req, "HTTP")
 }
 
-func (api *API) executePubsub(target *PubsubTarget) error {
-	// Publish to MiniSky PubSub shim
+func (api *API) executePubsub(target *PubsubTarget) (int, error) {
+	if api.gatewayBaseURL == "" {
+		return 0, fmt.Errorf("PubSub delivery requires MINISKY_GATEWAY_URL or Config.GatewayBaseURL")
+	}
 	payload := map[string]interface{}{
 		"messages": []map[string]interface{}{
 			{
@@ -341,35 +479,57 @@ func (api *API) executePubsub(target *PubsubTarget) error {
 			},
 		},
 	}
-	b, _ := json.Marshal(payload)
-	resp, err := http.Post("http://localhost:8080/v1/"+target.TopicName+":publish", "application/json", bytes.NewBuffer(b))
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("encode PubSub message: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("PubSub error: %s", resp.Status)
+	uri := api.gatewayBaseURL + "/v1/" + strings.TrimPrefix(target.TopicName, "/") + ":publish"
+	req, err := http.NewRequest(http.MethodPost, uri, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
 	}
-	return nil
+	req.Header.Set("Content-Type", "application/json")
+
+	return api.deliver(req, "PubSub")
 }
 
-func (api *API) executeAppEngine(target *AppEngineTarget) error {
-	// Mock AppEngine by calling local port 8080 with target path
-	client := &http.Client{Timeout: 10 * time.Second}
-	uri := "http://localhost:8080" + target.RelativeUri
-	req, err := http.NewRequest(target.HttpMethod, uri, bytes.NewBufferString(target.Body))
-	if err != nil {
-		return err
+func (api *API) executeAppEngine(target *AppEngineTarget) (int, error) {
+	if api.gatewayBaseURL == "" {
+		return 0, fmt.Errorf("App Engine delivery requires MINISKY_GATEWAY_URL or Config.GatewayBaseURL")
 	}
-	for k, v := range target.Headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
+	uri := api.gatewayBaseURL + "/" + strings.TrimPrefix(target.RelativeUri, "/")
+	req, err := newTargetRequest(target.HttpMethod, uri, target.Headers, target.Body)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	return api.deliver(req, "App Engine")
+}
+
+func newTargetRequest(method, uri string, headers map[string]string, body string) (*http.Request, error) {
+	if method == "" {
+		method = http.MethodPost
+	}
+	req, err := http.NewRequest(method, uri, bytes.NewBufferString(body))
+	if err != nil {
+		return nil, err
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	return req, nil
+}
+
+func (api *API) deliver(req *http.Request, targetName string) (int, error) {
+	resp, err := api.client.Do(req)
+	if err != nil {
+		return 0, err
 	}
 	defer resp.Body.Close()
-	return nil
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return resp.StatusCode, fmt.Errorf("%s delivery failed: %s", targetName, resp.Status)
+	}
+	return resp.StatusCode, nil
 }
 
 func extractJobName(path string) string {
@@ -388,4 +548,42 @@ func extractProject(path string) string {
 		}
 	}
 	return "default-project"
+}
+
+func cloneJob(job *Job) *Job {
+	if job == nil {
+		return nil
+	}
+	clone := *job
+	if job.Status != nil {
+		status := *job.Status
+		clone.Status = &status
+	}
+	if job.HttpTarget != nil {
+		target := *job.HttpTarget
+		target.Headers = cloneStringMap(job.HttpTarget.Headers)
+		clone.HttpTarget = &target
+	}
+	if job.PubsubTarget != nil {
+		target := *job.PubsubTarget
+		target.Attributes = cloneStringMap(job.PubsubTarget.Attributes)
+		clone.PubsubTarget = &target
+	}
+	if job.AppEngineTarget != nil {
+		target := *job.AppEngineTarget
+		target.Headers = cloneStringMap(job.AppEngineTarget.Headers)
+		clone.AppEngineTarget = &target
+	}
+	return &clone
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }

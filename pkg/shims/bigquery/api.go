@@ -2,6 +2,7 @@ package bigquery
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -161,19 +163,76 @@ type API struct {
 	mu       sync.RWMutex
 	opMgr    *orchestrator.OperationManager
 	backend  *DuckDBBackend
+	store    *state.Store
 	datasets map[string]*Dataset // key: project:datasetId
 	tables   map[string]*Table   // key: project:datasetId:tableId
 	jobs     map[string]*Job     // key: project:jobId
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: BigQuery] state disabled: %v", err)
+		return newAPI(opMgr, nil)
+	}
+	api, err := NewAPIWithStore(opMgr, store)
+	if err != nil {
+		log.Printf("[Shim: BigQuery] state rehydration failed: %v", err)
+		return newAPI(opMgr, nil)
+	}
+	return api
+}
+
+// NewAPIWithStore constructs a BigQuery shim backed by the supplied metadata
+// store. It returns an error rather than overwriting unreadable persisted state.
+func NewAPIWithStore(opMgr *orchestrator.OperationManager, store *state.Store) (*API, error) {
+	api := newAPI(opMgr, store)
+	if store == nil {
+		return api, nil
+	}
+	var persisted bigQueryMetadata
+	if err := store.Load(bigQueryStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api, nil
+		}
+		return nil, fmt.Errorf("load BigQuery metadata: %w", err)
+	}
+	if persisted.Datasets != nil {
+		api.datasets = persisted.Datasets
+	}
+	if persisted.Tables != nil {
+		api.tables = persisted.Tables
+	}
+	return api, nil
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, store *state.Store) *API {
 	return &API{
 		opMgr:    opMgr,
 		backend:  NewDuckDBBackend(),
+		store:    store,
 		datasets: make(map[string]*Dataset),
 		tables:   make(map[string]*Table),
 		jobs:     make(map[string]*Job),
 	}
+}
+
+const bigQueryStateEntry = "bigquery/metadata"
+
+type bigQueryMetadata struct {
+	Datasets map[string]*Dataset `json:"datasets"`
+	Tables   map[string]*Table   `json:"tables"`
+}
+
+// persistMetadataLocked requires api.mu to be held for writing.
+func (api *API) persistMetadataLocked() error {
+	if api.store == nil {
+		return nil
+	}
+	return api.store.Save(bigQueryStateEntry, bigQueryMetadata{
+		Datasets: api.datasets,
+		Tables:   api.tables,
+	})
 }
 
 // GetBackend exposes the backend for dynamic dashboard configuration.
@@ -290,6 +349,13 @@ func (api *API) routeDatasets(w http.ResponseWriter, r *http.Request, path strin
 		key := project + ":" + dsID
 		api.mu.Lock()
 		api.datasets[key] = ds
+		if err := api.persistMetadataLocked(); err != nil {
+			delete(api.datasets, key)
+			api.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist dataset metadata")
+			return
+		}
 		api.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(ds)
@@ -342,9 +408,16 @@ func (api *API) routeDatasets(w http.ResponseWriter, r *http.Request, path strin
 	case http.MethodDelete:
 		key := project + ":" + datasetId
 		api.mu.Lock()
-		_, ok := api.datasets[key]
+		deleted, ok := api.datasets[key]
 		if ok {
 			delete(api.datasets, key)
+			if err := api.persistMetadataLocked(); err != nil {
+				api.datasets[key] = deleted
+				api.mu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist dataset metadata")
+				return
+			}
 		}
 		api.mu.Unlock()
 		if !ok {
@@ -402,22 +475,27 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 				project, datasetId, tID),
 		}
 		key := tableKey(project, datasetId, tID)
-		api.mu.Lock()
-		api.tables[key] = t
-		api.mu.Unlock()
 
 		// Wire to DuckDB backend if enabled
 		if api.backend.Enabled() && t.Schema != nil {
 			if err := api.backend.CreateTable(project, datasetId, tID, t.Schema); err != nil {
 				log.Printf("[Shim: BigQuery] CreateTable failed for %s.%s: %v", datasetId, tID, err)
-				api.mu.Lock()
-				delete(api.tables, key)
-				api.mu.Unlock()
 				w.WriteHeader(http.StatusInternalServerError)
 				writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to create DuckDB table")
 				return
 			}
 		}
+
+		api.mu.Lock()
+		api.tables[key] = t
+		if err := api.persistMetadataLocked(); err != nil {
+			delete(api.tables, key)
+			api.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist table metadata")
+			return
+		}
+		api.mu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(t)
@@ -456,9 +534,16 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 	case http.MethodDelete:
 		key := tableKey(project, datasetId, tableId)
 		api.mu.Lock()
-		_, ok := api.tables[key]
+		deleted, ok := api.tables[key]
 		if ok {
 			delete(api.tables, key)
+			if err := api.persistMetadataLocked(); err != nil {
+				api.tables[key] = deleted
+				api.mu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist table metadata")
+				return
+			}
 		}
 		api.mu.Unlock()
 		if !ok {
@@ -517,6 +602,12 @@ func (api *API) insertAll(w http.ResponseWriter, r *http.Request, path string) {
 	api.mu.Lock()
 	table.rows = append(table.rows, rows...)
 	table.NumRows = fmt.Sprintf("%d", len(table.rows))
+	if err := api.persistMetadataLocked(); err != nil {
+		api.mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist table metadata")
+		return
+	}
 	api.mu.Unlock()
 
 	// GCP returns 200 with empty insertErrors on success

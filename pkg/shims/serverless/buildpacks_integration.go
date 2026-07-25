@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 )
 
@@ -40,42 +41,41 @@ type BuildpacksBackend struct {
 	builder  string // Buildpacks builder image to use
 	logStore map[string]*bytes.Buffer
 	logMu    sync.RWMutex
+	status   config.BackendState
 }
 
 // DefaultBuilder is the Google-24 stack builder that mirrors GCP's latest build environment.
 const DefaultBuilder = "gcr.io/buildpacks/builder:google-24"
 
-// NewBuildpacksBackend returns a BuildpacksBackend. Only active when
-// MINISKY_SERVERLESS_BACKEND=buildpacks is set.
+// NewBuildpacksBackend returns a backend selected by the runtime profile or an
+// explicit MINISKY_SERVERLESS_BACKEND override.
 func NewBuildpacksBackend() *BuildpacksBackend {
-	enabled := strings.EqualFold(os.Getenv("MINISKY_SERVERLESS_BACKEND"), "buildpacks")
+	selection := config.ResolveBackend("MINISKY_SERVERLESS_BACKEND", "buildpacks")
 	builder := os.Getenv("MINISKY_BUILDPACKS_BUILDER")
 	if builder == "" {
 		builder = DefaultBuilder
 	}
 
 	b := &BuildpacksBackend{
-		enabled:  enabled,
+		enabled:  selection.Requested,
 		builder:  builder,
 		logStore: make(map[string]*bytes.Buffer),
+		status:   selection.Effective(selection.Requested, ""),
 	}
 
-	if enabled {
-		binPath := orchestrator.GetPackBinaryName()
-		if _, err := exec.LookPath(binPath); err != nil {
-			// Fallback: check local bin
-			localPack := filepath.Join(orchestrator.GetLocalBinPath(), binPath)
-			if _, err := os.Stat(localPack); err == nil {
-				binPath = localPack
-			} else {
-				log.Printf("[Buildpacks] WARNING: MINISKY_SERVERLESS_BACKEND=buildpacks but 'pack' CLI not found. Falling back to in-memory simulation.")
-				b.enabled = false
-			}
+	if selection.Requested {
+		if missing := missingBuildpacksDependencies(); len(missing) > 0 {
+			diagnostic := fmt.Sprintf("Buildpacks dependencies missing (%s); using simulation", strings.Join(missing, ", "))
+			log.Printf("[Buildpacks] WARNING: %s", diagnostic)
+			b.enabled = false
+			b.status = selection.Effective(false, diagnostic)
 		}
 
 		if b.enabled {
 			log.Printf("[Buildpacks] ✅ Buildpacks integration ENABLED (builder: %s)", builder)
 		}
+	} else if b.status.Diagnostic != "" {
+		log.Printf("[Buildpacks] WARNING: %s", b.status.Diagnostic)
 	}
 	return b
 }
@@ -83,23 +83,48 @@ func NewBuildpacksBackend() *BuildpacksBackend {
 // Enabled reports whether Buildpacks backend is active.
 func (b *BuildpacksBackend) Enabled() bool { return b.enabled }
 
+// Status reports the effective backend selected after dependency checks.
+func (b *BuildpacksBackend) Status() config.BackendState { return b.status }
+
 // SetEnabled toggles the Buildpacks backend dynamically.
 func (b *BuildpacksBackend) SetEnabled(enabled bool) error {
-	b.enabled = enabled
 	if enabled {
-		binPath := orchestrator.GetPackBinaryName()
-		if _, err := exec.LookPath(binPath); err != nil {
-			localPack := filepath.Join(orchestrator.GetLocalBinPath(), binPath)
-			if _, err := os.Stat(localPack); err != nil {
-				b.enabled = false
-				return fmt.Errorf("'pack' CLI not found, cannot enable")
+		if missing := missingBuildpacksDependencies(); len(missing) > 0 {
+			b.enabled = false
+			b.status = config.BackendState{
+				Profile: config.GetRuntimeProfile().Name, Backend: config.RuntimeProfileSimulation,
+				Source: "dashboard", Diagnostic: fmt.Sprintf("Buildpacks dependencies missing (%s); using simulation", strings.Join(missing, ", ")),
 			}
+			return fmt.Errorf("missing Buildpacks dependencies: %s", strings.Join(missing, ", "))
+		}
+		b.enabled = true
+		b.status = config.BackendState{
+			Profile: config.GetRuntimeProfile().Name, Backend: "buildpacks", Enabled: true, Source: "dashboard",
 		}
 		log.Printf("[Buildpacks] dynamically ENABLED via UI")
 	} else {
+		b.enabled = false
+		b.status = config.BackendState{
+			Profile: config.GetRuntimeProfile().Name, Backend: config.RuntimeProfileSimulation, Source: "dashboard",
+		}
 		log.Printf("[Buildpacks] dynamically DISABLED via UI")
 	}
 	return nil
+}
+
+func missingBuildpacksDependencies() []string {
+	var missing []string
+	packName := orchestrator.GetPackBinaryName()
+	localPack := filepath.Join(orchestrator.GetLocalBinPath(), packName)
+	if _, err := os.Stat(localPack); err != nil {
+		if _, err := exec.LookPath(packName); err != nil {
+			missing = append(missing, "pack")
+		}
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		missing = append(missing, "docker")
+	}
+	return missing
 }
 
 func (b *BuildpacksBackend) GetLogs(name string) string {

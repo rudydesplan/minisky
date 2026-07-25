@@ -2,6 +2,7 @@ package dns
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
@@ -90,14 +93,99 @@ type zoneStore struct {
 // API is the high-fidelity Cloud DNS v1 shim.
 type API struct {
 	mu      sync.RWMutex
+	store   stateStore
 	zones   map[string]*zoneStore // key: project:zoneName
 	zoneSeq uint64
 }
 
+type stateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+const dnsStateEntry = "dns/metadata"
+
+type dnsMetadata struct {
+	Zones   map[string]persistedZone `json:"zones"`
+	ZoneSeq uint64                   `json:"zoneSeq"`
+}
+
+type persistedZone struct {
+	Zone      *ManagedZone                  `json:"zone"`
+	RRSets    map[string]*ResourceRecordSet `json:"rrsets"`
+	Changes   []*Change                     `json:"changes"`
+	ChangeSeq int                           `json:"changeSeq"`
+}
+
 func NewAPI() *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Cloud DNS] state disabled: %v", err)
+		return newAPI(nil)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		log.Printf("[Shim: Cloud DNS] state rehydration failed: %v", err)
+		return newAPI(store)
+	}
+	return api
+}
+
+// NewAPIWithStore constructs a DNS shim backed by the supplied metadata store.
+// It reports unreadable state instead of silently replacing it.
+func NewAPIWithStore(store stateStore) (*API, error) {
+	api := newAPI(store)
+	if store == nil {
+		return api, nil
+	}
+	var persisted dnsMetadata
+	if err := store.Load(dnsStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api, nil
+		}
+		return nil, fmt.Errorf("load DNS metadata: %w", err)
+	}
+	api.zoneSeq = persisted.ZoneSeq
+	for key, zone := range persisted.Zones {
+		rrsets := zone.RRSets
+		if rrsets == nil {
+			rrsets = make(map[string]*ResourceRecordSet)
+		}
+		api.zones[key] = &zoneStore{
+			zone:      zone.Zone,
+			rrsets:    rrsets,
+			changes:   zone.Changes,
+			changeSeq: zone.ChangeSeq,
+		}
+	}
+	return api, nil
+}
+
+func newAPI(store stateStore) *API {
 	return &API{
+		store: store,
 		zones: make(map[string]*zoneStore),
 	}
+}
+
+func (api *API) persistMetadata() error {
+	if api.store == nil {
+		return nil
+	}
+	api.mu.RLock()
+	metadata := snapshotDNSMetadata(api.zones, api.zoneSeq)
+	api.mu.RUnlock()
+	return api.store.Save(dnsStateEntry, metadata)
+}
+
+func (api *API) persistOrError(w http.ResponseWriter) bool {
+	if err := api.persistMetadata(); err != nil {
+		log.Printf("[Shim: Cloud DNS] persist metadata: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "Failed to persist DNS metadata")
+		return false
+	}
+	return true
 }
 
 // ServeHTTP dispatches Cloud DNS v1 paths.
@@ -248,6 +336,9 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 	api.zones[key] = store
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(zone)
 }
@@ -312,6 +403,9 @@ func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneN
 	zone := store.zone
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(zone)
 }
@@ -342,6 +436,9 @@ func (api *API) deleteZone(w http.ResponseWriter, project, zoneName string) {
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
+		return
+	}
+	if !api.persistOrError(w) {
 		return
 	}
 	// GCP returns 204 No Content on delete
@@ -421,6 +518,9 @@ func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zon
 	store.rrsets[rrk] = &rr
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(&rr)
 }
@@ -485,6 +585,9 @@ func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrTy
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("ResourceRecordSet '%s/%s' not found in zone '%s'", name, rrType, zoneName))
 		return
 	}
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -508,6 +611,9 @@ func (api *API) putRRSet(w http.ResponseWriter, r *http.Request, project, zoneNa
 	store.rrsets[rrKey(rr.Name, rr.Type)] = &rr
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(&rr)
 }
@@ -608,6 +714,9 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 	store.changes = append(store.changes, change)
 	api.mu.Unlock()
 
+	if !api.persistOrError(w) {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(change)
 }
@@ -707,4 +816,71 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 			"message": message,
 		},
 	})
+}
+
+func snapshotDNSMetadata(zones map[string]*zoneStore, zoneSeq uint64) dnsMetadata {
+	metadata := dnsMetadata{
+		Zones:   make(map[string]persistedZone, len(zones)),
+		ZoneSeq: zoneSeq,
+	}
+	for key, store := range zones {
+		persisted := persistedZone{
+			Zone:      cloneManagedZone(store.zone),
+			RRSets:    make(map[string]*ResourceRecordSet, len(store.rrsets)),
+			Changes:   make([]*Change, len(store.changes)),
+			ChangeSeq: store.changeSeq,
+		}
+		for rrKey, rrset := range store.rrsets {
+			persisted.RRSets[rrKey] = cloneRRSet(rrset)
+		}
+		for i, change := range store.changes {
+			clone := *change
+			clone.Additions = cloneRRSets(change.Additions)
+			clone.Deletions = cloneRRSets(change.Deletions)
+			persisted.Changes[i] = &clone
+		}
+		metadata.Zones[key] = persisted
+	}
+	return metadata
+}
+
+func cloneManagedZone(zone *ManagedZone) *ManagedZone {
+	if zone == nil {
+		return nil
+	}
+	clone := *zone
+	clone.NameServers = append([]string(nil), zone.NameServers...)
+	if zone.Labels != nil {
+		clone.Labels = make(map[string]string, len(zone.Labels))
+		for key, value := range zone.Labels {
+			clone.Labels[key] = value
+		}
+	}
+	if zone.DNSSECConfig != nil {
+		config := *zone.DNSSECConfig
+		clone.DNSSECConfig = &config
+	}
+	if zone.PrivateVisibilityConfig != nil {
+		config := *zone.PrivateVisibilityConfig
+		config.Networks = append([]PrivateNetwork(nil), config.Networks...)
+		clone.PrivateVisibilityConfig = &config
+	}
+	return &clone
+}
+
+func cloneRRSet(rrset *ResourceRecordSet) *ResourceRecordSet {
+	if rrset == nil {
+		return nil
+	}
+	clone := *rrset
+	clone.Rrdatas = append([]string(nil), rrset.Rrdatas...)
+	return &clone
+}
+
+func cloneRRSets(rrsets []ResourceRecordSet) []ResourceRecordSet {
+	clones := make([]ResourceRecordSet, len(rrsets))
+	for i := range rrsets {
+		clones[i] = *cloneRRSet(&rrsets[i])
+	}
+	return clones
 }

@@ -48,25 +48,34 @@ type DuckDBBackend struct {
 	enabled bool
 	dbPath  string
 	db      *sql.DB
+	status  config.BackendState
 }
 
-// NewDuckDBBackend returns a DuckDBBackend. Only active when
-// MINISKY_BQ_BACKEND=duckdb is set.
+// NewDuckDBBackend returns a DuckDBBackend selected by the runtime profile or
+// an explicit MINISKY_BQ_BACKEND override.
 func NewDuckDBBackend() *DuckDBBackend {
-	enabled := strings.EqualFold(os.Getenv("MINISKY_BQ_BACKEND"), "duckdb")
+	selection := config.ResolveBackend("MINISKY_BQ_BACKEND", "duckdb")
 	dbPath := os.Getenv("MINISKY_DUCKDB_PATH")
 	if dbPath == "" {
 		dbPath = filepath.Join(config.GetMiniskyDir(), "data", "bigquery.duckdb")
 	}
 
-	b := &DuckDBBackend{enabled: enabled, dbPath: dbPath}
+	b := &DuckDBBackend{
+		enabled: selection.Requested,
+		dbPath:  dbPath,
+		status:  selection.Effective(selection.Requested, ""),
+	}
 
-	if enabled {
+	if selection.Requested {
 		log.Printf("[DuckDBBackend] ✅ DuckDB integration ENABLED — queries will execute against %s", dbPath)
 		if err := b.init(); err != nil {
-			log.Printf("[DuckDBBackend] WARNING: DuckDB init failed: %v. Falling back to empty results.", err)
+			diagnostic := fmt.Sprintf("DuckDB initialization failed: %v; using simulation", err)
+			log.Printf("[DuckDBBackend] WARNING: %s", diagnostic)
 			b.enabled = false
+			b.status = selection.Effective(false, diagnostic)
 		}
+	} else if b.status.Diagnostic != "" {
+		log.Printf("[DuckDBBackend] WARNING: %s", b.status.Diagnostic)
 	}
 	return b
 }
@@ -74,19 +83,34 @@ func NewDuckDBBackend() *DuckDBBackend {
 // Enabled reports whether DuckDB backend is active.
 func (d *DuckDBBackend) Enabled() bool { return d.enabled }
 
+// Status reports the effective backend selected after initialization.
+func (d *DuckDBBackend) Status() config.BackendState { return d.status }
+
 // SetEnabled toggles the DuckDB backend dynamically.
 func (d *DuckDBBackend) SetEnabled(enabled bool) error {
 	if enabled {
 		log.Printf("[DuckDBBackend] dynamically ENABLED via UI")
 		if err := d.init(); err != nil {
 			d.enabled = false
+			d.status.Backend = config.RuntimeProfileSimulation
+			d.status.Enabled = false
+			d.status.Source = "dashboard"
+			d.status.Diagnostic = fmt.Sprintf("DuckDB initialization failed: %v; using simulation", err)
 			return err
 		}
 		d.enabled = true
+		d.status.Backend = "duckdb"
+		d.status.Enabled = true
+		d.status.Source = "dashboard"
+		d.status.Diagnostic = ""
 		return nil
 	}
 	log.Printf("[DuckDBBackend] dynamically DISABLED via UI")
 	d.enabled = false
+	d.status.Backend = config.RuntimeProfileSimulation
+	d.status.Enabled = false
+	d.status.Source = "dashboard"
+	d.status.Diagnostic = ""
 	return d.Close()
 }
 

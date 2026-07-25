@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
 	"strings"
+	"sync"
 
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
@@ -25,9 +27,10 @@ type EventObserver interface {
 }
 
 type API struct {
-	svcMgr   *orchestrator.ServiceManager
-	proxy    *httputil.ReverseProxy
-	observer EventObserver
+	svcMgr    *orchestrator.ServiceManager
+	proxy     *httputil.ReverseProxy
+	mu        sync.RWMutex
+	observers []EventObserver
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -43,7 +46,23 @@ func NewAPI(sm *orchestrator.ServiceManager) *API {
 }
 
 func (api *API) SetObserver(obs EventObserver) {
-	api.observer = obs
+	api.AddObserver(obs)
+}
+
+// AddObserver registers an event recipient without replacing existing recipients.
+// Registering the same observer more than once is a no-op.
+func (api *API) AddObserver(obs EventObserver) {
+	if obs == nil {
+		return
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, existing := range api.observers {
+		if sameObserver(existing, obs) {
+			return
+		}
+	}
+	api.observers = append(api.observers, obs)
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -97,11 +116,36 @@ func (api *API) handlePublish(w http.ResponseWriter, r *http.Request, targetURL 
 	target, _ := url.Parse(targetURL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
-	if api.observer != nil && topic != "" {
+	observers := api.eventObservers()
+	if len(observers) > 0 && topic != "" {
 		log.Printf("[PubSub Shim] 📢 Intercepted publish to topic: %s", topic)
-		api.observer.HandleEvent("google.cloud.pubsub.topic.v1.messagePublished", topic, string(body))
+		for _, observer := range observers {
+			observer.HandleEvent("google.cloud.pubsub.topic.v1.messagePublished", topic, string(body))
+		}
 	}
 
 	log.Printf("[PubSub Shim] %s %s", r.Method, r.URL.Path)
 	proxy.ServeHTTP(w, r)
+}
+
+func (api *API) eventObservers() []EventObserver {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]EventObserver(nil), api.observers...)
+}
+
+func sameObserver(a, b EventObserver) bool {
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	if av.Type() != bv.Type() {
+		return false
+	}
+	if av.Type().Comparable() {
+		return av.Interface() == bv.Interface()
+	}
+	switch av.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.Slice:
+		return av.Pointer() == bv.Pointer()
+	default:
+		return false
+	}
 }
