@@ -16,6 +16,18 @@ variable "enable_phase15_resources" {
   default     = false
 }
 
+variable "enable_phase10_lb_resources" {
+  description = "Create the optional local classic global HTTP load-balancer compatibility graph"
+  type        = bool
+  default     = false
+}
+
+variable "enable_phase10_artifact_resources" {
+  description = "Create the optional local Artifact Registry repository compatibility resource"
+  type        = bool
+  default     = false
+}
+
 variable "local_access_token" {
   description = "Non-secret access token used only for the local MiniSky profile"
   type        = string

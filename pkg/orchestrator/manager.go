@@ -560,6 +560,24 @@ func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
 // ProvisionComputeVM actively boots a Data Plane Docker container mimicking a GCE VM.
 func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning compute VM: %s (image: %s vpc: %s ports: %d env: %d cmd: %v)", containerName, osImage, vpcName, len(ports), len(env), cmd)
+	if !validDockerResourceName(containerName) {
+		return fmt.Errorf("invalid Compute container name")
+	}
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return fmt.Errorf("inspect Compute container: %w", err)
+	}
+	if status != "not_found" {
+		if !isOwnedComputeVM(labels, containerName) {
+			return fmt.Errorf("Compute container %q exists but is not owned by this profile and resource", containerName)
+		}
+		if status != "running" {
+			if err := sm.startContainer(containerName); err != nil {
+				return err
+			}
+		}
+		return sm.updatePortRegistry(containerName)
+	}
 
 	exists, err := sm.ImageExistsPublic(osImage)
 	if err != nil {
@@ -590,11 +608,14 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 		}
 	}
 
+	resourceLabels := ownedDockerLabels()
+	resourceLabels["minisky.service"] = "compute-instance"
+	resourceLabels["minisky.resource"] = containerName
 	payload := map[string]interface{}{
 		"Image":        osImage,
 		"Env":          append(sm.standardEnv(), env...),
 		"ExposedPorts": exposedPorts,
-		"Labels":       ownedDockerLabels(),
+		"Labels":       resourceLabels,
 		"HostConfig": map[string]interface{}{
 			"NetworkMode":  netMode,
 			"PortBindings": portBindings,
@@ -604,8 +625,8 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 		payload["Cmd"] = cmd
 	}
 	data, _ := json.Marshal(payload)
-	url := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	endpoint := "http://localhost/containers/create?name=" + url.QueryEscape(containerName)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := sm.dockerClient.Do(req)
@@ -614,7 +635,7 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict { // 409
+	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("vm creation rejected %d: %s", resp.StatusCode, b)
 	}
@@ -1034,19 +1055,46 @@ func (sm *ServiceManager) DeleteCloudSQLVM(instanceName string) error {
 // DeleteComputeVM permanently destroys a physical Data Plane compute instance.
 func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
 	log.Printf("[Orchestrator] Tearing down Data Plane VM: %s", containerName)
+	if !validDockerResourceName(containerName) {
+		return fmt.Errorf("invalid Compute container name")
+	}
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status == "not_found" {
+		return nil
+	}
+	if !isOwnedComputeVM(labels, containerName) {
+		return fmt.Errorf("refusing to delete unowned Compute container %q", containerName)
+	}
 
-	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", containerName)
+	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", url.PathEscape(containerName))
 	req, _ := http.NewRequest("POST", stopURL, nil)
-	sm.dockerClient.Do(req)
+	if response, stopErr := sm.dockerClient.Do(req); stopErr == nil {
+		response.Body.Close()
+	}
 
-	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", containerName)
+	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", url.PathEscape(containerName))
 	req, _ = http.NewRequest("DELETE", rmURL, nil)
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete Compute container returned %d", resp.StatusCode)
+	}
+	sm.mu.Lock()
+	delete(sm.portRegistry, containerName)
+	sm.mu.Unlock()
 	return nil
+}
+
+func isOwnedComputeVM(labels map[string]string, containerName string) bool {
+	return isOwnedDockerResource(labels) &&
+		labels["minisky.service"] == "compute-instance" &&
+		labels["minisky.resource"] == containerName
 }
 
 // ProvisionServerlessVM starts a container from a custom image (typically built by Buildpacks).

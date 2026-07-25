@@ -97,3 +97,116 @@ resource "google_spanner_database" "compatibility" {
     "CREATE TABLE Entries (Id STRING(64) NOT NULL, Value STRING(MAX)) PRIMARY KEY (Id)",
   ]
 }
+
+# The repository metadata is served by MiniSky while pushed image manifests and
+# blobs live in the profile-owned Registry v2 backend.
+resource "google_artifact_registry_repository" "phase10" {
+  count = local.use_minisky && var.enable_phase10_artifact_resources ? 1 : 0
+
+  location      = var.region
+  repository_id = "minisky-phase10"
+  description   = "MiniSky Phase-10 Artifact Registry compatibility"
+  format        = "DOCKER"
+
+  labels = {
+    environment = "minisky"
+    managed_by  = "terraform"
+  }
+}
+
+# This local-only graph intentionally exercises the bounded classic global HTTP
+# load-balancer slice: one unmanaged zonal group and defaultService routing.
+resource "google_compute_firewall" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name    = "minisky-phase10-http"
+  network = "default"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+
+  source_ranges = ["127.0.0.1/32"]
+}
+
+resource "google_compute_instance" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name         = "minisky-phase10-http"
+  machine_type = "e2-micro"
+  zone         = "us-central1-a"
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    network = "default"
+  }
+
+  depends_on = [google_compute_firewall.phase10_http]
+}
+
+resource "google_compute_instance_group" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name      = "minisky-phase10-http"
+  zone      = "us-central1-a"
+  instances = [google_compute_instance.phase10_http[0].self_link]
+
+  named_port {
+    name = "http"
+    port = 80
+  }
+}
+
+resource "google_compute_health_check" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name = "minisky-phase10-http"
+
+  http_health_check {
+    port         = 80
+    request_path = "/"
+  }
+}
+
+resource "google_compute_backend_service" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name          = "minisky-phase10-http"
+  protocol      = "HTTP"
+  port_name     = "http"
+  health_checks = [google_compute_health_check.phase10_http[0].self_link]
+
+  backend {
+    group = google_compute_instance_group.phase10_http[0].self_link
+  }
+}
+
+resource "google_compute_url_map" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name            = "minisky-phase10-http"
+  default_service = google_compute_backend_service.phase10_http[0].self_link
+}
+
+resource "google_compute_target_http_proxy" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name    = "minisky-phase10-http"
+  url_map = google_compute_url_map.phase10_http[0].self_link
+}
+
+resource "google_compute_global_forwarding_rule" "phase10_http" {
+  count = local.use_minisky && var.enable_phase10_lb_resources ? 1 : 0
+
+  name                  = "minisky-phase10-http"
+  target                = google_compute_target_http_proxy.phase10_http[0].self_link
+  port_range            = "80"
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+}

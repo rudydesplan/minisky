@@ -12,6 +12,7 @@ builds:
   - id: linux-amd64
     main: ./cmd/minisky
     binary: minisky
+    skip: '{{ and (ne (index .Env "MINISKY_GORELEASER_TARGET") "") (ne (index .Env "MINISKY_GORELEASER_TARGET") "linux-amd64") }}'
     env: [CGO_ENABLED=1]
     goos: [linux]
     goarch: [amd64]
@@ -22,6 +23,7 @@ builds:
   - id: linux-arm64
     main: ./cmd/minisky
     binary: minisky
+    skip: '{{ and (ne (index .Env "MINISKY_GORELEASER_TARGET") "") (ne (index .Env "MINISKY_GORELEASER_TARGET") "linux-arm64") }}'
     env: [CGO_ENABLED=1]
     goos: [linux]
     goarch: [arm64]
@@ -32,6 +34,7 @@ builds:
   - id: darwin-arm64
     main: ./cmd/minisky
     binary: minisky
+    skip: '{{ and (ne (index .Env "MINISKY_GORELEASER_TARGET") "") (ne (index .Env "MINISKY_GORELEASER_TARGET") "darwin-arm64") }}'
     env:
       - CGO_ENABLED=1
       - CC=clang
@@ -44,6 +47,7 @@ builds:
   - id: windows-amd64
     main: ./cmd/minisky
     binary: minisky
+    skip: '{{ and (ne (index .Env "MINISKY_GORELEASER_TARGET") "") (ne (index .Env "MINISKY_GORELEASER_TARGET") "windows-amd64") }}'
     env:
       - CGO_ENABLED=1
       - CC=gcc

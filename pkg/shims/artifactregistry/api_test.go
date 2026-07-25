@@ -6,17 +6,106 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"minisky/pkg/orchestrator"
 )
 
-func TestListPackagesUsesRegistryCatalog(t *testing.T) {
+func TestRepositoryCreateOperationReadDeleteLifecycle(t *testing.T) {
+	api := newTestAPI("http://registry.invalid")
+	const repositoryName = "projects/test/locations/us/repositories/apps"
+
+	created := serve(t, api, http.MethodPost, "/v1/projects/test/locations/us/repositories?repository_id=apps", `{
+		"format":"DOCKER",
+		"description":"application images",
+		"labels":{"environment":"test"}
+	}`)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var createOperation struct {
+		Name string `json:"name"`
+		Done bool   `json:"done"`
+	}
+	decodeResponse(t, created, &createOperation)
+	if !strings.HasPrefix(createOperation.Name, "projects/test/locations/us/operations/") {
+		t.Fatalf("create operation name = %q", createOperation.Name)
+	}
+	if createOperation.Done {
+		t.Fatal("create operation was immediately done")
+	}
+
+	createResult := pollOperation(t, api, createOperation.Name)
+	var createdRepository Repository
+	response, ok := createResult["response"]
+	if !ok {
+		t.Fatalf("terminal create operation = %#v", createResult)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal create response: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &createdRepository); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if createdRepository.Name != repositoryName || createdRepository.Format != "DOCKER" {
+		t.Fatalf("created repository = %#v", createdRepository)
+	}
+
+	read := serve(t, api, http.MethodGet, "/v1/"+repositoryName, "")
+	if read.Code != http.StatusOK {
+		t.Fatalf("read status = %d, body = %s", read.Code, read.Body.String())
+	}
+	var readRepository Repository
+	decodeResponse(t, read, &readRepository)
+	if readRepository.Name != repositoryName ||
+		readRepository.Description != "application images" ||
+		readRepository.Labels["environment"] != "test" ||
+		readRepository.CreateTime == "" ||
+		readRepository.UpdateTime != readRepository.CreateTime {
+		t.Fatalf("read repository = %#v", readRepository)
+	}
+
+	deleted := serve(t, api, http.MethodDelete, "/v1/"+repositoryName, "")
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", deleted.Code, deleted.Body.String())
+	}
+	var deleteOperation struct {
+		Name string `json:"name"`
+		Done bool   `json:"done"`
+	}
+	decodeResponse(t, deleted, &deleteOperation)
+	if !strings.HasPrefix(deleteOperation.Name, "projects/test/locations/us/operations/") {
+		t.Fatalf("delete operation name = %q", deleteOperation.Name)
+	}
+	deleteResult := pollOperation(t, api, deleteOperation.Name)
+	if _, ok := deleteResult["response"]; !ok {
+		t.Fatalf("terminal delete operation = %#v", deleteResult)
+	}
+
+	missing := serve(t, api, http.MethodGet, "/v1/"+repositoryName, "")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("read after delete status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+	assertErrorStatus(t, missing, "NOT_FOUND")
+}
+
+func TestUnknownRepositoryOperationReturnsNotFound(t *testing.T) {
+	api := newTestAPI("http://registry.invalid")
+	response := serve(t, api, http.MethodGet, "/v1/projects/test/locations/us/operations/missing", "")
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	assertErrorStatus(t, response, "NOT_FOUND")
+}
+
+func TestListPackagesUsesRepositoryScopedRegistryCatalog(t *testing.T) {
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/_catalog" {
 			t.Fatalf("unexpected registry path: %s", r.URL.Path)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"repositories": []string{"team/api", "worker"},
+			"repositories": []string{"apps/team/api", "apps/worker", "other/unrelated"},
 		})
 	}))
 	defer registry.Close()
@@ -45,11 +134,11 @@ func TestListPackagesUsesRegistryCatalog(t *testing.T) {
 
 func TestListVersionsUsesRegistryTags(t *testing.T) {
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/team/api/tags/list" {
+		if r.URL.Path != "/v2/apps/team/api/tags/list" {
 			t.Fatalf("unexpected registry path: %s", r.URL.Path)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"name": "team/api",
+			"name": "apps/team/api",
 			"tags": []string{"latest", "v1.2.3"},
 		})
 	}))
@@ -83,7 +172,7 @@ func TestEmptyRegistryReturnsEmptyCollections(t *testing.T) {
 		switch r.URL.Path {
 		case "/v2/_catalog":
 			_, _ = w.Write([]byte(`{"repositories":[]}`))
-		case "/v2/empty/tags/list":
+		case "/v2/apps/empty/tags/list":
 			_, _ = w.Write([]byte(`{"name":"empty","tags":null}`))
 		default:
 			http.NotFound(w, r)
@@ -130,6 +219,41 @@ func TestDeleteRepository(t *testing.T) {
 	missing := serve(t, api, http.MethodDelete, "/v1/projects/test/locations/us/repositories/apps", "")
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("second delete status = %d, want %d", missing.Code, http.StatusNotFound)
+	}
+}
+
+func pollOperation(t *testing.T, api *API, name string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		response := serve(t, api, http.MethodGet, "/v1/"+name, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("poll %q status = %d, body = %s", name, response.Code, response.Body.String())
+		}
+		var operation map[string]any
+		decodeResponse(t, response, &operation)
+		if done, _ := operation["done"].(bool); done {
+			if operation["error"] != nil {
+				t.Fatalf("operation failed: %#v", operation)
+			}
+			return operation
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("operation %q did not complete", name)
+	return nil
+}
+
+func assertErrorStatus(t *testing.T, response *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &body)
+	if body.Error.Status != want {
+		t.Fatalf("error status = %q, want %q", body.Error.Status, want)
 	}
 }
 

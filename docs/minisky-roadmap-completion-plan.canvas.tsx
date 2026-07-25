@@ -22,8 +22,8 @@ const phases = [
   ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; optional Phase-15 Terraform remains"],
   ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
   ["9", "Serverless and events", "Verified local slice", "Pack-backed Scheduler, Tasks, Storage, and Pub/Sub delivery passes locally"],
-  ["10", "Networking and artifacts", "Local slice", "Docker push/LB Terraform integration remains gated"],
-  ["11", "DX and distribution", "Verified local slice", "macOS ARM64 snapshot smoke passes; native Linux package publication remains"],
+  ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
+  ["11", "DX and distribution", "Verified local slice", "Native amd64/arm64 deb/rpm install gates pass; publication remains external"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
   ["13", "Security simulation", "Local slice", "Provider-backed WIF and delegated impersonation remain 501"],
   ["14", "Multi-tenancy", "Metadata slice", "Shared Docker backends are not project-isolated"],
@@ -129,24 +129,24 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Stack>
 
       <Callout tone="info" title="Implementation status">
-        Guarded Terraform, state durability, Buildpacks event delivery, and Phase-15 emulator data-plane
-        gates now pass locally. Remaining completion work is concentrated in Phase-10 load-balancer/artifact
-        integration, native Linux package installation, credentialed publication, and explicit unsupported
-        production-grade semantics.
+        Guarded Terraform-managed HTTP load balancing and Artifact Registry push/list/delete now pass locally,
+        alongside state durability, Buildpacks delivery, and Phase-15 emulator gates. Native amd64 and arm64
+        deb/rpm build-install-smoke-uninstall jobs also pass in read-only CI. Credentialed publication and
+        production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>4 passed</H2><Text tone="secondary">Terraform, durability, events, and Phase 15</Text></CardBody>
+          <CardBody><H2>5 passed</H2><Text tone="secondary">Including Phase-10 traffic and artifacts</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
           <CardBody><H2>Passed</H2><Text tone="secondary">macOS ARM64 snapshot and DuckDB doctor</Text></CardBody>
         </Card>
         <Card>
-          <CardHeader>Remaining external gate</CardHeader>
-          <CardBody><H2>Linux packages</H2><Text tone="secondary">Native install and credentialed publication</Text></CardBody>
+          <CardHeader>Native package gates</CardHeader>
+          <CardBody><H2>Passed</H2><Text tone="secondary">amd64 and arm64 deb/rpm lifecycle</Text></CardBody>
         </Card>
       </Grid>
 
@@ -215,9 +215,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Complete the Phase-10 Terraform load-balancer and registry push/list/delete workflows, then validate
-        deb/rpm installation on native Linux runners. Homebrew and Scoop publication remains blocked until
-        maintainer-owned repositories, scoped credentials, and protected approval gates exist.
+        Homebrew, Scoop, deb, and rpm publication remains blocked until maintainer-owned repositories,
+        scoped credentials, protected approval environments, and native install-from-repository tests exist.
       </Callout>
     </Stack>
   );

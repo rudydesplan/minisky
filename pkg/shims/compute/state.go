@@ -13,10 +13,11 @@ import (
 const computeStateEntry = "compute/metadata"
 
 type computeMetadata struct {
-	Instances     map[string]*Instance              `json:"instances"`
-	Networks      map[string]*Network               `json:"networks"`
-	Firewalls     map[string]*FirewallRule          `json:"firewalls"`
-	LoadBalancers map[string]map[string]interface{} `json:"loadBalancers"`
+	Instances      map[string]*Instance              `json:"instances"`
+	Networks       map[string]*Network               `json:"networks"`
+	Firewalls      map[string]*FirewallRule          `json:"firewalls"`
+	InstanceGroups map[string]*InstanceGroup         `json:"instanceGroups"`
+	LoadBalancers  map[string]map[string]interface{} `json:"loadBalancers"`
 }
 
 // NewAPIWithStore constructs a Compute shim backed by the supplied profile store.
@@ -48,6 +49,9 @@ func NewAPIWithStore(
 	if persisted.Firewalls != nil {
 		api.firewalls = persisted.Firewalls
 	}
+	if persisted.InstanceGroups != nil {
+		api.instanceGroups = persisted.InstanceGroups
+	}
 	if persisted.LoadBalancers != nil {
 		api.loadBalancers = persisted.LoadBalancers
 	}
@@ -77,10 +81,11 @@ func (api *API) persistMetadata() error {
 
 	api.mu.RLock()
 	payload, err := json.Marshal(computeMetadata{
-		Instances:     api.instances,
-		Networks:      api.networks,
-		Firewalls:     api.firewalls,
-		LoadBalancers: api.loadBalancers,
+		Instances:      api.instances,
+		Networks:       api.networks,
+		Firewalls:      api.firewalls,
+		InstanceGroups: api.instanceGroups,
+		LoadBalancers:  api.loadBalancers,
 	})
 	api.mu.RUnlock()
 	if err != nil {

@@ -30,6 +30,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 
 | Provider setting | Canonical endpoint | Routed domain |
 | :--- | :--- | :--- |
+| `artifact_registry_custom_endpoint` | `http://127.0.0.1:8080/_minisky/artifactregistry/` | `artifactregistry.googleapis.com` |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
 | `redis_custom_endpoint` | `http://127.0.0.1:8080/_minisky/redis/v1/` | `redis.googleapis.com` |
@@ -50,6 +51,7 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_bigquery_table` | Profile-persisted table and schema metadata CRUD | Synchronous | Table reference is read through the canonical endpoint |
 | `google_service_account` | Profile-persisted service-account metadata CRUD | Synchronous | Account email is read through the canonical endpoint |
 | `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
+| `google_artifact_registry_repository` (optional Phase 10) | In-memory repository metadata plus repository-scoped Registry v2 package/version views | Service LRO | Repository is created, read without drift, destroyed, and returns 404 |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
@@ -62,10 +64,13 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Redis and Spanner resources are disabled by default and local-profile-only
-because `emulator-config` is not a production Spanner configuration. Enable
-them with `enable_phase15_resources = true`; their outputs are `null` while
-disabled. The guarded Terraform script accepts `MINISKY_TERRAFORM_PHASE15=1`,
+The Artifact Registry, Redis, and Spanner resources are disabled by default and
+local-profile-only. Artifact Registry uses profile-owned Registry v2, and
+`emulator-config` is not a production Spanner configuration. Enable Artifact
+Registry with `enable_phase10_artifact_resources = true` and Redis and Spanner
+with `enable_phase15_resources = true`; their outputs are `null` while disabled.
+The guarded Terraform script accepts
+`MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
 data-plane gate. Resources not listed above are not claimed as
 Terraform-compatible. In particular, the tracked stack excludes Compute,
@@ -159,6 +164,15 @@ The separate opt-in `state-durability-integration` workflow runs the persisted
 BigQuery/IAM subset through create → restart → no-drift → metadata export →
 clean-profile import → no-drift → destroy. It intentionally excludes Storage
 because metadata snapshots do not archive Docker emulator data.
+
+The separate guarded `scripts/phase10-artifact-integration.sh` creates a
+repository through the public gateway, cold-starts the profile-owned
+`registry:2` backend, uploads a deterministic two-blob image to its dynamic
+loopback port, verifies repository-scoped package and version responses, and
+deletes the manifest by Registry v2 digest. It then deletes the repository and
+proves that no owned container or network remains. It requires
+`MINISKY_PHASE10_INTEGRATION=1`; GCP package/version DELETE remains outside the
+supported boundary.
 
 Run the same gate locally only on an otherwise idle MiniSky Docker environment:
 

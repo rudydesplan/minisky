@@ -37,6 +37,13 @@ func TestComputeMetadataRehydratesAndPreservesLoadBalancerDataPlane(t *testing.T
 	}
 	api.networks["test-project:network"] = &Network{Name: "network"}
 	api.firewalls["test-project:allow-http"] = &FirewallRule{Name: "allow-http"}
+	api.instanceGroups["test-project:us-central1-a:web"] = &InstanceGroup{
+		Name:       "web",
+		Zone:       computeZoneSelfLink("test-project", "us-central1-a"),
+		NamedPorts: []NamedPort{{Name: "http", Port: 80}},
+		Instances:  []string{selfLinkInstance("test-project", "us-central1-a", "vm")},
+		Size:       1,
+	}
 	createLoadBalancerResourceForTest(t, api, "healthChecks",
 		`{"name":"health","httpHealthCheck":{"requestPath":"/healthz"}}`)
 	createLoadBalancerResourceForTest(t, api, "backendServices",
@@ -60,6 +67,10 @@ func TestComputeMetadataRehydratesAndPreservesLoadBalancerDataPlane(t *testing.T
 	}
 	if restarted.networks["test-project:network"] == nil || restarted.firewalls["test-project:allow-http"] == nil {
 		t.Fatal("network or firewall metadata was not restored")
+	}
+	group := restarted.instanceGroups["test-project:us-central1-a:web"]
+	if group == nil || group.Size != 1 || len(group.NamedPorts) != 1 || len(group.Instances) != 1 {
+		t.Fatalf("instance-group metadata was not restored: %#v", group)
 	}
 
 	response := performComputeRequest(

@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-phase17 benchmark
+.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase17 benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -14,6 +14,10 @@ test-integration:
 	MINISKY_EVENT_INTEGRATION=1 ./scripts/event-delivery-integration.sh
 	MINISKY_STATE_DURABILITY_INTEGRATION=1 ./scripts/state-durability-integration.sh
 	MINISKY_TERRAFORM_INTEGRATION=1 ./scripts/terraform-integration.sh
+	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
+
+test-phase10-artifact:
+	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
 
 test-phase17:
 	go test ./scripts ./pkg/pluginsdk ./pkg/security ./pkg/dashboard ./pkg/router ./pkg/observability ./cmd/minisky

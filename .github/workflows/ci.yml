@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_phase10_artifact_integration:
+        description: Run Artifact Registry repository and Registry v2 acceptance
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -137,7 +142,7 @@ jobs:
         run: terraform validate
 
       - name: Validate integration script syntax
-        run: bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/phase15-emulator-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+        run: bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/phase10-artifact-integration.sh scripts/phase15-emulator-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
 
       - name: Verify air-gapped bundle workflow
         run: ./scripts/airgap-bundle-test.sh
@@ -307,6 +312,34 @@ jobs:
           MINISKY_PHASE15_INTEGRATION: "1"
         run: bash scripts/phase15-emulator-integration.sh
 
+  phase10-artifact-integration:
+    name: Artifact Registry API and data-plane acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase10_artifact_integration
+    needs:
+      - quality
+      - terraform-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase-10 Artifact Registry integration
+        env:
+          MINISKY_PHASE10_INTEGRATION: "1"
+        run: bash scripts/phase10-artifact-integration.sh
+
   release-snapshot:
     name: Validate release configuration
     runs-on: ubuntu-latest
@@ -344,6 +377,59 @@ jobs:
           distribution: goreleaser
           version: "~> v2"
           args: build --snapshot --clean --id linux-amd64
+
+  linux-packages:
+    name: Install Linux packages (${{ matrix.name }})
+    needs: quality
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            expected_arch: x86_64
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            expected_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify native Linux architecture
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Install rpm inspection and package tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm
+
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          install-only: true
+
+      - name: Build, install, smoke-test, and remove deb/rpm
+        env:
+          MINISKY_LINUX_PACKAGE_INTEGRATION: "1"
+        run: ./scripts/linux-package-integration.sh
 
   native-cgo:
     name: DuckDB conformance (${{ matrix.name }})

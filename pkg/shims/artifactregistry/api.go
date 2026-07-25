@@ -33,6 +33,7 @@ type Repository struct {
 	Labels      map[string]string `json:"labels,omitempty"`
 	CreateTime  string            `json:"createTime,omitempty"`
 	UpdateTime  string            `json:"updateTime,omitempty"`
+	Mode        string            `json:"mode,omitempty"`
 }
 
 type Package struct {
@@ -160,11 +161,19 @@ func NewAPIWithRegistryIndex(opMgr *orchestrator.OperationManager, sm *orchestra
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	if strings.Contains(path, "/operations/") {
+		if r.Method == http.MethodGet {
+			api.handleGetOperation(w, r)
+			return
+		}
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Artifact Registry operation not found")
+		return
+	}
 	// v1/projects/{project}/locations/{location}/repositories
 	if strings.Contains(path, "/repositories") {
 		if strings.Contains(path, "/packages") {
 			if r.Method != http.MethodGet {
-				writeError(w, http.StatusNotImplemented, "package and version mutation is not supported; use the Docker Registry v2 API with a manifest digest")
+				writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "package and version mutation is not supported; use the Docker Registry v2 API with a manifest digest")
 				return
 			}
 			if strings.HasSuffix(strings.TrimRight(path, "/"), "/versions") {
@@ -174,20 +183,102 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			api.handleListPackages(w, r)
 			return
 		}
+		isCollection := strings.HasSuffix(strings.TrimRight(path, "/"), "/repositories")
 		switch r.Method {
 		case http.MethodGet:
-			api.handleListRepositories(w, r)
+			if isCollection {
+				api.handleListRepositories(w, r)
+			} else {
+				api.handleGetRepository(w, r)
+			}
 			return
 		case http.MethodPost:
-			api.handleCreateRepository(w, r)
-			return
+			if isCollection {
+				api.handleCreateRepository(w, r)
+				return
+			}
 		case http.MethodDelete:
-			api.handleDeleteRepository(w, r)
-			return
+			if !isCollection {
+				api.handleDeleteRepository(w, r)
+				return
+			}
 		}
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	writeError(w, http.StatusNotFound, "NOT_FOUND", "Artifact Registry resource not found")
+}
+
+func (api *API) handleGetRepository(w http.ResponseWriter, r *http.Request) {
+	name := resourceName(r.URL.Path)
+	api.mu.RLock()
+	repository := cloneRepository(api.repos[name])
+	api.mu.RUnlock()
+	if repository == nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "repository not found: "+name)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(repository)
+}
+
+func (api *API) handleGetOperation(w http.ResponseWriter, r *http.Request) {
+	serviceName := resourceName(r.URL.Path)
+	managerName := serviceName[strings.LastIndex(serviceName, "/")+1:]
+	if api.opMgr == nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Artifact Registry operation not found: "+serviceName)
+		return
+	}
+	operation := api.opMgr.Get(managerName)
+	if operation == nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Artifact Registry operation not found: "+serviceName)
+		return
+	}
+	api.writeOperation(w, serviceName, operation)
+}
+
+func (api *API) writeOperation(w http.ResponseWriter, serviceName string, operation *orchestrator.Operation) {
+	response := map[string]any{
+		"name": serviceName,
+		"done": operation.Done,
+		"metadata": map[string]any{
+			"target": operation.TargetLink,
+			"verb":   operation.OperationType,
+		},
+	}
+	if operation.Error != nil {
+		response["error"] = operation.Error
+	} else if operation.Done {
+		if operation.OperationType == "DELETE" {
+			response["response"] = map[string]any{}
+		} else {
+			api.mu.RLock()
+			repository := cloneRepository(api.repos[operation.TargetLink])
+			api.mu.RUnlock()
+			if repository != nil {
+				response["response"] = repository
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func resourceName(path string) string {
+	return strings.Trim(strings.TrimPrefix(path, "/v1/"), "/")
+}
+
+func cloneRepository(repository *Repository) *Repository {
+	if repository == nil {
+		return nil
+	}
+	clone := *repository
+	if repository.Labels != nil {
+		clone.Labels = make(map[string]string, len(repository.Labels))
+		for key, value := range repository.Labels {
+			clone.Labels[key] = value
+		}
+	}
+	return &clone
 }
 
 func (api *API) handleListRepositories(w http.ResponseWriter, r *http.Request) {
@@ -221,7 +312,7 @@ func (api *API) handleListRepositories(w http.ResponseWriter, r *http.Request) {
 func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 	var repo Repository
 	if err := json.NewDecoder(r.Body).Decode(&repo); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid repository JSON")
 		return
 	}
 
@@ -240,11 +331,26 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repoId := r.URL.Query().Get("repositoryId")
+	if repoId == "" {
+		repoId = r.URL.Query().Get("repository_id")
+	}
+	if repoId == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "repositoryId is required")
+		return
+	}
 	repo.Name = fmt.Sprintf("projects/%s/locations/%s/repositories/%s", project, location, repoId)
-	repo.CreateTime = time.Now().Format(time.RFC3339)
+	repo.CreateTime = time.Now().UTC().Format(time.RFC3339Nano)
 	repo.UpdateTime = repo.CreateTime
+	if repo.Mode == "" {
+		repo.Mode = "STANDARD_REPOSITORY"
+	}
 
 	api.mu.Lock()
+	if _, exists := api.repos[repo.Name]; exists {
+		api.mu.Unlock()
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "repository already exists: "+repo.Name)
+		return
+	}
 	api.repos[repo.Name] = &repo
 	api.mu.Unlock()
 
@@ -258,10 +364,11 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		delete(api.repos, repo.Name)
 		api.mu.Unlock()
-		writeError(w, http.StatusInternalServerError, "failed to persist repository operation")
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation")
 		return
 	}
-	_ = json.NewEncoder(w).Encode(op)
+	serviceName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
+	api.writeOperation(w, serviceName, op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 }
 
@@ -282,11 +389,20 @@ func (api *API) handleListPackages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	repositoryID := repositoryIDFromParent(parent)
+	prefix := repositoryID + "/"
 	packages := make([]Package, 0, len(repositories))
 	for _, repository := range repositories {
+		if !strings.HasPrefix(repository, prefix) {
+			continue
+		}
+		packageID := strings.TrimPrefix(repository, prefix)
+		if packageID == "" {
+			continue
+		}
 		packages = append(packages, Package{
-			Name:        parent + "/packages/" + repository,
-			DisplayName: repository,
+			Name:        parent + "/packages/" + packageID,
+			DisplayName: packageID,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -319,7 +435,8 @@ func (api *API) handleListVersions(w http.ResponseWriter, r *http.Request) {
 		writeUpstreamError(w, err)
 		return
 	}
-	tags, err := index.Tags(r.Context(), packageID)
+	registryRepository := repositoryIDFromParent(repositoryParent) + "/" + packageID
+	tags, err := index.Tags(r.Context(), registryRepository)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -348,7 +465,11 @@ func (api *API) registryIndex(ctx context.Context) (RegistryIndex, error) {
 	if api.svcMgr == nil {
 		return nil, fmt.Errorf("Docker Registry backend is not configured")
 	}
-	baseURL, err := api.svcMgr.EnsureServiceRunning(ctx, "artifactregistry.googleapis.com")
+	baseURL, err := api.svcMgr.EnsureServiceRunning(
+		ctx,
+		"artifactregistry.googleapis.com",
+		"REGISTRY_STORAGE_DELETE_ENABLED=true",
+	)
 	if err != nil {
 		return nil, fmt.Errorf("start owned registry backend: %w", err)
 	}
@@ -364,7 +485,7 @@ func (api *API) registryIndex(ctx context.Context) (RegistryIndex, error) {
 }
 
 func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
-	name := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/"), "/")
+	name := resourceName(r.URL.Path)
 	if name == "" || strings.HasSuffix(name, "/repositories") {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -377,7 +498,7 @@ func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
 	}
 	api.mu.Unlock()
 	if !exists {
-		writeError(w, http.StatusNotFound, "repository not found: "+name)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "repository not found: "+name)
 		return
 	}
 
@@ -392,11 +513,32 @@ func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		api.repos[name] = repo
 		api.mu.Unlock()
-		writeError(w, http.StatusInternalServerError, "failed to persist repository operation")
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation")
 		return
 	}
-	_ = json.NewEncoder(w).Encode(op)
+	project := projectFromResource(repo.Name)
+	serviceName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
+	api.writeOperation(w, serviceName, op)
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
+}
+
+func repositoryIDFromParent(parent string) string {
+	const marker = "/repositories/"
+	position := strings.LastIndex(parent, marker)
+	if position < 0 {
+		return ""
+	}
+	return strings.Trim(parent[position+len(marker):], "/")
+}
+
+func projectFromResource(name string) string {
+	parts := strings.Split(name, "/")
+	for i, part := range parts {
+		if part == "projects" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 func resourceBefore(path, marker string) (string, bool) {
@@ -418,16 +560,18 @@ func locationFromResource(name string) string {
 }
 
 func writeUpstreamError(w http.ResponseWriter, err error) {
-	writeError(w, http.StatusBadGateway, "artifact registry upstream: "+err.Error())
+	writeError(w, http.StatusBadGateway, "BAD_GATEWAY", "artifact registry upstream: "+err.Error())
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
+func writeError(w http.ResponseWriter, status int, symbolicStatus, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
 			"code":    status,
 			"message": message,
+			"status":  symbolicStatus,
+			"details": []any{},
 		},
 	})
 }
