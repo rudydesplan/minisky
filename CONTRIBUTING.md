@@ -113,6 +113,17 @@ make test-phase17
 make benchmark
 ```
 
+To run the guarded enterprise WIF/RBAC/quota/audit cross-gate, start Docker and
+install `curl`, `docker`, `go`, `openssl`, `python3`, and Terraform, then run:
+
+```bash
+make test-phase17-enterprise
+```
+
+The target supplies the required `MINISKY_PHASE17_ENTERPRISE_INTEGRATION=1`
+guard. It creates isolated temporary state and Docker resources but is an
+explicit local integration run, not part of the default contributor checks.
+
 ---
 
 ## ✅ Pull Request Process

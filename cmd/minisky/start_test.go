@@ -50,6 +50,14 @@ func TestGatewayMuxExposesReadinessWithoutDispatching(t *testing.T) {
 	}
 }
 
+func TestDashboardAuditProjectUsesCanonicalHeader(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/api/settings", nil)
+	request.Header.Set("X-MiniSky-Project", "local-dev-project")
+	if got := dashboardAuditProject(request); got != "local-dev-project" {
+		t.Fatalf("dashboard audit project = %q, want local-dev-project", got)
+	}
+}
+
 type shutdownHandler struct {
 	http.Handler
 	called bool

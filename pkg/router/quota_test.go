@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	localsecurity "minisky/pkg/security"
 )
 
 func TestQuotaLimiterConcurrentResetAndGCPError(t *testing.T) {
@@ -98,6 +100,56 @@ func TestQuotaDefaultsDisabledAndJSONScopes(t *testing.T) {
 		proxy.ServeHTTP(response, request)
 		if response.Code != http.StatusNoContent {
 			t.Fatalf("disabled default request %d status=%d", i, response.Code)
+		}
+	}
+}
+
+func TestAuthorizedRequestsConsumeQuotaAfterAuthentication(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	limiter, err := NewQuotaLimiter(QuotaConfig{
+		Services: map[string]QuotaRule{
+			"compute.googleapis.com": {Limit: 1, Window: time.Minute},
+		},
+	}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("compute.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	proxy.ConfigureQuota(limiter, nil)
+
+	const route = "http://localhost/_minisky/compute/compute/v1/projects/demo/zones/us/instances"
+	unauthorized := httptest.NewRecorder()
+	proxy.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, route, nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "principal://iam.googleapis.com/projects/local-dev-project/locations/global/workloadIdentityPools/ci-pool/subject/repository:minisky",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range []int{http.StatusNoContent, http.StatusTooManyRequests} {
+		request := httptest.NewRequest(http.MethodGet, route, nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("authorized request %d status=%d want=%d body=%s",
+				index+1, response.Code, want, response.Body.String())
+		}
+		if want == http.StatusTooManyRequests &&
+			(!strings.Contains(response.Body.String(), `"RESOURCE_EXHAUSTED"`) ||
+				response.Header().Get("Retry-After") == "") {
+			t.Fatalf("quota response headers=%v body=%s", response.Header(), response.Body.String())
 		}
 	}
 }

@@ -81,6 +81,42 @@ workflow, and Compose expansion. Docker-backed integration remains explicitly
 guarded. `minisky doctor` also validates configured quota JSON and an enabled
 audit chain.
 
+### Guarded enterprise WIF cross-gate
+
+Prerequisites are a running Docker daemon plus `curl`, `docker`, `go`,
+`openssl`, `python3`, and Terraform. Run the repository target:
+
+```bash
+make test-phase17-enterprise
+```
+
+The target sets `MINISKY_PHASE17_ENTERPRISE_INTEGRATION=1`. The wrapper refuses
+to run without that exact value, then invokes the Phase 13 harness with these
+exact internal guards:
+
+```bash
+MINISKY_PHASE13_INTEGRATION=1
+MINISKY_PHASE13_ENTERPRISE_CONTROLS=1
+```
+
+The gate builds MiniSky in a temporary directory and uses isolated ports,
+profile state, HOME, and owned Docker resources. It retains the Phase 13 Google
+provider 7.41.0 WIF apply → restart → no-drift → destroy lifecycle and
+static-inline-JWKS RS256 exchange/delegated impersonation checks. In enterprise
+mode it also binds the federated principal to `roles/minisky.viewer`, proves
+Dashboard reads are allowed while settings and terminal access are denied,
+proves unauthenticated gateway access is rejected, and verifies two authorized
+BigQuery reads followed by a route-scoped `429 RESOURCE_EXHAUSTED` with numeric
+`Retry-After`. It verifies and exports the audit chain, checks the completed
+Dashboard denial records the federated principal, scans generated state and
+working files for selected secrets, proves an isolated mutation breaks audit
+verification, and clears the project policy during cleanup.
+
+This guarded cross-gate passed locally on 2026-07-25. The opt-in
+`phase17-enterprise-integration` GitHub Actions job is configured behind the
+`run_phase17_enterprise_integration` workflow-dispatch input, but configuration
+is not evidence that the job has passed in CI.
+
 ## In-tree plugin SDK v0
 
 Generate a source contribution:
@@ -143,9 +179,12 @@ minisky start
 ```
 
 A rejected request returns HTTP `429` with `RESOURCE_EXHAUSTED` and
-`Retry-After`. Metrics use only normalized service, route, and scope labels.
-These defaults do not alter Terraform behavior unless quotas are explicitly
-enabled.
+`Retry-After`. Rules can be scoped by normalized route, service, project, or
+default, and every matching scope must allow the request. Buckets are
+fixed-window and process-local: they are not shared across processes or hosts
+and restart with the MiniSky process. Metrics use only normalized service,
+route, and scope labels. These defaults do not alter Terraform behavior unless
+quotas are explicitly enabled.
 
 ## Audit and local RBAC
 
@@ -156,12 +195,18 @@ minisky audit export --limit 100 audit.json
 ```
 
 `MINISKY_AUDIT_STRICT=true` writes an attempt before dispatch and rejects a
-mutation if that write fails. Records are profile-scoped, append-only JSONL
-with a SHA-256 hash chain, and exclude bodies, raw queries, authorization,
-cookies, and arbitrary headers. Verification proves internal hash-chain
-consistency only. Without an externally anchored checkpoint, a host user who
-can rewrite the complete file can also construct a new valid chain; this is not
-immutable or compliance-certified storage.
+mutation if that write fails. Because the strict attempt is recorded before
+authentication/dispatch, it can legitimately omit the principal. The complete
+record is written after dispatch and includes the verified principal propagated
+by authentication when available, together with the response status. If that
+post-dispatch write fails, MiniSky cannot safely rewrite a response already
+sent; the strict attempt remains evidence that the mutation was tried. Records
+are profile-scoped, append-only JSONL with a SHA-256 hash chain, and exclude
+bodies, raw queries, authorization, cookies, and arbitrary headers.
+Verification proves internal tamper-evident hash-chain consistency only.
+Without an externally anchored checkpoint, a host user who can rewrite the
+complete file can also construct a new valid chain; this is not immutable,
+WORM, or compliance-certified storage.
 
 When `MINISKY_IAM_MODE=strict`, the existing verified local bearer principal is
 required by both gateway and Dashboard APIs. Project policies can bind:
@@ -202,6 +247,7 @@ Loading is optional and cannot occur unless the image archive itself verifies.
 ## Explicitly deferred
 
 - a separately published `setup-minisky` action repository/tag
+- Homebrew, Scoop, deb, and rpm package publication
 - remote plugin marketplace and runtime install/list/remove
 - loader protocol negotiation, process isolation, signatures, supervision, and
   third-party failure containment
@@ -209,3 +255,6 @@ Loading is optional and cannot occur unless the image archive itself verifies.
   administration UI, and compliance certification
 - distributed quotas or claims that local benchmark data proves production
   capacity
+- production federation: the implemented WIF path accepts static inline JWKS
+  within the Phase 13 limits and returns local `ms1` credentials, not Google
+  credentials

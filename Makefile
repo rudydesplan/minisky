@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase13-wif test-phase17 benchmark
+.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase13-wif test-phase17 test-phase17-enterprise benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -29,6 +29,9 @@ test-phase17:
 	bash -n scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
 	./scripts/airgap-bundle-test.sh
 	MINISKY_IMAGE=ghcr.io/qamarudeenm/minisky:test docker compose -f deployments/docker-compose.yml config >/dev/null
+
+test-phase17-enterprise:
+	MINISKY_PHASE17_ENTERPRISE_INTEGRATION=1 ./scripts/phase17-enterprise-wif-integration.sh
 
 benchmark:
 	go test -run='^$$' -bench=BenchmarkGatewayRouting -benchmem -count=5 ./pkg/router

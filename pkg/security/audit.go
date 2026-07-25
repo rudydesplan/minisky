@@ -134,7 +134,9 @@ func (a *AuditLog) Wrap(next http.Handler, resolve func(*http.Request) AuditEven
 			event.Method = r.Method
 		}
 		if a.strict {
-			if err := a.append(event, "attempt", 0); err != nil {
+			attempt := event
+			attempt.Principal = ""
+			if err := a.append(attempt, "attempt", 0); err != nil {
 				writeAuditError(w)
 				return
 			}
@@ -144,9 +146,7 @@ func (a *AuditLog) Wrap(next http.Handler, resolve func(*http.Request) AuditEven
 		if status == 0 {
 			status = http.StatusOK
 		}
-		if principal := strings.TrimSpace(r.Header.Get("X-MiniSky-Principal")); principal != "" {
-			event.Principal = principal
-		}
+		event.Principal = strings.TrimSpace(r.Header.Get("X-MiniSky-Principal"))
 		if err := a.append(event, "complete", status); err != nil && a.strict {
 			// The strict pre-dispatch record already proves the attempted mutation.
 			// A completed response cannot be safely rewritten after dispatch.

@@ -203,7 +203,7 @@ and is not safe to invoke from standalone diagnostics.
 | 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🚧 Metadata slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
 | 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🚧 Bounded slices |
-| 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | 🚧 Bounded local slice |
+| 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
 
 ### Phase 6 — Fidelity baseline
 
@@ -413,19 +413,25 @@ explicit `501 UNIMPLEMENTED` boundaries.
 
 ### Phase 17 — CI/CD integration, plugin ecosystem, and enterprise
 
-**Status (2026-07-25): bounded local slice implemented.** The repository-local
+**Status (2026-07-25): verified bounded local slice.** The repository-local
 GitHub Action is tested with a built artifact; GitLab and Compose templates,
-source-compiled SDK v0 scaffolds, correctness-checked benchmarks, opt-in quotas,
-profile audit records with verifiable hash-chain consistency (not externally
-anchored tamper evidence), local RBAC, and checksummed offline bundles have
-executable checks. See
+source-compiled SDK v0 scaffolds, correctness-checked benchmarks, opt-in
+fixed-window process-local quotas, profile audit records with a tamper-evident
+hash chain, local RBAC, and checksummed offline bundles have executable checks.
+A guarded Phase-13 WIF cross-gate passed locally with a federated principal
+exercising Dashboard RBAC, gateway authorization, quota rejection, audit
+verification, redaction checks, and tamper detection. An opt-in GitHub Actions
+job is configured, but has not yet produced CI pass evidence. See
 [Phase 17 local operations](docs/phase17-local-operations.md).
 
 The SDK is intentionally not third-party installable: there is no runtime
 loader, protocol negotiation, process isolation, artifact signature
 verification, or failure supervisor. A remote marketplace, published
-`minisky/setup-minisky@v1` action, immutable/WORM compliance storage, external
-identity/SSO/SCIM, distributed quotas, and video assets remain deferred.
+`minisky/setup-minisky@v1` action or package-manager publication,
+immutable/WORM compliance storage, external identity providers/SSO/SCIM,
+distributed quotas, and video assets remain deferred. The WIF path retains the
+Phase-13 static-JWKS limits and issues local `ms1` credentials only; this
+bounded slice is not production federation or a production-ready Phase 17.
 
 ---
 
