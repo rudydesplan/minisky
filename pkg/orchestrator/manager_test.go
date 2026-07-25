@@ -239,6 +239,341 @@ func TestPullImageHonorsCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestDeleteServerlessVMRequiresExactCurrentProfileOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "serverless-test")
+	identity := ServerlessIdentity{
+		ResourceType: ServerlessFunction,
+		Project:      "demo",
+		Location:     "us-central1",
+		Name:         "Hello_World",
+	}
+	ownedLabels, err := identity.labels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedOwnedLabels, err := json.Marshal(ownedLabels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		labels     string
+		status     int
+		wantError  bool
+		wantDelete bool
+	}{
+		{
+			name:       "owned",
+			labels:     string(encodedOwnedLabels),
+			status:     http.StatusOK,
+			wantDelete: true,
+		},
+		{
+			name:      "cross profile",
+			labels:    strings.Replace(string(encodedOwnedLabels), `"serverless-test"`, `"other"`, 1),
+			status:    http.StatusOK,
+			wantError: true,
+		},
+		{
+			name:      "unrelated service",
+			labels:    strings.Replace(string(encodedOwnedLabels), `"serverless"`, `"compute-instance"`, 1),
+			status:    http.StatusOK,
+			wantError: true,
+		},
+		{
+			name:      "different canonical resource",
+			labels:    strings.Replace(string(encodedOwnedLabels), identity.CanonicalResource(), "projects/other/locations/us-central1/functions/Hello_World", 1),
+			status:    http.StatusOK,
+			wantError: true,
+		},
+		{
+			name:   "missing is idempotent",
+			status: http.StatusNotFound,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deleted := false
+			manager := &ServiceManager{
+				portRegistry: make(map[string][]PortMapping),
+				dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					switch request.Method {
+					case http.MethodGet:
+						body := `{}`
+						if tt.status == http.StatusOK {
+							body = `{"State":{"Status":"running"},"Config":{"Labels":` + tt.labels + `}}`
+						}
+						return dockerResponse(tt.status, body), nil
+					case http.MethodPost:
+						return dockerResponse(http.StatusNoContent, `{}`), nil
+					case http.MethodDelete:
+						deleted = true
+						return dockerResponse(http.StatusNoContent, `{}`), nil
+					default:
+						t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+						return nil, nil
+					}
+				})},
+			}
+
+			err := manager.DeleteServerlessVM(identity)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("DeleteServerlessVM error = %v, wantError=%t", err, tt.wantError)
+			}
+			if deleted != tt.wantDelete {
+				t.Fatalf("Docker delete called = %t, want %t", deleted, tt.wantDelete)
+			}
+		})
+	}
+}
+
+func TestServerlessIdentitySeparatesTypeProjectAndLocation(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "serverless-test")
+	identities := []ServerlessIdentity{
+		{ResourceType: ServerlessFunction, Project: "project-a", Location: "us-central1", Name: "hello"},
+		{ResourceType: ServerlessService, Project: "project-a", Location: "us-central1", Name: "hello"},
+		{ResourceType: ServerlessFunction, Project: "project-b", Location: "us-central1", Name: "hello"},
+		{ResourceType: ServerlessFunction, Project: "project-a", Location: "europe-west1", Name: "hello"},
+	}
+	names := make(map[string]bool, len(identities))
+	images := make(map[string]bool, len(identities))
+	for _, identity := range identities {
+		name, err := identity.ContainerName()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if names[name] {
+			t.Fatalf("duplicate container name %q for identity %#v", name, identity)
+		}
+		names[name] = true
+		image, err := identity.ImageName()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if images[image] {
+			t.Fatalf("duplicate image name %q for identity %#v", image, identity)
+		}
+		images[image] = true
+	}
+}
+
+func TestProvisionServerlessVMUsesIdentityNameAndOwnershipLabels(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "serverless-test")
+	identity := ServerlessIdentity{
+		ResourceType: ServerlessFunction,
+		Project:      "demo",
+		Location:     "us-central1",
+		Name:         "Hello_World",
+	}
+	containerName, err := identity.ContainerName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer app.Close()
+	appPort := strings.TrimPrefix(app.URL, "http://127.0.0.1:")
+
+	var createPayload struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	inspectCount := 0
+	manager := &ServiceManager{
+		portRegistry: make(map[string][]PortMapping),
+		dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			switch {
+			case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/json"):
+				inspectCount++
+				if inspectCount == 1 {
+					return dockerResponse(http.StatusNotFound, `{}`), nil
+				}
+				return dockerResponse(http.StatusOK, `{"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"`+appPort+`"}]}}}`), nil
+			case request.Method == http.MethodPost && request.URL.Path == "/containers/create":
+				if got := request.URL.Query().Get("name"); got != containerName {
+					t.Fatalf("container name = %q", got)
+				}
+				if err := json.NewDecoder(request.Body).Decode(&createPayload); err != nil {
+					t.Fatal(err)
+				}
+				return dockerResponse(http.StatusCreated, `{}`), nil
+			case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/start"):
+				return dockerResponse(http.StatusNoContent, `{}`), nil
+			default:
+				t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+				return nil, nil
+			}
+		})},
+	}
+
+	gotURL, err := manager.ProvisionServerlessVM(identity, "example/service:local", []string{"PORT=8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != app.URL {
+		t.Fatalf("service URL = %q, want %q", gotURL, app.URL)
+	}
+	if createPayload.Labels["managed-by"] != "minisky" ||
+		createPayload.Labels["minisky.profile"] != "serverless-test" ||
+		createPayload.Labels["minisky.service"] != "serverless" ||
+		createPayload.Labels["minisky.resource"] != identity.CanonicalResource() ||
+		createPayload.Labels["minisky.resource-type"] != string(ServerlessFunction) {
+		t.Fatalf("serverless labels = %#v", createPayload.Labels)
+	}
+}
+
+func TestProvisionServerlessVMCleansOwnedContainerAfterPostCreateFailure(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "serverless-cleanup")
+	identity := ServerlessIdentity{
+		ResourceType: ServerlessService,
+		Project:      "demo",
+		Location:     "us-central1",
+		Name:         "cleanup",
+	}
+	labels, err := identity.labels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLabels, err := json.Marshal(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name          string
+		stage         string
+		cleanupStatus int
+		cleanupLabels string
+		want          string
+		wantCleanup   bool
+	}{
+		{name: "start", stage: "start", cleanupStatus: http.StatusNoContent, cleanupLabels: string(encodedLabels), want: "start Serverless container", wantCleanup: true},
+		{name: "port discovery", stage: "discover", cleanupStatus: http.StatusNoContent, cleanupLabels: string(encodedLabels), want: "port discovery", wantCleanup: true},
+		{name: "readiness", stage: "readiness", cleanupStatus: http.StatusNoContent, cleanupLabels: string(encodedLabels), want: "readiness failed", wantCleanup: true},
+		{name: "cleanup failure is appended", stage: "start", cleanupStatus: http.StatusInternalServerError, cleanupLabels: string(encodedLabels), want: "cleanup owned backend failed", wantCleanup: true},
+		{name: "ownership refusal stays safe", stage: "start", cleanupStatus: http.StatusNoContent, cleanupLabels: `{"managed-by":"someone-else"}`, want: "refusing to delete unowned", wantCleanup: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			created := false
+			inspectAfterCreate := 0
+			deleteCalls := 0
+			manager := &ServiceManager{
+				portRegistry: make(map[string][]PortMapping),
+				serverlessReady: func(string, time.Duration) error {
+					if tt.stage == "readiness" {
+						return errors.New("readiness failed")
+					}
+					return nil
+				},
+				dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					switch {
+					case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/json"):
+						if !created {
+							return dockerResponse(http.StatusNotFound, `{}`), nil
+						}
+						inspectAfterCreate++
+						if tt.stage == "discover" && inspectAfterCreate == 1 {
+							return dockerResponse(http.StatusOK, `{"NetworkSettings":{"Ports":{}}}`), nil
+						}
+						if tt.stage == "readiness" && inspectAfterCreate == 1 {
+							return dockerResponse(http.StatusOK, `{"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}`), nil
+						}
+						return dockerResponse(http.StatusOK, `{"State":{"Status":"running"},"Config":{"Labels":`+tt.cleanupLabels+`}}`), nil
+					case request.Method == http.MethodPost && request.URL.Path == "/containers/create":
+						created = true
+						return dockerResponse(http.StatusCreated, `{}`), nil
+					case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/start"):
+						if tt.stage == "start" {
+							return dockerResponse(http.StatusInternalServerError, `{"message":"start failed"}`), nil
+						}
+						return dockerResponse(http.StatusNoContent, `{}`), nil
+					case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/stop"):
+						return dockerResponse(http.StatusNoContent, `{}`), nil
+					case request.Method == http.MethodDelete:
+						deleteCalls++
+						return dockerResponse(tt.cleanupStatus, `{}`), nil
+					default:
+						t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+						return nil, nil
+					}
+				})},
+			}
+
+			_, err := manager.ProvisionServerlessVM(identity, "example/service:local", nil)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("provision error = %v, want text %q", err, tt.want)
+			}
+			if got := deleteCalls > 0; got != tt.wantCleanup {
+				t.Fatalf("cleanup delete called = %t, want %t", got, tt.wantCleanup)
+			}
+		})
+	}
+}
+
+func TestServerlessLifecycleGateRejectsSameIdentityAndAllowsUnrelatedIdentity(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "serverless-lifecycle")
+	identityA := ServerlessIdentity{
+		ResourceType: ServerlessFunction,
+		Project:      "demo",
+		Location:     "us-central1",
+		Name:         "shared",
+	}
+	identityB := identityA
+	identityB.Name = "other"
+	nameA, err := identityA.ContainerName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	manager := &ServiceManager{
+		portRegistry: make(map[string][]PortMapping),
+		dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet {
+				t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			}
+			if strings.Contains(request.URL.Path, nameA) {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+				<-release
+			}
+			return dockerResponse(http.StatusNotFound, `{}`), nil
+		})},
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.DeleteServerlessVM(identityA)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first lifecycle did not reach backend")
+	}
+
+	if err := manager.DeleteServerlessVM(identityA); !errors.Is(err, ErrServerlessLifecycleInProgress) {
+		t.Fatalf("same-identity delete error = %v", err)
+	}
+	if err := manager.DeleteServerlessVM(identityB); err != nil {
+		t.Fatalf("unrelated identity was blocked: %v", err)
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first delete failed: %v", err)
+	}
+	manager.serverlessMu.Lock()
+	active := len(manager.serverlessActive)
+	manager.serverlessMu.Unlock()
+	if active != 0 {
+		t.Fatalf("active lifecycle entries after release = %d", active)
+	}
+}
+
 func dockerResponse(code int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: code,

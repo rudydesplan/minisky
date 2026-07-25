@@ -195,7 +195,7 @@ and is not safe to invoke from standalone diagnostics.
 | 6 | Service fidelity baseline and compatibility matrices | Every registered domain has manifest/docs coherence and an executable in-process or backend-gated contract | ✅ Baseline |
 | 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; Phase-15 Redis and Spanner resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
-| 9 | Executable serverless and event delivery | Buildpacks deployments run user code; Pub/Sub, Storage, Scheduler, and Cloud Tasks reach real targets with observable retries | 🚧 Local slice |
+| 9 | Executable serverless and event delivery | A guarded local Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes; Scheduler remains manual `:run` E2E | ✅ Verified bounded local slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
 | 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
@@ -252,21 +252,36 @@ import → no-drift → destroy with run-scoped Docker ownership and cleanup.
 
 ### Phase 9 — Serverless and event-driven workflows
 
-**Status (2026-07-25): local delivery slice implemented.** Cloud Tasks state,
-Scheduler gateway wiring, strict Buildpacks failure handling, and the guarded
-event-delivery harness have focused tests. The guarded Docker/Pack gate passed
-locally with Pack 0.40.8: Scheduler and Cloud Tasks reached HTTP targets, while
-Storage and Pub/Sub events built and invoked real function containers.
+**Status (2026-07-25): verified bounded local slice.** The real Pack v0.40.8
+gate passed locally in about 177 seconds. Through MiniSky's local
+`POST /v2/deploy` helper, Storage and Pub/Sub each reached an existing function
+and a Cloud Run-style `type=service` handler; service metadata became ready and
+owned deletion removed its container. Cloud Tasks recorded transient
+`503` → `204` as `COMPLETED` in two attempts and terminal `500` as `FAILED` in
+two attempts. Scheduler HTTP delivery remains a manual `:run` E2E check. The
+opt-in CI job is configured but has no passing CI evidence yet.
+
+`POST /v2/deploy` is a MiniSky-local source-deployment helper shared by the
+function and service harnesses. It is not the Google Cloud Run v2 image-based
+service create API and does not demonstrate Terraform-managed serverless.
 
 - [x] Add explicit `full` and backward-compatible `simulation` runtime profiles,
   dependency-aware real backends, and consistent doctor/dashboard state.
-- Execute deployed Cloud Functions and Cloud Run user handlers rather than
+- [x] Execute deployed Cloud Functions and Cloud Run-style user handlers rather than
   fallback containers.
-- Deliver Cloud Tasks HTTP requests with retry, backoff, attempt, and terminal
+- [x] Deliver Cloud Tasks HTTP requests with retry, backoff, attempt, and terminal
   failure state.
-- Route Pub/Sub and Storage events to both Functions and Cloud Run.
-- Remove hard-coded scheduler gateway ports and record delivery outcomes.
-- Verify upload/publish/schedule/task → handler invocation end to end.
+- [x] Route Pub/Sub and Storage events to both Functions and Cloud Run-style
+  services in the bounded local harness.
+- [x] Remove hard-coded scheduler gateway ports and record delivery outcomes.
+- [x] Verify upload/publish/task → handler invocation end to end; retain
+  Scheduler as a manual `:run` HTTP E2E check.
+
+Unsupported boundaries remain full Cloud Run v2 source build and Terraform
+serverless, Eventarc and CloudEvents envelopes, Pub/Sub push, Cloud Tasks OIDC,
+task-header, redirect, and dead-letter-queue parity, durable event queueing,
+ordering, exactly-once delivery, interrupted task replay, and production
+serverless operation.
 
 ### Phase 10 — Networking and artifact workflows
 

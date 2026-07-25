@@ -21,7 +21,7 @@ const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
   ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; optional Phase-15 Terraform remains"],
   ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
-  ["9", "Serverless and events", "Verified local slice", "Pack-backed Scheduler, Tasks, Storage, and Pub/Sub delivery passes locally"],
+  ["9", "Serverless and events", "Verified bounded local slice", "Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes pass; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
   ["11", "DX and distribution", "Verified local slice", "Native amd64/arm64 deb/rpm install gates pass; publication remains external"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
@@ -131,16 +131,16 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Callout tone="info" title="Implementation status">
         Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
-        delivery, Phase-15 emulator, and Phase-17 federated RBAC/quota/audit integration gates. Seven guarded
+        delivery, Phase-15 emulator, and Phase-17 federated RBAC/quota/audit integration gates. Eight guarded
         local gates have passed. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs also pass in
-        read-only CI; the opt-in Phase-17 CI job is configured but has no CI pass evidence yet. Production-grade
-        semantics remain explicit external boundaries.
+        read-only CI; the opt-in Phase-9 event-delivery and Phase-17 CI jobs are configured but have no CI pass
+        evidence yet. Production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>7 passed</H2><Text tone="secondary">Including Phase-17 federated enterprise controls</Text></CardBody>
+          <CardBody><H2>8 passed</H2><Text tone="secondary">Including bounded Phase-9 event delivery</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -167,7 +167,19 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Grid columns="2fr 1fr" gap={20}>
         <Stack gap={8}>
-          <H2>Phase 13 and 17 verified boundaries</H2>
+          <H2>Phase 9, 13, and 17 verified boundaries</H2>
+          <Text>
+            The real Pack v0.40.8 gate passed locally in about 235 seconds. Storage and Pub/Sub each invoked an
+            existing function and a Cloud Run-style service through MiniSky&apos;s local <Code>/v2/deploy</Code>
+            helper; service readiness and owned container deletion passed. Tasks proved two-attempt
+            <Code>503 → 204</Code> completion and two-attempt terminal <Code>500</Code> failure.
+          </Text>
+          <Text tone="secondary">
+            This does not verify the Cloud Run v2 image API, full source builds, Terraform serverless,
+            Eventarc/CloudEvents, Pub/Sub push, Cloud Tasks OIDC/task-header/redirect/dead-letter-queue parity,
+            interrupted task replay, production serverless, or durable/ordered/exactly-once delivery. Scheduler
+            remains a manual <Code>:run</Code> HTTP E2E check.
+          </Text>
           <Text>
             Google provider 7.41.0 passed apply → restart → no-drift → destroy for local project-ID WIF
             resources, static inline public JWKS, RS256 exchange, and one-delegate impersonation.
@@ -247,10 +259,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: extend the Phase-9 Pack gate so Pub/Sub and Storage events invoke a
-        real Cloud Run handler. Homebrew, Scoop, deb, and rpm publication remains externally blocked until
-        maintainer-owned repositories, scoped credentials, protected approval environments, and native
-        install-from-repository tests exist.
+        Next internal executable milestone: add Phase-14 cross-project Pub/Sub guarded SDK/reference acceptance,
+        building on the existing project registry before deepening Phase-16 MQL. Homebrew, Scoop, deb, and rpm
+        publication remains externally blocked until maintainer-owned repositories, scoped credentials,
+        protected approval environments, and native install-from-repository tests exist.
       </Callout>
     </Stack>
   );

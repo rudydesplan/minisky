@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_event_delivery_integration:
+        description: Run Docker-backed event delivery acceptance
+        required: false
+        type: boolean
+        default: false
       run_phase15_emulator_integration:
         description: Run Firestore, Datastore, and Spanner SDK emulator acceptance
         required: false
@@ -152,7 +157,7 @@ jobs:
         run: terraform validate
 
       - name: Validate integration script syntax
-        run: bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+        run: bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
 
       - name: Verify air-gapped bundle workflow
         run: ./scripts/airgap-bundle-test.sh
@@ -293,6 +298,44 @@ jobs:
         env:
           MINISKY_STATE_DURABILITY_INTEGRATION: "1"
         run: ./scripts/state-durability-integration.sh
+
+  event-delivery-integration:
+    name: Cloud Run and event delivery acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_event_delivery_integration
+    needs: quality
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Install checksum-verified Pack v0.40.8
+        run: |
+          ./scripts/install-pack.sh
+          echo "${HOME}/.minisky/bin" >>"${GITHUB_PATH}"
+          case "$("${HOME}/.minisky/bin/pack" version)" in
+            *0.40.8*) ;;
+            *) echo "Unexpected Pack version" >&2; exit 1 ;;
+          esac
+
+      - name: Run event delivery integration
+        run: make test-event-delivery
 
   phase15-emulator-integration:
     name: Firestore, Datastore, and Spanner SDK acceptance

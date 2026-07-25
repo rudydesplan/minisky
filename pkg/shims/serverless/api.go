@@ -166,6 +166,7 @@ type TrafficStatus struct {
 type Condition struct {
 	Type               string `json:"type"`
 	State              string `json:"state"` // CONDITION_SUCCEEDED, CONDITION_FAILED, CONDITION_RECONCILING
+	Reason             string `json:"reason,omitempty"`
 	Message            string `json:"message,omitempty"`
 	LastTransitionTime string `json:"lastTransitionTime"`
 	Severity           string `json:"severity,omitempty"`
@@ -176,17 +177,34 @@ type Condition struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // API handles both cloudfunctions.googleapis.com and run.googleapis.com traffic.
+type buildBackend interface {
+	Enabled() bool
+	Requested() bool
+	Status() config.BackendState
+	GetLogs(string) string
+	DownloadSourceFromGCS(string, string) (string, error)
+	BuildFunction(orchestrator.ServerlessIdentity, string, string) (string, error)
+	BuildService(orchestrator.ServerlessIdentity, string) (string, error)
+}
+
+type serverlessManager interface {
+	ProvisionServerlessVM(orchestrator.ServerlessIdentity, string, []string) (string, error)
+	DeleteServerlessVM(orchestrator.ServerlessIdentity) error
+}
+
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	svcMgr     *orchestrator.ServiceManager
-	logger     *logging.API
-	backend    *BuildpacksBackend
-	client     *http.Client
-	stateStore *state.Store
-	functions  map[string]*Function // key: project:location:name
-	services   map[string]*Service  // key: project:location:name
+	mu              sync.RWMutex
+	persistMu       sync.Mutex
+	lifecycleMu     sync.Mutex
+	opMgr           *orchestrator.OperationManager
+	svcMgr          serverlessManager
+	logger          *logging.API
+	backend         buildBackend
+	client          *http.Client
+	stateStore      *state.Store
+	functions       map[string]*Function // key: project:location:name
+	services        map[string]*Service  // key: project:location:name
+	activeLifecycle map[orchestrator.ServerlessIdentity]struct{}
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -211,20 +229,22 @@ func NewAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManage
 
 func newAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, logger *logging.API, store *state.Store) *API {
 	return &API{
-		opMgr:      opMgr,
-		svcMgr:     sm,
-		logger:     logger,
-		backend:    NewBuildpacksBackend(),
-		client:     http.DefaultClient,
-		stateStore: store,
-		functions:  make(map[string]*Function),
-		services:   make(map[string]*Service),
+		opMgr:           opMgr,
+		svcMgr:          sm,
+		logger:          logger,
+		backend:         NewBuildpacksBackend(),
+		client:          http.DefaultClient,
+		stateStore:      store,
+		functions:       make(map[string]*Function),
+		services:        make(map[string]*Service),
+		activeLifecycle: make(map[orchestrator.ServerlessIdentity]struct{}),
 	}
 }
 
 // GetBackend exposes the backend for dynamic dashboard configuration.
 func (api *API) GetBackend() *BuildpacksBackend {
-	return api.backend
+	backend, _ := api.backend.(*BuildpacksBackend)
+	return backend
 }
 
 // SetHTTPClient replaces the client used for event delivery.
@@ -403,6 +423,7 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 
 	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", project, location, functionId)
 	serviceUri := fmt.Sprintf("http://localhost:8080/%s", functionId)
+	identity := serverlessIdentity(orchestrator.ServerlessFunction, project, location, functionId)
 
 	fn := &Function{
 		Name:          fullName,
@@ -429,6 +450,17 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 	}
 
 	key := serverlessKey(project, location, functionId)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
+		return
+	}
+	asyncOwnsLifecycle := false
+	defer func() {
+		if !asyncOwnsLifecycle {
+			releaseLifecycle()
+		}
+	}()
 	api.mu.Lock()
 	api.functions[key] = fn
 	api.mu.Unlock()
@@ -444,7 +476,9 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	asyncOwnsLifecycle = true
 	api.opMgr.RunAsync(op.Name, func() error {
+		defer releaseLifecycle()
 		if !api.backend.Enabled() {
 			if api.backend.Requested() {
 				err := fmt.Errorf("Buildpacks execution was requested but is unavailable: %s", api.backend.Status().Diagnostic)
@@ -496,7 +530,7 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 			if fn.BuildConfig != nil && fn.BuildConfig.EntryPoint != "" {
 				entryPoint = fn.BuildConfig.EntryPoint
 			}
-			image, err = api.backend.BuildFunction(functionId, sourcePath, entryPoint)
+			image, err = api.backend.BuildFunction(identity, sourcePath, entryPoint)
 		}
 		if err != nil {
 			log.Printf("[Serverless] Build failed: %v", err)
@@ -517,7 +551,7 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 			}
 		}
 
-		url, err := api.svcMgr.ProvisionServerlessVM(functionId, image, env)
+		url, err := api.svcMgr.ProvisionServerlessVM(identity, image, env)
 		if err != nil {
 			log.Printf("[Serverless] Provisioning failed: %v", err)
 			api.mu.Lock()
@@ -534,7 +568,7 @@ func (api *API) createFunction(w http.ResponseWriter, r *http.Request, project, 
 		fn.Url = url
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			return fmt.Errorf("persist active function: %w", err)
+			return api.failProvisionPersistence(identity, "persist active function", err)
 		}
 		return nil
 	})
@@ -576,32 +610,40 @@ func (api *API) listFunctions(w http.ResponseWriter, project, location string) {
 
 func (api *API) deleteFunction(w http.ResponseWriter, r *http.Request, project, location, name string) {
 	key := serverlessKey(project, location, name)
-	api.mu.Lock()
+	api.mu.RLock()
 	_, ok := api.functions[key]
-	if ok {
-		delete(api.functions, key)
-	}
-	api.mu.Unlock()
+	api.mu.RUnlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Function "+name+" not found")
 		return
 	}
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist function deletion: "+err.Error())
+	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", project, location, name)
+	identity := serverlessIdentity(orchestrator.ServerlessFunction, project, location, name)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
 		return
 	}
-	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", project, location, name)
+	asyncOwnsLifecycle := false
+	defer func() {
+		if !asyncOwnsLifecycle {
+			releaseLifecycle()
+		}
+	}()
 	op, err := api.opMgr.RegisterDurable("cloudfunctions#operation", "DELETE", fullName, "", location)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	asyncOwnsLifecycle = true
 	api.opMgr.RunAsync(op.Name, func() error {
-		api.svcMgr.DeleteComputeVM("minisky-serverless-" + sanitizeImageName(name))
-		return nil
+		defer releaseLifecycle()
+		if err := api.svcMgr.DeleteServerlessVM(identity); err != nil {
+			return err
+		}
+		return api.deleteMetadata(orchestrator.ServerlessFunction, key)
 	})
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(toCloudFunctionsLRO(op, project, location))
@@ -650,6 +692,7 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 
 	fullName := fmt.Sprintf("projects/%s/locations/%s/services/%s", project, location, serviceId)
 	svcUri := fmt.Sprintf("https://%s-%s.run.app", serviceId, project)
+	identity := serverlessIdentity(orchestrator.ServerlessService, project, location, serviceId)
 
 	svc := &Service{
 		Name:               fullName,
@@ -672,6 +715,17 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 	}
 
 	key := serverlessKey(project, location, serviceId)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
+		return
+	}
+	asyncOwnsLifecycle := false
+	defer func() {
+		if !asyncOwnsLifecycle {
+			releaseLifecycle()
+		}
+	}()
 	api.mu.Lock()
 	api.services[key] = svc
 	api.mu.Unlock()
@@ -687,7 +741,9 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	asyncOwnsLifecycle = true
 	api.opMgr.RunAsync(op.Name, func() error {
+		defer releaseLifecycle()
 		if !api.backend.Enabled() {
 			if api.backend.Requested() {
 				err := fmt.Errorf("serverless execution was requested but Buildpacks is unavailable: %s", api.backend.Status().Diagnostic)
@@ -734,7 +790,7 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 			}
 		}
 
-		url, err := api.svcMgr.ProvisionServerlessVM(serviceId, image, env)
+		url, err := api.svcMgr.ProvisionServerlessVM(identity, image, env)
 		if err != nil {
 			log.Printf("[Serverless] Run Provisioning failed: %v", err)
 			api.mu.Lock()
@@ -766,7 +822,7 @@ func (api *API) createService(w http.ResponseWriter, r *http.Request, project, l
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			return fmt.Errorf("persist ready service: %w", err)
+			return api.failProvisionPersistence(identity, "persist ready service", err)
 		}
 		return nil
 	})
@@ -805,32 +861,40 @@ func (api *API) listServices(w http.ResponseWriter, project, location string) {
 
 func (api *API) deleteService(w http.ResponseWriter, r *http.Request, project, location, name string) {
 	key := serverlessKey(project, location, name)
-	api.mu.Lock()
+	api.mu.RLock()
 	_, ok := api.services[key]
-	if ok {
-		delete(api.services, key)
-	}
-	api.mu.Unlock()
+	api.mu.RUnlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Service "+name+" not found")
 		return
 	}
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist service deletion: "+err.Error())
+	fullName := fmt.Sprintf("projects/%s/locations/%s/services/%s", project, location, name)
+	identity := serverlessIdentity(orchestrator.ServerlessService, project, location, name)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
 		return
 	}
-	fullName := fmt.Sprintf("projects/%s/locations/%s/services/%s", project, location, name)
+	asyncOwnsLifecycle := false
+	defer func() {
+		if !asyncOwnsLifecycle {
+			releaseLifecycle()
+		}
+	}()
 	op, err := api.opMgr.RegisterDurable("run#operation", "DELETE", fullName, "", location)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	asyncOwnsLifecycle = true
 	api.opMgr.RunAsync(op.Name, func() error {
-		api.svcMgr.DeleteComputeVM("minisky-serverless-" + sanitizeImageName(name))
-		return nil
+		defer releaseLifecycle()
+		if err := api.svcMgr.DeleteServerlessVM(identity); err != nil {
+			return err
+		}
+		return api.deleteMetadata(orchestrator.ServerlessService, key)
 	})
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(toRunLRO(op, project, location))
@@ -861,14 +925,33 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 	if req.Location == "" {
 		req.Location = "us-central1"
 	}
+	if req.Type != "function" && req.Type != "service" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "type must be function or service")
+		return
+	}
 
 	log.Printf("[Serverless] Direct deployment requested: %s (%s)", req.Name, req.Type)
 
 	fullName := fmt.Sprintf("projects/%s/locations/%s/%s/%s", req.Project, req.Location, req.Type+"s", req.Name)
 	opType := "cloudfunctions#operation"
+	resourceType := orchestrator.ServerlessFunction
 	if req.Type == "service" {
 		opType = "run#operation"
+		resourceType = orchestrator.ServerlessService
 	}
+	identity := serverlessIdentity(resourceType, req.Project, req.Location, req.Name)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
+		return
+	}
+	asyncOwnsLifecycle := false
+	defer func() {
+		if !asyncOwnsLifecycle {
+			releaseLifecycle()
+		}
+	}()
 	op, err := api.opMgr.RegisterDurable(opType, "CREATE", fullName, "", req.Location)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -896,7 +979,9 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	asyncOwnsLifecycle = true
 	api.opMgr.RunAsync(op.Name, func() error {
+		defer releaseLifecycle()
 		// 1. Create source directory
 		tmpDir, err := os.MkdirTemp("", "minisky-deploy-*")
 		if err != nil {
@@ -904,7 +989,8 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 		}
 		defer os.RemoveAll(tmpDir)
 
-		// 2. Write code
+		// 2. Write code and the minimal service metadata required by the
+		// Python buildpack to detect and launch a stdlib HTTP service.
 		fileName := "index.js"
 		if strings.HasPrefix(req.Runtime, "python") {
 			fileName = "main.py"
@@ -915,6 +1001,14 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 		if err := os.WriteFile(tmpDir+"/"+fileName, []byte(req.Code), 0644); err != nil {
 			return err
 		}
+		if req.Type == "service" && strings.HasPrefix(req.Runtime, "python") {
+			if err := os.WriteFile(tmpDir+"/requirements.txt", nil, 0644); err != nil {
+				return err
+			}
+			if err := os.WriteFile(tmpDir+"/Procfile", []byte("web: python main.py\n"), 0644); err != nil {
+				return err
+			}
+		}
 
 		// 3. Build
 		entryPoint := req.EntryPoint
@@ -922,11 +1016,20 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 			entryPoint = "handler"
 		}
 
-		image, err := api.backend.BuildFunction(req.Name, tmpDir, entryPoint)
+		var image string
+		if req.Type == "service" {
+			image, err = api.backend.BuildService(identity, tmpDir)
+		} else {
+			image, err = api.backend.BuildFunction(identity, tmpDir, entryPoint)
+		}
 		if err != nil {
 			api.mu.Lock()
-			if f, ok := api.functions[serverlessKey(req.Project, req.Location, req.Name)]; ok {
+			key := serverlessKey(req.Project, req.Location, req.Name)
+			if f, ok := api.functions[key]; ok {
 				f.State = "FAILED"
+			}
+			if s, ok := api.services[key]; ok {
+				setServiceFailed(s, "BuildFailed", err)
 			}
 			api.mu.Unlock()
 			if persistErr := api.persistMetadata(); persistErr != nil {
@@ -958,11 +1061,15 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 			envVars = []string{"PORT=8080"} // Cloud Run services don't use FUNCTION_TARGET
 		}
 
-		url, err := api.svcMgr.ProvisionServerlessVM(req.Name, image, envVars)
+		url, err := api.svcMgr.ProvisionServerlessVM(identity, image, envVars)
 		if err != nil {
 			api.mu.Lock()
-			if f, ok := api.functions[serverlessKey(req.Project, req.Location, req.Name)]; ok {
+			key := serverlessKey(req.Project, req.Location, req.Name)
+			if f, ok := api.functions[key]; ok {
 				f.State = "FAILED"
+			}
+			if s, ok := api.services[key]; ok {
+				setServiceFailed(s, "ProvisionFailed", err)
 			}
 			api.mu.Unlock()
 			if persistErr := api.persistMetadata(); persistErr != nil {
@@ -986,7 +1093,7 @@ func (api *API) deployResource(w http.ResponseWriter, r *http.Request) {
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			return fmt.Errorf("persist deployed resource: %w", err)
+			return api.failProvisionPersistence(identity, "persist deployed resource", err)
 		}
 		return nil
 	})
@@ -1013,7 +1120,6 @@ func (api *API) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Serverless] Deleting %s: %s", resType, shortName)
 
-	api.mu.Lock()
 	project := extractSegmentAfter(r.URL.Path, "projects")
 	if project == "" {
 		project = r.URL.Query().Get("project")
@@ -1024,24 +1130,93 @@ func (api *API) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
 	location := firstOf(extractSegmentAfter(r.URL.Path, "locations"), "us-central1")
 	key := serverlessKey(project, location, shortName)
 
+	var resourceType orchestrator.ServerlessResourceType
+	api.mu.RLock()
+	exists := false
 	if resType == "function" {
-		delete(api.functions, key)
-	} else {
-		delete(api.services, key)
+		resourceType = orchestrator.ServerlessFunction
+		_, exists = api.functions[key]
+	} else if resType == "service" {
+		resourceType = orchestrator.ServerlessService
+		_, exists = api.services[key]
 	}
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		http.Error(w, "persist deletion: "+err.Error(), http.StatusInternalServerError)
+	api.mu.RUnlock()
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Serverless resource not found")
 		return
 	}
 
-	// Force cleanup Docker container
-	containerName := "minisky-serverless-" + shortName
-	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://localhost/containers/%s?force=true", containerName), nil)
-	api.svcMgr.DoDockerRequest(req)
+	identity := serverlessIdentity(resourceType, project, location, shortName)
+	releaseLifecycle, ok := api.tryLifecycle(identity)
+	if !ok {
+		writeLifecycleConflict(w, identity)
+		return
+	}
+	defer releaseLifecycle()
+	if err := api.svcMgr.DeleteServerlessVM(identity); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "delete serverless container: "+err.Error())
+		return
+	}
+	if err := api.deleteMetadata(resourceType, key); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "persist deletion: "+err.Error())
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"DELETED"}`)
+}
+
+func setServiceFailed(service *Service, reason string, err error) {
+	service.Reconciling = false
+	service.Uri = ""
+	service.Conditions = []Condition{{
+		Type:               "Ready",
+		State:              "CONDITION_FAILED",
+		Reason:             reason,
+		Message:            err.Error(),
+		LastTransitionTime: time.Now().UTC().Format(time.RFC3339),
+	}}
+}
+
+func (api *API) failProvisionPersistence(identity orchestrator.ServerlessIdentity, action string, persistErr error) error {
+	failure := fmt.Errorf("%s: %w", action, persistErr)
+	if cleanupErr := api.svcMgr.DeleteServerlessVM(identity); cleanupErr != nil {
+		message := cleanupErr.Error()
+		if len(message) > 256 {
+			message = message[:256]
+		}
+		failure = fmt.Errorf("%w; cleanup owned backend failed: %s", failure, message)
+	}
+
+	key := serverlessKey(identity.Project, identity.Location, identity.Name)
+	api.mu.Lock()
+	switch identity.ResourceType {
+	case orchestrator.ServerlessFunction:
+		if function := api.functions[key]; function != nil {
+			function.State = "FAILED"
+			function.Url = ""
+			if function.ServiceConfig != nil {
+				function.ServiceConfig.Uri = ""
+			}
+			function.StateMessages = []StateMessage{{
+				Severity: "ERROR",
+				Type:     "PERSISTENCE",
+				Message:  failure.Error(),
+			}}
+		}
+	case orchestrator.ServerlessService:
+		if service := api.services[key]; service != nil {
+			setServiceFailed(service, "PersistenceFailed", failure)
+		}
+	}
+	api.mu.Unlock()
+	if retryErr := api.persistMetadata(); retryErr != nil {
+		log.Printf("[Serverless] persist cleanup state failed: %v", retryErr)
+	}
+	return failure
 }
 
 func (api *API) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -1115,6 +1290,39 @@ func (api *API) OnStorageEvent(bucket, object, eventType string) {
 
 func serverlessKey(project, location, name string) string {
 	return project + ":" + location + ":" + name
+}
+
+func serverlessIdentity(resourceType orchestrator.ServerlessResourceType, project, location, name string) orchestrator.ServerlessIdentity {
+	return orchestrator.ServerlessIdentity{
+		ResourceType: resourceType,
+		Project:      project,
+		Location:     location,
+		Name:         name,
+	}
+}
+
+func (api *API) tryLifecycle(identity orchestrator.ServerlessIdentity) (func(), bool) {
+	api.lifecycleMu.Lock()
+	if api.activeLifecycle == nil {
+		api.activeLifecycle = make(map[orchestrator.ServerlessIdentity]struct{})
+	}
+	if _, active := api.activeLifecycle[identity]; active {
+		api.lifecycleMu.Unlock()
+		return nil, false
+	}
+	api.activeLifecycle[identity] = struct{}{}
+	api.lifecycleMu.Unlock()
+
+	return func() {
+		api.lifecycleMu.Lock()
+		delete(api.activeLifecycle, identity)
+		api.lifecycleMu.Unlock()
+	}, true
+}
+
+func writeLifecycleConflict(w http.ResponseWriter, identity orchestrator.ServerlessIdentity) {
+	w.WriteHeader(http.StatusConflict)
+	writeError(w, http.StatusConflict, "ABORTED", "Serverless lifecycle already in progress for "+identity.CanonicalResource())
 }
 
 func extractSegmentAfter(path, keyword string) string {

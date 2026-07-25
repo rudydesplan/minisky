@@ -280,6 +280,10 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			} else if len(parts) == 9 {
+				if r.Method == http.MethodGet {
+					api.getTask(w, r, project, queueId, parts[8])
+					return
+				}
 				if r.Method == http.MethodDelete {
 					api.deleteTask(w, r, project, queueId, parts[8])
 					return
@@ -398,6 +402,23 @@ func (api *API) listTasks(w http.ResponseWriter, r *http.Request, project, queue
 	api.mu.RUnlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"tasks": tasks})
+}
+
+func (api *API) getTask(w http.ResponseWriter, r *http.Request, project, queueId, taskId string) {
+	queueName := fmt.Sprintf("projects/%s/locations/us-central1/queues/%s", project, queueId)
+	taskName := fmt.Sprintf("%s/tasks/%s", queueName, taskId)
+
+	api.mu.RLock()
+	for _, task := range api.tasks[queueName] {
+		if task.Name == taskName {
+			taskCopy := *task
+			api.mu.RUnlock()
+			json.NewEncoder(w).Encode(taskCopy)
+			return
+		}
+	}
+	api.mu.RUnlock()
+	w.WriteHeader(http.StatusNotFound)
 }
 
 func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queueId string) {

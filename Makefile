@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-phase10-artifact test-phase13-wif test-phase17 test-phase17-enterprise benchmark
+.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase17 test-phase17-enterprise benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -11,10 +11,13 @@ test: ui-build
 
 test-integration:
 	@test "$${MINISKY_INTEGRATION:-}" = "1" || (echo "Set MINISKY_INTEGRATION=1 to run Docker-backed integration tests" >&2; exit 1)
-	MINISKY_EVENT_INTEGRATION=1 ./scripts/event-delivery-integration.sh
+	$(MAKE) test-event-delivery
 	MINISKY_STATE_DURABILITY_INTEGRATION=1 ./scripts/state-durability-integration.sh
 	MINISKY_TERRAFORM_INTEGRATION=1 ./scripts/terraform-integration.sh
 	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
+
+test-event-delivery:
+	MINISKY_EVENT_INTEGRATION=1 ./scripts/event-delivery-integration.sh
 
 test-phase10-artifact:
 	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh

@@ -145,12 +145,16 @@ func (b *BuildpacksBackend) GetLogs(name string) string {
 }
 
 // BuildFunction builds a Docker image for a Cloud Function source directory.
-func (b *BuildpacksBackend) BuildFunction(functionName, sourcePath, entryPoint string) (imageRef string, err error) {
+func (b *BuildpacksBackend) BuildFunction(identity orchestrator.ServerlessIdentity, sourcePath, entryPoint string) (imageRef string, err error) {
 	if !b.enabled {
 		return "", fmt.Errorf("buildpacks backend not enabled")
 	}
 
-	imageRef = fmt.Sprintf("minisky-fn-%s:local", sanitizeImageName(functionName))
+	imageRef, err = identity.ImageName()
+	if err != nil {
+		return "", err
+	}
+	functionName := identity.Name
 	log.Printf("[Buildpacks] Building image %s from %s using builder %s", imageRef, sourcePath, b.builder)
 
 	binPath := orchestrator.GetPackBinaryName()
@@ -186,12 +190,16 @@ func (b *BuildpacksBackend) BuildFunction(functionName, sourcePath, entryPoint s
 }
 
 // BuildService builds a Docker image for a Cloud Run service.
-func (b *BuildpacksBackend) BuildService(serviceName, sourcePath string) (imageRef string, err error) {
+func (b *BuildpacksBackend) BuildService(identity orchestrator.ServerlessIdentity, sourcePath string) (imageRef string, err error) {
 	if !b.enabled {
 		return "", fmt.Errorf("buildpacks backend not enabled")
 	}
 
-	imageRef = fmt.Sprintf("minisky-svc-%s:local", sanitizeImageName(serviceName))
+	imageRef, err = identity.ImageName()
+	if err != nil {
+		return "", err
+	}
+	serviceName := identity.Name
 	log.Printf("[Buildpacks] Building image %s from %s", imageRef, sourcePath)
 
 	binPath := orchestrator.GetPackBinaryName()
@@ -243,15 +251,4 @@ func (b *BuildpacksBackend) DownloadSourceFromGCS(bucket, object string) (string
 	unzipCmd.Run() // ignore errors if it wasn't a zip (might be a raw dir if we were fancy)
 
 	return tmpDir, nil
-}
-
-func sanitizeImageName(name string) string {
-	result := strings.ToLower(name)
-	result = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, result)
-	return strings.Trim(result, "-")
 }
