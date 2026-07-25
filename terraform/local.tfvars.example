@@ -1,0 +1,3 @@
+profile          = "local"
+project_id       = "local-dev-project"
+minisky_endpoint = "http://127.0.0.1:8080"
