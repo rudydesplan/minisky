@@ -5,6 +5,10 @@ bin/
 
 # MiniSky Local State
 .minisky/
+/*.pid
+/operations_poll.json
+/iihub.mp4
+/lro.mp4
 
 # Node.js / UI
 ui/node_modules/
@@ -56,7 +60,6 @@ docs/*
 !docs/terraform.md
 !docs/user-guide.md
 !docs/contribution-guide.md
-!docs/changelog.md
 !docs/cli_reference.md
 
 

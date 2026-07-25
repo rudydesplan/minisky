@@ -15,10 +15,44 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type CloudSqlManagerDrawerProps = { open: boolean; onClose: () => void };
 
+interface CloudSqlIpAddress {
+  ipAddress: string;
+}
+
+interface CloudSqlInstance {
+  name: string;
+  databaseVersion: string;
+  state: string;
+  connectionName: string;
+  ipAddresses?: CloudSqlIpAddress[];
+}
+
+interface DatabaseVersion {
+  version: string;
+  label: string;
+  engine: 'POSTGRES' | 'MYSQL';
+}
+
+interface ImagesConfig {
+  sql?: {
+    postgres?: { versions?: Omit<DatabaseVersion, 'engine'>[] };
+    mysql?: { versions?: Omit<DatabaseVersion, 'engine'>[] };
+  };
+}
+
+interface ErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+const getErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
 export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManagerDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [instances, setInstances] = useState<any[]>([]);
-  const [activeInstance, setActiveInstance] = useState<any | null>(null);
+  const [instances, setInstances] = useState<CloudSqlInstance[]>([]);
+  const [activeInstance, setActiveInstance] = useState<CloudSqlInstance | null>(null);
 
   const [toast, setToast] = useState({ msg: '', open: false, severity: 'success' as 'success' | 'error' });
 
@@ -26,7 +60,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
   const [newInstanceOpen, setNewInstanceOpen] = useState(false);
   const [newInstanceName, setNewInstanceName] = useState('');
   const [newDbVersion, setNewDbVersion] = useState('POSTGRES_18');
-  const [availableDbVersions, setAvailableDbVersions] = useState<any[]>([]);
+  const [availableDbVersions, setAvailableDbVersions] = useState<DatabaseVersion[]>([]);
 
   const apiRoot = `/api/manage/cloudsql/projects/${activeProject}`;
 
@@ -37,7 +71,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
     try {
       const res = await fetch(`${apiRoot}/instances`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { items?: CloudSqlInstance[] } = await res.json();
         setInstances(data.items || []);
       }
     } catch (e) { console.error(e); }
@@ -48,9 +82,9 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
       loadInstances();
       fetch('/api/config/images')
         .then(r => r.json())
-        .then(d => {
-          const pg = (d.sql?.postgres?.versions || []).map((v: any) => ({ ...v, engine: 'POSTGRES' }));
-          const my = (d.sql?.mysql?.versions || []).map((v: any) => ({ ...v, engine: 'MYSQL' }));
+        .then((d: ImagesConfig) => {
+          const pg: DatabaseVersion[] = (d.sql?.postgres?.versions || []).map(v => ({ ...v, engine: 'POSTGRES' }));
+          const my: DatabaseVersion[] = (d.sql?.mysql?.versions || []).map(v => ({ ...v, engine: 'MYSQL' }));
           setAvailableDbVersions([...pg, ...my]);
         })
         .catch(console.error);
@@ -90,10 +124,10 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
         showToast('Processing Database Instance Creation...');
         setTimeout(loadInstances, 1000); // Wait for the state to bounce
       } else {
-        const e = await res.json();
+        const e: ErrorResponse = await res.json();
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
     setNewInstanceOpen(false);
     setNewInstanceName('');
   };
@@ -178,7 +212,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
                       <IconButton size="small" onClick={() => copyToClipboard(activeInstance.connectionName)}><ContentCopyIcon fontSize="small" /></IconButton>
                     </Box>
 
-                    {activeInstance.ipAddresses && activeInstance.ipAddresses.map((ip: any, idx: number) => (
+                    {activeInstance.ipAddresses && activeInstance.ipAddresses.map((ip, idx) => (
                       <Box key={idx} sx={{ display: 'grid', gridTemplateColumns: '120px 1fr auto', gap: 2, alignItems: 'center', mb: 1.5 }}>
                         <Typography variant="body2" sx={{ fontWeight: 500 }}>IP Address:</Typography>
                         <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{ip.ipAddress}</Typography>

@@ -28,7 +28,7 @@
       "name": "minisky-datastore",
       "image": "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators",
       "port": "8081/tcp",
-      "cmd": ["gcloud", "beta", "emulators", "datastore", "start", "--host-port=0.0.0.0:8081", "--data-dir=/data", "--project=minisky-project"],
+      "cmd": ["gcloud", "beta", "emulators", "datastore", "start", "--host-port=0.0.0.0:8081", "--data-dir=/data", "--project=local-dev-project"],
       "volume": "./data/datastore:/data"
     },
     "spanner.googleapis.com": {
@@ -41,43 +41,37 @@
       "name": "minisky-firebase-auth",
       "image": "andreysenov/firebase-tools:latest",
       "port": "9099/tcp",
-      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only auth --project minisky-project"],
+      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only auth --project local-dev-project"],
       "volume": "",
       "env": [
         "FIREBASE_AUTH_EMULATOR_HOST=0.0.0.0:9099",
         "PUBSUB_EMULATOR_HOST=172.17.0.1:8080",
         "FIRESTORE_EMULATOR_HOST=172.17.0.1:8080",
-        "GOOGLE_CLOUD_PROJECT=minisky-project"
+        "GOOGLE_CLOUD_PROJECT=local-dev-project"
       ]
     },
     "firebaseio.com": {
       "name": "minisky-firebase-rtdb",
       "image": "andreysenov/firebase-tools:latest",
       "port": "9000/tcp",
-      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only database --project minisky-project"],
+      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only database --project local-dev-project"],
       "volume": "",
       "env": [
         "FIREBASE_DATABASE_EMULATOR_HOST=0.0.0.0:9000",
         "FIREBASE_AUTH_EMULATOR_HOST=172.17.0.1:8080",
-        "GOOGLE_CLOUD_PROJECT=minisky-project"
+        "GOOGLE_CLOUD_PROJECT=local-dev-project"
       ]
     },
     "firebasehosting.googleapis.com": {
       "name": "minisky-firebase-hosting",
       "image": "andreysenov/firebase-tools:latest",
       "port": "5000/tcp",
-      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only hosting --project minisky-project"],
+      "cmd": ["sh", "-c", "printf '{\"emulators\":{\"hub\":{\"host\":\"0.0.0.0\",\"port\":4400},\"auth\":{\"host\":\"0.0.0.0\",\"port\":9099},\"database\":{\"host\":\"0.0.0.0\",\"port\":9000},\"hosting\":{\"host\":\"0.0.0.0\",\"port\":5000},\"ui\":{\"enabled\":false}}}' > firebase.json && firebase emulators:start --only hosting --project local-dev-project"],
       "volume": "",
       "env": [
         "FIREBASE_HOSTING_EMULATOR_HOST=0.0.0.0:5000",
-        "GOOGLE_CLOUD_PROJECT=minisky-project"
+        "GOOGLE_CLOUD_PROJECT=local-dev-project"
       ]
-    },
-    "cloudkms.googleapis.com": {
-      "name": "minisky-kms",
-      "image": "winor30/fake-cloud-kms:latest",
-      "port": "9010/tcp",
-      "cmd": []
     }
   },
   "compute": {

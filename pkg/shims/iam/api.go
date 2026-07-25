@@ -39,9 +39,9 @@ type ServiceAccount struct {
 // The PrivateKeyData is a base64-encoded fake JSON service account key file.
 type ServiceAccountKey struct {
 	Name            string `json:"name"`
-	KeyType         string `json:"keyType"` // USER_MANAGED
-	KeyOrigin       string `json:"keyOrigin"` // GOOGLE_PROVIDED
-	KeyAlgorithm    string `json:"keyAlgorithm"` // KEY_ALG_RSA_2048
+	KeyType         string `json:"keyType"`        // USER_MANAGED
+	KeyOrigin       string `json:"keyOrigin"`      // GOOGLE_PROVIDED
+	KeyAlgorithm    string `json:"keyAlgorithm"`   // KEY_ALG_RSA_2048
 	PrivateKeyType  string `json:"privateKeyType"` // TYPE_GOOGLE_CREDENTIALS_FILE
 	PrivateKeyData  string `json:"privateKeyData"` // base64 JSON
 	ValidAfterTime  string `json:"validAfterTime"`
@@ -69,9 +69,9 @@ type Binding struct {
 // It handles service account CRUD, key generation, and IAM policy management.
 type API struct {
 	mu              sync.RWMutex
-	serviceAccounts map[string]*ServiceAccount    // key: "project:email"
+	serviceAccounts map[string]*ServiceAccount      // key: "project:email"
 	keys            map[string][]*ServiceAccountKey // key: "project:email"
-	policies        map[string]*IamPolicy          // key: resource full name
+	policies        map[string]*IamPolicy           // key: resource full name
 }
 
 func NewAPI() *API {
@@ -85,15 +85,16 @@ func NewAPI() *API {
 // ServeHTTP dispatches based on path structure.
 //
 // Supported paths:
-//   POST   /v1/projects/{project}/serviceAccounts
-//   GET    /v1/projects/{project}/serviceAccounts
-//   GET    /v1/projects/{project}/serviceAccounts/{email}
-//   DELETE /v1/projects/{project}/serviceAccounts/{email}
-//   POST   /v1/projects/{project}/serviceAccounts/{email}/keys
-//   GET    /v1/projects/{project}/serviceAccounts/{email}/keys
-//   POST   /v1/{resource}:setIamPolicy
-//   GET    /v1/{resource}:getIamPolicy
-//   POST   /v1/{resource}:testIamPermissions
+//
+//	POST   /v1/projects/{project}/serviceAccounts
+//	GET    /v1/projects/{project}/serviceAccounts
+//	GET    /v1/projects/{project}/serviceAccounts/{email}
+//	DELETE /v1/projects/{project}/serviceAccounts/{email}
+//	POST   /v1/projects/{project}/serviceAccounts/{email}/keys
+//	GET    /v1/projects/{project}/serviceAccounts/{email}/keys
+//	POST   /v1/{resource}:setIamPolicy
+//	GET    /v1/{resource}:getIamPolicy
+//	POST   /v1/{resource}:testIamPermissions
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: IAM] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
@@ -155,7 +156,7 @@ func (api *API) routeServiceAccounts(w http.ResponseWriter, r *http.Request, pat
 
 func (api *API) createServiceAccount(w http.ResponseWriter, r *http.Request, project string) {
 	var body struct {
-		AccountId   string `json:"accountId"`
+		AccountId      string `json:"accountId"`
 		ServiceAccount struct {
 			DisplayName string `json:"displayName"`
 			Description string `json:"description"`

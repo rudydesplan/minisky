@@ -27,10 +27,12 @@ var vertexCmd = &cobra.Command{
 func init() {
 	// Artifact Registry
 	arCmd.AddCommand(&cobra.Command{
-		Use:   "repositories list",
+		Use: "repositories list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
+			if port == "" {
+				port = "8081"
+			}
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/artifactregistry/repositories", port))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
@@ -52,10 +54,12 @@ func init() {
 
 	// Cloud Build
 	cbCmd.AddCommand(&cobra.Command{
-		Use:   "builds list",
+		Use: "builds list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
+			if port == "" {
+				port = "8081"
+			}
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/cloudbuild/builds", port))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
@@ -78,10 +82,12 @@ func init() {
 
 	// Vertex AI
 	vertexCmd.AddCommand(&cobra.Command{
-		Use:   "models list",
+		Use: "models list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
+			if port == "" {
+				port = "8081"
+			}
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/vertexai/internal/models", port))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)

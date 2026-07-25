@@ -19,10 +19,56 @@ type DataprocManagerDrawerProps = {
   onOpenBigQuery?: () => void;
 };
 
+interface DataprocCluster {
+  clusterName: string;
+  config?: {
+    workerConfig?: {
+      numInstances?: number;
+    };
+  };
+  status?: {
+    state?: string;
+  };
+}
+
+interface DataprocJob {
+  reference?: {
+    jobId?: string;
+  };
+  status?: {
+    state?: string;
+    details?: string;
+  };
+  placement?: {
+    clusterName?: string;
+  };
+  pysparkJob?: {
+    mainPythonFileUri?: string;
+  };
+  sparkJob?: {
+    mainJarFileUri?: string;
+  };
+}
+
+interface DataprocVersion {
+  version: string;
+  label: string;
+}
+
+interface ApiErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
 export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, onOpenBigQuery }: DataprocManagerDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [clusters, setClusters] = useState<any[]>([]);
-  const [jobs, setJobs] = useState<any[]>([]);
+  const [clusters, setClusters] = useState<DataprocCluster[]>([]);
+  const [jobs, setJobs] = useState<DataprocJob[]>([]);
   const [activeTab, setActiveTab] = useState(0);
 
   const [toast, setToast] = useState({ msg: '', open: false, severity: 'success' as 'success' | 'error' });
@@ -32,7 +78,7 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
   const [newClusterName, setNewClusterName] = useState('');
   const [numWorkers, setNumWorkers] = useState(2);
   const [selectedVersion, setSelectedVersion] = useState('4.0');
-  const [availableVersions, setAvailableVersions] = useState<any[]>([]);
+  const [availableVersions, setAvailableVersions] = useState<DataprocVersion[]>([]);
 
   // Job Dialog
   const [newJobOpen, setNewJobOpen] = useState(false);
@@ -95,10 +141,10 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
         showToast('Provisioning Spark/Hadoop cluster nodes...');
         setTimeout(loadData, 1000);
       } else {
-        const e = await res.json();
+        const e = await res.json() as ApiErrorResponse;
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e, 'Failed to create cluster'), 'error'); }
     setNewClusterOpen(false);
     setNewClusterName('');
   };
@@ -127,10 +173,10 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
         showToast('PySpark Job submitted successfully.');
         setTimeout(loadData, 500);
       } else {
-        const e = await res.json();
+        const e = await res.json() as ApiErrorResponse;
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (e: unknown) { showToast(getErrorMessage(e, 'Failed to submit job'), 'error'); }
     setNewJobOpen(false);
   };
 

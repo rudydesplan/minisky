@@ -23,13 +23,13 @@ func init() {
 }
 
 type LogEntry struct {
-	InsertId    string            `json:"insertId"`
-	Timestamp   string            `json:"timestamp"`
-	Severity    string            `json:"severity"`
-	TextPayload string            `json:"textPayload,omitempty"`
-	JsonPayload interface{}       `json:"jsonPayload,omitempty"`
+	InsertId    string             `json:"insertId"`
+	Timestamp   string             `json:"timestamp"`
+	Severity    string             `json:"severity"`
+	TextPayload string             `json:"textPayload,omitempty"`
+	JsonPayload interface{}        `json:"jsonPayload,omitempty"`
 	Resource    *MonitoredResource `json:"resource"`
-	LogName     string            `json:"logName"`
+	LogName     string             `json:"logName"`
 }
 
 type MonitoredResource struct {
@@ -151,11 +151,11 @@ func (api *API) PushLog(projectId, severity, resourceType, resourceName, text st
 	}
 
 	entry := LogEntry{
-		InsertId:  fmt.Sprintf("%d", time.Now().UnixNano()),
-		Timestamp: time.Now().Format(time.RFC3339),
-		Severity:  severity,
+		InsertId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+		Timestamp:   time.Now().Format(time.RFC3339),
+		Severity:    severity,
 		TextPayload: text,
-		LogName:   fmt.Sprintf("projects/%s/logs/%s", projectId, resourceType),
+		LogName:     fmt.Sprintf("projects/%s/logs/%s", projectId, resourceType),
 		Resource: &MonitoredResource{
 			Type: resourceType,
 			Labels: map[string]string{
@@ -194,7 +194,7 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 
 func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
 	log.Printf("[Logging] 🚜 Starting Background Log Harvester...")
-	
+
 	// Track the last timestamp we saw for each container to avoid duplicates
 	lastSeen := make(map[string]int64)
 
@@ -212,7 +212,7 @@ func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
 
 				// Fetch logs for this container
 				logs, _ := sm.GetContainerLogsSince(c.Name, since)
-				
+
 				// Update last seen to now
 				lastSeen[c.Name] = time.Now().Unix()
 
@@ -244,7 +244,7 @@ func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
 					if strings.Contains(upper, "ERROR") || strings.Contains(upper, "FAILED") {
 						severity = "ERROR"
 					}
-					
+
 					resourceType := "container"
 					resourceName := strings.TrimPrefix(c.Name, "minisky-")
 					if strings.HasPrefix(resourceName, "serverless-") {
@@ -268,7 +268,7 @@ func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
 					// If the container name contains a project hint, use it
 					// e.g. minisky-serverless-my-proj-my-fn
 					// For now we just use default-project as a safe fallback for harvesters
-					
+
 					api.mu.Lock()
 					entry := LogEntry{
 						InsertId:    fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -298,7 +298,7 @@ func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
 func (api *API) ListProjects() []string {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
-	
+
 	projects := make(map[string]bool)
 	for _, entry := range api.entries {
 		// LogName format: projects/{id}/logs/...
@@ -307,7 +307,7 @@ func (api *API) ListProjects() []string {
 			projects[parts[1]] = true
 		}
 	}
-	
+
 	res := []string{}
 	for p := range projects {
 		res = append(res, p)

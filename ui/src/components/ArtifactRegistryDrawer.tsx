@@ -16,12 +16,32 @@ import { useProjectContext } from '../contexts/ProjectContext';
 
 type ArtifactRegistryDrawerProps = { open: boolean; onClose: () => void };
 
+type Repository = {
+  name: string;
+  format: string;
+};
+
+type ArtifactPackage = {
+  name: string;
+  displayName?: string;
+};
+
+type ArtifactVersion = {
+  name: string;
+  relatedTags?: string[];
+  createTime: string;
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegistryDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [repositories, setRepositories] = useState<any[]>([]);
-  const [activeRepo, setActiveRepo] = useState<any | null>(null);
-  const [packages, setPackages] = useState<any[]>([]);
-  const [versions, setVersions] = useState<any[]>([]);
+  const [repositories, setRepositories] = useState<Repository[]>([]);
+  const [activeRepo, setActiveRepo] = useState<Repository | null>(null);
+  const [packages, setPackages] = useState<ArtifactPackage[]>([]);
+  const [versions, setVersions] = useState<ArtifactVersion[]>([]);
 
   const [toast, setToast] = useState({ msg: '', open: false, severity: 'success' as 'success' | 'error' });
   const [newRepoOpen, setNewRepoOpen] = useState(false);
@@ -87,7 +107,7 @@ export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegist
         const e = await res.json();
         showToast(e.error?.message || 'Failed', 'error');
       }
-    } catch (e: any) { showToast(e.message, 'error'); }
+    } catch (error: unknown) { showToast(errorMessage(error), 'error'); }
     setNewRepoOpen(false);
     setNewRepoName('');
   };

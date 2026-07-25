@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -27,18 +25,21 @@ var tasksCmd = &cobra.Command{
 func init() {
 	// KMS
 	kmsCmd.AddCommand(&cobra.Command{
-		Use:   "keyrings list",
+		Use: "keyrings list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
-			resp, _ := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/cloudkms/keyRings", port))
-			defer resp.Body.Close()
+			if port == "" {
+				port = "8081"
+			}
 			var data struct {
 				KeyRings []struct {
 					Name string `json:"name"`
 				} `json:"keyRings"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
+			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/cloudkms/keyRings", port), &data); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
 			fmt.Println("KMS KEY RINGS:")
 			for _, k := range data.KeyRings {
 				fmt.Printf("  - %s\n", k.Name)
@@ -48,18 +49,21 @@ func init() {
 
 	// Secret Manager
 	secretCmd.AddCommand(&cobra.Command{
-		Use:   "list",
+		Use: "list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
-			resp, _ := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/secretmanager/secrets", port))
-			defer resp.Body.Close()
+			if port == "" {
+				port = "8081"
+			}
 			var data struct {
 				Secrets []struct {
 					Name string `json:"name"`
 				} `json:"secrets"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
+			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/secretmanager/secrets", port), &data); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
 			fmt.Println("SECRET MANAGER SECRETS:")
 			for _, s := range data.Secrets {
 				fmt.Printf("  - %s\n", s.Name)
@@ -69,19 +73,22 @@ func init() {
 
 	// Cloud Tasks
 	tasksCmd.AddCommand(&cobra.Command{
-		Use:   "queues list",
+		Use: "queues list",
 		Run: func(cmd *cobra.Command, args []string) {
 			port := os.Getenv("MINISKY_UI_PORT")
-			if port == "" { port = "8081" }
-			resp, _ := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/cloudtasks/queues", port))
-			defer resp.Body.Close()
+			if port == "" {
+				port = "8081"
+			}
 			var data struct {
 				Queues []struct {
-					Name string `json:"name"`
+					Name  string `json:"name"`
 					State string `json:"state"`
 				} `json:"queues"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
+			if err := getJSON(fmt.Sprintf("http://localhost:%s/api/manage/cloudtasks/queues", port), &data); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", err)
+				return
+			}
 			fmt.Println("CLOUD TASKS QUEUES:")
 			for _, q := range data.Queues {
 				fmt.Printf("  - %s [%s]\n", q.Name, q.State)

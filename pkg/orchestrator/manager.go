@@ -25,7 +25,7 @@ type ServiceManager struct {
 	mu           sync.RWMutex
 	dockerClient *http.Client
 	sockPath     string
-	portRegistry map[string][]PortMapping  // containerName → host ports
+	portRegistry map[string][]PortMapping   // containerName → host ports
 	fwRules      map[string][]FirewallEntry // vpcName → rules
 }
 
@@ -60,8 +60,8 @@ type FirewallEntry struct {
 func NewServiceManager() (*ServiceManager, error) {
 	sockPath := resolveDockerSocket()
 	// On Unix, ensure DOCKER_HOST is set if we found a socket
-	if !strings.HasPrefix(sockPath, "//./pipe/") && os.Getenv("DOCKER_HOST") == "" { 
-		os.Setenv("DOCKER_HOST", "unix://"+sockPath); 
+	if !strings.HasPrefix(sockPath, "//./pipe/") && os.Getenv("DOCKER_HOST") == "" {
+		os.Setenv("DOCKER_HOST", "unix://"+sockPath)
 	}
 	log.Printf("[ServiceManager] Docker socket resolved: %s", sockPath)
 	sm := &ServiceManager{
@@ -461,7 +461,7 @@ func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
 // ProvisionComputeVM actively boots a Data Plane Docker container mimicking a GCE VM.
 func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning compute VM: %s (image: %s vpc: %s ports: %d env: %d cmd: %v)", containerName, osImage, vpcName, len(ports), len(env), cmd)
-	
+
 	exists, err := sm.ImageExistsPublic(osImage)
 	if err != nil {
 		log.Printf("[Orchestrator] Image check error for %s: %v", osImage, err)
@@ -507,13 +507,13 @@ func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage strin
 	url := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict { // 409
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("vm creation rejected %d: %s", resp.StatusCode, b)
@@ -522,14 +522,14 @@ func (sm *ServiceManager) ProvisionComputeVM(containerName string, osImage strin
 	if err := sm.startContainer(containerName); err != nil {
 		return err
 	}
-	
+
 	return sm.updatePortRegistry(containerName)
 }
 
 // ProvisionCloudSQLVM starts a fully-interactive PostgreSQL or MySQL docker database data plane.
 func (sm *ServiceManager) ProvisionBuildStep(containerName string, image string, binds []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning build step: %s (image: %s binds: %v cmd: %v)", containerName, image, binds, cmd)
-	
+
 	exists, _ := sm.ImageExistsPublic(image)
 	if !exists {
 		sm.pullImageInternal(image)
@@ -555,13 +555,13 @@ func (sm *ServiceManager) ProvisionBuildStep(containerName string, image string,
 	url := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("build step creation rejected %d: %s", resp.StatusCode, b)
@@ -591,8 +591,8 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(instanceName string, version strin
 		if image == "" {
 			image = reg.Sql.Postgres.DefaultImage
 		}
-		env = append(sm.standardEnv(), 
-			"POSTGRES_PASSWORD=" + rootPassword,
+		env = append(sm.standardEnv(),
+			"POSTGRES_PASSWORD="+rootPassword,
 			"PGDATA=/var/lib/postgresql/data",
 		)
 		expPort = "5432/tcp"
@@ -614,7 +614,7 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(instanceName string, version strin
 		if image == "" {
 			image = reg.Sql.Mysql.DefaultImage
 		}
-		env = append(sm.standardEnv(), "MYSQL_ROOT_PASSWORD=" + rootPassword)
+		env = append(sm.standardEnv(), "MYSQL_ROOT_PASSWORD="+rootPassword)
 		expPort = "3306/tcp"
 	} else {
 		return "", fmt.Errorf("unsupported database version: %s", version)
@@ -722,7 +722,7 @@ func (sm *ServiceManager) DeleteCloudSQLVM(instanceName string) error {
 // DeleteComputeVM permanently destroys a physical Data Plane compute instance.
 func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
 	log.Printf("[Orchestrator] Tearing down Data Plane VM: %s", containerName)
-	
+
 	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", containerName)
 	req, _ := http.NewRequest("POST", stopURL, nil)
 	sm.dockerClient.Do(req)
@@ -754,7 +754,7 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 			expPort: struct{}{},
 		},
 		"HostConfig": map[string]interface{}{
-			"NetworkMode":  networkName,
+			"NetworkMode": networkName,
 			"PortBindings": map[string]interface{}{
 				expPort: []map[string]string{
 					{"HostIp": "127.0.0.1", "HostPort": "0"},
@@ -817,9 +817,9 @@ func (sm *ServiceManager) fetchLogs(url string) (string, error) {
 		return "Log source not found.", nil
 	}
 
-	// Docker logs stream format: [8]byte header + payload. 
+	// Docker logs stream format: [8]byte header + payload.
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	// Quick header strip for standard docker logs stream headers (8 bytes)
 	var result strings.Builder
 	for i := 0; i < len(body); {
@@ -886,7 +886,7 @@ func (sm *ServiceManager) RunCommandInContainer(name string, cmd []string) (stri
 
 	// 3. Collect output (Docker stream format)
 	rawOutput, _ := io.ReadAll(startResp.Body)
-	
+
 	// Helper to strip headers
 	var result strings.Builder
 	for i := 0; i < len(rawOutput); {
@@ -1137,7 +1137,7 @@ func (sm *ServiceManager) CheckFirewallAllows(vpcName, protocol, port, sourceIP 
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	rules := sm.fwRules[vpcName]
-	
+
 	allowed := false
 	for _, r := range rules {
 		if r.Direction == "INGRESS" {
@@ -1251,10 +1251,10 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
-
-func (sm *ServiceManager) DoDockerRequest(req *http.Request) (*http.Response, error) { 
-	return sm.dockerClient.Do(req) 
+func (sm *ServiceManager) DoDockerRequest(req *http.Request) (*http.Response, error) {
+	return sm.dockerClient.Do(req)
 }
+
 // GetContainerIP retrieves the internal IP address of a container.
 func (sm *ServiceManager) GetContainerIP(name string) string {
 	resp, err := sm.dockerClient.Get(fmt.Sprintf("http://localhost/containers/%s/json", name))
@@ -1355,8 +1355,8 @@ func (sm *ServiceManager) GetContainerStats(name string) (*ContainerStats, error
 			SystemCPUUsage uint64 `json:"system_cpu_usage"`
 		} `json:"precpu_stats"`
 		MemoryStats struct {
-			Usage    uint64 `json:"usage"`
-			Stats    map[string]uint64 `json:"stats"`
+			Usage uint64            `json:"usage"`
+			Stats map[string]uint64 `json:"stats"`
 		} `json:"memory_stats"`
 	}
 

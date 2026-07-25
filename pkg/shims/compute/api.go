@@ -25,27 +25,27 @@ func init() {
 
 // Instance represents a GCE VM with its full lifecycle state.
 type Instance struct {
-	Kind              string            `json:"kind"`
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	Zone              string            `json:"zone"`
-	MachineType       string            `json:"machineType"`
-	Status            string            `json:"status"`
-	SelfLink          string            `json:"selfLink"`
-	Description       string            `json:"description"`
-	Labels            map[string]string `json:"labels,omitempty"`
-	Metadata          *InstanceMetadata `json:"metadata,omitempty"`
-	NetworkInterfaces []NetworkInterface `json:"networkInterfaces"`
-	Disks             []AttachedDisk    `json:"disks"`
-	CreationTimestamp string            `json:"creationTimestamp"`
+	Kind              string                     `json:"kind"`
+	ID                string                     `json:"id"`
+	Name              string                     `json:"name"`
+	Zone              string                     `json:"zone"`
+	MachineType       string                     `json:"machineType"`
+	Status            string                     `json:"status"`
+	SelfLink          string                     `json:"selfLink"`
+	Description       string                     `json:"description"`
+	Labels            map[string]string          `json:"labels,omitempty"`
+	Metadata          *InstanceMetadata          `json:"metadata,omitempty"`
+	NetworkInterfaces []NetworkInterface         `json:"networkInterfaces"`
+	Disks             []AttachedDisk             `json:"disks"`
+	CreationTimestamp string                     `json:"creationTimestamp"`
 	HostPorts         []orchestrator.PortMapping `json:"hostPorts,omitempty"`
 	// internal tracking only
-	project string
-	zone    string
-	Fingerprint string `json:"fingerprint"`
-	LabelFingerprint  string            `json:"labelFingerprint"`
-	Scheduling        *Scheduling       `json:"scheduling,omitempty"`
-	CanIpForward      bool              `json:"canIpForward"`
+	project          string
+	zone             string
+	Fingerprint      string      `json:"fingerprint"`
+	LabelFingerprint string      `json:"labelFingerprint"`
+	Scheduling       *Scheduling `json:"scheduling,omitempty"`
+	CanIpForward     bool        `json:"canIpForward"`
 }
 
 func (i *Instance) DeepCopy() *Instance {
@@ -92,8 +92,8 @@ type Scheduling struct {
 }
 
 type InstanceMetadata struct {
-	Kind  string            `json:"kind"`
-	Items []MetadataItem    `json:"items,omitempty"`
+	Kind  string         `json:"kind"`
+	Items []MetadataItem `json:"items,omitempty"`
 }
 
 type MetadataItem struct {
@@ -150,14 +150,14 @@ type SecurityPolicy struct {
 }
 
 type SecurityPolicyRule struct {
-	Priority    int             `json:"priority"`
-	Action      string          `json:"action"`
-	Description string          `json:"description,omitempty"`
-	Match       *RuleMatch      `json:"match,omitempty"`
+	Priority    int        `json:"priority"`
+	Action      string     `json:"action"`
+	Description string     `json:"description,omitempty"`
+	Match       *RuleMatch `json:"match,omitempty"`
 }
 
 type RuleMatch struct {
-	VersionedExpr string `json:"versionedExpr,omitempty"` // SRC_IPS_V1
+	VersionedExpr string           `json:"versionedExpr,omitempty"` // SRC_IPS_V1
 	Config        *RuleMatchConfig `json:"config,omitempty"`
 }
 
@@ -173,8 +173,8 @@ type FirewallRule struct {
 	Description       string          `json:"description,omitempty"`
 	Network           string          `json:"network"`
 	Priority          int             `json:"priority"`
-	Direction         string          `json:"direction"`   // INGRESS, EGRESS
-	Action            string          `json:"action"`      // allow, deny
+	Direction         string          `json:"direction"` // INGRESS, EGRESS
+	Action            string          `json:"action"`    // allow, deny
 	SourceRanges      []string        `json:"sourceRanges,omitempty"`
 	DestinationRanges []string        `json:"destinationRanges,omitempty"`
 	Allowed           []FirewallAllow `json:"allowed,omitempty"`
@@ -199,10 +199,10 @@ type API struct {
 	mu               sync.RWMutex
 	opMgr            *orchestrator.OperationManager
 	svcMgr           *orchestrator.ServiceManager
-	instances        map[string]*Instance        // key: project+":"+zone+":"+name
-	networks         map[string]*Network         // key: project+":"+name
-	securityPolicies map[string]*SecurityPolicy  // key: project+":"+name
-	firewalls        map[string]*FirewallRule     // key: project+":"+name
+	instances        map[string]*Instance       // key: project+":"+zone+":"+name
+	networks         map[string]*Network        // key: project+":"+name
+	securityPolicies map[string]*SecurityPolicy // key: project+":"+name
+	firewalls        map[string]*FirewallRule   // key: project+":"+name
 }
 
 // NewAPI builds the Compute shim with the shared LRO manager and service manager.
@@ -224,7 +224,7 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 func (api *API) ListProjects() []string {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
-	
+
 	projects := make(map[string]bool)
 	for _, inst := range api.instances {
 		if inst.project != "" {
@@ -239,7 +239,7 @@ func (api *API) ListProjects() []string {
 		p := strings.Split(k, ":")[0]
 		projects[p] = true
 	}
-	
+
 	res := []string{}
 	for p := range projects {
 		res = append(res, p)
@@ -321,20 +321,19 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 // Creates an in-memory instance in PROVISIONING state and kicks off an LRO.
 func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, zone string) {
 	var body struct {
-		Name        string `json:"name"`
-		MachineType string `json:"machineType"`
-		Description string `json:"description"`
-		Labels      map[string]string `json:"labels"`
-		Metadata    *InstanceMetadata `json:"metadata"`
+		Name              string             `json:"name"`
+		MachineType       string             `json:"machineType"`
+		Description       string             `json:"description"`
+		Labels            map[string]string  `json:"labels"`
+		Metadata          *InstanceMetadata  `json:"metadata"`
 		NetworkInterfaces []NetworkInterface `json:"networkInterfaces"`
-		Disks       []AttachedDisk `json:"disks"`
+		Disks             []AttachedDisk     `json:"disks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Request body parse error: "+err.Error())
 		return
 	}
-
 
 	name := body.Name
 	if name == "" {
@@ -495,7 +494,7 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 
 		// Tell the Orchestrator to physically spin up the Docker container!
 		err := api.svcMgr.ProvisionComputeVM(containerName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
-		
+
 		api.mu.Lock()
 		if i, ok := api.instances[key]; ok {
 			if err != nil {
@@ -504,7 +503,7 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 				api.mu.Unlock()
 				return err
 			}
-			
+
 			// 3. Post-provisioning delay to ensure the UI catches the transition
 			time.Sleep(1500 * time.Millisecond)
 
@@ -530,7 +529,7 @@ func (api *API) getInstance(w http.ResponseWriter, r *http.Request, project, zon
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("Instance '%s' not found in zone '%s'", name, zone))
 		return
 	}
-	
+
 	// Deep copy under lock to avoid racing with background updates
 	instCopy := inst.DeepCopy()
 	api.mu.RUnlock()
@@ -551,7 +550,7 @@ func (api *API) getInstance(w http.ResponseWriter, r *http.Request, project, zon
 			instCopy.NetworkInterfaces[0].Subnetwork = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s/subnetworks/default", project, strings.Join(strings.Split(zone, "-")[:2], "-"))
 		}
 	}
-	
+
 	if instCopy.Fingerprint == "" {
 		instCopy.Fingerprint = "minisky-mock-fingerprint"
 	}
@@ -618,18 +617,18 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	containerName := fmt.Sprintf("minisky-vm-%s", name)
 	op := api.opMgr.Register("compute#operation", "delete",
 		selfLinkInstance(project, zone, name), zone, "")
-	
+
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Simulate winding down time
 		time.Sleep(3 * time.Second)
-		
+
 		api.svcMgr.DeleteComputeVM(containerName)
-		
+
 		// Finally remove from memory
 		api.mu.Lock()
 		delete(api.instances, key)
 		api.mu.Unlock()
-		return nil 
+		return nil
 	})
 
 	w.WriteHeader(http.StatusOK)
@@ -823,14 +822,14 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 			api.mu.RLock()
 			n, ok := api.networks[key]
 			api.mu.RUnlock()
-			
+
 			if !ok && name == "default" {
 				// Return a virtual default network
 				n = &Network{
-					Kind: "compute#network",
-					ID: "0",
-					Name: "default",
-					SelfLink: fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project),
+					Kind:              "compute#network",
+					ID:                "0",
+					Name:              "default",
+					SelfLink:          fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project),
 					CreationTimestamp: "2024-01-01T00:00:00Z",
 				}
 				ok = true
@@ -857,13 +856,13 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 				}
 			}
 			api.mu.RUnlock()
-			
+
 			if !hasDefault {
 				items = append(items, &Network{
-					Kind: "compute#network",
-					ID: "0",
-					Name: "default",
-					SelfLink: fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project),
+					Kind:              "compute#network",
+					ID:                "0",
+					Name:              "default",
+					SelfLink:          fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project),
 					CreationTimestamp: "2024-01-01T00:00:00Z",
 				})
 			}
@@ -1156,7 +1155,7 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 	op := api.opMgr.Register("compute#operation", "insert", body.SelfLink, "", "")
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(body.Network)
-		return nil 
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
@@ -1226,7 +1225,7 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 	op := api.opMgr.Register("compute#operation", "patch", result.SelfLink, "", "")
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(result.Network)
-		return nil 
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
@@ -1251,7 +1250,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 	op := api.opMgr.Register("compute#operation", "delete", "", "", "")
 	api.opMgr.RunAsync(op.Name, func() error {
 		api.reapplyFirewallToVPC(networkURL)
-		return nil 
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(op)
@@ -1290,7 +1289,7 @@ func (api *API) reapplyFirewallToVPC(networkURL string) {
 	vpcName := extractNameFromURL(networkURL)
 	var containerNames []string
 	var osImages []string
-	
+
 	api.mu.RLock()
 	for _, inst := range api.instances {
 		if len(inst.NetworkInterfaces) > 0 {
@@ -1309,7 +1308,7 @@ func (api *API) reapplyFirewallToVPC(networkURL string) {
 		}
 	}
 	api.mu.RUnlock()
-	
+
 	if len(containerNames) > 0 {
 		api.svcMgr.ApplyFirewallPortsToVPC(vpcName, containerNames, osImages)
 	}

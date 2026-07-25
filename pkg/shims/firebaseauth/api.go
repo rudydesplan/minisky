@@ -1,11 +1,11 @@
 package firebaseauth
 
 import (
+	"minisky/pkg/orchestrator"
+	"minisky/pkg/registry"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"minisky/pkg/orchestrator"
-	"minisky/pkg/registry"
 )
 
 func init() {

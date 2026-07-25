@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { 
   Drawer, Box, Typography, TextField, Button, 
   Stack, Divider, Alert, List, ListItem, ListItemText, IconButton,
   CircularProgress, Collapse, Paper, Chip
 } from '@mui/material';
+import type { ChipProps } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
@@ -31,10 +32,24 @@ interface Build {
   };
 }
 
+interface BuildConfig {
+  steps: BuildStep[];
+  [key: string]: unknown;
+}
+
+interface ErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
 }
+
+const getErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
 
 export default function CloudBuildDrawer({ open, onClose }: Props) {
   const { activeProject } = useProjectContext();
@@ -49,35 +64,35 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
   const [sourceRepo, setSourceRepo] = useState('');
   const [sourceBranch, setSourceBranch] = useState('main');
 
-  const fetchBuilds = async () => {
+  const fetchBuilds = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/cloudbuild/v1/projects/${activeProject}/builds`);
       if (!res.ok) throw new Error('Failed to fetch builds');
-      const data = await res.json();
+      const data: { builds?: Build[] } = await res.json();
       setBuilds(data.builds || []);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   useEffect(() => {
     if (open) {
       fetchBuilds();
     }
-  }, [open, activeProject]);
+  }, [open, fetchBuilds]);
 
   const handleSubmitBuild = async () => {
     setSubmitting(true);
     setError(null);
     try {
-      let body;
+      let body: BuildConfig;
       try {
-        body = JSON.parse(buildConfig);
+        body = JSON.parse(buildConfig) as BuildConfig;
       } catch (e) {
-        throw new Error('Invalid JSON configuration');
+        throw new Error('Invalid JSON configuration', { cause: e });
       }
 
       const payload = {
@@ -97,19 +112,19 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
       });
       
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
+        const errData: ErrorResponse = await res.json().catch(() => ({}));
         throw new Error(errData.error?.message || 'Failed to submit build');
       }
 
       fetchBuilds();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
     } finally {
       setSubmitting(false);
     }
   };
 
-  const getStatusColor = (status: string) => {
+  const getStatusColor = (status: string): ChipProps['color'] => {
     switch (status) {
       case 'SUCCESS': return 'success';
       case 'FAILURE': return 'error';
@@ -213,7 +228,7 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
                       <Chip 
                         size="small" 
                         label={b.status} 
-                        color={getStatusColor(b.status) as any} 
+                        color={getStatusColor(b.status)}
                         variant="filled"
                         sx={{ fontWeight: 600, fontSize: '0.7rem' }}
                       />

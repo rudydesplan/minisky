@@ -1,7 +1,7 @@
 provider "google" {
   project      = "local-dev-project"
   region       = "us-central1"
-  access_token = "minisky-token"
+  access_token = "minisky-local-token"
 
   # Redirect APIs to MiniSky Gateway
   storage_custom_endpoint         = "http://localhost:8080/storage/v1/"

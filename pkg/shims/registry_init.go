@@ -2,16 +2,16 @@ package shims
 
 import (
 	"minisky/pkg/registry"
-	
+
 	// Blank imports to trigger init() in all shim packages
 	_ "minisky/pkg/shims/appengine"
 	_ "minisky/pkg/shims/artifactregistry"
 	_ "minisky/pkg/shims/bigquery"
 	_ "minisky/pkg/shims/bigtable"
-	_ "minisky/pkg/shims/cloudsql"
-	_ "minisky/pkg/shims/cloudkms"
-	_ "minisky/pkg/shims/cloudtasks"
 	_ "minisky/pkg/shims/cloudbuild"
+	_ "minisky/pkg/shims/cloudkms"
+	_ "minisky/pkg/shims/cloudsql"
+	_ "minisky/pkg/shims/cloudtasks"
 	_ "minisky/pkg/shims/compute"
 	_ "minisky/pkg/shims/dataproc"
 	_ "minisky/pkg/shims/dns"

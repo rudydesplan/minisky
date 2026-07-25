@@ -7,7 +7,7 @@ import CloseIcon from '@mui/icons-material/Close';
 import DeleteIcon from '@mui/icons-material/Delete';
 import CreateNewFolderIcon from '@mui/icons-material/CreateNewFolder';
 import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useProjectContext } from '../contexts/ProjectContext';
 
 type StorageManagerDrawerProps = {
@@ -15,32 +15,41 @@ type StorageManagerDrawerProps = {
   onClose: () => void;
 };
 
+type StorageBucket = {
+  name: string;
+};
+
+type StorageObject = {
+  name: string;
+  size?: string;
+};
+
 export default function StorageManagerDrawer({ open, onClose }: StorageManagerDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [buckets, setBuckets] = useState<any[]>([]);
+  const [buckets, setBuckets] = useState<StorageBucket[]>([]);
   const [newBucketName, setNewBucketName] = useState('');
   
   const [currentBucket, setCurrentBucket] = useState<string | null>(null);
-  const [objects, setObjects] = useState<any[]>([]);
+  const [objects, setObjects] = useState<StorageObject[]>([]);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
 
-  const loadBuckets = async () => {
+  const loadBuckets = useCallback(async () => {
     try {
       const res = await fetch(`/api/manage/storage/b?project=${activeProject}`);
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json() as { items?: StorageBucket[] };
         setBuckets(data.items || []);
       }
     } catch (e) {
       console.error(e);
     }
-  };
+  }, [activeProject]);
 
   const loadObjects = async (bucket: string) => {
     try {
       const res = await fetch(`/api/manage/storage/b/${bucket}/o`);
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json() as { items?: StorageObject[] };
         setObjects(data.items || []);
       }
     } catch (e) {
@@ -53,7 +62,7 @@ export default function StorageManagerDrawer({ open, onClose }: StorageManagerDr
       loadBuckets();
       setCurrentBucket(null);
     }
-  }, [open, activeProject]);
+  }, [open, loadBuckets]);
 
   useEffect(() => {
     if (currentBucket) {

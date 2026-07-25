@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Test, lint, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Lint UI
+        working-directory: ui
+        run: npm run lint
+
+      - name: Audit UI dependencies
+        working-directory: ui
+        run: npm audit --audit-level=high
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Share UI assets with native platform jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l cmd pkg ui)"
+
+      - name: Vet Go code
+        run: go vet ./cmd/... ./pkg/... ./ui
+
+      - name: Test Go code with race detector
+        run: go test -race ./cmd/... ./pkg/... ./ui
+
+      - name: Build MiniSky
+        run: go build -trimpath ./cmd/minisky
+
+  release-snapshot:
+    name: Validate release configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: goreleaser/goreleaser-action@v6
+        name: Validate GoReleaser configuration
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
+
+      - uses: goreleaser/goreleaser-action@v6
+        name: Build Linux amd64 release snapshot
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --snapshot --clean --id linux-amd64
+
+  native-cgo:
+    name: DuckDB conformance (${{ matrix.name }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            expected_arch: aarch64
+            cc: gcc
+          - name: macos-arm64
+            runner: macos-14
+            expected_arch: arm64
+            cc: clang
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify native architecture
+        run: test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Run DuckDB conformance suite
+        env:
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
+        run: go test -count=1 ./pkg/shims/bigquery
+
+      - name: Build native MiniSky binary
+        env:
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
+        run: go build -trimpath -o minisky ./cmd/minisky
+
+      - name: Smoke test native binary
+        run: ./minisky doctor bigquery
+
+  windows-cgo:
+    name: DuckDB conformance (windows-amd64)
+    needs: quality
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Add UCRT toolchain to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH 'C:\msys64\ucrt64\bin'
+
+      - name: Run DuckDB conformance suite
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+        run: go test -count=1 ./pkg/shims/bigquery
+
+      - name: Build native MiniSky binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+        run: go build -trimpath -o minisky.exe ./cmd/minisky
+
+      - name: Audit runtime DLL dependencies
+        shell: pwsh
+        run: |
+          $dependencies = & objdump -p minisky.exe |
+            Select-String 'DLL Name' |
+            ForEach-Object { $_.Line.Trim() }
+          $dependencies | Tee-Object -FilePath windows-dll-dependencies.txt
+          if ($dependencies -match 'libgcc|libstdc\+\+|libwinpthread') {
+            throw 'MiniSky requires non-system MinGW runtime DLLs'
+          }
+
+      - name: Smoke test native binary
+        shell: pwsh
+        run: .\minisky.exe version
+
+      - name: Upload feasibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cgo-evidence
+          path: |
+            minisky.exe
+            windows-dll-dependencies.txt
+          if-no-files-found: warn

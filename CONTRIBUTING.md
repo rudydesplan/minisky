@@ -76,18 +76,27 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 
 ## 🎨 Dashboard Development
 
-The UI is built with **React + Vite + Tailwind CSS**.
+The UI is built with **React + Vite + Material UI**.
 1.  Navigate to `ui/`.
 2.  Add a new manager component in `src/components/`.
 3.  Register your tab in `App.tsx`.
 4.  The UI communicates with the backend via the Management API at `:8081/api/manage/`.
 
+Before submitting UI changes, run:
+
+```bash
+cd ui
+npm ci
+npm run lint
+npm run build
+```
+
 ---
 
 ## ✅ Pull Request Process
 
-1.  **Format**: Ensure your code is formatted with `go fmt`.
-2.  **Tests**: If you add logic, add a unit test in your shim directory.
+1.  **Format**: Ensure your code is formatted with `gofmt`.
+2.  **Tests**: Add or update tests for changed behavior, then run `go test -race ./cmd/... ./pkg/...`.
 3.  **Documentation**: Update the `CLI Reference` or `User Guide` if you added user-facing flags or commands.
 4.  **Screenshot**: If you modified the UI, include a screenshot in your PR description.
 

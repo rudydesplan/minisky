@@ -25,26 +25,26 @@ func init() {
 
 // Cluster mirrors the GKE container.v1 Cluster resource.
 type Cluster struct {
-	Name             string          `json:"name"`
-	Description      string          `json:"description,omitempty"`
-	NodeConfig       *NodeConfig     `json:"nodeConfig,omitempty"`
-	MasterAuth       *MasterAuth     `json:"masterAuth,omitempty"`
-	LoggingService   string          `json:"loggingService"`
-	MonitoringService string         `json:"monitoringService"`
-	Network          string          `json:"network"`
-	ClusterIpv4Cidr  string          `json:"clusterIpv4Cidr"`
-	Endpoint         string          `json:"endpoint"`
-	InitialClusterVersion string     `json:"initialClusterVersion"`
-	CurrentMasterVersion  string     `json:"currentMasterVersion"`
-	Status           string          `json:"status"` // PROVISIONING, RUNNING, RECONCILING, STOPPING, ERROR, DEGRADED
-	StatusMessage    string          `json:"statusMessage,omitempty"`
-	NodeIpv4CidrSize int             `json:"nodeIpv4CidrSize"`
-	ServicesIpv4Cidr string          `json:"servicesIpv4Cidr"`
-	SelfLink         string          `json:"selfLink"`
-	Zone             string          `json:"zone"`
-	Location         string          `json:"location"`
-	CreateTime       string          `json:"createTime"`
-	InitialNodeCount int             `json:"initialNodeCount"`
+	Name                  string      `json:"name"`
+	Description           string      `json:"description,omitempty"`
+	NodeConfig            *NodeConfig `json:"nodeConfig,omitempty"`
+	MasterAuth            *MasterAuth `json:"masterAuth,omitempty"`
+	LoggingService        string      `json:"loggingService"`
+	MonitoringService     string      `json:"monitoringService"`
+	Network               string      `json:"network"`
+	ClusterIpv4Cidr       string      `json:"clusterIpv4Cidr"`
+	Endpoint              string      `json:"endpoint"`
+	InitialClusterVersion string      `json:"initialClusterVersion"`
+	CurrentMasterVersion  string      `json:"currentMasterVersion"`
+	Status                string      `json:"status"` // PROVISIONING, RUNNING, RECONCILING, STOPPING, ERROR, DEGRADED
+	StatusMessage         string      `json:"statusMessage,omitempty"`
+	NodeIpv4CidrSize      int         `json:"nodeIpv4CidrSize"`
+	ServicesIpv4Cidr      string      `json:"servicesIpv4Cidr"`
+	SelfLink              string      `json:"selfLink"`
+	Zone                  string      `json:"zone"`
+	Location              string      `json:"location"`
+	CreateTime            string      `json:"createTime"`
+	InitialNodeCount      int         `json:"initialNodeCount"`
 }
 
 type NodeConfig struct {
@@ -56,10 +56,10 @@ type NodeConfig struct {
 }
 
 type MasterAuth struct {
-	Username              string     `json:"username,omitempty"`
-	ClusterCaCertificate  string     `json:"clusterCaCertificate"`
-	ClientCertificate     string     `json:"clientCertificate"`
-	ClientKey             string     `json:"clientKey"`
+	Username             string `json:"username,omitempty"`
+	ClusterCaCertificate string `json:"clusterCaCertificate"`
+	ClientCertificate    string `json:"clientCertificate"`
+	ClientKey            string `json:"clientKey"`
 }
 
 // GkeOperation mirrors the GKE Operation resource.
@@ -103,12 +103,13 @@ func (api *API) GetBackend() *KindBackend {
 // ServeHTTP dispatches GKE container.v1 paths.
 //
 // Supported paths (container.googleapis.com):
-//   POST   /v1/projects/{project}/zones/{zone}/clusters
-//   GET    /v1/projects/{project}/zones/{zone}/clusters
-//   GET    /v1/projects/{project}/zones/{zone}/clusters/{cluster}
-//   DELETE /v1/projects/{project}/zones/{zone}/clusters/{cluster}
-//   GET    /v1/projects/{project}/zones/{zone}/operations/{operation}
-//   (location-based paths /v1/projects/{project}/locations/{zone}/... also handled)
+//
+//	POST   /v1/projects/{project}/zones/{zone}/clusters
+//	GET    /v1/projects/{project}/zones/{zone}/clusters
+//	GET    /v1/projects/{project}/zones/{zone}/clusters/{cluster}
+//	DELETE /v1/projects/{project}/zones/{zone}/clusters/{cluster}
+//	GET    /v1/projects/{project}/zones/{zone}/operations/{operation}
+//	(location-based paths /v1/projects/{project}/locations/{zone}/... also handled)
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: GKE] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
@@ -321,7 +322,7 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("Cluster '%s' not found", name))
 		return
 	}
-	
+
 	// Mark as STOPPING to simulate winding down in the UI
 	cl.Status = "STOPPING"
 	api.mu.Unlock()

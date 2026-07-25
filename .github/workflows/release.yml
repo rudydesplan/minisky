@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ui:
+    name: Build UI assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  native-binaries:
+    name: Build ${{ matrix.name }}
+    needs: ui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            expected_arch: x86_64
+            cgo: "1"
+            cc: gcc
+            archive: minisky_linux_amd64.tar.gz
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            expected_arch: aarch64
+            cgo: "1"
+            cc: gcc
+            archive: minisky_linux_arm64.tar.gz
+          - name: darwin-arm64
+            runner: macos-14
+            expected_arch: arm64
+            cgo: "1"
+            cc: clang
+            archive: minisky_darwin_arm64.tar.gz
+          - name: windows-amd64
+            runner: windows-latest
+            expected_arch: amd64
+            cgo: "1"
+            cc: gcc
+            archive: minisky_windows_amd64.zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Add UCRT toolchain to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH 'C:\msys64\ucrt64\bin'
+
+      - name: Verify Unix runner architecture
+        if: runner.os != 'Windows'
+        run: test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Verify Windows runner architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ((go env GOARCH) -ne '${{ matrix.expected_arch }}') {
+            throw "Unexpected architecture: $(go env GOARCH)"
+          }
+
+      - name: Run platform contract tests
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
+        run: go test -count=1 ./pkg/shims/bigquery
+
+      - name: Build and package Unix binary
+        if: runner.os != 'Windows'
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir package
+          go build -trimpath \
+            -ldflags "-s -w -X minisky/pkg/version.Version=${version}" \
+            -o package/minisky ./cmd/minisky
+          cp README.md CONTRIBUTING.md LICENSE package/
+          cp -R docs package/
+          tar -C package -czf "${{ matrix.archive }}" \
+            minisky README.md CONTRIBUTING.md LICENSE docs
+          mkdir installed
+          tar -C installed -xzf "${{ matrix.archive }}"
+          ./installed/minisky doctor bigquery
+
+      - name: Build and package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          New-Item -ItemType Directory package
+          go build -trimpath `
+            -ldflags "-s -w -X minisky/pkg/version.Version=$version" `
+            -o package\minisky.exe ./cmd/minisky
+          Copy-Item README.md, CONTRIBUTING.md, LICENSE package\
+          Copy-Item -Recurse docs package\
+          Compress-Archive -Path package\* -DestinationPath "${{ matrix.archive }}"
+          New-Item -ItemType Directory installed
+          Expand-Archive -Path "${{ matrix.archive }}" -DestinationPath installed
+          .\installed\minisky.exe doctor bigquery
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.name }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish checksummed release
+    needs: native-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate native artifact set
+        run: |
+          for artifact in \
+            minisky_linux_amd64.tar.gz \
+            minisky_linux_arm64.tar.gz \
+            minisky_darwin_arm64.tar.gz \
+            minisky_windows_amd64.zip; do
+            test -s "release-assets/${artifact}"
+          done
+          cd release-assets
+          sha256sum minisky_* > checksums.txt
+          sha256sum --check checksums.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "MiniSky ${GITHUB_REF_NAME}"

@@ -76,11 +76,11 @@ type Status struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type API struct {
-	mu     sync.RWMutex
-	jobs   map[string]*Job // key: projects/{p}/locations/{l}/jobs/{j}
-	cron   *cron.Cron
+	mu      sync.RWMutex
+	jobs    map[string]*Job // key: projects/{p}/locations/{l}/jobs/{j}
+	cron    *cron.Cron
 	cronIDs map[string]cron.EntryID
-	logAPI *logging.API
+	logAPI  *logging.API
 }
 
 func NewAPI(logAPI *logging.API) *API {

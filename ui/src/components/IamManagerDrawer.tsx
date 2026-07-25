@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Drawer, Box, Typography, IconButton, Button,
   Table, TableBody, TableCell, TableHead, TableRow,
@@ -16,51 +16,62 @@ type IamManagerDrawerProps = {
   onClose: () => void;
 };
 
+type ServiceAccount = {
+  email: string;
+  uniqueId: string;
+};
+
+type ServiceAccountKey = {
+  name: string;
+  validAfterTime: string;
+  keyAlgorithm: string;
+};
+
 export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProps) {
   const { activeProject } = useProjectContext();
-  const [serviceAccounts, setServiceAccounts] = useState<any[]>([]);
+  const [serviceAccounts, setServiceAccounts] = useState<ServiceAccount[]>([]);
   const [newAccountId, setNewAccountId] = useState('');
   
-  const [currentSA, setCurrentSA] = useState<any | null>(null);
-  const [keys, setKeys] = useState<any[]>([]);
+  const [currentSA, setCurrentSA] = useState<ServiceAccount | null>(null);
+  const [keys, setKeys] = useState<ServiceAccountKey[]>([]);
   const [toast, setToast] = useState<{msg: string, open: boolean}>({msg: '', open: false});
 
-  const loadServiceAccounts = async () => {
+  const loadServiceAccounts = useCallback(async () => {
     try {
       const res = await fetch(`/api/manage/iam/projects/${activeProject}/serviceAccounts`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { accounts?: ServiceAccount[] } = await res.json();
         setServiceAccounts(data.accounts || []);
       }
     } catch (e) {
       console.error(e);
     }
-  };
+  }, [activeProject]);
 
-  const loadKeys = async (email: string) => {
+  const loadKeys = useCallback(async (email: string) => {
     try {
       const res = await fetch(`/api/manage/iam/projects/${activeProject}/serviceAccounts/${email}/keys`);
       if (res.ok) {
-        const data = await res.json();
+        const data: { keys?: ServiceAccountKey[] } = await res.json();
         setKeys(data.keys || []);
       }
     } catch (e) {
       console.error(e);
     }
-  };
+  }, [activeProject]);
 
   useEffect(() => {
     if (open) {
       loadServiceAccounts();
       setCurrentSA(null);
     }
-  }, [open, activeProject]);
+  }, [open, loadServiceAccounts]);
 
   useEffect(() => {
     if (currentSA) {
       loadKeys(currentSA.email);
     }
-  }, [currentSA, activeProject]);
+  }, [currentSA, loadKeys]);
 
   const handleCreateSA = async () => {
     if (!newAccountId) return;
@@ -87,7 +98,7 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
       method: 'POST'
     });
     if (res.ok) {
-      const keyData = await res.json();
+      const keyData: { privateKeyData: string } = await res.json();
       // Auto-trigger fake download of the JSON file
       const decodedKey = atob(keyData.privateKeyData);
       const blob = new Blob([decodedKey], { type: 'application/json' });
@@ -134,7 +145,7 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
                 <TableBody>
                   {keys.length === 0 && <TableRow><TableCell colSpan={3} align="center">No active keys for this account</TableCell></TableRow>}
                   {keys.map(k => {
-                    const kid = k.name.split('/').pop();
+                    const kid = k.name.split('/').pop() ?? k.name;
                     return (
                       <TableRow key={k.name}>
                         <TableCell>

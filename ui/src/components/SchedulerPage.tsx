@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { 
   Box, Typography, Button, Paper, Table, TableBody, TableCell, 
   TableContainer, TableHead, TableRow, IconButton, Tooltip, 
@@ -31,22 +31,22 @@ export default function SchedulerPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = 'us-central1';
 
-  const fetchJobs = async () => {
+  const fetchJobs = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/scheduler/projects/${activeProject}/locations/${location}/jobs`);
-      const data = await res.json();
+      const data: { jobs?: Job[] } = await res.json();
       setJobs(data.jobs || []);
     } catch (err) {
       console.error('Failed to fetch jobs:', err);
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   useEffect(() => {
     fetchJobs();
-  }, [activeProject]);
+  }, [fetchJobs]);
 
   const handleRunNow = async (jobName: string) => {
     try {

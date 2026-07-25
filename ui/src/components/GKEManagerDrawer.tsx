@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Box, Typography, Button, Drawer, IconButton, Table, TableBody, TableCell, TableHead, TableRow, Chip, Alert, CircularProgress, Tooltip, TextField } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -26,7 +26,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
   const [newClusterName, setNewClusterName] = useState('');
   const [provisioning, setProvisioning] = useState(false);
 
-  const fetchClusters = async (silent = false) => {
+  const fetchClusters = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
@@ -38,12 +38,12 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         const text = await res.text();
         setError(text);
       }
-    } catch (err) {
+    } catch {
       setError('Failed to connect to backend API');
     } finally {
       if (!silent) setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   const handleCreate = async () => {
     if (!newClusterName) return;
@@ -62,7 +62,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         const text = await res.text();
         setError(text);
       }
-    } catch (err) {
+    } catch {
       setError('Failed to provision cluster');
     } finally {
       setProvisioning(false);
@@ -95,7 +95,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         const text = await res.text();
         alert(`Delete failed: ${text}`);
       }
-    } catch (err) {
+    } catch {
       alert('Network error during deletion');
     } finally {
       setLoading(false);
@@ -113,7 +113,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
       
       return () => clearInterval(timer);
     }
-  }, [open]);
+  }, [open, fetchClusters]);
 
   return (
     <Drawer anchor="right" open={open} onClose={onClose}>

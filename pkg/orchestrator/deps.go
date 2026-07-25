@@ -30,13 +30,17 @@ const (
 func (sm *ServiceManager) InstallDependency(id string) error {
 	var dep Dependency
 	var isArchive bool
-	
+
 	osName := runtime.GOOS
 	arch := runtime.GOARCH
 
 	// Map architectures
-	if arch == "x86_64" { arch = "amd64" }
-	if arch == "aarch64" { arch = "arm64" }
+	if arch == "x86_64" {
+		arch = "amd64"
+	}
+	if arch == "aarch64" {
+		arch = "arm64"
+	}
 
 	switch id {
 	case "kind":
@@ -61,7 +65,7 @@ func (sm *ServiceManager) InstallDependency(id string) error {
 			ext = "tgz"
 			osName = "macos" // pack uses 'macos' in URL
 		}
-		
+
 		dep = Dependency{
 			ID:          "pack",
 			Name:        binaryName,
@@ -87,7 +91,7 @@ func (sm *ServiceManager) InstallDependency(id string) error {
 	if isArchive {
 		tempFile += "." + filepath.Ext(dep.DownloadURL)
 	}
-	
+
 	log.Printf("[Deps] Downloading %s from %s...", dep.ID, dep.DownloadURL)
 
 	// 2. Download
@@ -135,7 +139,7 @@ func (sm *ServiceManager) InstallDependency(id string) error {
 			os.WriteFile(targetPath, input, 0755)
 		}
 	}
-	
+
 	// Ensure executable
 	os.Chmod(targetPath, 0755)
 

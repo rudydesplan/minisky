@@ -25,30 +25,30 @@ func init() {
 
 // DatabaseInstance mirrors the Cloud SQL DatabaseInstance resource.
 type DatabaseInstance struct {
-	Kind            string          `json:"kind"`
-	Name            string          `json:"name"`
-	Project         string          `json:"project"`
-	SelfLink        string          `json:"selfLink"`
-	DatabaseVersion string          `json:"databaseVersion"` // e.g. POSTGRES_15, MYSQL_8_0
-	Region          string          `json:"region"`
-	State           string          `json:"state"` // PENDING_CREATE → RUNNABLE → SUSPENDED → DELETED
+	Kind            string           `json:"kind"`
+	Name            string           `json:"name"`
+	Project         string           `json:"project"`
+	SelfLink        string           `json:"selfLink"`
+	DatabaseVersion string           `json:"databaseVersion"` // e.g. POSTGRES_15, MYSQL_8_0
+	Region          string           `json:"region"`
+	State           string           `json:"state"` // PENDING_CREATE → RUNNABLE → SUSPENDED → DELETED
 	Settings        InstanceSettings `json:"settings"`
-	ConnectionName  string          `json:"connectionName"`
-	IpAddresses     []IpMapping     `json:"ipAddresses"`
-	ServerCaCert    *SslCert        `json:"serverCaCert,omitempty"`
-	CreateTime      string          `json:"createTime,omitempty"`
-	Etag            string          `json:"etag"`
+	ConnectionName  string           `json:"connectionName"`
+	IpAddresses     []IpMapping      `json:"ipAddresses"`
+	ServerCaCert    *SslCert         `json:"serverCaCert,omitempty"`
+	CreateTime      string           `json:"createTime,omitempty"`
+	Etag            string           `json:"etag"`
 }
 
 type InstanceSettings struct {
-	Tier             string            `json:"tier"`             // e.g. db-n1-standard-2
-	ActivationPolicy string            `json:"activationPolicy"` // ALWAYS, NEVER
-	BackupConfiguration *BackupConfig  `json:"backupConfiguration,omitempty"`
-	DatabaseFlags    []DatabaseFlag    `json:"databaseFlags,omitempty"`
-	UserLabels       map[string]string `json:"userLabels,omitempty"`
-	StorageAutoResize bool             `json:"storageAutoResize"`
-	DataDiskSizeGb   string           `json:"dataDiskSizeGb"`
-	DataDiskType     string           `json:"dataDiskType"` // PD_SSD, PD_HDD
+	Tier                string            `json:"tier"`             // e.g. db-n1-standard-2
+	ActivationPolicy    string            `json:"activationPolicy"` // ALWAYS, NEVER
+	BackupConfiguration *BackupConfig     `json:"backupConfiguration,omitempty"`
+	DatabaseFlags       []DatabaseFlag    `json:"databaseFlags,omitempty"`
+	UserLabels          map[string]string `json:"userLabels,omitempty"`
+	StorageAutoResize   bool              `json:"storageAutoResize"`
+	DataDiskSizeGb      string            `json:"dataDiskSizeGb"`
+	DataDiskType        string            `json:"dataDiskType"` // PD_SSD, PD_HDD
 }
 
 type BackupConfig struct {
@@ -62,7 +62,7 @@ type DatabaseFlag struct {
 }
 
 type IpMapping struct {
-	Type      string `json:"type"`      // PRIMARY, OUTGOING
+	Type      string `json:"type"` // PRIMARY, OUTGOING
 	IpAddress string `json:"ipAddress"`
 }
 
@@ -78,14 +78,14 @@ type SslCert struct {
 
 // Database represents a schema within a Cloud SQL instance.
 type Database struct {
-	Kind     string `json:"kind"`
-	Name     string `json:"name"`
-	Instance string `json:"instance"`
-	Project  string `json:"project"`
-	SelfLink string `json:"selfLink"`
-	Charset  string `json:"charset"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Instance  string `json:"instance"`
+	Project   string `json:"project"`
+	SelfLink  string `json:"selfLink"`
+	Charset   string `json:"charset"`
 	Collation string `json:"collation"`
-	Etag     string `json:"etag"`
+	Etag      string `json:"etag"`
 }
 
 // User represents a database user.
@@ -136,15 +136,16 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 // ServeHTTP dispatches Cloud SQL v1 paths.
 //
 // Supported paths (sqladmin.googleapis.com):
-//   POST   /v1/projects/{project}/instances
-//   GET    /v1/projects/{project}/instances
-//   GET    /v1/projects/{project}/instances/{instance}
-//   DELETE /v1/projects/{project}/instances/{instance}
-//   POST   /v1/projects/{project}/instances/{instance}/databases
-//   GET    /v1/projects/{project}/instances/{instance}/databases
-//   POST   /v1/projects/{project}/instances/{instance}/users
-//   GET    /v1/projects/{project}/instances/{instance}/users
-//   GET    /v1/projects/{project}/operations/{operation}
+//
+//	POST   /v1/projects/{project}/instances
+//	GET    /v1/projects/{project}/instances
+//	GET    /v1/projects/{project}/instances/{instance}
+//	DELETE /v1/projects/{project}/instances/{instance}
+//	POST   /v1/projects/{project}/instances/{instance}/databases
+//	GET    /v1/projects/{project}/instances/{instance}/databases
+//	POST   /v1/projects/{project}/instances/{instance}/users
+//	GET    /v1/projects/{project}/instances/{instance}/users
+//	GET    /v1/projects/{project}/operations/{operation}
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud SQL] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
@@ -194,9 +195,9 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, project, 
 
 func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project string) {
 	var body struct {
-		Name            string          `json:"name"`
-		DatabaseVersion string          `json:"databaseVersion"`
-		Region          string          `json:"region"`
+		Name            string           `json:"name"`
+		DatabaseVersion string           `json:"databaseVersion"`
+		Region          string           `json:"region"`
 		Settings        InstanceSettings `json:"settings"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -348,13 +349,13 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, name)
 	op := api.opMgr.Register("sql#operation", "DELETE", selfLink, "", "")
-	
+
 	api.opMgr.RunAsync(op.Name, func() error {
 		// Simulate winding down time
 		time.Sleep(3 * time.Second)
-		
+
 		api.svcMgr.DeleteCloudSQLVM(name)
-		
+
 		// Finally remove from memory
 		api.mu.Lock()
 		delete(api.instances, key)
@@ -363,7 +364,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		api.mu.Unlock()
 		return nil
 	})
-	
+
 	sqlOp := toSqlOperation(op, "DELETE", selfLink)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(sqlOp)
@@ -413,10 +414,10 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"kind":      "sql#operation",
-			"status":    "DONE",
+			"kind":          "sql#operation",
+			"status":        "DONE",
 			"operationType": "CREATE_DATABASE",
-			"targetLink": db.SelfLink,
+			"targetLink":    db.SelfLink,
 		})
 
 	case http.MethodGet:
@@ -483,8 +484,8 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"kind":      "sql#operation",
-			"status":    "DONE",
+			"kind":          "sql#operation",
+			"status":        "DONE",
 			"operationType": "CREATE_USER",
 		})
 

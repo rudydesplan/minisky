@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -37,7 +38,12 @@ func NewValidator() *Validator {
 // Returns false if the request is invalid and writes a GCP-shaped error response.
 // Returns true if the request passes all checks.
 func (v *Validator) ValidateRequest(w http.ResponseWriter, r *http.Request) bool {
-	domain := r.Host
+	return v.ValidateRequestForDomain(w, r, r.Host)
+}
+
+// ValidateRequestForDomain validates a request against an explicitly resolved
+// service domain. Routers should use this after host or path-based routing.
+func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Request, domain string) bool {
 
 	// ── 1. Skip validation for domains with no embedded rules ────────────────
 	svc, ok := v.rulesIndex[domain]
@@ -157,6 +163,9 @@ func globMatch(glob, path string) bool {
 	}
 	for i, g := range gParts {
 		if g == "*" {
+			if pParts[i] == "" {
+				return false
+			}
 			continue // wildcard — match any segment
 		}
 		if g != pParts[i] {
@@ -199,8 +208,10 @@ func checkFieldType(fieldPath string, val interface{}, expected string) string {
 		s, isStr := val.(string)
 		ok = isStr && s != ""
 	case "integer":
-		switch val.(type) {
-		case float64, int, int64:
+		switch number := val.(type) {
+		case float64:
+			ok = !math.IsNaN(number) && !math.IsInf(number, 0) && math.Trunc(number) == number
+		case int, int64:
 			ok = true
 		}
 	case "boolean":

@@ -33,15 +33,15 @@ type Repository struct {
 
 type Package struct {
 	Name        string `json:"name"`
-	DisplayName string `displayName,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
 	CreateTime  string `json:"createTime,omitempty"`
 	UpdateTime  string `json:"updateTime,omitempty"`
 }
 
 type Version struct {
-	Name       string   `json:"name"`
-	Description string  `json:"description,omitempty"`
-	CreateTime string   `json:"createTime,omitempty"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	CreateTime  string   `json:"createTime,omitempty"`
 	RelatedTags []string `json:"relatedTags,omitempty"`
 }
 
@@ -118,7 +118,7 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(r.URL.Path, "/")
 	project := "default"
 	location := "us-central1"
-	
+
 	for i, p := range parts {
 		if p == "projects" && i+1 < len(parts) {
 			project = parts[i+1]
@@ -132,7 +132,7 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 	repo.Name = fmt.Sprintf("projects/%s/locations/%s/repositories/%s", project, location, repoId)
 	repo.CreateTime = time.Now().Format(time.RFC3339)
 	repo.UpdateTime = repo.CreateTime
-	
+
 	api.repos[repo.Name] = &repo
 
 	op := api.opMgr.Register("artifactregistry#operation", "CREATE", repo.Name, "", location)

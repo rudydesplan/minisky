@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback } from 'react';
+import { useLocation } from 'wouter';
 import { 
   Box, Typography, Button, Drawer, IconButton, Table, TableBody, TableCell, 
   TableHead, TableRow, Chip, Alert, CircularProgress, Tooltip, Tabs, Tab,
@@ -33,13 +33,19 @@ type SlsResource = {
   url?: string;
   uri?: string;
   updateTime?: string;
+  runtime?: string;
+  entryPoint?: string;
+  sourceCode?: string;
+  eventTrigger?: {
+    resource?: string;
+  };
 };
 
 export default function ServerlessManagerDrawer({ 
   open, onClose, isBuildpacksEnabled, onEnableBuildpacks, missingPack, onInstallPack 
 }: Props) {
   const { activeProject } = useProjectContext();
-  const navigate = useNavigate();
+  const [, navigate] = useLocation();
   const [tab, setTab] = useState(0);
   const [functions, setFunctions] = useState<SlsResource[]>([]);
   const [services, setServices] = useState<SlsResource[]>([]);
@@ -81,12 +87,12 @@ export default function ServerlessManagerDrawer({
         code: 'package function\n\nimport (\n\t"fmt"\n\t"net/http"\n)\n\nfunc Handler(w http.ResponseWriter, r *http.Request) {\n\tfmt.Fprint(w, "Hello from Go on MiniSky!")\n}' 
       }));
     }
-  }, [deployForm.runtime, deployDialogOpen]);
+  }, [deployForm.name, deployForm.runtime, deployDialogOpen]);
   const [logDialogOpen, setLogDialogOpen] = useState(false);
   const [logContent, setLogContent] = useState('');
   const [activeLogResource, setActiveLogResource] = useState('');
 
-  const fetchResources = async (silent = false) => {
+  const fetchResources = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
@@ -103,12 +109,12 @@ export default function ServerlessManagerDrawer({
         const data = await sRes.json();
         setServices(data.services || []);
       }
-    } catch (err) {
+    } catch {
       setError('Failed to connect to Serverless API');
     } finally {
       if (!silent) setLoading(false);
     }
-  };
+  }, [activeProject]);
 
   const handleDelete = async (type: 'functions' | 'services', fullName: string) => {
     const resourceName = fullName.split('/').pop() || fullName;
@@ -123,7 +129,7 @@ export default function ServerlessManagerDrawer({
         const text = await res.text();
         alert(`Deletion failed: ${text}`);
       }
-    } catch (err) {
+    } catch {
       alert('Network error during deletion');
     } finally {
       setLoading(false);
@@ -138,7 +144,7 @@ export default function ServerlessManagerDrawer({
     }
   };
   
-  const handleEdit = (resource: any) => {
+  const handleEdit = (resource: SlsResource) => {
     const name = resource.name.split('/').pop() || '';
     setDeployForm({
       type: tab === 0 ? 'function' : 'service',
@@ -175,7 +181,7 @@ export default function ServerlessManagerDrawer({
         const text = await res.text();
         setError(`Deployment failed: ${text}`);
       }
-    } catch (err) {
+    } catch {
       setError('Network error during deployment');
     } finally {
       setLoading(false);
@@ -188,7 +194,7 @@ export default function ServerlessManagerDrawer({
     setLogContent("Loading logs..."); 
     fetchLogs(resourceName); 
   }; 
-  const fetchLogs = async (name: string) => { 
+  const fetchLogs = useCallback(async (name: string) => {
     try { 
       const res = await fetch(`/api/manage/serverless/projects/${activeProject}/logs/${name}`); 
       if (res.ok) { 
@@ -197,7 +203,7 @@ export default function ServerlessManagerDrawer({
     } catch (err) { 
       console.error("Failed to fetch logs", err); 
     } 
-  };
+  }, [activeProject]);
 
   useEffect(() => {
     if (open) {
@@ -205,14 +211,14 @@ export default function ServerlessManagerDrawer({
       const timer = setInterval(() => fetchResources(true), 5000);
       return () => clearInterval(timer);
     }
-  }, [open]);
+  }, [open, fetchResources]);
 
   useEffect(() => {
     if (logDialogOpen && activeLogResource) {
       const timer = setInterval(() => fetchLogs(activeLogResource), 2000);
       return () => clearInterval(timer);
     }
-  }, [logDialogOpen, activeLogResource]);
+  }, [logDialogOpen, activeLogResource, fetchLogs]);
 
   const activeResources = tab === 0 ? functions : services;
   const resourceLabel = tab === 0 ? 'Functions' : 'Cloud Run Services';

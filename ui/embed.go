@@ -11,7 +11,7 @@ import (
 //go:embed dist/*
 var Assets embed.FS
 
-// Handler returns an HTTP FileServer with SPA fallback support. 
+// Handler returns an HTTP FileServer with SPA fallback support.
 // It resolves the compiled Vite React Single-Page Application (SPA) by serving index.html
 // for any non-existent paths (client-side routes).
 func Handler() http.Handler {
@@ -24,7 +24,7 @@ func Handler() http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
-		
+
 		// If requesting a specific file that exists, serve it
 		if path != "" {
 			_, err := fsys.Open(path)

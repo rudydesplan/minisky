@@ -22,7 +22,8 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
     let term: Terminal | null = null;
     let socket: WebSocket | null = null;
     let fitAddon: FitAddon | null = null;
-    let timer: any;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const handleResize = () => fitAddon?.fit();
 
     const init = () => {
       if (!terminalRef.current) {
@@ -79,7 +80,6 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
         }
       });
 
-      const handleResize = () => fitAddon?.fit();
       window.addEventListener('resize', handleResize);
     };
 
@@ -87,7 +87,7 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
 
     return () => {
       clearTimeout(timer);
-      window.removeEventListener('resize', () => fitAddon?.fit());
+      window.removeEventListener('resize', handleResize);
       socket?.close();
       term?.dispose();
       xtermRef.current = null;

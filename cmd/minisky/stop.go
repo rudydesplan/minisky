@@ -29,7 +29,7 @@ var stopCmd = &cobra.Command{
 		}
 
 		log.Printf("Stopping MiniSky (PID %d)...", pid)
-		
+
 		process, err := os.FindProcess(pid)
 		if err != nil {
 			log.Fatalf("Failed to find process %d: %v", pid, err)

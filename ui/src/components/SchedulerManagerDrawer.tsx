@@ -12,6 +12,22 @@ interface Props {
   onCreated: () => void;
 }
 
+interface SchedulerJob {
+  name: string;
+  description: string;
+  schedule: string;
+  timeZone: string;
+  httpTarget?: {
+    uri: string;
+    httpMethod: string;
+    body: string;
+  };
+  pubsubTarget?: {
+    topicName: string;
+    data: string;
+  };
+}
+
 export default function SchedulerManagerDrawer({ open, onClose, onCreated }: Props) {
   const { activeProject } = useProjectContext();
   const [activeTab, setActiveTab] = useState(0);
@@ -37,7 +53,7 @@ export default function SchedulerManagerDrawer({ open, onClose, onCreated }: Pro
     setLoading(true);
     setError(null);
 
-    const job: any = {
+    const job: SchedulerJob = {
       name: form.id,
       description: form.description,
       schedule: form.schedule,
@@ -69,8 +85,8 @@ export default function SchedulerManagerDrawer({ open, onClose, onCreated }: Pro
       onCreated();
       onClose();
       setForm({ ...form, id: '', description: '' });
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }

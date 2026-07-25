@@ -22,22 +22,22 @@ func GetMiniskyDir() string {
 var embeddedImagesJSON []byte
 
 type ImageRegistry struct {
-	Emulators map[string]EmulatorConfig `json:"emulators"`
-	Compute   ComputeConfig             `json:"compute"`
-	Sql       SqlConfig                 `json:"sql"`
-	Serverless ServerlessConfig         `json:"serverless"`
-	Dataproc   DataprocConfig           `json:"dataproc"`
-	Memorystore MemorystoreConfig       `json:"memorystore"`
-	CloudBuild  CloudBuildConfig        `json:"cloudbuild"`
-	ArtifactRegistry ArtifactRegistryConfig `json:"artifact_registry"`
-	VertexAI    VertexAiConfig          `json:"vertex_ai"`
+	Emulators        map[string]EmulatorConfig `json:"emulators"`
+	Compute          ComputeConfig             `json:"compute"`
+	Sql              SqlConfig                 `json:"sql"`
+	Serverless       ServerlessConfig          `json:"serverless"`
+	Dataproc         DataprocConfig            `json:"dataproc"`
+	Memorystore      MemorystoreConfig         `json:"memorystore"`
+	CloudBuild       CloudBuildConfig          `json:"cloudbuild"`
+	ArtifactRegistry ArtifactRegistryConfig    `json:"artifact_registry"`
+	VertexAI         VertexAiConfig            `json:"vertex_ai"`
 }
 
 type EmulatorConfig struct {
-	Name  string   `json:"name"`
-	Image string   `json:"image"`
-	Port  string   `json:"port"`
-	Cmd   []string `json:"cmd"`
+	Name   string   `json:"name"`
+	Image  string   `json:"image"`
+	Port   string   `json:"port"`
+	Cmd    []string `json:"cmd"`
 	Volume string   `json:"volume,omitempty"`
 }
 
@@ -164,4 +164,3 @@ func fallbackRegistry() *ImageRegistry {
 		},
 	}
 }
-

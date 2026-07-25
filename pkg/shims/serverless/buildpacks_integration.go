@@ -127,7 +127,7 @@ func (b *BuildpacksBackend) BuildFunction(functionName, sourcePath, entryPoint s
 	}
 
 	// Force shell to see the version and allow internet access for dependencies
-	// Crucially, we pass GOOGLE_FUNCTION_TARGET at build time so the buildpacks 
+	// Crucially, we pass GOOGLE_FUNCTION_TARGET at build time so the buildpacks
 	// can generate the correct entrypoint metadata.
 	cmdArgs := []string{"-c", fmt.Sprintf("DOCKER_API_VERSION=1.44 %s build %s --path %s --builder %s --trust-builder --network host --env GOOGLE_FUNCTION_TARGET=%s --env GOOGLE_FUNCTION_SIGNATURE_TYPE=http", binPath, imageRef, sourcePath, b.builder, entryPoint)}
 	cmd := exec.Command("sh", cmdArgs...)

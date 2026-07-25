@@ -76,31 +76,51 @@ func (d *DuckDBBackend) Enabled() bool { return d.enabled }
 
 // SetEnabled toggles the DuckDB backend dynamically.
 func (d *DuckDBBackend) SetEnabled(enabled bool) error {
-	d.enabled = enabled
 	if enabled {
 		log.Printf("[DuckDBBackend] dynamically ENABLED via UI")
-		return d.init()
+		if err := d.init(); err != nil {
+			d.enabled = false
+			return err
+		}
+		d.enabled = true
+		return nil
 	}
 	log.Printf("[DuckDBBackend] dynamically DISABLED via UI")
-	// If it was already opened, you would close d.db here.
-	return nil
+	d.enabled = false
+	return d.Close()
 }
 
 // init opens or creates the DuckDB database file.
-// Uncomment the sql.Open call once go-duckdb is added to go.mod.
 func (d *DuckDBBackend) init() error {
-	// Ensure the data directory exists
-	dir := filepath.Join(config.GetMiniskyDir(), "data")
+	dir := filepath.Dir(d.dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("cannot create data directory: %w", err)
 	}
 
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("close existing duckdb connection: %w", err)
+	}
 	db, err := sql.Open("duckdb", d.dbPath)
 	if err != nil {
 		return fmt.Errorf("open duckdb: %w", err)
 	}
 	d.db = db
-	return db.Ping()
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		d.db = nil
+		return err
+	}
+	return nil
+}
+
+// Close releases the DuckDB connection when the backend is disabled or replaced.
+func (d *DuckDBBackend) Close() error {
+	if d.db == nil {
+		return nil
+	}
+	err := d.db.Close()
+	d.db = nil
+	return err
 }
 
 // ExecuteQuery runs a BigQuery StandardSQL query and returns rows as a slice of maps.
@@ -157,12 +177,12 @@ func (d *DuckDBBackend) LoadData(project, dataset, table, sourceURI, format stri
 		return fmt.Errorf("duckdb backend not enabled")
 	}
 	tableName := fmt.Sprintf("%s__%s", dataset, table)
-	
+
 	var query string
 	format = strings.ToUpper(format)
-	
+
 	// Convert Windows path separators to forward slashes to prevent SQL escape sequence errors
-	safeURI := filepath.ToSlash(sourceURI)
+	safeURI := strings.ReplaceAll(filepath.ToSlash(sourceURI), "'", "''")
 
 	switch format {
 	case "CSV":
@@ -195,30 +215,82 @@ func (d *DuckDBBackend) CreateTable(project, dataset, table string, schema *Tabl
 	return err
 }
 
+// InsertRows writes BigQuery streaming rows into their DuckDB table.
+func (d *DuckDBBackend) InsertRows(dataset, table string, schema *TableSchema, rows []map[string]interface{}) error {
+	if !d.enabled {
+		return fmt.Errorf("duckdb backend not enabled")
+	}
+	if d.db == nil {
+		return fmt.Errorf("duckdb backend is not initialized")
+	}
+	if schema == nil || len(schema.Fields) == 0 || len(rows) == 0 {
+		return nil
+	}
+
+	columns := make([]string, len(schema.Fields))
+	placeholders := make([]string, len(schema.Fields))
+	for i, field := range schema.Fields {
+		columns[i] = quoteIdentifier(field.Name)
+		placeholders[i] = "?"
+	}
+	query := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s)",
+		quoteIdentifier(dataset+"__"+table),
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin streaming insert: %w", err)
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.Prepare(query)
+	if err != nil {
+		return fmt.Errorf("prepare streaming insert: %w", err)
+	}
+	defer statement.Close()
+
+	for _, row := range rows {
+		values := make([]interface{}, len(schema.Fields))
+		for i, field := range schema.Fields {
+			values[i] = row[field.Name]
+		}
+		if _, err := statement.Exec(values...); err != nil {
+			return fmt.Errorf("execute streaming insert: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit streaming insert: %w", err)
+	}
+	return nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SQL Translation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 // bqToDuckTypeMap maps BigQuery field types to DuckDB equivalents.
 var bqToDuckTypeMap = map[string]string{
-	"STRING":    "VARCHAR",
-	"BYTES":     "BLOB",
-	"INTEGER":   "BIGINT",
-	"INT64":     "BIGINT",
-	"FLOAT":     "DOUBLE",
-	"FLOAT64":   "DOUBLE",
-	"NUMERIC":   "DECIMAL(38,9)",
+	"STRING":     "VARCHAR",
+	"BYTES":      "BLOB",
+	"INTEGER":    "BIGINT",
+	"INT64":      "BIGINT",
+	"FLOAT":      "DOUBLE",
+	"FLOAT64":    "DOUBLE",
+	"NUMERIC":    "DECIMAL(38,9)",
 	"BIGNUMERIC": "DECIMAL(76,38)",
-	"BOOLEAN":   "BOOLEAN",
-	"BOOL":      "BOOLEAN",
-	"TIMESTAMP": "TIMESTAMPTZ",
-	"DATE":      "DATE",
-	"TIME":      "TIME",
-	"DATETIME":  "TIMESTAMP",
-	"GEOGRAPHY": "VARCHAR", // approximate — DuckDB lacks native GEOGRAPHY
-	"JSON":      "JSON",
-	"RECORD":    "STRUCT", // nested — requires recursive handling
-	"STRUCT":    "STRUCT",
+	"BOOLEAN":    "BOOLEAN",
+	"BOOL":       "BOOLEAN",
+	"TIMESTAMP":  "TIMESTAMPTZ",
+	"DATE":       "DATE",
+	"TIME":       "TIME",
+	"DATETIME":   "TIMESTAMP",
+	"GEOGRAPHY":  "VARCHAR", // approximate — DuckDB lacks native GEOGRAPHY
+	"JSON":       "JSON",
+	"RECORD":     "STRUCT", // nested — requires recursive handling
+	"STRUCT":     "STRUCT",
 }
 
 // translateBQtoDuck does lightweight BigQuery → DuckDB SQL dialect conversion.
@@ -258,20 +330,47 @@ func translateBQtoDuck(bqSQL string) string {
 
 // buildDDL generates a CREATE TABLE IF NOT EXISTS statement for DuckDB.
 func buildDDL(project, dataset, table string, schema *TableSchema) string {
+	_ = project
 	// DuckDB table name: dataset__table (project is ignored in local context)
 	tableName := fmt.Sprintf("%s__%s", dataset, table)
 	cols := make([]string, 0, len(schema.Fields))
 	for _, f := range schema.Fields {
-		duckType := bqToDuckTypeMap[strings.ToUpper(f.Type)]
-		if duckType == "" {
-			duckType = "VARCHAR"
-		}
+		duckType := duckDBFieldType(f)
 		nullable := ""
 		if strings.ToUpper(f.Mode) == "REQUIRED" {
 			nullable = " NOT NULL"
 		}
-		cols = append(cols, fmt.Sprintf("  \"%s\" %s%s", f.Name, duckType, nullable))
+		cols = append(cols, fmt.Sprintf("  %s %s%s", quoteIdentifier(f.Name), duckType, nullable))
 	}
-	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS \"%s\" (\n%s\n);",
-		tableName, strings.Join(cols, ",\n"))
+	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n%s\n);",
+		quoteIdentifier(tableName), strings.Join(cols, ",\n"))
+}
+
+func duckDBFieldType(field FieldSchema) string {
+	fieldType := strings.ToUpper(field.Type)
+	var duckType string
+	if fieldType == "RECORD" || fieldType == "STRUCT" {
+		children := make([]string, 0, len(field.Fields))
+		for _, child := range field.Fields {
+			children = append(children, fmt.Sprintf("%s %s", quoteIdentifier(child.Name), duckDBFieldType(child)))
+		}
+		if len(children) == 0 {
+			duckType = "STRUCT"
+		} else {
+			duckType = fmt.Sprintf("STRUCT(%s)", strings.Join(children, ", "))
+		}
+	} else {
+		duckType = bqToDuckTypeMap[fieldType]
+		if duckType == "" {
+			duckType = "VARCHAR"
+		}
+	}
+	if strings.EqualFold(field.Mode, "REPEATED") {
+		duckType += "[]"
+	}
+	return duckType
+}
+
+func quoteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }

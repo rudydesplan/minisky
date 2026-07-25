@@ -24,6 +24,8 @@ func (d *DuckDBBackend) SetEnabled(enabled bool) error {
 	return nil
 }
 
+func (d *DuckDBBackend) Close() error { return nil }
+
 func (d *DuckDBBackend) ExecuteQuery(query string) ([]map[string]interface{}, error) {
 	return nil, fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
 }
@@ -33,5 +35,9 @@ func (d *DuckDBBackend) LoadData(project, dataset, table, sourceURI, format stri
 }
 
 func (d *DuckDBBackend) CreateTable(project, dataset, table string, schema *TableSchema) error {
-	return nil
+	return fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
+}
+
+func (d *DuckDBBackend) InsertRows(dataset, table string, schema *TableSchema, rows []map[string]interface{}) error {
+	return fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
 }

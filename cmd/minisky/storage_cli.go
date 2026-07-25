@@ -1,10 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"encoding/json"
 
 	"github.com/spf13/cobra"
 )
@@ -24,8 +24,10 @@ var listBucketsCmd = &cobra.Command{
 	Short: "List storage buckets",
 	Run: func(cmd *cobra.Command, args []string) {
 		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" { port = "8081" }
-		
+		if port == "" {
+			port = "8081"
+		}
+
 		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/api/manage/storage/b", port))
 		if err != nil {
 			fmt.Printf("❌ Error: %v\n", err)

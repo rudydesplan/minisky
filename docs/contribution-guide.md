@@ -1,37 +1,18 @@
 # MiniSky Developer & Contributing Guide
 
-MiniSky is built to be extensible. If a GCP service you need is missing, you can add it through our plugin architecture or by building a custom "Shim."
+MiniSky is built to be extensible. If a GCP service is missing, add either a
+native Go shim or a Docker-backed emulator through the source registry.
 
 ## 1. Project Structure
 - **/cmd/minisky:** CLI entry points.
 - **/pkg/router:** Reverse proxy and protocol detection.
 - **/pkg/orchestrator:** Docker lifecycle and container management.
 - **/pkg/shims:** API translation layers (GCE, GKE, BigQuery, Dataproc).
-- **/plugins:** YAML-based service definitions.
+- **/pkg/config/images.json:** Embedded Docker emulator and image definitions.
 
 ---
 
-## 2. Adding a Simple Service (Plugin)
-If a service already has a high-quality Docker image (e.g., official Google emulators or community tools), you can add it via a YAML manifest in the `plugins/` directory.
-
-```yaml
-id: custom-service
-name: My Custom Service
-image: gcr.io/google-samples/custom-emulator:latest
-default_port: 9000
-routing:
-  - host: custom.googleapis.com
-    path: /
-```
-
-MiniSky will automatically:
-1. Register the routing rule.
-2. Manage the container lifecycle.
-3. Handle persistence for any volumes defined in the image.
-
----
-
-## 3. Developing a Service Shim
+## 2. Developing a Service Shim
 When no emulator exists (e.g., for Compute Engine), you must build a "Shim." 
 
 ### Step 1: Define the API Surface
@@ -48,22 +29,27 @@ Your shim should map GCP concepts to Docker or local OS primitives.
 - **Example (GCE):** `instances.insert` -> `docker run --name <vm-name>`.
 - **Example (BigQuery):** `jobs.query` -> `duckdb.Query(...)`.
 
-### Step 3: Register the Shim
-Add your shim to the `ServiceRegistry` in `pkg/orchestrator/registry.go`.
+### Step 5: Register the Shim
+Register the domain with `registry.Register` from the shim's `init` function,
+then add a blank import to `pkg/shims/registry_init.go`. For a direct Docker
+backend, add its image definition to `pkg/config/images.json` and register its
+domain with `registry.RegisterLazyDocker`.
 
 ---
 
-## 4. Key Implementation Principles
+## 3. Key Implementation Principles
 1. **API Fidelity:** Always match the GCP response schema exactly, including headers like `x-goog-generation`.
 2. **Behavioral Fidelity:** Don't just return 200 OK. If GCP uses LROs, return an Operation. If GCP has eventual consistency, simulate it.
-3. **IAM Checking:** Use the internal `AuthMiddleware` to verify that the local service account has the required permission strings.
-4. **Lazy Loading:** All services must be "Lazy" by default. Use the Router to trigger initialization.
-5. **State Persistence:** Always use volumes mapped to `.minisky/data/`.
+3. **Lazy Loading:** Docker-backed services should use the router's lazy registration when no native shim is required.
+4. **State Clarity:** Document whether a service is in-memory, file-backed, or volume-backed. Do not imply persistence for in-memory resources.
 
 ---
 
-## 5. Local Testing
+## 4. Local Testing
 To test your new service integration:
-1. Rebuild the MiniSky binary: `go build ./cmd/minisky`.
-2. Run your service using Terraform (point `custom_endpoint` to `localhost:8080`).
-3. Verify the resources appear in the **MiniSky Dashboard**.
+1. Add tests for routing, validation, and service behavior.
+2. Run `go test -race ./cmd/... ./pkg/...`.
+3. Rebuild the UI with `cd ui && npm ci && npm run lint && npm run build`.
+4. Build the MiniSky binary: `go build ./cmd/minisky`.
+5. Run your service using Terraform (point `custom_endpoint` to `localhost:8080`).
+6. Verify the resources appear in the **MiniSky Dashboard**.

@@ -1,10 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"encoding/json"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,8 +20,10 @@ var tailLogsCmd = &cobra.Command{
 	Short: "Tail logs in real-time from MiniSky",
 	Run: func(cmd *cobra.Command, args []string) {
 		port := os.Getenv("MINISKY_UI_PORT")
-		if port == "" { port = "8081" }
-		
+		if port == "" {
+			port = "8081"
+		}
+
 		fmt.Println("🛰️  Streaming MiniSky logs (Ctrl+C to stop)...")
 		lastSeenId := ""
 
@@ -40,11 +42,11 @@ var tailLogsCmd = &cobra.Command{
 			// Print new entries
 			foundLast := lastSeenId == ""
 			newLastSeen := lastSeenId
-			
+
 			for i := len(entries) - 1; i >= 0; i-- {
 				e := entries[i]
 				id := e["insertId"].(string)
-				
+
 				if id == lastSeenId {
 					foundLast = true
 					continue
