@@ -200,7 +200,7 @@ and is not safe to invoke from standalone diagnostics.
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
 | 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
-| 14 | Multi-tenancy and organization emulation | Multiple projects coexist with org-level policies; cross-project references resolve correctly | 🚧 Metadata slice |
+| 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
 | 16 | ML/AI, monitoring, and advanced networking | Vertex AI serves predictions; Cloud Monitoring/Logging emits and queries metrics/logs; VPC peering and Private Service Connect route traffic | 🚧 Bounded slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
@@ -365,13 +365,16 @@ recovery, chains over four delegates, and `generateIdToken`, `signJwt`, and
 
 ### Phase 14 — Multi-tenancy and organization emulation
 
-**Status (2026-07-25): metadata tenancy slice implemented.** Go race tests
+**Status (2026-07-25): bounded local tenancy slice verified.** Go race tests
 cover project CRUD, persistence/export/import, unknown-project enforcement,
 inherited IAM, same-name BigQuery isolation, and cross-project Pub/Sub
-permission denial. The two-project Terraform/Pub/Sub fixture validates
-statically, and its guarded Docker apply/assert/no-drift/destroy lifecycle
-passed locally on 2026-07-25. This does not establish isolation for shared
-passthrough backends. Shared VPC packet routing remains out of scope.
+resource-scoped allow/deny behavior. The guarded Google provider 7.41.0
+two-project fixture passed apply, canonical reference assertions, Go SDK
+publish in the primary project, pull and acknowledgement from the secondary
+project, zero drift, destroy, and post-destroy `404` checks. Malformed or
+relative topic names are rejected before dispatch. This does not establish
+isolation for shared passthrough backends, organization-policy parity, or
+shared VPC packet routing.
 
 - Support multiple GCP projects running concurrently with isolated resource
   namespaces.

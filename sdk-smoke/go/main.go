@@ -212,6 +212,9 @@ func run() error {
 	if gotBucket.Name != bucketName {
 		return fmt.Errorf("storage bucket round trip returned the wrong name")
 	}
+	if err := runOptionalPubSubSmoke(ctx, gateway, os.Getenv, os.Stdout); err != nil {
+		return fmt.Errorf("Pub/Sub smoke: %w", err)
+	}
 
 	fmt.Printf("Go SDK smoke passed: dataset=%s table=%s service_account=%s bucket=%s\n",
 		datasetID, tableID, accountEmail, bucketName)

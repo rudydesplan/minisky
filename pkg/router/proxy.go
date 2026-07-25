@@ -344,10 +344,14 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 		return false
 	}
 	if domain == "pubsub.googleapis.com" && permission == "pubsub.subscriptions.create" {
-		topic := pubsubTopicFromBody(r)
+		topic, topicProject, valid := pubsubTopicFromBody(r)
+		if !valid {
+			p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+				"field 'topic' must use projects/{project}/topics/{topic}")
+			return false
+		}
 		subscriptionProject := projectFromRequest(r)
-		topicProject := projectFromResourceName(topic)
-		if topicProject != "" && topicProject != subscriptionProject &&
+		if topicProject != subscriptionProject &&
 			!authorizer.Authorize(topic, principal, "pubsub.topics.attachSubscription") {
 			p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED",
 				"Caller lacks permission pubsub.topics.attachSubscription")
@@ -357,32 +361,27 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 	return true
 }
 
-func pubsubTopicFromBody(r *http.Request) string {
+func pubsubTopicFromBody(r *http.Request) (topic, project string, valid bool) {
 	if r.Body == nil {
-		return ""
+		return "", "", false
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return ""
+		return "", "", false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	var input struct {
 		Topic string `json:"topic"`
 	}
 	if json.Unmarshal(body, &input) != nil {
-		return ""
+		return "", "", false
 	}
-	return input.Topic
-}
-
-func projectFromResourceName(resource string) string {
-	parts := strings.Split(strings.Trim(resource, "/"), "/")
-	for index, part := range parts {
-		if part == "projects" && index+1 < len(parts) {
-			return parts[index+1]
-		}
+	parts := strings.Split(input.Topic, "/")
+	if len(parts) != 4 || parts[0] != "projects" || parts[1] == "" ||
+		parts[2] != "topics" || parts[3] == "" {
+		return input.Topic, "", false
 	}
-	return ""
+	return input.Topic, parts[1], true
 }
 
 func (p *ProxyRouter) validateProject(w http.ResponseWriter, r *http.Request, domain string) bool {

@@ -26,7 +26,7 @@ const phases = [
   ["11", "DX and distribution", "Verified local slice", "Native amd64/arm64 deb/rpm install gates pass; publication remains external"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
-  ["14", "Multi-tenancy", "Metadata slice", "Shared Docker backends are not project-isolated"],
+  ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Bounded slices", "Advanced peering/NAT/PSC and broad query engines remain 501"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
@@ -131,7 +131,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Callout tone="info" title="Implementation status">
         Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
-        delivery, Phase-15 emulator, and Phase-17 federated RBAC/quota/audit integration gates. Eight guarded
+        delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, and Phase-17 federated RBAC/quota/audit
+        integration gates. Nine guarded
         local gates have passed. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs also pass in
         read-only CI; the opt-in Phase-9 event-delivery and Phase-17 CI jobs are configured but have no CI pass
         evidence yet. Production-grade semantics remain explicit external boundaries.
@@ -140,7 +141,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>8 passed</H2><Text tone="secondary">Including bounded Phase-9 event delivery</Text></CardBody>
+          <CardBody><H2>9 passed</H2><Text tone="secondary">Including Phase-14 cross-project Pub/Sub</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -167,7 +168,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Grid columns="2fr 1fr" gap={20}>
         <Stack gap={8}>
-          <H2>Phase 9, 13, and 17 verified boundaries</H2>
+          <H2>Phase 9, 13, 14, and 17 verified boundaries</H2>
           <Text>
             The real Pack v0.40.8 gate passed locally in about 235 seconds. Storage and Pub/Sub each invoked an
             existing function and a Cloud Run-style service through MiniSky&apos;s local <Code>/v2/deploy</Code>
@@ -188,6 +189,15 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Issuer and allowed audience match exactly, temporal claims are checked, and the bounded subject is
             preserved exactly for IAM matching; only <Code>google.subject=assertion.sub</Code> executes.
             Returned <Code>ms1</Code> tokens are local, not Google credentials.
+          </Text>
+          <Text>
+            Google provider 7.41.0 and the discovery-based Go SDK passed a two-project Pub/Sub reference flow:
+            apply, canonical topic/subscription reads, unique publish, secondary-project pull and acknowledgement,
+            zero drift, destroy, and post-destroy 404 checks.
+          </Text>
+          <Text tone="secondary">
+            Resource-scoped strict authorization checks exact attach permission and rejects malformed topic names,
+            but the shared emulator backend is not a production tenant-isolation boundary.
           </Text>
           <Text>
             The Phase-17 cross-gate passed locally with the federated principal exercising Dashboard RBAC,
@@ -259,10 +269,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: add Phase-14 cross-project Pub/Sub guarded SDK/reference acceptance,
-        building on the existing project registry before deepening Phase-16 MQL. Homebrew, Scoop, deb, and rpm
-        publication remains externally blocked until maintainer-owned repositories, scoped credentials,
-        protected approval environments, and native install-from-repository tests exist.
+        Next internal executable milestone: deepen the bounded Phase-16 Monitoring slice with a focused MQL query
+        subset and SDK persistence evidence. Homebrew, Scoop, deb, and rpm publication remains externally blocked
+        until maintainer-owned repositories, scoped credentials, protected approval environments, and native
+        install-from-repository tests exist.
       </Callout>
     </Stack>
   );

@@ -194,6 +194,10 @@ secondary_dataset_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${secon
 table_url="${gateway}/_minisky/bigquery/bigquery/v2/projects/${project_id}/datasets/${dataset_id}/tables/${table_id}"
 service_account_url="${gateway}/_minisky/iam/v1/projects/${project_id}/serviceAccounts/${service_account_email}"
 storage_bucket_url="${gateway}/_minisky/storage/storage/v1/b/${storage_bucket_name}"
+pubsub_topic_name="projects/${project_id}/topics/minisky-cross-project"
+pubsub_subscription_name="projects/${secondary_project_id}/subscriptions/minisky-cross-project"
+pubsub_topic_url="${gateway}/_minisky/pubsub/v1/${pubsub_topic_name}"
+pubsub_subscription_url="${gateway}/_minisky/pubsub/v1/${pubsub_subscription_name}"
 redis_instance_url="${gateway}/_minisky/redis/v1/projects/${project_id}/locations/us-central1/instances/minisky-terraform"
 spanner_instance_url="${gateway}/_minisky/spanner/v1/projects/${project_id}/instances/minisky-terraform"
 spanner_database_url="${spanner_instance_url}/databases/minisky-terraform"
@@ -214,6 +218,8 @@ assert_json_value "${secondary_dataset_url}" "datasetReference.projectId" "${sec
 assert_json_value "${table_url}" "tableReference.tableId" "${table_id}"
 assert_json_value "${service_account_url}" "email" "${service_account_email}"
 assert_json_value "${storage_bucket_url}" "name" "${storage_bucket_name}"
+assert_json_value "${pubsub_topic_url}" "name" "${pubsub_topic_name}"
+assert_json_value "${pubsub_subscription_url}" "topic" "${pubsub_topic_name}"
 if [[ "${enable_phase15_resources}" == "1" ]]; then
   assert_json_value "${redis_instance_url}" "name" "projects/${project_id}/locations/us-central1/instances/minisky-terraform"
   assert_json_value "${spanner_instance_url}" "name" "projects/${project_id}/instances/minisky-terraform"
@@ -244,8 +250,15 @@ fi
 export MINISKY_ENDPOINT="${gateway}"
 export MINISKY_PROJECT_ID="${project_id}"
 export MINISKY_SECONDARY_PROJECT_ID="${secondary_project_id}"
+export MINISKY_PUBSUB_PRIMARY_TOPIC="${pubsub_topic_name}"
+export MINISKY_PUBSUB_SECONDARY_SUBSCRIPTION="${pubsub_subscription_name}"
 (cd "${repository_root}" && go run ./sdk-smoke/go)
-python3 "${repository_root}/sdk-smoke/python/smoke.py"
+python3 -m venv "${work_dir}/python-venv"
+"${work_dir}/python-venv/bin/python" -m pip install \
+  --disable-pip-version-check \
+  --quiet \
+  -r "${repository_root}/sdk-smoke/python/requirements.txt"
+"${work_dir}/python-venv/bin/python" "${repository_root}/sdk-smoke/python/smoke.py"
 
 set +e
 terraform -chdir="${terraform_dir}" plan \
@@ -264,7 +277,15 @@ terraform -chdir="${terraform_dir}" destroy \
   -input=false \
   "${tf_vars[@]}"
 
-destroyed_urls=("${table_url}" "${dataset_url}" "${secondary_dataset_url}" "${service_account_url}" "${storage_bucket_url}")
+destroyed_urls=(
+  "${table_url}"
+  "${dataset_url}"
+  "${secondary_dataset_url}"
+  "${service_account_url}"
+  "${storage_bucket_url}"
+  "${pubsub_subscription_url}"
+  "${pubsub_topic_url}"
+)
 if [[ "${enable_phase15_resources}" == "1" ]]; then
   destroyed_urls+=("${redis_instance_url}" "${spanner_database_url}" "${spanner_instance_url}")
 fi

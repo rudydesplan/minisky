@@ -34,6 +34,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
 | `iam_credentials_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iamcredentials/v1/` | `iamcredentials.googleapis.com` |
+| `pubsub_custom_endpoint` | `http://127.0.0.1:8080/_minisky/pubsub/v1/` | `pubsub.googleapis.com` |
 | `redis_custom_endpoint` | `http://127.0.0.1:8080/_minisky/redis/v1/` | `redis.googleapis.com` |
 | `spanner_custom_endpoint` | `http://127.0.0.1:8080/_minisky/spanner/v1/` | `spanner.googleapis.com` |
 | `storage_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storage/storage/v1/` | `storage.googleapis.com` |
@@ -55,6 +56,8 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_iam_workload_identity_pool_provider` (optional Phase 13) | Profile-persisted OIDC metadata with static inline public JWKS | Service LRO | Provider survives restart and drives a verified RS256 JWT exchange |
 | `google_service_account_iam_member` (optional Phase 13) | Persisted policy edges for the federated caller and ordered delegates | Synchronous | Federated caller reaches the first delegate and each delegate reaches the next target |
 | `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
+| `google_pubsub_topic` | Primary-project topic in the profile-owned Pub/Sub emulator | Synchronous | Canonical name is read and a unique Go SDK message is published |
+| `google_pubsub_subscription` | Secondary-project subscription referencing the primary topic | Synchronous | Exact topic reference is read, then the published message is pulled and acknowledged |
 | `google_artifact_registry_repository` (optional Phase 10) | In-memory repository metadata plus repository-scoped Registry v2 package/version views | Service LRO | Repository is created, read without drift, destroyed, and returns 404 |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
@@ -94,11 +97,17 @@ canonical gateway paths:
 - BigQuery: `${MINISKY_ENDPOINT}/_minisky/bigquery/bigquery/v2/`
 - IAM: `${MINISKY_ENDPOINT}/_minisky/iam/v1/`
 - IAM Credentials: `${MINISKY_ENDPOINT}/_minisky/iamcredentials/` (the generated clients append `v1/`)
+- Pub/Sub: `${MINISKY_ENDPOINT}/_minisky/pubsub/` (the generated client appends `v1/`)
 - Storage: `${MINISKY_ENDPOINT}/_minisky/storage/storage/v1/`
 
 Each program creates, reads, and deletes a uniquely named BigQuery dataset and
 table, IAM service account, and Storage bucket. Storage smoke execution requires
-Docker because the first request cold-starts `fake-gcs-server`.
+Docker because the first request cold-starts `fake-gcs-server`. When
+`MINISKY_PUBSUB_PRIMARY_TOPIC` and
+`MINISKY_PUBSUB_SECONDARY_SUBSCRIPTION` are set together, the Go smoke also
+verifies their exact cross-project reference, publishes a unique message,
+bounded-polls the secondary subscription, and acknowledges the matching
+delivery without deleting Terraform-owned resources.
 
 With MiniSky already running, execute the Go smoke:
 
@@ -143,9 +152,12 @@ emulator images, with a 600-second per-image default timeout configurable via
 `MINISKY_PHASE15_PULL_TIMEOUT_SECONDS`, and prints the pull log on failure.
 
 Live local evidence on 2026-07-25: the default Terraform gate applied seven
-resources, passed direct assertions plus Go/Python SDK smokes, produced a
-zero-change plan, destroyed all seven resources, and passed post-destroy 404
-checks. The separate Phase-15 gate also passed after public emulator images
+resources, passed direct assertions plus Go/Python SDK smokes—including an
+exact primary-project topic → secondary-project subscription publish/pull/ack
+flow—produced a zero-change plan, destroyed all seven resources, and passed
+post-destroy `404` checks. The script creates an isolated Python virtual
+environment and installs its pinned direct dependency before running the
+Python smoke. The separate Phase-15 gate also passed after public emulator images
 were pulled with an isolated Docker client configuration; its SDK smoke covered
 Firestore document CRUD/query, Datastore entity CRUD/ancestor queries, and
 Spanner instance/database/DDL/insert/read/delete behavior.
