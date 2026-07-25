@@ -28,7 +28,7 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `cloudfunctions.googleapis.com` | standard | hybrid |
 | `cloudkms.googleapis.com` | standard | file |
 | `cloudscheduler.googleapis.com` | standard | file |
-| `cloudtasks.googleapis.com` | standard | memory |
+| `cloudtasks.googleapis.com` | standard | file |
 | `compute.googleapis.com` | standard | hybrid |
 | `container.googleapis.com` | standard | file |
 | `dataproc.googleapis.com` | standard | hybrid |
@@ -110,11 +110,24 @@ that its private key and signed subject JWT were not persisted or logged.
 ## Phase 9–11 boundaries
 
 - Scheduler cross-shim delivery uses the daemon's configured gateway port.
-- Cloud Tasks terminal attempts survive restart. Persisted pending or retrying
-  deliveries become terminal interruption failures and are not replayed.
+  Its HTTP end-to-end evidence is a manual `:run` invocation, not scheduled
+  clock execution.
+- Cloud Tasks queue and task metadata, including terminal attempts, persists.
+  After restart, persisted `PENDING` or `RETRYING` work becomes a terminal
+  interruption failure and is not replayed. This is metadata durability, not a
+  durable delivery queue or payload replay guarantee.
 - Simulation stores Serverless metadata without claiming to run code. Requested
   Buildpacks execution fails explicitly when dependencies, source, or an image
   are missing; no Cloud SDK utility image is substituted.
+- The guarded Pack v0.40.8 gate uses MiniSky's local `POST /v2/deploy` source
+  helper for both functions and Cloud Run-style `type=service` handlers. That
+  path is not the Cloud Run v2 image API and does not establish full Cloud Run
+  v2 source-build or Terraform serverless compatibility.
+- Event delivery is a synchronous local bridge with native MiniSky payloads.
+  Eventarc/CloudEvents envelopes, Pub/Sub push, a durable event queue, ordering,
+  exactly-once delivery, and production serverless operation are unsupported.
+- Cloud Tasks does not claim OIDC, task-header, redirect, or dead-letter-queue
+  parity, and interrupted deliveries are not replayed.
 - Strict IAM (`MINISKY_IAM_MODE=strict`) covers only Storage bucket/object,
   Pub/Sub topic/subscription/publish, and Compute instance mutations. Callers
   provide `X-MiniSky-Principal`; default mode remains permissive.

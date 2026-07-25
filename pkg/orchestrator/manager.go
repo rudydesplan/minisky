@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,13 +27,18 @@ const (
 	dockerImagePullTimeout = 2 * time.Minute
 )
 
+var ErrServerlessLifecycleInProgress = errors.New("Serverless lifecycle already in progress")
+
 // ServiceManager handles native REST-driven lifecycle events over the Docker Unix Socket.
 type ServiceManager struct {
-	mu           sync.RWMutex
-	dockerClient *http.Client
-	sockPath     string
-	portRegistry map[string][]PortMapping   // containerName → host ports
-	fwRules      map[string][]FirewallEntry // vpcName → rules
+	mu               sync.RWMutex
+	serverlessMu     sync.Mutex
+	dockerClient     *http.Client
+	sockPath         string
+	portRegistry     map[string][]PortMapping   // containerName → host ports
+	fwRules          map[string][]FirewallEntry // vpcName → rules
+	serverlessActive map[ServerlessIdentity]struct{}
+	serverlessReady  func(string, time.Duration) error
 }
 
 // ContainerConfig describes one backend emulator container.
@@ -72,9 +78,11 @@ func NewServiceManager() (*ServiceManager, error) {
 	}
 	log.Printf("[ServiceManager] Docker socket resolved: %s", sockPath)
 	sm := &ServiceManager{
-		sockPath:     sockPath,
-		portRegistry: make(map[string][]PortMapping),
-		fwRules:      make(map[string][]FirewallEntry),
+		sockPath:         sockPath,
+		portRegistry:     make(map[string][]PortMapping),
+		fwRules:          make(map[string][]FirewallEntry),
+		serverlessActive: make(map[ServerlessIdentity]struct{}),
+		serverlessReady:  waitUntilHTTPReady,
 	}
 	transport := &http.Transport{
 		DialContext: sm.dialDocker,
@@ -1097,18 +1105,90 @@ func isOwnedComputeVM(labels map[string]string, containerName string) bool {
 		labels["minisky.resource"] == containerName
 }
 
+// DeleteServerlessVM deletes only the current profile's exact MiniSky-owned
+// serverless container. A missing owned container is an idempotent success.
+func (sm *ServiceManager) DeleteServerlessVM(identity ServerlessIdentity) error {
+	containerName, err := identity.ContainerName()
+	if err != nil {
+		return err
+	}
+	release, ok := sm.tryServerlessLifecycle(identity)
+	if !ok {
+		return fmt.Errorf("%w for %s", ErrServerlessLifecycleInProgress, identity.CanonicalResource())
+	}
+	defer release()
+	return sm.deleteServerlessVM(identity, containerName)
+}
+
+func (sm *ServiceManager) deleteServerlessVM(identity ServerlessIdentity, containerName string) error {
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status == "not_found" {
+		return nil
+	}
+	if !isOwnedServerlessVM(labels, identity) {
+		return fmt.Errorf("refusing to delete unowned Serverless container %q", containerName)
+	}
+
+	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", url.PathEscape(containerName))
+	req, _ := http.NewRequest(http.MethodPost, stopURL, nil)
+	if response, stopErr := sm.dockerClient.Do(req); stopErr == nil {
+		response.Body.Close()
+	}
+
+	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", url.PathEscape(containerName))
+	req, _ = http.NewRequest(http.MethodDelete, rmURL, nil)
+	resp, err := sm.dockerClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete Serverless container returned %d", resp.StatusCode)
+	}
+	sm.mu.Lock()
+	delete(sm.portRegistry, containerName)
+	sm.mu.Unlock()
+	return nil
+}
+
+func isOwnedServerlessVM(labels map[string]string, identity ServerlessIdentity) bool {
+	expected, err := identity.labels()
+	if err != nil {
+		return false
+	}
+	for key, value := range expected {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
 // ProvisionServerlessVM starts a container from a custom image (typically built by Buildpacks).
-func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image string, env []string) (string, error) {
-	containerName := "minisky-serverless-" + resourceName
+func (sm *ServiceManager) ProvisionServerlessVM(identity ServerlessIdentity, image string, env []string) (string, error) {
+	containerName, err := identity.ContainerName()
+	if err != nil {
+		return "", err
+	}
+	release, ok := sm.tryServerlessLifecycle(identity)
+	if !ok {
+		return "", fmt.Errorf("%w for %s", ErrServerlessLifecycleInProgress, identity.CanonicalResource())
+	}
+	defer release()
 	log.Printf("[Orchestrator] Provisioning Serverless VM: %s (image: %s)", containerName, image)
 
-	// Clean up any stale container
-	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://localhost/containers/%s?force=true", containerName), nil)
-	sm.dockerClient.Do(req)
+	if err := sm.deleteServerlessVM(identity, containerName); err != nil {
+		return "", err
+	}
 
 	expPort := "8080/tcp"
-	labels := ownedDockerLabels()
-	labels["resource"] = resourceName
+	labels, err := identity.labels()
+	if err != nil {
+		return "", err
+	}
 	payload := map[string]interface{}{
 		"Image": image,
 		"Env":   append(sm.standardEnv(), env...),
@@ -1127,7 +1207,8 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 	}
 
 	b, _ := json.Marshal(payload)
-	cReq, _ := http.NewRequest("POST", "http://localhost/containers/create?name="+containerName, bytes.NewBuffer(b))
+	createURL := "http://localhost/containers/create?" + url.Values{"name": {containerName}}.Encode()
+	cReq, _ := http.NewRequest("POST", createURL, bytes.NewBuffer(b))
 	cReq.Header.Set("Content-Type", "application/json")
 	resp, err := sm.dockerClient.Do(cReq)
 	if err != nil {
@@ -1140,20 +1221,54 @@ func (sm *ServiceManager) ProvisionServerlessVM(resourceName string, image strin
 	}
 
 	if err := sm.startContainer(containerName); err != nil {
-		return "", fmt.Errorf("start Serverless container: %v", err)
+		return "", sm.cleanupFailedServerlessProvision(identity, containerName, fmt.Errorf("start Serverless container: %w", err))
 	}
 
 	config := ContainerConfig{Name: containerName, ContainerPort: expPort}
 	internalURL, err := sm.discoverInternalURL(config)
 	if err != nil {
-		return "", fmt.Errorf("port discovery: %v", err)
+		return "", sm.cleanupFailedServerlessProvision(identity, containerName, fmt.Errorf("port discovery: %w", err))
 	}
-	if err := waitUntilHTTPReady(internalURL, 60*time.Second); err != nil {
-		return "", fmt.Errorf("serverless readiness probe failed: %w", err)
+	ready := sm.serverlessReady
+	if ready == nil {
+		ready = waitUntilHTTPReady
+	}
+	if err := ready(internalURL, 60*time.Second); err != nil {
+		return "", sm.cleanupFailedServerlessProvision(identity, containerName, fmt.Errorf("serverless readiness probe failed: %w", err))
 	}
 
-	log.Printf("[Orchestrator] ✅ Serverless Instance '%s' ONLINE at %s", resourceName, internalURL)
+	log.Printf("[Orchestrator] ✅ Serverless Instance '%s' ONLINE at %s", identity.CanonicalResource(), internalURL)
 	return internalURL, nil
+}
+
+func (sm *ServiceManager) cleanupFailedServerlessProvision(identity ServerlessIdentity, containerName string, cause error) error {
+	if cleanupErr := sm.deleteServerlessVM(identity, containerName); cleanupErr != nil {
+		message := cleanupErr.Error()
+		if len(message) > 256 {
+			message = message[:256]
+		}
+		return fmt.Errorf("%w; cleanup owned backend failed: %s", cause, message)
+	}
+	return cause
+}
+
+func (sm *ServiceManager) tryServerlessLifecycle(identity ServerlessIdentity) (func(), bool) {
+	sm.serverlessMu.Lock()
+	if sm.serverlessActive == nil {
+		sm.serverlessActive = make(map[ServerlessIdentity]struct{})
+	}
+	if _, active := sm.serverlessActive[identity]; active {
+		sm.serverlessMu.Unlock()
+		return nil, false
+	}
+	sm.serverlessActive[identity] = struct{}{}
+	sm.serverlessMu.Unlock()
+
+	return func() {
+		sm.serverlessMu.Lock()
+		delete(sm.serverlessActive, identity)
+		sm.serverlessMu.Unlock()
+	}, true
 }
 
 // GetContainerLogs returns the last 'tail' lines of stdout/stderr from a container.

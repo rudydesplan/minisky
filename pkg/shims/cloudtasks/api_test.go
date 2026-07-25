@@ -127,6 +127,37 @@ func TestHTTPTaskTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestGetTaskReturnsExactNamedTask(t *testing.T) {
+	const queueName = "projects/test/locations/us-central1/queues/q"
+	const taskName = queueName + "/tasks/wanted"
+	api := newMemoryAPI(t)
+	defer api.Close()
+	api.tasks[queueName] = []*Task{
+		{Name: queueName + "/tasks/other", Status: "COMPLETED"},
+		{Name: taskName, Status: "FAILED", AttemptCount: 2, LastStatusCode: http.StatusInternalServerError},
+	}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v2/"+taskName, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("get task status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var task Task
+	if err := json.NewDecoder(response.Body).Decode(&task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Name != taskName || task.Status != "FAILED" || task.AttemptCount != 2 ||
+		task.LastStatusCode != http.StatusInternalServerError {
+		t.Fatalf("get task = %#v", task)
+	}
+
+	missing := httptest.NewRecorder()
+	api.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/v2/"+queueName+"/tasks/missing", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing task status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+}
+
 func TestTaskStateSurvivesRestartWithoutReplay(t *testing.T) {
 	store := &memoryStateStore{}
 	var deliveries atomic.Int32

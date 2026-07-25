@@ -295,14 +295,19 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 
 		os.WriteFile(tmpDir+"/"+fileName, []byte(req.Code), 0644)
 
-		image, err := backend.BuildFunction("gae-"+req.Service+"-"+req.Version, tmpDir, req.Entrypoint)
+		identity := orchestrator.ServerlessIdentity{
+			ResourceType: orchestrator.ServerlessAppEngineVersion,
+			Project:      req.Project,
+			Location:     "global",
+			Name:         req.Service + "/versions/" + req.Version,
+		}
+		image, err := backend.BuildFunction(identity, tmpDir, req.Entrypoint)
 		if err != nil {
 			return err
 		}
 
 		// Provision as a Serverless VM
-		containerName := fmt.Sprintf("minisky-appengine-%s-%s-%s", req.Project, req.Service, req.Version)
-		_, err = api.svcMgr.ProvisionServerlessVM(containerName, image, []string{"PORT=8080", "GAE_SERVICE=" + req.Service, "GAE_VERSION=" + req.Version})
+		_, err = api.svcMgr.ProvisionServerlessVM(identity, image, []string{"PORT=8080", "GAE_SERVICE=" + req.Service, "GAE_VERSION=" + req.Version})
 		if err != nil {
 			api.pushLog(req.Project, "ERROR", req.Service, fmt.Sprintf("Deployment failed for version %s: %v", req.Version, err))
 			return err

@@ -61,7 +61,7 @@ var serviceManifest = map[string]serviceMetadata{
 	"cloudfunctions.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
 	"cloudkms.googleapis.com":             {FidelityStandard, PersistenceFile, true},
 	"cloudscheduler.googleapis.com":       {FidelityStandard, PersistenceFile, true},
-	"cloudtasks.googleapis.com":           {FidelityStandard, PersistenceMemory, true},
+	"cloudtasks.googleapis.com":           {FidelityStandard, PersistenceFile, true},
 	"compute.googleapis.com":              {FidelityStandard, PersistenceHybrid, true},
 	"container.googleapis.com":            {FidelityStandard, PersistenceFile, true},
 	"dataproc.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},

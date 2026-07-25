@@ -106,6 +106,19 @@ npm run lint
 npm run build
 ```
 
+To run the guarded local serverless/event-delivery acceptance gate, start
+Docker and install `curl`, `go`, `python3`, and checksum-verified Pack v0.40.8,
+then run:
+
+```bash
+make test-event-delivery
+```
+
+The target supplies `MINISKY_EVENT_INTEGRATION=1`. Its `POST /v2/deploy`
+requests use MiniSky's local source-deployment helper, not the Cloud Run v2
+image API. The gate is intentionally local and may take several minutes on a
+cold Buildpacks cache.
+
 For the Phase 17 CI, plugin, control, offline-bundle, and Compose checks, run:
 
 ```bash

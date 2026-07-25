@@ -24,7 +24,7 @@ Current boundaries:
 - Storage and Pub/Sub maintain observer lists and wire the serverless shim during `OnPostBoot`.
 - Their observer callback is `HandleEvent(eventType, resource, payload string)`.
 - Observer notification is currently synchronous; do not describe it as guaranteed non-blocking.
-- Cloud Tasks owns cancellable background delivery jobs, bounded HTTP timeouts, bounded retries, and in-memory task outcome fields.
+- Cloud Tasks owns cancellable background delivery jobs, bounded HTTP timeouts, bounded retries, and profile-persisted queue, task, attempt, and terminal outcome metadata.
 - Cloud Scheduler uses `robfig/cron/v3` with the default five-field parser, persists job metadata, and dispatches HTTP, Pub/Sub, or App Engine targets.
 - There is no general durable event queue or dead-letter subsystem.
 
@@ -95,7 +95,11 @@ Scheduled callbacks currently reference job pointers. Any update/delete work mus
 
 ## Persistence and restart
 
-Only claim durability where a shim has a state adapter. Scheduler metadata is persisted; Cloud Tasks delivery state currently is not.
+Only claim durability where a shim has a state adapter. Scheduler job metadata
+is persisted. Cloud Tasks queue and task metadata persists; after restart,
+persisted `PENDING` or `RETRYING` work becomes a terminal interruption failure
+and is not replayed. This does not provide a durable delivery queue or payload
+delivery replay.
 
 When adding persistence:
 
