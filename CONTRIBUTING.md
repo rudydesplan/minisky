@@ -142,6 +142,20 @@ and no Docker. It covers bounded filtered entry listing plus sink
 create/get/list/delete; pagination, partial-success writes, sink updates, and
 sink-delivery output remain outside the claim.
 
+To verify Cloud DNS managed zones and A records through the generated
+`google.golang.org/api/dns/v1` client across restart, including the loopback UDP
+resolver and cleanup durability, run:
+
+```bash
+make test-phase16-dns
+```
+
+This guarded gate uses isolated temporary state, dynamic loopback TCP and UDP
+ports, and no Docker. DNS mutation bodies are limited to 1 MiB, RRSet data and
+change batches have MiniSky-specific safety bounds, and the gate does not imply
+pagination, DNSSEC signing, recursion, private-network enforcement, or broader
+DNS protocol support.
+
 To verify the generated Vertex AI Go client against MiniSky's bounded
 deterministic endpoint prediction path, including an exact response comparison
 across a clean daemon restart, run:

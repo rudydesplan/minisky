@@ -202,7 +202,7 @@ and is not safe to invoke from standalone diagnostics.
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
-| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sink metadata, and deterministic Vertex endpoint predictions; broader ML and networking remain bounded | ✅ Verified bounded Monitoring, Logging, and Vertex slices |
+| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, and deterministic Vertex predictions; advanced networking remains bounded | ✅ Verified bounded Monitoring, Logging, DNS, and Vertex slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
 
 ### Phase 6 — Fidelity baseline
@@ -410,9 +410,9 @@ and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
 
-**Status (2026-07-26): bounded Monitoring, Logging, and Vertex slices verified.**
-DNS resolution and subnetwork/IPAM contracts have focused tests. A guarded
-Monitoring gate used
+**Status (2026-07-26): bounded Monitoring, Logging, DNS, and Vertex slices
+verified.** Subnetwork/IPAM contracts have focused tests. A guarded Monitoring
+gate used
 the official generated REST client to create a descriptor and write a sample,
 restarted MiniSky against the same isolated profile, and retrieved the
 persisted value through the canonical project-scoped PromQL instant-query
@@ -433,6 +433,18 @@ bodies, deterministic timestamp ordering, validation-only `dryRun`, and
 create/get/list/delete sink lifecycle. Pagination, `partialSuccess`, sink
 patch/update, per-entry errors, durable sink-delivery replay, log-based metrics,
 and alerting policies remain unsupported.
+
+A guarded Cloud DNS gate used the official generated REST client to create and
+read a public managed zone and A record, restarted MiniSky against the same
+profile, and validated the supported persisted zone and record fields plus a
+real loopback UDP answer.
+It deleted the record and zone, restarted again, and confirmed API `404` and UDP
+`NXDOMAIN` cleanup in 11 seconds. Mutation bodies are strict and limited to
+1 MiB, DNS names are canonicalized case-insensitively, records must belong to
+their zone, and legacy TTLs are clamped safely during rehydration. Pagination,
+DNSSEC signing, forwarding/peering, policies, recursion, TCP/DoH/DoT, broader
+record resolution, CNAME chaining, EDNS0, and private-network enforcement
+remain unsupported.
 
 A separate guarded Vertex gate used the official generated AI Platform REST
 client against a canonical endpoint `:predict` route, recorded two
@@ -455,8 +467,8 @@ stores, log-based alerting, and peering/NAT/PSC remain unsupported.
   log-based metrics and alerting policy evaluation remain future work.
 - Implement VPC peering, Private Service Connect, and Cloud NAT with local
   network routing.
-- Add DNS zone emulation with record sets and local resolution for service
-  discovery.
+- Extend the bounded persisted DNS zone, record-set, and loopback resolution
+  slice only where explicit client and protocol evidence exists.
 
 ### Phase 17 — CI/CD integration, plugin ecosystem, and enterprise
 

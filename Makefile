@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
+.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -30,6 +30,9 @@ test-phase16-monitoring:
 
 test-phase16-logging:
 	MINISKY_PHASE16_LOGGING_INTEGRATION=1 ./scripts/phase16-logging-integration.sh
+
+test-phase16-dns:
+	MINISKY_PHASE16_DNS_INTEGRATION=1 ./scripts/phase16-dns-integration.sh
 
 test-phase16-vertex:
 	MINISKY_PHASE16_VERTEX_INTEGRATION=1 ./scripts/phase16-vertex-integration.sh

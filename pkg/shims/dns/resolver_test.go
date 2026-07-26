@@ -1,6 +1,8 @@
 package dns
 
 import (
+	"context"
+	"math"
 	"net"
 	"net/http"
 	"testing"
@@ -9,6 +11,90 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"minisky/pkg/state"
 )
+
+func TestResolverClampsLegacyTTLAfterRestart(t *testing.T) {
+	store, err := state.New(t.TempDir(), "legacy-ttl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dnsMetadata{
+		ZoneSeq: 1,
+		Zones: map[string]persistedZone{
+			"test:legacy": {
+				Zone: &ManagedZone{Name: "legacy", DnsName: "Example.Test.", Visibility: "public"},
+				RRSets: map[string]*ResourceRecordSet{
+					"stale-negative-key": {
+						Name: "Negative.Example.Test.", Type: "a", TTL: -1, Rrdatas: []string{"192.0.2.10"},
+					},
+					"stale-overflow-key": {
+						Name: "Overflow.Example.Test.", Type: "A", TTL: int64(math.MaxUint32) + 1,
+						Rrdatas: []string{"192.0.2.11"},
+					},
+				},
+			},
+		},
+	}
+	if err := store.Save(dnsStateEntry, legacy); err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewResolver(api, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	assertDNSAnswer(t, resolver.Addr(), "negative.example.test.", dnsmessage.TypeA, "192.0.2.10", 0)
+	assertDNSAnswer(t, resolver.Addr(), "overflow.example.test.", dnsmessage.TypeA, "192.0.2.11", math.MaxUint32)
+}
+
+func TestAPIShutdownClosesConfiguredResolverIdempotently(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "resolver-lifecycle")
+	t.Setenv("MINISKY_DNS_ADDR", "127.0.0.1:0")
+	api := NewAPI()
+	if api.resolver == nil {
+		t.Fatal("configured resolver was not retained by API")
+	}
+	address := api.resolver.Addr()
+	if err := api.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.ListenUDP("udp", udpAddress)
+	if err != nil {
+		t.Fatalf("resolver port was not released: %v", err)
+	}
+	_ = connection.Close()
+}
+
+func TestConfiguredResolverStartupFailureRemainsObservable(t *testing.T) {
+	occupied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "resolver-startup-failure")
+	t.Setenv("MINISKY_DNS_ADDR", occupied.LocalAddr().String())
+
+	api := NewAPI()
+	if api.resolver != nil || api.initErr == nil {
+		t.Fatalf("resolver=%v initErr=%v", api.resolver, api.initErr)
+	}
+	response := dnsRequest(api, http.MethodGet, "/dns/v1/projects/test/managedZones", "")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
 
 func TestResolverServesUpdatesDeletesAndRestartedRecords(t *testing.T) {
 	store, err := state.New(t.TempDir(), "dns-resolver")
