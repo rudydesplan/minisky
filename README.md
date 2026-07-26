@@ -202,7 +202,7 @@ and is not safe to invoke from standalone diagnostics.
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
-| 16 | ML/AI, monitoring, and advanced networking | A guarded restart gate proves SDK-written Monitoring samples through a bounded project-scoped PromQL instant query; broader ML and networking remain bounded | ✅ Verified bounded Monitoring slice |
+| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL and deterministic Vertex endpoint predictions; broader ML and networking remain bounded | ✅ Verified bounded Monitoring and Vertex slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
 
 ### Phase 6 — Fidelity baseline
@@ -410,9 +410,9 @@ and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
 
-**Status (2026-07-25): bounded Monitoring slice verified.** Vertex mock
-prediction, profile-scoped Logging and sinks, DNS resolution, and
-subnetwork/IPAM contracts have focused tests. A guarded Monitoring gate used
+**Status (2026-07-25): bounded Monitoring and Vertex slices verified.**
+Profile-scoped Logging and sinks, DNS resolution, and subnetwork/IPAM contracts
+have focused tests. A guarded Monitoring gate used
 the official generated REST client to create a descriptor and write a sample,
 restarted MiniSky against the same isolated profile, and retrieved the
 persisted value through the canonical project-scoped PromQL instant-query
@@ -421,8 +421,18 @@ endpoint in 11 seconds. The supported PromQL grammar is one exact
 writes collapse to one latest sample per metric-label set. MQL remains
 `501 UNIMPLEMENTED`: Google stopped recommending it for new queries in 2024.
 PromQL label matchers, operators, functions, aggregations, range queries, and
-full Cloud Monitoring metric/resource translation remain unsupported, as do
-log-based alerting, feature-store/batch prediction, and peering/NAT/PSC.
+full Cloud Monitoring metric/resource translation remain unsupported.
+
+A separate guarded Vertex gate used the official generated AI Platform REST
+client against a canonical endpoint `:predict` route, recorded two
+MiniSky-specific predictions, restarted MiniSky, and verified the exact
+ordered inputs, framed deterministic scores, deployed-model metadata, and
+canonical model resource in 13 seconds. Equivalent JSON encodings produce the
+same scores, optional billing labels are accepted but ignored, and requests are
+bounded to 1 MiB and 100 instances. This is deterministic local simulation:
+predictions are not persisted, endpoint/model deployment and semantic model
+parity are not implemented, and streaming/raw/batch prediction, feature
+stores, log-based alerting, and peering/NAT/PSC remain unsupported.
 
 - Emulate Vertex AI model deployment, online prediction endpoints, and batch
   prediction jobs with configurable mock responses.
