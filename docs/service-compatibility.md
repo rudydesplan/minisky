@@ -169,10 +169,16 @@ SDK coverage.
   operators, functions, aggregations, ranges, Boolean samples, and
   `query_range` are unsupported. Monitoring Query Language remains
   `501 UNIMPLEMENTED`.
-- Logging migrates the legacy global log file into profile state, supports
-  bounded `severity`, `logName`, and `resource.type` filters, and supports safe
-  relative file sinks plus Pub/Sub sinks with a delivery-loop marker.
-  Alerting and log-based metrics are `501 UNIMPLEMENTED`.
+- Logging migrates the legacy global log file into profile state and supports
+  generated-client entries write/list plus sink create/get/list/delete across
+  restart. Entry listing is project-scoped when `resourceNames` is supplied,
+  supports bounded `severity`, `logName`, and `resource.type` filters, and
+  accepts only timestamp ascending/descending ordering. Writes inherit
+  top-level log name, resource, and labels; `dryRun` validates without
+  persistence or delivery. Safe relative file sinks and exact Pub/Sub topic
+  destinations are supported with a delivery-loop marker. Pagination,
+  `partialSuccess`, sink patch/update, per-entry errors, alerting, and log-based
+  metrics remain unsupported.
 - Vertex AI supports the generated Go client's canonical endpoint `predict`
   call with at most 100 instances, optional parameters, and ignored billing
   labels. Its ordered `{instance,score}` predictions and model metadata are a

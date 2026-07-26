@@ -110,18 +110,23 @@ var startCmd = &cobra.Command{
 			log.Fatalf("[FATAL] Cannot restore operation state: %v", err)
 		}
 
-		// 2. Docker service manager — creates the isolated minisky-net bridge network
-		//    and handles cold-starting long-lived emulator containers (GCS, Pub/Sub, etc.)
-		svcMgr, err := orchestrator.NewServiceManager()
-		if err != nil {
-			log.Fatalf("[FATAL] Cannot connect to Docker: %v", err)
-		}
 		ctx := context.Background()
-		if err := svcMgr.EnsureNetwork(ctx); err != nil {
-			log.Fatalf("[FATAL] Cannot create isolated minisky-net network: %v", err)
+		// 2. Docker service manager — creates the isolated minisky-net bridge network
+		//    and handles cold-starting long-lived emulator containers (GCS, Pub/Sub, etc.).
+		//    The guarded Phase 16 Logging gate is native-only and does not use Docker.
+		var svcMgr *orchestrator.ServiceManager
+		if os.Getenv("MINISKY_PHASE16_LOGGING_INTEGRATION") == "1" {
+			log.Printf("[WARN] Docker orchestration disabled; Docker-backed services are unavailable")
+		} else {
+			svcMgr, err = orchestrator.NewServiceManager()
+			if err != nil {
+				log.Fatalf("[FATAL] Cannot connect to Docker: %v", err)
+			}
+			if err := svcMgr.EnsureNetwork(ctx); err != nil {
+				log.Fatalf("[FATAL] Cannot create isolated minisky-net network: %v", err)
+			}
 		}
 
-		// ── Router ──────────────────────────────────────────────────────────
 		// ── Router ──────────────────────────────────────────────────────────
 		proxyRouter := router.NewProxyRouterWithManager(svcMgr)
 		gatewayTLS, tlsDiagnostics, err := localsecurity.PrepareTLS(localsecurity.TLSOptions{
@@ -236,7 +241,9 @@ var startCmd = &cobra.Command{
 				}
 			}
 			cancel()
-			svcMgr.Teardown(context.Background())
+			if svcMgr != nil {
+				svcMgr.Teardown(context.Background())
+			}
 			os.Remove(pidFile)
 			os.Exit(0)
 		}()
@@ -249,23 +256,28 @@ var startCmd = &cobra.Command{
 			uiMux := http.NewServeMux()
 
 			// REST API for dynamic dashboard control
-			apiHandler := dashboard.NewAPIHandler(
-				svcMgr,
-				bqAPI.GetBackend(),
-				gkeAPI.GetBackend(),
-				serverlessShim.GetBackend(),
-				logShim,
-				monShim,
-				appEngineAPI,
-				memoAPI,
-				schedulerAPI,
-				computeAPI,
-				projectAPI,
-				gatewayURL,
-				gatewayObservability.DiagnosticsHandler(),
-				iamAPI,
-				tokenAudience,
-			)
+			var apiHandler http.Handler
+			if svcMgr == nil {
+				apiHandler = dashboardUnavailableHandler()
+			} else {
+				apiHandler = dashboard.NewAPIHandler(
+					svcMgr,
+					bqAPI.GetBackend(),
+					gkeAPI.GetBackend(),
+					serverlessShim.GetBackend(),
+					logShim,
+					monShim,
+					appEngineAPI,
+					memoAPI,
+					schedulerAPI,
+					computeAPI,
+					projectAPI,
+					gatewayURL,
+					gatewayObservability.DiagnosticsHandler(),
+					iamAPI,
+					tokenAudience,
+				)
+			}
 			if auditLog != nil {
 				apiHandler = auditLog.Wrap(apiHandler, func(r *http.Request) localsecurity.AuditEvent {
 					return localsecurity.AuditEvent{
@@ -457,6 +469,20 @@ func gatewayMux(gateway http.Handler) http.Handler {
 	})
 	mux.Handle("/", gateway)
 	return mux
+}
+
+func dashboardUnavailableHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code":    http.StatusServiceUnavailable,
+				"message": "dashboard API is unavailable while Docker orchestration is disabled",
+				"status":  "UNAVAILABLE",
+			},
+		})
+	})
 }
 
 func shutdownPlugins(ctx context.Context, shims map[string]http.Handler) error {

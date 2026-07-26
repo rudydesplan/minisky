@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -68,6 +70,284 @@ func TestLoggingWriteListFiltersAndUnsupportedSurfaces(t *testing.T) {
 	for _, path := range []string{"/v2/projects/p/metrics", "/v3/projects/p/alertPolicies"} {
 		response := loggingRequest(api, http.MethodPost, path, `{}`)
 		assertLoggingError(t, response, http.StatusNotImplemented, "UNIMPLEMENTED")
+	}
+}
+
+func TestLoggingEntriesAndSinksSurviveRestartWithProjectIsolation(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.New(root, "restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliverer := &recordingSinkDeliverer{}
+	api, err := NewAPIWithStore(store, "", deliverer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := loggingRequest(api, http.MethodPost, "/v2/projects/project-a/sinks",
+		`{"name":"errors","destination":"file://errors","filter":"severity>=ERROR"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create sink status=%d body=%s", create.Code, create.Body.String())
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write", `{
+		"logName":"projects/project-a/logs/app",
+		"resource":{"type":"global","labels":{"project_id":"project-a"}},
+		"labels":{"phase":"16","shared":"default"},
+		"entries":[
+			{"insertId":"a-info","timestamp":"2026-07-26T08:00:00Z","severity":"INFO","textPayload":"info","labels":{"shared":"entry"}},
+			{"insertId":"a-error","timestamp":"2026-07-26T08:01:00Z","severity":"ERROR","textPayload":"error"},
+			{"insertId":"b-error","timestamp":"2026-07-26T08:02:00Z","severity":"ERROR","textPayload":"other","logName":"projects/project-b/logs/app"}
+		]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write status=%d body=%s", write.Code, write.Body.String())
+	}
+	if len(deliverer.deliveries) != 1 {
+		t.Fatalf("deliveries=%#v", deliverer.deliveries)
+	}
+
+	restartedDelivery := &recordingSinkDeliverer{}
+	restarted, err := NewAPIWithStore(store, "", restartedDelivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restartedDelivery.deliveries) != 0 {
+		t.Fatalf("restart replayed sink delivery: %#v", restartedDelivery.deliveries)
+	}
+	list := loggingRequest(restarted, http.MethodPost, "/v2/entries:list", `{
+		"resourceNames":["projects/project-a"],
+		"filter":"severity>=ERROR AND logName=\"projects/project-a/logs/app\" AND resource.type=\"global\"",
+		"orderBy":"timestamp asc",
+		"pageSize":10
+	}`)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var listed struct {
+		Entries []LogEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Entries) != 1 || listed.Entries[0].InsertId != "a-error" {
+		t.Fatalf("entries=%#v", listed.Entries)
+	}
+	if listed.Entries[0].Labels["phase"] != "16" || listed.Entries[0].Resource == nil ||
+		listed.Entries[0].Resource.Type != "global" {
+		t.Fatalf("inherited fields=%#v", listed.Entries[0])
+	}
+	get := loggingRequest(restarted, http.MethodGet, "/v2/projects/project-a/sinks/errors", "")
+	if get.Code != http.StatusOK {
+		t.Fatalf("get sink status=%d body=%s", get.Code, get.Body.String())
+	}
+	listSinks := loggingRequest(restarted, http.MethodGet, "/v2/projects/project-a/sinks", "")
+	if listSinks.Code != http.StatusOK || !strings.Contains(listSinks.Body.String(), `"name":"errors"`) {
+		t.Fatalf("list sinks status=%d body=%s", listSinks.Code, listSinks.Body.String())
+	}
+	deleteSink := loggingRequest(restarted, http.MethodDelete, "/v2/projects/project-a/sinks/errors", "")
+	if deleteSink.Code != http.StatusOK {
+		t.Fatalf("delete sink status=%d body=%s", deleteSink.Code, deleteSink.Body.String())
+	}
+	afterDelete, err := NewAPIWithStore(store, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := loggingRequest(afterDelete, http.MethodGet, "/v2/projects/project-a/sinks/errors", "")
+	assertLoggingError(t, missing, http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestLoggingListOrderingAndBounds(t *testing.T) {
+	api, err := NewAPIWithStore(nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write", `{"entries":[
+		{"insertId":"b","timestamp":"2026-07-26T08:00:00Z","logName":"projects/p/logs/app"},
+		{"insertId":"a","timestamp":"2026-07-26T08:00:00Z","logName":"projects/p/logs/app"},
+		{"insertId":"c","timestamp":"2026-07-26T08:01:00Z","logName":"projects/p/logs/app"}
+	]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write status=%d body=%s", write.Code, write.Body.String())
+	}
+	for _, test := range []struct {
+		name    string
+		orderBy string
+		want    []string
+	}{
+		{name: "default ascending", want: []string{"a", "b", "c"}},
+		{name: "ascending", orderBy: "timestamp asc", want: []string{"a", "b", "c"}},
+		{name: "descending", orderBy: "timestamp desc", want: []string{"c", "b", "a"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := loggingRequest(api, http.MethodPost, "/v2/entries:list",
+				fmt.Sprintf(`{"resourceNames":["projects/p"],"orderBy":%q,"pageSize":10}`, test.orderBy))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var body struct {
+				Entries []LogEntry `json:"entries"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]string, len(body.Entries))
+			for i := range body.Entries {
+				got[i] = body.Entries[i].InsertId
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("order=%v want=%v", got, test.want)
+			}
+		})
+	}
+	for _, body := range []string{
+		`{"orderBy":"severity desc"}`,
+		`{"pageToken":"unsupported-token"}`,
+		`{"resourceNames":[` + repeatedJSONStrings("projects/p", 101) + `]}`,
+	} {
+		response := loggingRequest(api, http.MethodPost, "/v2/entries:list", body)
+		assertLoggingError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+	}
+}
+
+func TestLoggingNormalizesTimestampsBeforeOrdering(t *testing.T) {
+	api, err := NewAPIWithStore(nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write", `{"entries":[
+		{"insertId":"offset","timestamp":"2026-07-26T10:00:00+02:00","logName":"projects/p/logs/app"},
+		{"insertId":"zulu","timestamp":"2026-07-26T08:30:00Z","logName":"projects/p/logs/app"}
+	]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write status=%d body=%s", write.Code, write.Body.String())
+	}
+	list := loggingRequest(api, http.MethodPost, "/v2/entries:list",
+		`{"resourceNames":["projects/p"],"orderBy":"timestamp asc","pageSize":10}`)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var body struct {
+		Entries []LogEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Entries) != 2 || body.Entries[0].InsertId != "offset" ||
+		body.Entries[0].Timestamp != "2026-07-26T08:00:00Z" ||
+		body.Entries[1].InsertId != "zulu" {
+		t.Fatalf("entries=%#v", body.Entries)
+	}
+}
+
+func TestLoggingRejectsInvalidTimestampsForRealAndDryRunWrites(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dryRun=%t", dryRun), func(t *testing.T) {
+			api, err := NewAPIWithStore(nil, "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+				fmt.Sprintf(`{"dryRun":%t,"entries":[{"insertId":"bad","timestamp":"not-a-timestamp","logName":"projects/p/logs/app"}]}`, dryRun))
+			assertLoggingError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+			if len(api.GetEntries()) != 0 {
+				t.Fatalf("invalid timestamp persisted entries=%#v", api.GetEntries())
+			}
+		})
+	}
+}
+
+func TestLoggingWriteOptionsAndBounds(t *testing.T) {
+	deliverer := &recordingSinkDeliverer{}
+	api, err := NewAPIWithStore(nil, "", deliverer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+		`{"name":"all","destination":"file://all"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create sink status=%d body=%s", create.Code, create.Body.String())
+	}
+	dryRun := loggingRequest(api, http.MethodPost, "/v2/entries:write", `{
+		"dryRun":true,
+		"logName":"projects/p/logs/app",
+		"resource":{"type":"global"},
+		"labels":{"default":"yes","same":"default"},
+		"entries":[{"insertId":"dry","timestamp":"2026-07-26T08:00:00Z","labels":{"same":"entry"}}]
+	}`)
+	if dryRun.Code != http.StatusOK || len(api.GetEntries()) != 0 || len(deliverer.deliveries) != 0 {
+		t.Fatalf("dry run status=%d entries=%#v deliveries=%#v", dryRun.Code, api.GetEntries(), deliverer.deliveries)
+	}
+	partial := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+		`{"partialSuccess":true,"entries":[{"logName":"projects/p/logs/app"}]}`)
+	assertLoggingError(t, partial, http.StatusNotImplemented, "UNIMPLEMENTED")
+
+	entries := make([]string, 1001)
+	for i := range entries {
+		entries[i] = `{"logName":"projects/p/logs/app"}`
+	}
+	oversizedBatch := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+		`{"entries":[`+strings.Join(entries, ",")+`]}`)
+	assertLoggingError(t, oversizedBatch, http.StatusBadRequest, "INVALID_ARGUMENT")
+	if len(api.GetEntries()) != 0 {
+		t.Fatalf("oversized batch mutated entries=%#v", api.GetEntries())
+	}
+}
+
+func TestLoggingStrictJSONBodyLimit(t *testing.T) {
+	type payload struct {
+		Value string `json:"value"`
+	}
+	const prefix = `{"value":"`
+	const suffix = `"}`
+	exact := prefix + strings.Repeat("x", (1<<20)-len(prefix)-len(suffix)) + suffix
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "exactly one MiB", body: exact},
+		{name: "over one MiB", body: exact + " ", wantErr: true},
+		{name: "unknown field", body: `{"value":"ok","extra":true}`, wantErr: true},
+		{name: "trailing JSON", body: `{"value":"ok"} {}`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(test.body))
+			var decoded payload
+			err := decodeJSON(request, &decoded)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoggingSinkRoutesAndDestinationsAreCanonical(t *testing.T) {
+	api, err := NewAPIWithStore(nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"/v2/projects/p/sinks/extra/path",
+		"/v2/projects//sinks/name",
+		"/v2/projects/p/sinks/",
+	} {
+		response := loggingRequest(api, http.MethodGet, path, "")
+		assertLoggingError(t, response, http.StatusNotFound, "NOT_FOUND")
+	}
+	collectionDelete := loggingRequest(api, http.MethodDelete, "/v2/projects/p/sinks", "")
+	assertLoggingError(t, collectionDelete, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
+	for _, destination := range []string{
+		"pubsub.googleapis.com/projects/p/topics/",
+		"pubsub.googleapis.com/projects//topics/t",
+		"pubsub.googleapis.com/projects/p/topics/t/extra",
+		"pubsub.googleapis.com/projects/p/not-topics/t",
+	} {
+		response := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+			fmt.Sprintf(`{"name":"bad","destination":%q}`, destination))
+		assertLoggingError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodPut} {
+		response := loggingRequest(api, method, "/v2/projects/p/sinks/name", `{}`)
+		assertLoggingError(t, response, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
 	}
 }
 
@@ -171,6 +451,15 @@ func loggingRequest(handler http.Handler, method, path, body string) *httptest.R
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func repeatedJSONStrings(value string, count int) string {
+	encoded, _ := json.Marshal(value)
+	values := make([]string, count)
+	for i := range values {
+		values[i] = string(encoded)
+	}
+	return strings.Join(values, ",")
 }
 
 func assertLoggingError(t *testing.T, response *httptest.ResponseRecorder, code int, status string) {

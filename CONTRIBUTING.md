@@ -130,6 +130,18 @@ This guarded gate uses temporary profile state and dynamic loopback ports. It
 does not require Docker, and it leaves MQL, range queries, and broader PromQL
 grammar explicitly unsupported.
 
+To verify Cloud Logging entries and sink metadata through the generated
+`google.golang.org/api/logging/v2` client across a clean restart, run:
+
+```bash
+make test-phase16-logging
+```
+
+This guarded gate uses an isolated temporary profile, dynamic loopback ports,
+and no Docker. It covers bounded filtered entry listing plus sink
+create/get/list/delete; pagination, partial-success writes, sink updates, and
+sink-delivery output remain outside the claim.
+
 To verify the generated Vertex AI Go client against MiniSky's bounded
 deterministic endpoint prediction path, including an exact response comparison
 across a clean daemon restart, run:
