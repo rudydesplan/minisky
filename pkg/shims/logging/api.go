@@ -23,8 +23,11 @@ import (
 )
 
 const (
-	loggingStateEntry = "logging/metadata"
-	sinkLoopLabel     = "minisky.logging/sink-delivery"
+	loggingStateEntry        = "logging/metadata"
+	sinkLoopLabel            = "minisky.logging/sink-delivery"
+	maxLoggingBodySize int64 = 1 << 20
+	maxWriteEntries          = 1000
+	maxResourceNames         = 100
 )
 
 func init() {
@@ -55,6 +58,7 @@ type LogSink struct {
 	Destination string `json:"destination"`
 	Filter      string `json:"filter,omitempty"`
 	Description string `json:"description,omitempty"`
+	project     string
 }
 
 type sinkDeliverer interface {
@@ -177,10 +181,12 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		LogName  string             `json:"logName"`
-		Resource *MonitoredResource `json:"resource"`
-		Labels   map[string]string  `json:"labels"`
-		Entries  []LogEntry         `json:"entries"`
+		LogName        string             `json:"logName"`
+		Resource       *MonitoredResource `json:"resource"`
+		Labels         map[string]string  `json:"labels"`
+		Entries        []LogEntry         `json:"entries"`
+		DryRun         bool               `json:"dryRun"`
+		PartialSuccess bool               `json:"partialSuccess"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid entries.write JSON")
@@ -190,6 +196,14 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "entries must contain at least one log entry")
 		return
 	}
+	if len(body.Entries) > maxWriteEntries {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "entries must contain at most 1000 log entries")
+		return
+	}
+	if body.PartialSuccess {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "partialSuccess is not implemented")
+		return
+	}
 
 	now := time.Now().UTC()
 	entries := make([]LogEntry, len(body.Entries))
@@ -197,6 +211,13 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 	for i := range entries {
 		if entries[i].Timestamp == "" {
 			entries[i].Timestamp = now.Format(time.RFC3339Nano)
+		} else {
+			timestamp, err := time.Parse(time.RFC3339Nano, entries[i].Timestamp)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "timestamp must be a valid RFC3339 timestamp")
+				return
+			}
+			entries[i].Timestamp = timestamp.UTC().Format(time.RFC3339Nano)
 		}
 		if entries[i].InsertId == "" {
 			entries[i].InsertId = fmt.Sprintf("%d-%d", now.UnixNano(), i)
@@ -207,13 +228,23 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		if entries[i].Resource == nil {
 			entries[i].Resource = body.Resource
 		}
-		if entries[i].Labels == nil && body.Labels != nil {
-			entries[i].Labels = cloneLabels(body.Labels)
+		if body.Labels != nil {
+			labels := cloneLabels(entries[i].Labels)
+			for key, value := range body.Labels {
+				if _, exists := labels[key]; !exists {
+					labels[key] = value
+				}
+			}
+			entries[i].Labels = labels
 		}
 		if entries[i].LogName == "" {
 			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "logName is required")
 			return
 		}
+	}
+	if body.DryRun {
+		_, _ = w.Write([]byte("{}"))
+		return
 	}
 
 	sinks := make([]LogSink, 0)
@@ -222,7 +253,8 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		if len(api.entries) > api.maxSize {
 			api.entries = api.entries[len(api.entries)-api.maxSize:]
 		}
-		for _, sink := range api.sinks {
+		for key, sink := range api.sinks {
+			sink.project = strings.SplitN(key, ":", 2)[0]
 			sinks = append(sinks, sink)
 		}
 		return nil
@@ -237,6 +269,9 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			for _, sink := range sinks {
+				if sink.project != entryProject(entry.LogName) {
+					continue
+				}
 				matches, _ := matchesFilter(entry, sink.Filter)
 				if matches {
 					if err := api.deliverer.Deliver(sink, entry); err != nil {
@@ -255,6 +290,7 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 		Filter        string   `json:"filter"`
 		OrderBy       string   `json:"orderBy"`
 		PageSize      int      `json:"pageSize"`
+		PageToken     string   `json:"pageToken"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid entries.list JSON")
@@ -266,6 +302,18 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.PageSize < 0 || body.PageSize > 1000 {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "pageSize must be between 0 and 1000")
+		return
+	}
+	if len(body.ResourceNames) > maxResourceNames {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "resourceNames must contain at most 100 resources")
+		return
+	}
+	if body.PageToken != "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "pageToken is not supported")
+		return
+	}
+	if body.OrderBy != "" && body.OrderBy != "timestamp asc" && body.OrderBy != "timestamp desc" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", `orderBy must be empty, "timestamp asc", or "timestamp desc"`)
 		return
 	}
 
@@ -281,11 +329,18 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	api.mu.RUnlock()
+	descending := body.OrderBy == "timestamp desc"
 	sort.SliceStable(entries, func(i, j int) bool {
-		if strings.EqualFold(strings.TrimSpace(body.OrderBy), "timestamp asc") {
-			return entries[i].Timestamp < entries[j].Timestamp
+		if entries[i].Timestamp == entries[j].Timestamp {
+			if descending {
+				return entries[i].InsertId > entries[j].InsertId
+			}
+			return entries[i].InsertId < entries[j].InsertId
 		}
-		return entries[i].Timestamp > entries[j].Timestamp
+		if descending {
+			return entries[i].Timestamp > entries[j].Timestamp
+		}
+		return entries[i].Timestamp < entries[j].Timestamp
 	})
 	if body.PageSize > 0 && len(entries) > body.PageSize {
 		entries = entries[:body.PageSize]
@@ -294,13 +349,16 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
-	project := extractProject(r.URL.Path)
-	name := extractAfter(r.URL.Path, "sinks")
+	project, name, collection, ok := parseSinkPath(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Logging resource not found")
+		return
+	}
 	key := project + ":" + name
 	switch r.Method {
 	case http.MethodPost:
-		if name != "" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if !collection {
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 			return
 		}
 		var sink LogSink
@@ -330,7 +388,7 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(sink)
 	case http.MethodGet:
-		if name != "" {
+		if !collection {
 			api.mu.RLock()
 			sink, ok := api.sinks[key]
 			api.mu.RUnlock()
@@ -352,6 +410,10 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(sinks, func(i, j int) bool { return sinks[i].Name < sinks[j].Name })
 		_ = json.NewEncoder(w).Encode(map[string]any{"sinks": sinks})
 	case http.MethodDelete:
+		if collection {
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+			return
+		}
 		err := api.commitMutation(func() error {
 			if _, ok := api.sinks[key]; !ok {
 				return errLoggingNotFound
@@ -369,7 +431,7 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte("{}"))
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -665,8 +727,7 @@ func validateSink(sink LogSink) error {
 	if !validIdentifier(sink.Name) {
 		return fmt.Errorf("sink name is required and may contain only letters, digits, hyphens, and underscores")
 	}
-	if !strings.HasPrefix(sink.Destination, "file://") &&
-		!strings.HasPrefix(sink.Destination, "pubsub.googleapis.com/projects/") {
+	if !strings.HasPrefix(sink.Destination, "file://") && !validPubSubDestination(sink.Destination) {
 		return fmt.Errorf("only file:// and pubsub.googleapis.com/projects/... destinations are supported")
 	}
 	if strings.HasPrefix(sink.Destination, "file://") &&
@@ -691,24 +752,62 @@ func validIdentifier(value string) bool {
 	return true
 }
 
-func extractProject(path string) string {
-	return extractAfter(path, "projects")
+func parseSinkPath(path string) (project, name string, collection, ok bool) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) != 4 && len(parts) != 5 {
+		return "", "", false, false
+	}
+	if parts[0] != "v2" || parts[1] != "projects" || !validIdentifier(parts[2]) || parts[3] != "sinks" {
+		return "", "", false, false
+	}
+	if len(parts) == 4 {
+		return parts[2], "", true, true
+	}
+	if !validIdentifier(parts[4]) {
+		return "", "", false, false
+	}
+	return parts[2], parts[4], false, true
 }
 
-func extractAfter(path, segment string) string {
-	parts := strings.Split(path, "/")
-	for i, part := range parts {
-		if part == segment && i+1 < len(parts) {
-			return parts[i+1]
-		}
+func validPubSubDestination(destination string) bool {
+	parts := strings.Split(destination, "/")
+	return len(parts) == 5 &&
+		parts[0] == "pubsub.googleapis.com" &&
+		parts[1] == "projects" &&
+		validIdentifier(parts[2]) &&
+		parts[3] == "topics" &&
+		validIdentifier(parts[4])
+}
+
+func entryProject(logName string) string {
+	parts := strings.Split(logName, "/")
+	if len(parts) >= 2 && parts[0] == "projects" {
+		return parts[1]
 	}
 	return ""
 }
 
 func decodeJSON(r *http.Request, target any) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxLoggingBodySize+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > maxLoggingBodySize {
+		return fmt.Errorf("request body exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body contains trailing JSON")
+		}
+		return err
+	}
+	return nil
 }
 
 func cloneLabels(labels map[string]string) map[string]string {

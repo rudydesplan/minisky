@@ -28,7 +28,7 @@ const phases = [
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
-  ["16", "ML, monitoring, networking", "Verified Monitoring + Vertex slices", "Persisted PromQL and deterministic generated-SDK endpoint predictions pass restart gates"],
+  ["16", "ML, monitoring, networking", "Verified Monitoring + Logging + Vertex", "Persisted PromQL, Logging entries/sinks, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
 ];
 
@@ -131,8 +131,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Callout tone="info" title="Implementation status">
         Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
-        delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL and Vertex
-        prediction restart gates, and Phase-17 federated RBAC/quota/audit integration. Eleven guarded
+        delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL, Logging, and
+        Vertex prediction restart gates, and Phase-17 federated RBAC/quota/audit integration. Twelve guarded
         local gates have passed. Native amd64 and arm64 deb/rpm build-install-smoke-uninstall jobs also pass in
         read-only CI; the opt-in Phase-9 event-delivery and Phase-17 CI jobs are configured but have no CI pass
         evidence yet. Production-grade semantics remain explicit external boundaries.
@@ -141,7 +141,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>11 passed</H2><Text tone="secondary">Including Phase-16 Vertex predictions</Text></CardBody>
+          <CardBody><H2>12 passed</H2><Text tone="secondary">Including Phase-16 Logging persistence</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -207,6 +207,16 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Only exact <Code>{`{__name__="<metric-type>"}`}</Code> instant selectors are supported. Label matchers,
             operators, functions, aggregation, ranges, Boolean samples, and full metric/resource translation remain
             unsupported. MQL stays 501 because Google no longer recommends it for new queries.
+          </Text>
+          <Text>
+            The generated Logging REST client wrote fixed entries for two projects and created a filtered sink.
+            Restart verified exact project-scoped entry and sink metadata; deletion remained absent after a third
+            daemon start while the entries remained available.
+          </Text>
+          <Text tone="secondary">
+            The bounded slice supports entries write/list and sink create/get/list/delete. Pagination,
+            partial-success writes, sink updates, per-entry errors, delivery replay, log-based metrics, and alerting
+            remain unsupported.
           </Text>
           <Text>
             The generated AI Platform REST client recorded two deterministic endpoint predictions, MiniSky
@@ -287,10 +297,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: add generated-SDK and restart evidence for bounded Phase-16 Cloud
-        Logging entry filters and sink metadata. Homebrew, Scoop, deb, and rpm publication remains externally
-        blocked until maintainer-owned repositories, scoped credentials, protected approval environments, and
-        native install-from-repository tests exist.
+        Next internal executable milestone: add generated-SDK restart and loopback-resolution evidence for the
+        bounded Phase-16 Cloud DNS zone and record-set slice. Homebrew, Scoop, deb, and rpm publication remains
+        externally blocked until maintainer-owned repositories, scoped credentials, protected approval
+        environments, and native install-from-repository tests exist.
       </Callout>
     </Stack>
   );

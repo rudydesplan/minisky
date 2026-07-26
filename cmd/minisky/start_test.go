@@ -58,6 +58,23 @@ func TestDashboardAuditProjectUsesCanonicalHeader(t *testing.T) {
 	}
 }
 
+func TestDashboardUnavailableHandlerReturnsStableJSON(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/api/services", nil)
+	response := httptest.NewRecorder()
+	dashboardUnavailableHandler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content-type=%q", response.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(response.Body.String(), `"code":503`) ||
+		!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+		t.Fatalf("body=%s", response.Body.String())
+	}
+}
+
 type shutdownHandler struct {
 	http.Handler
 	called bool
