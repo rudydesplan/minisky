@@ -480,7 +480,10 @@ func createLoadBalancerResourceForTest(t *testing.T, api *API, collection, body 
 
 func newComputeTestAPI() (*API, *orchestrator.OperationManager) {
 	opMgr := orchestrator.NewOperationManager()
-	return newAPI(opMgr, nil, nil), opMgr
+	api := newAPI(opMgr, nil, nil)
+	useFakeVPCIPAM(api)
+	api.legacyVPC = &fakeLegacyVPCBackend{}
+	return api, opMgr
 }
 
 func performComputeRequest(api *API, method, path, body string) *httptest.ResponseRecorder {
@@ -504,12 +507,15 @@ func assertComputeError(t *testing.T, response *httptest.ResponseRecorder, wantC
 	}
 	var payload struct {
 		Error struct {
-			Status string `json:"status"`
+			Code    int    `json:"code"`
+			Status  string `json:"status"`
+			Message string `json:"message"`
 		} `json:"error"`
 	}
 	decodeComputeResponse(t, response, &payload)
-	if payload.Error.Status != wantStatus {
-		t.Fatalf("error status = %q, want %q", payload.Error.Status, wantStatus)
+	if payload.Error.Code != wantCode || payload.Error.Status != wantStatus || payload.Error.Message == "" {
+		t.Fatalf("error = %#v, want code=%d status=%q and non-empty message",
+			payload.Error, wantCode, wantStatus)
 	}
 }
 

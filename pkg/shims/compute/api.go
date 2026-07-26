@@ -3,6 +3,7 @@ package compute
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -277,44 +278,81 @@ var loadBalancerCollections = map[string]loadBalancerCollection{
 // ─────────────────────────────────────────────────────────────────────────────
 
 // API is the high-fidelity Compute Engine v1 shim.
+type legacyVMBackend interface {
+	DeleteLegacyComputeVM(string) error
+}
+
+type legacyVPCBackend interface {
+	DeleteLegacyVPCNetwork(context.Context, string) error
+}
+
+type firewallBackend interface {
+	RegisterFirewallRule(string, orchestrator.FirewallEntry)
+	RemoveFirewallRule(string, string)
+	ApplyFirewallPortsToComputeInstances(
+		string,
+		string,
+		[]orchestrator.ComputeInstanceIdentity,
+		[]string,
+	) error
+}
+
 type API struct {
-	mu               sync.RWMutex
-	persistMu        sync.Mutex
-	opMgr            *orchestrator.OperationManager
-	svcMgr           *orchestrator.ServiceManager
-	stateStore       *state.Store
-	instances        map[string]*Instance       // key: project+":"+zone+":"+name
-	networks         map[string]*Network        // key: project+":"+name
-	securityPolicies map[string]*SecurityPolicy // key: project+":"+name
-	firewalls        map[string]*FirewallRule   // key: project+":"+name
-	instanceGroups   map[string]*InstanceGroup  // key: project+":"+zone+":"+name
-	loadBalancers    map[string]map[string]interface{}
-	roundRobin       map[string]uint64
-	httpClient       *http.Client
+	mu                sync.RWMutex
+	persistMu         sync.Mutex
+	initMu            sync.RWMutex
+	opMgr             *orchestrator.OperationManager
+	svcMgr            *orchestrator.ServiceManager
+	vpcIPAM           vpcIPAMBackend
+	legacyVM          legacyVMBackend
+	legacyVPC         legacyVPCBackend
+	firewall          firewallBackend
+	initializationErr error
+	stateStore        computeMetadataStore
+	instances         map[string]*Instance   // key: project+":"+zone+":"+name
+	networks          map[string]*Network    // key: project+":"+name
+	subnetworks       map[string]*Subnetwork // key: project+":"+region+":"+name
+	nextSubnetworkID  uint64
+	securityPolicies  map[string]*SecurityPolicy // key: project+":"+name
+	firewalls         map[string]*FirewallRule   // key: project+":"+name
+	instanceGroups    map[string]*InstanceGroup  // key: project+":"+zone+":"+name
+	loadBalancers     map[string]map[string]interface{}
+	roundRobin        map[string]uint64
+	httpClient        *http.Client
 }
 
 // NewAPI builds the Compute shim with the shared LRO manager and service manager.
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
-		log.Printf("[Shim: Compute Engine] state disabled: %v", err)
-		return newAPI(opMgr, svcMgr, nil)
+		log.Printf("[Shim: Compute Engine] state initialization failed: %v", err)
+		api := newAPI(opMgr, svcMgr, nil)
+		api.setInitializationError(fmt.Errorf("initialize Compute state: %w", err))
+		return api
 	}
 	api, err := NewAPIWithStore(opMgr, svcMgr, store)
 	if err != nil {
 		log.Printf("[Shim: Compute Engine] state rehydration failed: %v", err)
-		return newAPI(opMgr, svcMgr, store)
+		api = newAPI(opMgr, svcMgr, store)
+		api.setInitializationError(err)
+		return api
+	}
+	if err := api.ReconcileVPCIPAM(context.Background()); err != nil {
+		log.Printf("[Shim: Compute Engine] VPC IPAM reconciliation failed: %v", err)
+		api.setInitializationError(err)
 	}
 	return api
 }
 
-func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store *state.Store) *API {
-	return &API{
+func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store computeMetadataStore) *API {
+	api := &API{
 		opMgr:            opMgr,
 		svcMgr:           svcMgr,
 		stateStore:       store,
 		instances:        make(map[string]*Instance),
 		networks:         make(map[string]*Network),
+		subnetworks:      make(map[string]*Subnetwork),
+		nextSubnetworkID: 1,
 		securityPolicies: make(map[string]*SecurityPolicy),
 		firewalls:        make(map[string]*FirewallRule),
 		instanceGroups:   make(map[string]*InstanceGroup),
@@ -322,6 +360,13 @@ func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 		roundRobin:       make(map[string]uint64),
 		httpClient:       &http.Client{Timeout: 2 * time.Second},
 	}
+	if svcMgr != nil {
+		api.vpcIPAM = svcMgr
+		api.legacyVM = svcMgr
+		api.legacyVPC = svcMgr
+		api.firewall = svcMgr
+	}
+	return api
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +407,16 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Compute Engine] %s %s", r.Method, r.URL.Path)
 
 	path := r.URL.Path
+	if api.initializationError() != nil {
+		w.Header().Set("Content-Type", "application/json")
+		writeErrorStatus(
+			w,
+			http.StatusServiceUnavailable,
+			"FAILED_PRECONDITION",
+			"Compute backend reconciliation is incomplete",
+		)
+		return
+	}
 	if project, forwardingRule, proxyPath, ok := parseLoadBalancerProxyPath(path); ok {
 		api.proxyLoadBalancerRequest(w, r, project, forwardingRule, proxyPath)
 		return
@@ -375,6 +430,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.routeInstanceGroups(w, r, path)
 	case strings.Contains(path, "/operations/"):
 		api.routeOperations(w, r, path)
+	case strings.Contains(path, "/regions/") && strings.Contains(path, "/subnetworks"):
+		api.routeSubnetworks(w, r, path)
 	case strings.Contains(path, "/instanceGroupManagers") ||
 		(strings.Contains(path, "/regions/") && strings.Contains(path, "/instanceGroups")) ||
 		strings.Contains(path, "/targetHttpsProxies") ||
@@ -490,6 +547,13 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		writeError(w, 400, "INVALID_ARGUMENT", "Field 'name' is required for instances.insert")
 		return
 	}
+	isGKE := body.Labels != nil && body.Labels["managed-by"] == "gke"
+	if !isGKE {
+		if _, err := orchestratorComputeIdentity(project, zone, name).DockerName(); err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+			return
+		}
+	}
 
 	selfLink := selfLinkInstance(project, zone, name)
 	targetLink := selfLink
@@ -505,15 +569,16 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			project, zone, machineType)
 	}
 
-	// Default network interfaces
-	netIfaces := body.NetworkInterfaces
-	if len(netIfaces) == 0 {
-		netIfaces = []NetworkInterface{{
-			Kind:      "compute#networkInterface",
-			Name:      "nic0",
-			Network:   fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project),
-			NetworkIP: "10.128.0.2",
-		}}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	netIfaces, err := api.resolveInstanceNetworkInterfaces(project, zone, body.NetworkInterfaces)
+	if err != nil {
+		if errors.Is(err, errUnsupportedAutoNetwork) || errors.Is(err, errUnsupportedMultipleNICs) {
+			writeErrorStatus(w, http.StatusNotImplemented, "UNIMPLEMENTED", err.Error())
+		} else {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		}
+		return
 	}
 
 	// Default boot disk
@@ -588,11 +653,26 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 
 	key := instanceKey(project, zone, name)
 	api.mu.Lock()
+	if api.instances[key] != nil {
+		api.mu.Unlock()
+		writeErrorStatus(w, http.StatusConflict, "ALREADY_EXISTS", "Instance "+name+" already exists")
+		return
+	}
 	api.instances[key] = inst
+	payload, snapshotErr := api.marshalMetadataLocked()
 	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	saveErr := snapshotErr
+	if saveErr == nil {
+		saveErr = api.saveMetadataPayload(payload)
+	}
+	if saveErr != nil {
+		api.mu.Lock()
+		if api.instances[key] == inst {
+			delete(api.instances, key)
+		}
+		api.mu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist instance metadata: "+err.Error())
+		writeError(w, 500, "INTERNAL", "persist instance metadata: "+saveErr.Error())
 		return
 	}
 
@@ -604,12 +684,6 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 	op.Kind = "compute#operation"
-
-	containerName := fmt.Sprintf("minisky-vm-%s", name)
-	isGKE := body.Labels != nil && body.Labels["managed-by"] == "gke"
-	if isGKE {
-		containerName = name // Kind sets container name exactly as kind cluster node name
-	}
 
 	// Drive state machine asynchronously: PROVISIONING → PROVISIONING_DOCKER → RUNNING
 	opName := op.Name
@@ -648,22 +722,28 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			log.Printf("[Shim: Compute Engine] persist provisioning instance: %v", err)
 		}
 
-		vpcName := "default"
+		var interfaces []NetworkInterface
 		api.mu.RLock()
 		if i, ok := api.instances[key]; ok {
-			if len(i.NetworkInterfaces) > 0 {
-				parts := strings.Split(i.NetworkInterfaces[0].Network, "/")
-				if len(parts) > 0 && parts[len(parts)-1] != "" {
-					vpcName = parts[len(parts)-1]
-				}
-			}
+			interfaces = append(interfaces, i.NetworkInterfaces...)
 		}
 		api.mu.RUnlock()
-
-		allowedPorts := api.getAllowedPortsForVPC(vpcName)
+		logicalVPC, dockerVPC, nameErr := resolvedInstanceVPCDockerNetwork(project, interfaces)
+		if nameErr != nil {
+			return nameErr
+		}
+		allowedPorts := api.getAllowedPortsForVPC(logicalVPC)
 
 		// Tell the Orchestrator to physically spin up the Docker container!
-		err := api.svcMgr.ProvisionComputeVM(context.Background(), containerName, osImage, vpcName, allowedPorts, []string{}, dockerCommand)
+		err := api.svcMgr.ProvisionComputeInstance(
+			context.Background(),
+			orchestratorComputeIdentity(project, zone, name),
+			osImage,
+			dockerVPC,
+			allowedPorts,
+			[]string{},
+			dockerCommand,
+		)
 
 		// Keep the simulated delay outside the metadata lock.
 		if err == nil {
@@ -711,20 +791,13 @@ func (api *API) getInstance(w http.ResponseWriter, r *http.Request, project, zon
 	api.mu.RUnlock()
 
 	// Inject dynamic host ports from orchestrator
-	cName := "minisky-vm-" + instCopy.Name
-	if instCopy.Labels != nil && instCopy.Labels["managed-by"] == "gke" {
-		cName = instCopy.Name
-	}
-	instCopy.HostPorts = api.svcMgr.GetVMPortMappings(cName)
+	instCopy.HostPorts = api.computeInstancePortMappings(project, zone, instCopy)
 	if len(instCopy.NetworkInterfaces) > 0 {
-		ip := api.svcMgr.GetContainerIP(cName)
+		ip := api.computeInstanceIP(project, zone, instCopy)
 		if ip == "" {
 			ip = "10.128.0.2" // Fallback to avoid empty IP which can crash some providers
 		}
 		instCopy.NetworkInterfaces[0].NetworkIP = ip
-		if instCopy.NetworkInterfaces[0].Subnetwork == "" {
-			instCopy.NetworkInterfaces[0].Subnetwork = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s/subnetworks/default", project, strings.Join(strings.Split(zone, "-")[:2], "-"))
-		}
 	}
 
 	if instCopy.Fingerprint == "" {
@@ -744,13 +817,9 @@ func (api *API) listInstances(w http.ResponseWriter, r *http.Request, project, z
 	for k, v := range api.instances {
 		if strings.HasPrefix(k, prefix) {
 			copyOfInst := v.DeepCopy()
-			cName := "minisky-vm-" + copyOfInst.Name
-			if copyOfInst.Labels != nil && copyOfInst.Labels["managed-by"] == "gke" {
-				cName = copyOfInst.Name
-			}
-			copyOfInst.HostPorts = api.svcMgr.GetVMPortMappings(cName)
+			copyOfInst.HostPorts = api.computeInstancePortMappings(project, zone, copyOfInst)
 			if len(copyOfInst.NetworkInterfaces) > 0 {
-				ip := api.svcMgr.GetContainerIP(cName)
+				ip := api.computeInstanceIP(project, zone, copyOfInst)
 				if ip == "" {
 					ip = "10.128.0.2"
 				}
@@ -785,6 +854,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		writeError(w, 403, "FORBIDDEN", "This instance is managed by Kubernetes Engine and cannot be manually deleted.")
 		return
 	}
+	isGKE := inst.Labels != nil && inst.Labels["managed-by"] == "gke"
 
 	// Mark as DELETING so the UI shows the "winding down" process
 	inst.Status = "DELETING"
@@ -795,7 +865,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 
-	containerName := fmt.Sprintf("minisky-vm-%s", name)
+	containerName, _ := computeInstanceContainerName(project, zone, inst)
 	op, err := api.opMgr.RegisterDurable("compute#operation", "delete",
 		selfLinkInstance(project, zone, name), zone, "")
 	if err != nil {
@@ -808,12 +878,16 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		// Simulate winding down time
 		time.Sleep(3 * time.Second)
 
-		api.svcMgr.DeleteComputeVM(containerName)
+		if isGKE {
+			api.svcMgr.DeleteComputeVM(containerName)
+		} else {
+			_ = api.svcMgr.DeleteComputeInstance(orchestratorComputeIdentity(project, zone, name))
+		}
 
-		// Finally remove from memory
-		api.mu.Lock()
-		delete(api.instances, key)
-		api.mu.Unlock()
+		legacyCleanup := api.removeInstanceAndLegacyCleanupEligibility(key, name)
+		if !isGKE {
+			api.cleanupLegacyComputeVM(name, legacyCleanup)
+		}
 		if err := api.persistMetadata(); err != nil {
 			log.Printf("[Shim: Compute Engine] persist deleted instance: %v", err)
 		}
@@ -822,6 +896,24 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
+}
+
+func (api *API) removeInstanceAndLegacyCleanupEligibility(key, name string) bool {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	delete(api.instances, key)
+	for _, instance := range api.instances {
+		if instance != nil && instance.Name == name {
+			return false
+		}
+	}
+	return true
+}
+
+func (api *API) cleanupLegacyComputeVM(name string, eligible bool) {
+	if eligible && api.legacyVM != nil {
+		_ = api.legacyVM.DeleteLegacyComputeVM(name)
+	}
 }
 
 func (api *API) instanceAction(w http.ResponseWriter, r *http.Request, project, zone, name, action string) {
@@ -1197,6 +1289,29 @@ func (api *API) routeImages(w http.ResponseWriter, r *http.Request, path string)
 func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path string) {
 	project := extractProject(path)
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if strings.Contains(path, "/regions/") {
+		if r.Method != http.MethodGet || len(parts) != 8 ||
+			parts[0] != "compute" || parts[1] != "v1" || parts[2] != "projects" ||
+			parts[3] == "" || parts[4] != "regions" || parts[5] == "" ||
+			parts[6] != "operations" || parts[7] == "" {
+			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Regional operation not found")
+			return
+		}
+		if api.opMgr == nil {
+			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Regional operation not found")
+			return
+		}
+		op := api.opMgr.Get(parts[7])
+		targetProjectPrefix := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/", parts[3])
+		if op == nil || op.Kind != "compute#operation" || op.Region != parts[5] ||
+			!strings.HasPrefix(op.TargetLink, targetProjectPrefix) {
+			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Operation not found: "+parts[7])
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		writeComputeOperation(w, parts[3], op)
+		return
+	}
 	// Find "operations" segment and take next segment as name
 	opName := ""
 	for i, p := range parts {
@@ -1232,45 +1347,7 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 
 	switch r.Method {
 	case http.MethodPost:
-		var body struct {
-			Name                  string `json:"name"`
-			Description           string `json:"description"`
-			AutoCreateSubnetworks bool   `json:"autoCreateSubnetworks"`
-		}
-		json.NewDecoder(r.Body).Decode(&body)
-		n := &Network{
-			Kind:                  "compute#network",
-			ID:                    randomNumericID(),
-			Name:                  body.Name,
-			Description:           body.Description,
-			AutoCreateSubnetworks: body.AutoCreateSubnetworks,
-			SelfLink:              fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/%s", project, body.Name),
-			CreationTimestamp:     time.Now().UTC().Format(time.RFC3339),
-		}
-		key := project + ":" + body.Name
-		api.mu.Lock()
-		api.networks[key] = n
-		api.mu.Unlock()
-		if err := api.persistMetadata(); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeError(w, 500, "INTERNAL", "persist network metadata: "+err.Error())
-			return
-		}
-
-		if body.Name != "default" {
-			api.svcMgr.CreateVPCNetwork(r.Context(), body.Name)
-		}
-
-		op, err := api.opMgr.RegisterDurable("compute#operation", "insert",
-			n.SelfLink, "", "")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
-			return
-		}
-		api.opMgr.RunAsync(op.Name, func() error { return nil })
-		w.WriteHeader(http.StatusOK)
-		writeComputeOperation(w, project, op)
+		api.insertNetwork(w, r, project)
 
 	case http.MethodGet:
 		if name != "" {
@@ -1331,36 +1408,7 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 		}
 
 	case http.MethodDelete:
-		key := project + ":" + name
-		api.mu.Lock()
-		_, ok := api.networks[key]
-		if ok {
-			delete(api.networks, key)
-		}
-		api.mu.Unlock()
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			writeError(w, 404, "NOT_FOUND", "Network "+name+" not found")
-			return
-		}
-		if err := api.persistMetadata(); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeError(w, 500, "INTERNAL", "persist network deletion: "+err.Error())
-			return
-		}
-		if name != "default" {
-			api.svcMgr.DeleteVPCNetwork(r.Context(), name)
-		}
-
-		op, err := api.opMgr.RegisterDurable("compute#operation", "delete", "", "", "")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
-			return
-		}
-		api.opMgr.RunAsync(op.Name, func() error { return nil })
-		w.WriteHeader(http.StatusOK)
-		writeComputeOperation(w, project, op)
+		api.deleteNetwork(w, r, project, name)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1735,17 +1783,14 @@ func (api *API) resolveInstanceBackend(
 		return loadBalancerBackend{}, fmt.Errorf("Compute instance %q was not found", instanceName)
 	}
 	status := instance.Status
-	containerName := "minisky-vm-" + instance.Name
-	if instance.Labels != nil && instance.Labels["managed-by"] == "gke" {
-		containerName = instance.Name
-	}
 	mappings := append([]orchestrator.PortMapping(nil), instance.HostPorts...)
+	instanceCopy := instance.DeepCopy()
 	api.mu.RUnlock()
 	if status != "" && status != "RUNNING" {
 		return loadBalancerBackend{}, fmt.Errorf("Compute instance %q is not running", instanceName)
 	}
 	if api.svcMgr != nil {
-		if current := api.svcMgr.GetVMPortMappings(containerName); len(current) > 0 {
+		if current := api.computeInstancePortMappings(project, zone, instanceCopy); len(current) > 0 {
 			mappings = current
 		}
 	}
@@ -2276,6 +2321,13 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 	if body.Network == "" {
 		body.Network = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/default", project)
 	}
+	networkIdentity, firewallKey, err := parseCanonicalVPCNetwork(body.Network)
+	if err != nil || networkIdentity.Project != project {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"firewall network must be a canonical network in the request project")
+		return
+	}
+	body.Network = firewallKey
 	body.Kind = "compute#firewall"
 	body.ID = randomNumericID()
 	body.SelfLink = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/firewalls/%s", project, body.Name)
@@ -2291,15 +2343,12 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		return
 	}
 
-	api.svcMgr.RegisterFirewallRule(body.Network, orchestrator.FirewallEntry{
-		Name:      body.Name,
-		VpcName:   extractNameFromURL(body.Network),
-		Direction: body.Direction,
-		Action:    body.Action,
-		Protocol:  "all", // default, will refine below
-		Ports:     []string{},
-		Ranges:    append(body.SourceRanges, body.DestinationRanges...),
-	})
+	if api.firewall == nil {
+		writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+			"firewall backend is unavailable")
+		return
+	}
+	api.firewall.RegisterFirewallRule(firewallKey, firewallEntryFromRule(&body))
 
 	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", body.SelfLink, "", "")
 	if err != nil {
@@ -2308,8 +2357,7 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		return
 	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		api.reapplyFirewallToVPC(body.Network)
-		return nil
+		return api.reapplyFirewallToVPC(body.Network)
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -2360,9 +2408,13 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 	json.NewDecoder(r.Body).Decode(&patch)
 	if len(patch.Allowed) > 0 {
 		fw.Allowed = patch.Allowed
+		fw.Denied = nil
+		fw.Action = "allow"
 	}
 	if len(patch.Denied) > 0 {
 		fw.Denied = patch.Denied
+		fw.Allowed = nil
+		fw.Action = "deny"
 	}
 	if len(patch.SourceRanges) > 0 {
 		fw.SourceRanges = patch.SourceRanges
@@ -2380,6 +2432,13 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		writeError(w, 500, "INTERNAL", "persist firewall update: "+err.Error())
 		return
 	}
+	if api.firewall == nil {
+		writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+			"firewall backend is unavailable")
+		return
+	}
+	api.firewall.RemoveFirewallRule(result.Network, result.Name)
+	api.firewall.RegisterFirewallRule(result.Network, firewallEntryFromRule(result))
 
 	op, err := api.opMgr.RegisterDurable("compute#operation", "patch", result.SelfLink, "", "")
 	if err != nil {
@@ -2388,8 +2447,7 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		return
 	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		api.reapplyFirewallToVPC(result.Network)
-		return nil
+		return api.reapplyFirewallToVPC(result.Network)
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -2415,7 +2473,12 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		writeError(w, 500, "INTERNAL", "persist firewall deletion: "+err.Error())
 		return
 	}
-	api.svcMgr.RemoveFirewallRule(networkURL, name)
+	if api.firewall == nil {
+		writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+			"firewall backend is unavailable")
+		return
+	}
+	api.firewall.RemoveFirewallRule(networkURL, name)
 	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", "", "", "")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -2423,8 +2486,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		return
 	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		api.reapplyFirewallToVPC(networkURL)
-		return nil
+		return api.reapplyFirewallToVPC(networkURL)
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -2447,8 +2509,7 @@ func (api *API) getAllowedPortsForVPC(vpcName string) []string {
 	defer api.mu.RUnlock()
 	ports := []string{}
 	for _, rule := range api.firewalls {
-		nw := extractNameFromURL(rule.Network)
-		if (nw == vpcName || (nw == "" && vpcName == "default")) && rule.Direction == "INGRESS" && rule.Action == "allow" {
+		if rule.Network == vpcName && rule.Direction == "INGRESS" && rule.Action == "allow" {
 			for _, allowed := range rule.Allowed {
 				for _, p := range allowed.Ports {
 					ports = append(ports, p)
@@ -2459,31 +2520,92 @@ func (api *API) getAllowedPortsForVPC(vpcName string) []string {
 	return ports
 }
 
-func (api *API) reapplyFirewallToVPC(networkURL string) {
-	vpcName := extractNameFromURL(networkURL)
-	var containerNames []string
+func (api *API) reapplyFirewallToVPC(networkURL string) error {
+	firewallKey, dockerVPC, identities, osImages, err := api.firewallTargetsForNetwork(networkURL)
+	if err != nil {
+		return err
+	}
+	if len(identities) == 0 {
+		return nil
+	}
+	if api.firewall == nil {
+		return errors.New("firewall backend is unavailable")
+	}
+	return api.firewall.ApplyFirewallPortsToComputeInstances(
+		firewallKey,
+		dockerVPC,
+		identities,
+		osImages,
+	)
+}
+
+func (api *API) firewallTargetsForNetwork(
+	networkURL string,
+) (string, string, []orchestrator.ComputeInstanceIdentity, []string, error) {
+	networkIdentity, firewallKey, err := parseCanonicalVPCNetwork(networkURL)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	dockerVPC := "default"
+	if networkIdentity.Network != "default" {
+		dockerVPC, err = networkIdentity.DockerName()
+		if err != nil {
+			return "", "", nil, nil, err
+		}
+	}
+	var identities []orchestrator.ComputeInstanceIdentity
 	var osImages []string
 
 	api.mu.RLock()
 	for _, inst := range api.instances {
-		if len(inst.NetworkInterfaces) > 0 {
-			nw := extractNameFromURL(inst.NetworkInterfaces[0].Network)
-			if nw == vpcName || (nw == "" && vpcName == "default") {
-				cName := fmt.Sprintf("minisky-vm-%s", inst.Name)
-				containerNames = append(containerNames, cName)
-				img := "ubuntu:latest"
-				for _, d := range inst.Disks {
-					if strings.Contains(strings.ToLower(d.Source), "centos") {
-						img = "centos:latest"
-					}
-				}
-				osImages = append(osImages, img)
+		if inst != nil && inst.project == networkIdentity.Project &&
+			len(inst.NetworkInterfaces) > 0 &&
+			inst.NetworkInterfaces[0].Network == firewallKey {
+			if inst.Labels != nil && inst.Labels["managed-by"] == "gke" {
+				continue
 			}
+			identity := orchestratorComputeIdentity(inst.project, inst.zone, inst.Name)
+			if err := identity.Validate(); err != nil {
+				continue
+			}
+			identities = append(identities, identity)
+			img := "ubuntu:latest"
+			for _, d := range inst.Disks {
+				if strings.Contains(strings.ToLower(d.Source), "centos") {
+					img = "centos:latest"
+				}
+			}
+			osImages = append(osImages, img)
 		}
 	}
 	api.mu.RUnlock()
+	return firewallKey, dockerVPC, identities, osImages, nil
+}
 
-	if len(containerNames) > 0 {
-		api.svcMgr.ApplyFirewallPortsToVPC(vpcName, containerNames, osImages)
+func parseCanonicalVPCNetwork(value string) (orchestrator.VPCNetworkIdentity, string, error) {
+	const marker = "https://www.googleapis.com/compute/v1/projects/"
+	if !strings.HasPrefix(value, marker) {
+		return orchestrator.VPCNetworkIdentity{}, "", errors.New("network is not canonical")
 	}
+	parts := strings.Split(strings.TrimPrefix(value, marker), "/")
+	if len(parts) != 4 || parts[1] != "global" || parts[2] != "networks" {
+		return orchestrator.VPCNetworkIdentity{}, "", errors.New("network is not canonical")
+	}
+	identity := orchestrator.VPCNetworkIdentity{Project: parts[0], Network: parts[3]}
+	if err := identity.Validate(); err != nil {
+		return orchestrator.VPCNetworkIdentity{}, "", err
+	}
+	return identity, networkSelfLink(identity.Project, identity.Network), nil
+}
+
+func firewallEntryFromRule(rule *FirewallRule) orchestrator.FirewallEntry {
+	entry := orchestrator.FirewallEntry{
+		Name: rule.Name, VpcName: extractNameFromURL(rule.Network),
+		Direction: rule.Direction, Action: rule.Action, Protocol: "all",
+		Ranges: append(append([]string{}, rule.SourceRanges...), rule.DestinationRanges...),
+	}
+	for _, allowed := range rule.Allowed {
+		entry.Ports = append(entry.Ports, allowed.Ports...)
+	}
+	return entry
 }

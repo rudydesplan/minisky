@@ -13,7 +13,6 @@ import (
 	"minisky/pkg/config"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,6 +24,7 @@ import (
 const (
 	networkName            = "minisky-net"
 	dockerImagePullTimeout = 2 * time.Minute
+	dockerRequestTimeout   = 10 * time.Second
 )
 
 var ErrServerlessLifecycleInProgress = errors.New("Serverless lifecycle already in progress")
@@ -34,6 +34,7 @@ type ServiceManager struct {
 	mu               sync.RWMutex
 	serverlessMu     sync.Mutex
 	dockerClient     *http.Client
+	dockerTimeout    time.Duration
 	sockPath         string
 	portRegistry     map[string][]PortMapping   // containerName → host ports
 	fwRules          map[string][]FirewallEntry // vpcName → rules
@@ -79,6 +80,7 @@ func NewServiceManager() (*ServiceManager, error) {
 	log.Printf("[ServiceManager] Docker socket resolved: %s", sockPath)
 	sm := &ServiceManager{
 		sockPath:         sockPath,
+		dockerTimeout:    dockerRequestTimeout,
 		portRegistry:     make(map[string][]PortMapping),
 		fwRules:          make(map[string][]FirewallEntry),
 		serverlessActive: make(map[ServerlessIdentity]struct{}),
@@ -567,6 +569,22 @@ func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
 
 // ProvisionComputeVM actively boots a Data Plane Docker container mimicking a GCE VM.
 func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "compute-instance"
+	labels["minisky.resource"] = containerName
+	return sm.provisionComputeVM(ctx, containerName, osImage, vpcName, ports, env, cmd, labels)
+}
+
+func (sm *ServiceManager) ProvisionComputeInstance(ctx context.Context, identity ComputeInstanceIdentity, osImage string, vpcName string, ports []string, env []string, cmd []string) error {
+	containerName, err := identity.DockerName()
+	if err != nil {
+		return err
+	}
+	labels, _ := identity.labels()
+	return sm.provisionComputeVM(ctx, containerName, osImage, vpcName, ports, env, cmd, labels)
+}
+
+func (sm *ServiceManager) provisionComputeVM(ctx context.Context, containerName string, osImage string, vpcName string, ports []string, env []string, cmd []string, resourceLabels map[string]string) error {
 	log.Printf("[Orchestrator] Provisioning compute VM: %s (image: %s vpc: %s ports: %d env: %d cmd: %v)", containerName, osImage, vpcName, len(ports), len(env), cmd)
 	if !validDockerResourceName(containerName) {
 		return fmt.Errorf("invalid Compute container name")
@@ -576,7 +594,7 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 		return fmt.Errorf("inspect Compute container: %w", err)
 	}
 	if status != "not_found" {
-		if !isOwnedComputeVM(labels, containerName) {
+		if !exactLabels(labels, resourceLabels) {
 			return fmt.Errorf("Compute container %q exists but is not owned by this profile and resource", containerName)
 		}
 		if status != "running" {
@@ -601,7 +619,11 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 
 	netMode := networkName
 	if vpcName != "" && vpcName != "default" {
-		netMode = "minisky-vpc-" + vpcName
+		if strings.HasPrefix(vpcName, "minisky-vpc-") && validDockerResourceName(vpcName) {
+			netMode = vpcName
+		} else {
+			netMode = "minisky-vpc-" + vpcName
+		}
 	}
 
 	exposedPorts := make(map[string]interface{})
@@ -616,9 +638,6 @@ func (sm *ServiceManager) ProvisionComputeVM(ctx context.Context, containerName 
 		}
 	}
 
-	resourceLabels := ownedDockerLabels()
-	resourceLabels["minisky.service"] = "compute-instance"
-	resourceLabels["minisky.resource"] = containerName
 	payload := map[string]interface{}{
 		"Image":        osImage,
 		"Env":          append(sm.standardEnv(), env...),
@@ -1062,6 +1081,36 @@ func (sm *ServiceManager) DeleteCloudSQLVM(instanceName string) error {
 
 // DeleteComputeVM permanently destroys a physical Data Plane compute instance.
 func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "compute-instance"
+	labels["minisky.resource"] = containerName
+	return sm.deleteComputeVM(containerName, labels)
+}
+
+func (sm *ServiceManager) DeleteComputeInstance(identity ComputeInstanceIdentity) error {
+	containerName, err := identity.DockerName()
+	if err != nil {
+		return err
+	}
+	labels, _ := identity.labels()
+	return sm.deleteComputeVM(containerName, labels)
+}
+
+// DeleteLegacyComputeVM removes only the pre-scoped container name when it has
+// the exact legacy labels for the current profile. It is cleanup-only and is
+// never used to adopt or provision a Compute instance.
+func (sm *ServiceManager) DeleteLegacyComputeVM(instanceName string) error {
+	if !gcpNetworkName.MatchString(instanceName) {
+		return fmt.Errorf("invalid legacy Compute instance name")
+	}
+	containerName := "minisky-vm-" + instanceName
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "compute-instance"
+	labels["minisky.resource"] = containerName
+	return sm.deleteComputeVM(containerName, labels)
+}
+
+func (sm *ServiceManager) deleteComputeVM(containerName string, expectedLabels map[string]string) error {
 	log.Printf("[Orchestrator] Tearing down Data Plane VM: %s", containerName)
 	if !validDockerResourceName(containerName) {
 		return fmt.Errorf("invalid Compute container name")
@@ -1073,7 +1122,7 @@ func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
 	if status == "not_found" {
 		return nil
 	}
-	if !isOwnedComputeVM(labels, containerName) {
+	if !exactLabels(labels, expectedLabels) {
 		return fmt.Errorf("refusing to delete unowned Compute container %q", containerName)
 	}
 
@@ -1100,9 +1149,10 @@ func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
 }
 
 func isOwnedComputeVM(labels map[string]string, containerName string) bool {
-	return isOwnedDockerResource(labels) &&
-		labels["minisky.service"] == "compute-instance" &&
-		labels["minisky.resource"] == containerName
+	expected := ownedDockerLabels()
+	expected["minisky.service"] = "compute-instance"
+	expected["minisky.resource"] = containerName
+	return exactLabels(labels, expected)
 }
 
 // DeleteServerlessVM deletes only the current profile's exact MiniSky-owned
@@ -1542,13 +1592,11 @@ func (sm *ServiceManager) CreateVPCNetworkWithSubnet(ctx context.Context, name, 
 		return fmt.Errorf("invalid VPC network name")
 	}
 	if cidr != "" {
-		prefix, err := netip.ParsePrefix(cidr)
-		if err != nil || !prefix.Addr().Is4() || prefix.Bits() < 8 ||
-			prefix.Addr().IsLoopback() || prefix.Addr().IsMulticast() ||
-			prefix.Addr().IsUnspecified() {
+		prefix, err := NormalizeVPCIPv4Prefix(cidr)
+		if err != nil {
 			return fmt.Errorf("invalid IPv4 subnetwork CIDR %q", cidr)
 		}
-		cidr = prefix.Masked().String()
+		cidr = prefix.String()
 	}
 	netName := "minisky-vpc-" + name
 	log.Printf("[Orchestrator] Creating VPC Docker network '%s'", netName)
@@ -1715,6 +1763,21 @@ func (sm *ServiceManager) GetVMPortMappings(containerName string) []PortMapping 
 	return sm.portRegistry[containerName]
 }
 
+func (sm *ServiceManager) GetComputeInstancePortMappings(identity ComputeInstanceIdentity) []PortMapping {
+	containerName, err := identity.DockerName()
+	if err != nil {
+		return nil
+	}
+	expected, _ := identity.labels()
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil || status != "running" || !exactLabels(labels, expected) {
+		return nil
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return append([]PortMapping(nil), sm.portRegistry[containerName]...)
+}
+
 func (sm *ServiceManager) ApplyFirewallPortsToVPC(vpcName string, containerNames []string, osImages []string) error {
 	allowedPorts := []string{}
 	sm.mu.RLock()
@@ -1734,6 +1797,43 @@ func (sm *ServiceManager) ApplyFirewallPortsToVPC(vpcName string, containerNames
 		osImage := osImages[i]
 		sm.DeleteComputeVM(cName)
 		sm.ProvisionComputeVM(context.Background(), cName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
+	}
+	return nil
+}
+
+func (sm *ServiceManager) ApplyFirewallPortsToComputeInstances(
+	firewallRuleKey string,
+	dockerVPCName string,
+	identities []ComputeInstanceIdentity,
+	osImages []string,
+) error {
+	if len(identities) != len(osImages) {
+		return fmt.Errorf("Compute firewall target/image count mismatch")
+	}
+	allowedPorts := []string{}
+	sm.mu.RLock()
+	rules := sm.fwRules[firewallRuleKey]
+	sm.mu.RUnlock()
+	for _, rule := range rules {
+		if rule.Action == "allow" && rule.Direction == "INGRESS" {
+			allowedPorts = append(allowedPorts, rule.Ports...)
+		}
+	}
+	for index, identity := range identities {
+		if err := sm.DeleteComputeInstance(identity); err != nil {
+			return err
+		}
+		if err := sm.ProvisionComputeInstance(
+			context.Background(),
+			identity,
+			osImages[index],
+			dockerVPCName,
+			allowedPorts,
+			nil,
+			[]string{"tail", "-f", "/dev/null"},
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1955,6 +2055,47 @@ func (sm *ServiceManager) GetContainerIP(name string) string {
 		}
 	}
 
+	return ""
+}
+
+func (sm *ServiceManager) GetComputeInstanceIP(identity ComputeInstanceIdentity) string {
+	name, err := identity.DockerName()
+	if err != nil || sm.dockerClient == nil {
+		return ""
+	}
+	resp, err := sm.dockerClient.Get("http://localhost/containers/" + url.PathEscape(name) + "/json")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var info struct {
+		Config struct {
+			Labels map[string]string
+		}
+		NetworkSettings struct {
+			Networks map[string]struct {
+				IPAddress string
+			}
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return ""
+	}
+	expected, _ := identity.labels()
+	if !exactLabels(info.Config.Labels, expected) {
+		return ""
+	}
+	if network, ok := info.NetworkSettings.Networks[networkName]; ok && network.IPAddress != "" {
+		return network.IPAddress
+	}
+	for _, network := range info.NetworkSettings.Networks {
+		if network.IPAddress != "" {
+			return network.IPAddress
+		}
+	}
 	return ""
 }
 

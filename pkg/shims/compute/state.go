@@ -1,10 +1,15 @@
 package compute
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
@@ -12,9 +17,25 @@ import (
 
 const computeStateEntry = "compute/metadata"
 
+type computeMetadataStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+type vpcIPAMBackend interface {
+	EnsureVPCNetworkIPAM(
+		context.Context,
+		orchestrator.VPCNetworkIdentity,
+		string,
+	) (orchestrator.VPCNetworkIPAMState, error)
+	DeleteVPCNetworkIPAM(context.Context, orchestrator.VPCNetworkIdentity, string) error
+}
+
 type computeMetadata struct {
 	Instances      map[string]*Instance              `json:"instances"`
 	Networks       map[string]*Network               `json:"networks"`
+	Subnetworks    map[string]*Subnetwork            `json:"subnetworks"`
+	NextSubnetID   uint64                            `json:"nextSubnetworkId"`
 	Firewalls      map[string]*FirewallRule          `json:"firewalls"`
 	InstanceGroups map[string]*InstanceGroup         `json:"instanceGroups"`
 	LoadBalancers  map[string]map[string]interface{} `json:"loadBalancers"`
@@ -27,6 +48,14 @@ func NewAPIWithStore(
 	opMgr *orchestrator.OperationManager,
 	svcMgr *orchestrator.ServiceManager,
 	store *state.Store,
+) (*API, error) {
+	return newAPIWithMetadataStore(opMgr, svcMgr, store)
+}
+
+func newAPIWithMetadataStore(
+	opMgr *orchestrator.OperationManager,
+	svcMgr *orchestrator.ServiceManager,
+	store computeMetadataStore,
 ) (*API, error) {
 	api := newAPI(opMgr, svcMgr, store)
 	if store == nil {
@@ -46,6 +75,10 @@ func NewAPIWithStore(
 	if persisted.Networks != nil {
 		api.networks = persisted.Networks
 	}
+	if persisted.Subnetworks != nil {
+		api.subnetworks = persisted.Subnetworks
+	}
+	api.nextSubnetworkID = persisted.NextSubnetID
 	if persisted.Firewalls != nil {
 		api.firewalls = persisted.Firewalls
 	}
@@ -54,6 +87,13 @@ func NewAPIWithStore(
 	}
 	if persisted.LoadBalancers != nil {
 		api.loadBalancers = persisted.LoadBalancers
+	}
+	if err := validatePersistedSubnetworkGraph(api.networks, api.subnetworks, api.nextSubnetworkID); err != nil {
+		api.setInitializationError(fmt.Errorf("validate persisted Compute subnetworks: %w", err))
+		return api, nil
+	}
+	if api.nextSubnetworkID == 0 {
+		api.nextSubnetworkID = 1
 	}
 	for key, instance := range api.instances {
 		if instance == nil {
@@ -72,6 +112,177 @@ func NewAPIWithStore(
 	return api, nil
 }
 
+// ReconcileVPCIPAM restores the exact Docker bridges promised by persisted
+// subnetworks. Loading through NewAPIWithStore remains side-effect free.
+func (api *API) ReconcileVPCIPAM(ctx context.Context) error {
+	api.setInitializationError(nil)
+	api.mu.RLock()
+	validationErr := validatePersistedSubnetworkGraph(api.networks, api.subnetworks, api.nextSubnetworkID)
+	api.mu.RUnlock()
+	if validationErr != nil {
+		err := fmt.Errorf("validate persisted Compute subnetworks: %w", validationErr)
+		api.setInitializationError(err)
+		return err
+	}
+	if api.vpcIPAM == nil {
+		api.mu.RLock()
+		hasSubnetworks := len(api.subnetworks) > 0
+		api.mu.RUnlock()
+		if hasSubnetworks {
+			err := errors.New("VPC IPAM backend is unavailable")
+			api.setInitializationError(err)
+			return err
+		}
+		return nil
+	}
+
+	api.mu.RLock()
+	keys := make([]string, 0, len(api.subnetworks))
+	for key := range api.subnetworks {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	subnetworks := make([]*Subnetwork, 0, len(keys))
+	for _, key := range keys {
+		if subnetwork := cloneSubnetwork(api.subnetworks[key]); subnetwork != nil {
+			subnetworks = append(subnetworks, subnetwork)
+		}
+	}
+	api.mu.RUnlock()
+
+	for _, subnetwork := range subnetworks {
+		project, network, err := subnetworkVPCIdentity(subnetwork)
+		if err != nil {
+			reconcileErr := fmt.Errorf("reconcile subnetwork %q: %w", subnetwork.Name, err)
+			api.setInitializationError(reconcileErr)
+			return reconcileErr
+		}
+		identity := orchestrator.VPCNetworkIdentity{Project: project, Network: network}
+		if _, err := api.vpcIPAM.EnsureVPCNetworkIPAM(ctx, identity, subnetwork.IPCidrRange); err != nil {
+			reconcileErr := fmt.Errorf("reconcile %s: %w", identity.CanonicalResource(), err)
+			api.setInitializationError(reconcileErr)
+			return reconcileErr
+		}
+	}
+	api.setInitializationError(nil)
+	return nil
+}
+
+func validatePersistedSubnetworkGraph(
+	networks map[string]*Network,
+	subnetworks map[string]*Subnetwork,
+	nextID uint64,
+) error {
+	type seenSubnet struct {
+		project string
+		prefix  netip.Prefix
+	}
+	parents := map[string]bool{}
+	names := map[string]bool{}
+	ids := map[uint64]bool{}
+	seen := make([]seenSubnet, 0, len(subnetworks))
+	maxID := uint64(0)
+	for key, subnet := range subnetworks {
+		if subnet == nil {
+			return fmt.Errorf("subnetwork %q is nil", key)
+		}
+		parts := strings.Split(key, ":")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] != subnet.Name ||
+			!gceResourceName.MatchString(parts[1]) || !gceResourceName.MatchString(subnet.Name) {
+			return fmt.Errorf("subnetwork key %q does not match its identity", key)
+		}
+		project, region := parts[0], parts[1]
+		if subnet.Kind != "compute#subnetwork" ||
+			subnet.Region != regionSelfLink(project, region) ||
+			subnet.SelfLink != subnetworkSelfLink(project, region, subnet.Name) ||
+			subnet.Purpose != "PRIVATE" || subnet.StackType != "IPV4_ONLY" ||
+			subnet.State != "READY" || subnet.PrivateIPGoogleAccess {
+			return fmt.Errorf("subnetwork %q has invalid stable fields", key)
+		}
+		if _, err := time.Parse(time.RFC3339, subnet.CreationTimestamp); err != nil {
+			return fmt.Errorf("subnetwork %q has invalid creation timestamp", key)
+		}
+		prefix, err := validateSubnetworkRequest(subnetworkInsertRequest{
+			Name: subnet.Name, IPCidrRange: subnet.IPCidrRange, Network: subnet.Network,
+			Purpose: subnet.Purpose, StackType: subnet.StackType,
+		})
+		if err != nil || subnet.GatewayAddress != prefix.Addr().Next().String() ||
+			subnet.Fingerprint != subnetworkFingerprint(subnet) {
+			return fmt.Errorf("subnetwork %q has invalid CIDR, gateway, or fingerprint", key)
+		}
+		id, err := strconv.ParseUint(subnet.ID, 10, 64)
+		if err != nil || id == 0 || ids[id] {
+			return fmt.Errorf("subnetwork %q has invalid or duplicate ID", key)
+		}
+		ids[id] = true
+		if id > maxID {
+			maxID = id
+		}
+		parentProject, parentName, err := subnetworkVPCIdentity(subnet)
+		if err != nil || parentProject != project {
+			return fmt.Errorf("subnetwork %q has invalid parent identity", key)
+		}
+		parentKey := project + ":" + parentName
+		parent := networks[parentKey]
+		if parent == nil || parent.Kind != "compute#network" || parent.ID == "" ||
+			parent.Name != parentName || parent.SelfLink != networkSelfLink(project, parentName) ||
+			parent.AutoCreateSubnetworks {
+			return fmt.Errorf("subnetwork %q parent is missing or not custom mode", key)
+		}
+		if parents[parentKey] {
+			return fmt.Errorf("multiple subnetworks use parent %q", parentKey)
+		}
+		parents[parentKey] = true
+		nameKey := project + ":" + subnet.Name
+		if names[nameKey] {
+			return fmt.Errorf("duplicate subnetwork name %q in project", subnet.Name)
+		}
+		names[nameKey] = true
+		for _, previous := range seen {
+			if previous.project == project && previous.prefix.Overlaps(prefix) {
+				return fmt.Errorf("subnetwork %q overlaps another project CIDR", key)
+			}
+		}
+		seen = append(seen, seenSubnet{project: project, prefix: prefix})
+	}
+	minimumNext := maxID + 1
+	if minimumNext == 1 && nextID == 0 {
+		return nil
+	}
+	if nextID < minimumNext {
+		return fmt.Errorf("next subnetwork ID is %d, want at least %d", nextID, minimumNext)
+	}
+	return nil
+}
+
+func (api *API) setInitializationError(err error) {
+	api.initMu.Lock()
+	api.initializationErr = err
+	api.initMu.Unlock()
+}
+
+func (api *API) initializationError() error {
+	api.initMu.RLock()
+	defer api.initMu.RUnlock()
+	return api.initializationErr
+}
+
+func subnetworkVPCIdentity(subnetwork *Subnetwork) (string, string, error) {
+	const marker = "https://www.googleapis.com/compute/v1/projects/"
+	if subnetwork == nil || !strings.HasPrefix(subnetwork.Network, marker) {
+		return "", "", errors.New("subnetwork has invalid parent network")
+	}
+	parts := strings.Split(strings.TrimPrefix(subnetwork.Network, marker), "/")
+	if len(parts) != 4 || parts[1] != "global" || parts[2] != "networks" {
+		return "", "", errors.New("subnetwork has invalid parent network")
+	}
+	identity := orchestrator.VPCNetworkIdentity{Project: parts[0], Network: parts[3]}
+	if err := identity.Validate(); err != nil {
+		return "", "", err
+	}
+	return identity.Project, identity.Network, nil
+}
+
 func (api *API) persistMetadata() error {
 	if api.stateStore == nil {
 		return nil
@@ -80,16 +291,22 @@ func (api *API) persistMetadata() error {
 	defer api.persistMu.Unlock()
 
 	api.mu.RLock()
-	payload, err := json.Marshal(computeMetadata{
-		Instances:      api.instances,
-		Networks:       api.networks,
-		Firewalls:      api.firewalls,
-		InstanceGroups: api.instanceGroups,
-		LoadBalancers:  api.loadBalancers,
-	})
+	payload, err := api.marshalMetadataLocked()
 	api.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("snapshot Compute metadata: %w", err)
 	}
 	return api.stateStore.Save(computeStateEntry, json.RawMessage(payload))
+}
+
+func (api *API) marshalMetadataLocked() ([]byte, error) {
+	return json.Marshal(computeMetadata{
+		Instances:      api.instances,
+		Networks:       api.networks,
+		Subnetworks:    api.subnetworks,
+		NextSubnetID:   api.nextSubnetworkID,
+		Firewalls:      api.firewalls,
+		InstanceGroups: api.instanceGroups,
+		LoadBalancers:  api.loadBalancers,
+	})
 }

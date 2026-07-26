@@ -41,6 +41,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_phase16_subnetwork_integration:
+        description: Run Compute subnetwork/IPAM generated-SDK Docker acceptance
+        required: false
+        type: boolean
+        default: false
       run_phase16_vertex_integration:
         description: Run Vertex AI deterministic prediction restart acceptance
         required: false
@@ -177,7 +182,9 @@ jobs:
         run: terraform validate
 
       - name: Validate integration script syntax
-        run: bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-vertex-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+        run: |
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-vertex-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          MINISKY_PHASE16_SUBNETWORK_SELF_TEST=1 ./scripts/phase16-subnetwork-integration.sh
 
       - name: Verify air-gapped bundle workflow
         run: ./scripts/airgap-bundle-test.sh
@@ -234,7 +241,7 @@ jobs:
         run: python -m pip install --requirement sdk-smoke/python/requirements.txt
 
       - name: Compile Go SDK smoke
-        run: go test ./sdk-smoke/go ./sdk-smoke/phase15 ./sdk-smoke/phase16 ./sdk-smoke/phase16-logging ./sdk-smoke/phase16-dns ./sdk-smoke/phase16-vertex
+        run: go test ./sdk-smoke/go ./sdk-smoke/phase15 ./sdk-smoke/phase16 ./sdk-smoke/phase16-logging ./sdk-smoke/phase16-dns ./sdk-smoke/phase16-subnetwork ./sdk-smoke/phase16-vertex
 
       - name: Compile Python SDK smoke
         run: python -m compileall -q sdk-smoke/python
@@ -462,6 +469,35 @@ jobs:
 
       - name: Run Phase 16 Cloud DNS integration
         run: make test-phase16-dns
+
+  phase16-subnetwork-integration:
+    name: Compute subnetwork/IPAM SDK and Docker acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase16_subnetwork_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 16 subnetwork/IPAM integration
+        run: make test-phase16-subnetwork
 
   phase16-vertex-integration:
     name: Vertex AI deterministic prediction restart acceptance
