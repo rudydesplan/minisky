@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
 )
 
 func init() {
+	state.MustRegisterEntryValidator(gkeStateEntry, state.StrictEntryValidator(validateGKEMetadataImport))
 	registry.Register("container.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr)
 	})
@@ -29,26 +31,47 @@ func init() {
 
 // Cluster mirrors the GKE container.v1 Cluster resource.
 type Cluster struct {
-	Name                  string      `json:"name"`
-	Description           string      `json:"description,omitempty"`
-	NodeConfig            *NodeConfig `json:"nodeConfig,omitempty"`
-	MasterAuth            *MasterAuth `json:"masterAuth,omitempty"`
-	LoggingService        string      `json:"loggingService"`
-	MonitoringService     string      `json:"monitoringService"`
-	Network               string      `json:"network"`
-	ClusterIpv4Cidr       string      `json:"clusterIpv4Cidr"`
-	Endpoint              string      `json:"endpoint"`
-	InitialClusterVersion string      `json:"initialClusterVersion"`
-	CurrentMasterVersion  string      `json:"currentMasterVersion"`
-	Status                string      `json:"status"` // PROVISIONING, RUNNING, RECONCILING, STOPPING, ERROR, DEGRADED
-	StatusMessage         string      `json:"statusMessage,omitempty"`
-	NodeIpv4CidrSize      int         `json:"nodeIpv4CidrSize"`
-	ServicesIpv4Cidr      string      `json:"servicesIpv4Cidr"`
-	SelfLink              string      `json:"selfLink"`
-	Zone                  string      `json:"zone"`
-	Location              string      `json:"location"`
-	CreateTime            string      `json:"createTime"`
-	InitialNodeCount      int         `json:"initialNodeCount"`
+	Name                     string             `json:"name"`
+	Description              string             `json:"description,omitempty"`
+	NodeConfig               *NodeConfig        `json:"nodeConfig,omitempty"`
+	MasterAuth               *MasterAuth        `json:"masterAuth,omitempty"`
+	LoggingService           string             `json:"loggingService"`
+	MonitoringService        string             `json:"monitoringService"`
+	Network                  string             `json:"network"`
+	ClusterIpv4Cidr          string             `json:"clusterIpv4Cidr"`
+	Endpoint                 string             `json:"endpoint"`
+	InitialClusterVersion    string             `json:"initialClusterVersion"`
+	CurrentMasterVersion     string             `json:"currentMasterVersion"`
+	Status                   string             `json:"status"` // PROVISIONING, RUNNING, RECONCILING, STOPPING, ERROR, DEGRADED
+	StatusMessage            string             `json:"statusMessage,omitempty"`
+	NodeIpv4CidrSize         int                `json:"nodeIpv4CidrSize"`
+	ServicesIpv4Cidr         string             `json:"servicesIpv4Cidr"`
+	SelfLink                 string             `json:"selfLink"`
+	Zone                     string             `json:"zone"`
+	Location                 string             `json:"location"`
+	CreateTime               string             `json:"createTime"`
+	InitialNodeCount         int                `json:"initialNodeCount"`
+	LegacyAbac               *LegacyAbac        `json:"legacyAbac"`
+	NetworkConfig            *NetworkConfig     `json:"networkConfig"`
+	ShieldedNodes            *ShieldedNodes     `json:"shieldedNodes"`
+	DefaultMaxPodsConstraint *MaxPodsConstraint `json:"defaultMaxPodsConstraint"`
+}
+
+type LegacyAbac struct {
+	Enabled bool `json:"enabled"`
+}
+
+type NetworkConfig struct {
+	Network    string `json:"network"`
+	Subnetwork string `json:"subnetwork"`
+}
+
+type ShieldedNodes struct {
+	Enabled bool `json:"enabled"`
+}
+
+type MaxPodsConstraint struct {
+	MaxPodsPerNode int64 `json:"maxPodsPerNode,string"`
 }
 
 type NodeConfig struct {
@@ -259,6 +282,21 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 	}
 	if cl.Network == "" {
 		cl.Network = "default"
+	}
+	if cl.LegacyAbac == nil {
+		cl.LegacyAbac = &LegacyAbac{}
+	}
+	if cl.NetworkConfig == nil {
+		cl.NetworkConfig = &NetworkConfig{Network: cl.Network}
+	}
+	if cl.NetworkConfig.Network == "" {
+		cl.NetworkConfig.Network = cl.Network
+	}
+	if cl.ShieldedNodes == nil {
+		cl.ShieldedNodes = &ShieldedNodes{}
+	}
+	if cl.DefaultMaxPodsConstraint == nil {
+		cl.DefaultMaxPodsConstraint = &MaxPodsConstraint{}
 	}
 	if cl.NodeConfig == nil {
 		cl.NodeConfig = &NodeConfig{
@@ -590,7 +628,19 @@ func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string
 	opName := extractSegmentAfter(path, "operations")
 
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	targetZonePrefix := fmt.Sprintf(
+		"https://container.googleapis.com/v1/projects/%s/zones/%s/",
+		project,
+		zone,
+	)
+	targetLocationPrefix := fmt.Sprintf(
+		"https://container.googleapis.com/v1/projects/%s/locations/%s/",
+		project,
+		zone,
+	)
+	if op == nil || op.Kind != "container#operation" || op.Zone != zone ||
+		(!strings.HasPrefix(op.TargetLink, targetZonePrefix) &&
+			!strings.HasPrefix(op.TargetLink, targetLocationPrefix)) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
@@ -669,7 +719,7 @@ func (api *API) registerNodes(ctx context.Context, method, project, zone string,
 		req.Host = "compute.googleapis.com"
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Minisky-GKE-Bypass", "true")
-		resp, err := client.Do(req)
+		resp, err := observability.Do(client, req)
 		if err != nil {
 			return completed, fmt.Errorf("register managed node %s: %w", nodeName, err)
 		}
@@ -698,7 +748,7 @@ func (api *API) removeRegisteredNodes(ctx context.Context, project, zone string,
 			req.Host = "compute.googleapis.com"
 			req.Header.Set("X-Minisky-GKE-Bypass", "true")
 			var resp *http.Response
-			resp, err = client.Do(req)
+			resp, err = observability.Do(client, req)
 			if err == nil {
 				resp.Body.Close()
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -797,6 +847,22 @@ func cloneCluster(cluster *Cluster) *Cluster {
 	if cluster.MasterAuth != nil {
 		auth := *cluster.MasterAuth
 		clone.MasterAuth = &auth
+	}
+	if cluster.LegacyAbac != nil {
+		value := *cluster.LegacyAbac
+		clone.LegacyAbac = &value
+	}
+	if cluster.NetworkConfig != nil {
+		value := *cluster.NetworkConfig
+		clone.NetworkConfig = &value
+	}
+	if cluster.ShieldedNodes != nil {
+		value := *cluster.ShieldedNodes
+		clone.ShieldedNodes = &value
+	}
+	if cluster.DefaultMaxPodsConstraint != nil {
+		value := *cluster.DefaultMaxPodsConstraint
+		clone.DefaultMaxPodsConstraint = &value
 	}
 	return &clone
 }

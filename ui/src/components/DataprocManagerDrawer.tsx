@@ -180,8 +180,8 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
               <Typography variant="caption" sx={{ color: '#5f6368' }}>Native Apache Spark & Hadoop Orchestration • {activeProject}</Typography>
             </Box>
             <Box>
-              <IconButton onClick={() => loadData()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh" onClick={() => loadData()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 
@@ -231,7 +231,7 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
                           </Typography>
                           <Chip size="small" label={cl.status?.state} color={cl.status?.state === 'RUNNING' ? 'success' : 'warning'} />
                         </Box>
-                        <IconButton color="error" onClick={() => handleDeleteCluster(cl.clusterName)}><DeleteIcon /></IconButton>
+                        <IconButton aria-label={`Delete cluster ${cl.clusterName}`} color="error" onClick={() => handleDeleteCluster(cl.clusterName)}><DeleteIcon /></IconButton>
                       </Paper>
                     ))}
                   </Box>

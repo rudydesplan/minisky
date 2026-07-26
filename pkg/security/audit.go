@@ -53,14 +53,24 @@ type auditWriter interface {
 }
 
 type AuditLog struct {
-	mu       sync.Mutex
-	path     string
-	profile  string
-	strict   bool
-	writer   auditWriter
-	sequence uint64
-	lastHash string
-	now      func() time.Time
+	mu             sync.Mutex
+	path           string
+	profile        string
+	strict         bool
+	writer         auditWriter
+	sequence       uint64
+	lastHash       string
+	now            func() time.Time
+	persistenceErr error
+}
+
+func (a *AuditLog) PersistenceError() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.persistenceErr
 }
 
 func OpenAuditLog(profileDir, profile string, strict bool) (*AuditLog, error) {
@@ -162,7 +172,9 @@ func (a *AuditLog) append(event AuditEvent, phase string, status int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.writer == nil {
-		return errors.New("audit log is closed")
+		err := errors.New("audit log is closed")
+		a.recordPersistenceErrorLocked(err)
+		return err
 	}
 	now := a.now
 	if now == nil {
@@ -192,11 +204,15 @@ func (a *AuditLog) append(event AuditEvent, phase string, status int) error {
 	}
 	payload = append(payload, '\n')
 	if _, err := a.writer.Write(payload); err != nil {
-		return fmt.Errorf("append audit record: %w", err)
+		err = fmt.Errorf("append audit record: %w", err)
+		a.recordPersistenceErrorLocked(err)
+		return err
 	}
 	if file, ok := a.writer.(*os.File); ok {
 		if err := file.Sync(); err != nil {
-			return fmt.Errorf("sync audit record: %w", err)
+			err = fmt.Errorf("sync audit record: %w", err)
+			a.recordPersistenceErrorLocked(err)
+			return err
 		}
 	}
 	a.sequence = record.Sequence
@@ -209,9 +225,17 @@ func (a *AuditLog) append(event AuditEvent, phase string, status int) error {
 		return err
 	}
 	if err := atomicWrite(a.path+".checkpoint", append(checkpoint, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write audit checkpoint: %w", err)
+		err = fmt.Errorf("write audit checkpoint: %w", err)
+		a.recordPersistenceErrorLocked(err)
+		return err
 	}
 	return nil
+}
+
+func (a *AuditLog) recordPersistenceErrorLocked(err error) {
+	if a.persistenceErr == nil {
+		a.persistenceErr = err
+	}
 }
 
 func (a *AuditLog) Verify() error {

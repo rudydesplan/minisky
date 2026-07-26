@@ -1,21 +1,27 @@
 # Distribution
 
-MiniSky's release workflow runs only for stable `vMAJOR.MINOR.PATCH` tags. Before
-publishing, it builds and tests the native archives and runs
+MiniSky's release workflow runs only for stable `vMAJOR.MINOR.PATCH` tags. It
+first requires successful mandatory checks attached to the exact tagged commit;
+relevant runtime changes also require the critical provider, durability, and
+Kind checks. Before publishing, it builds and tests the native archives and runs
 `minisky doctor bigquery` from both the `linux/amd64` and `linux/arm64`
 container images.
 
 ## GitHub releases
 
-Each release contains the supported native archives and a `checksums.txt` file.
-The workflow validates each archive's integrity, rejects unsafe paths, checks
-for the binary, license, documentation, and readme files, and verifies the
-generated SHA-256 checksums before creating the release.
+Each release contains the supported native archives, `container-digests.json`,
+and a `checksums.txt` file that covers every archive plus the container digest
+evidence. The evidence records the immutable multi-platform index digest, both
+tested platform digests, and the source commit SHA. The workflow validates each
+archive's integrity, rejects unsafe paths, checks for the binary, license,
+documentation, and readme files, and verifies the generated SHA-256 checksums
+before creating the release.
 
-Download the archive and `checksums.txt` as separate files, then run
-`sha256sum -c checksums.txt` on Linux or `shasum -a 256 -c checksums.txt` on
-macOS before extraction. MiniSky does not require executing a downloaded
-installer script.
+Download the archive and `checksums.txt` as separate files, require exactly one
+checksum line for the selected archive, and pipe only that line to
+`sha256sum --check --strict -` on Linux or `shasum -a 256 --check -` on macOS
+before extraction. MiniSky does not require executing a downloaded installer
+script.
 
 The repository-local action at `.github/actions/setup-minisky` applies the same
 release checksum requirement or accepts a caller-supplied binary. It is tested
@@ -29,17 +35,55 @@ verifies all files before optional `docker load`. It never publishes or pulls.
 
 ## GHCR
 
-The workflow publishes `ghcr.io/<owner>/<repository>` with these tags:
+MiniSky publishes no GHCR tags: not exact semantic versions and not moving
+`latest`, major, or minor aliases. The exact container identity is the
+checksummed `container-digests.json` GitHub Release asset. Its index is pushed
+and referenced only by digest, and is assembled from two platform digests that
+were individually vulnerability-scanned and started through the shipped
+entrypoint until `/healthz` was ready.
 
-- the immutable release version, such as `1.2.3`
-- the moving minor and major tags, such as `1.2` and `1`
-- `latest`
+Download and verify the exact release evidence, then pull by digest:
 
-The manifest includes `linux/amd64` and `linux/arm64` images plus BuildKit
-provenance and SBOM attestations. Publishing uses the workflow-scoped
-`GITHUB_TOKEN` with only `contents: read` and `packages: write`; no registry
-secret is required. Pull requests cannot publish because the release workflow
-is triggered only by version-tag pushes and the publish job repeats that gate.
+```bash
+VERSION=v1.2.3
+gh release download "${VERSION}" \
+  --repo qamarudeenm/minisky \
+  --pattern checksums.txt \
+  --pattern container-digests.json
+test "$(awk '$2 == "container-digests.json" { count++ } END { print count+0 }' checksums.txt)" -eq 1
+awk '$2 == "container-digests.json"' checksums.txt |
+  sha256sum --check --strict -
+IMAGE="$(jq -r .image container-digests.json)"
+DIGEST="$(jq -r .indexDigest container-digests.json)"
+docker pull "${IMAGE}@${DIGEST}"
+```
+
+On macOS, use the same exact-line filter with
+`shasum -a 256 --check -` instead of `sha256sum --check --strict -`. The
+manifest includes `linux/amd64` and `linux/arm64` images plus BuildKit
+provenance and SBOM attestations. Publishing uses only the workflow-scoped
+`GITHUB_TOKEN`; no PAT, GitHub App credential, repository ruleset, or registry
+secret is required.
+
+Immediately before each registry digest push and GitHub Release asset write,
+the workflow dereferences the annotated release tag through the GitHub API and
+requires it to equal the original workflow `GITHUB_SHA`. The checksummed
+evidence records that source SHA. Existing-release retries accept only the
+exact complete expected asset set when every asset is byte-identical. New
+release creation specifies the target SHA and verifies that the remote tag
+already exists. These visible checks do not provide impossible atomic
+protection against a malicious authorized tag force-move between API calls;
+maintainers must not move published release tags. The source SHA and
+content-addressed digests make the published evidence independently
+verifiable.
+
+Promotions are serialized FIFO with GitHub Actions'
+`concurrency.queue: max`; the workflow intentionally omits
+`cancel-in-progress`. Separate stable tags are therefore not cancelled while
+waiting. That queue schema is authoritative for GitHub-hosted validation.
+Older local `actionlint` versions may reject only the `queue` key before their
+schema catches up; local validation must use a narrowly scoped ignore for that
+single schema-lag diagnostic and still fail on every other workflow error.
 
 ## Homebrew and Scoop
 

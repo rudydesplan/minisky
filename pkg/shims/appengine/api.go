@@ -28,6 +28,7 @@ var (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(appEngineStateEntry, state.StrictEntryValidator[appEngineMetadata](nil))
 	f := func(ctx *registry.Context) http.Handler {
 		once.Do(func() {
 			// App Engine needs access to the Serverless backend for Buildpacks
@@ -199,7 +200,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAppEngineError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "App Engine persistence is unavailable")
 		return
 	}
-	if api.afterAdmission != nil {
+	if api.afterAdmission != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		api.afterAdmission()
 	}
 
@@ -230,30 +231,12 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (api *API) handleApps(w http.ResponseWriter, r *http.Request) {
 	project := extractSegmentAfter(r.URL.Path, "projects")
 	if r.Method == http.MethodGet {
-		api.mutationMu.Lock()
-		defer api.mutationMu.Unlock()
-		if api.rejectDegradedMutation(w) {
-			return
-		}
 		api.mu.RLock()
 		app := cloneApp(api.apps[project])
-		previous := api.snapshotLocked()
 		api.mu.RUnlock()
 		if app == nil {
-			snapshot := cloneAppEngineMetadata(previous)
-			app = &App{
-				Id:              project,
-				LocationId:      "us-central1",
-				DefaultHostname: fmt.Sprintf("%s.appspot.com", project),
-			}
-			snapshot.Apps[project] = cloneApp(app)
-			if api.rejectDegradedMutation(w) {
-				return
-			}
-			if err := api.commitMetadata(previous, snapshot); err != nil {
-				writeAppEngineError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist App Engine app metadata")
-				return
-			}
+			writeAppEngineError(w, http.StatusNotFound, "NOT_FOUND", "App not found")
+			return
 		}
 		_ = json.NewEncoder(w).Encode(app)
 		return
@@ -493,10 +476,11 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleOperations(w http.ResponseWriter, r *http.Request) {
-	opName := strings.TrimPrefix(r.URL.Path, "/v1/projects/")
-	opName = strings.Split(opName, "/operations/")[1]
+	project := extractSegmentAfter(r.URL.Path, "projects")
+	opName := extractSegmentAfter(r.URL.Path, "operations")
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	if op == nil || op.Kind != "appengine#operation" ||
+		!strings.HasPrefix(op.TargetLink, "apps/"+project+"/") {
 		writeAppEngineError(w, http.StatusNotFound, "NOT_FOUND", "Operation not found")
 		return
 	}

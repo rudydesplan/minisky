@@ -161,10 +161,10 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
             <Button variant="contained" size="small" startIcon={<AddIcon />} onClick={() => setCreateOpen(true)}>
               Create Instance
             </Button>
-            <IconButton onClick={() => fetchInstances()} disabled={loading} size="small">
+            <IconButton aria-label="Refresh" onClick={() => fetchInstances()} disabled={loading} size="small">
               <RefreshIcon fontSize="small" />
             </IconButton>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
         </Box>
 
@@ -205,7 +205,7 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
                     <TableCell><StateChip state={inst.state} /></TableCell>
                     <TableCell align="right">
                       <Tooltip title="Delete">
-                        <IconButton size="small" color="error" onClick={() => handleDelete(inst.name)}>
+                        <IconButton aria-label={`Delete instance ${id}`} size="small" color="error" onClick={() => handleDelete(inst.name)}>
                           <DeleteIcon fontSize="small" />
                         </IconButton>
                       </Tooltip>

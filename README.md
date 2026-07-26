@@ -1,10 +1,14 @@
 # 🛰️ MiniSky
 
-**High-Fidelity local emulator for Google Cloud Platform.**
+**Bounded local emulator for tested Google Cloud workflows.**
 
 **Official Website:** [minisky.bmics.com.ng](https://minisky.bmics.com.ng)
 
-MiniSky provides a seamless, professional-grade development environment that emulates GCP services locally. It allows developers to test Infrastructure-as-Code (Terraform), Serverless functions, and complex data workflows without incurring cloud costs. Once dependencies and required images are available locally, many workflows can run offline; first use may pull lazily loaded emulator images.
+MiniSky provides one local gateway for custom Go shims and selected
+Docker-backed emulators. It supports explicitly documented Terraform, SDK,
+serverless, data, and observability slices; it does not claim broad GCP parity.
+Once dependencies and required images are available locally, many workflows can
+run offline; first use may pull lazily loaded emulator images.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -15,15 +19,23 @@ MiniSky provides a seamless, professional-grade development environment that emu
 
 ## ✨ Features
 
-- **🚀 29+ GCP Services**: Support for Compute Engine, GKE, Bigtable, Pub/Sub, Storage, Cloud SQL, Vertex AI, Artifact Registry, and more.
-- **🖥️ Embedded Dashboard**: Real-time observability and resource management via a premium web UI.
-- **🛠️ Terraform Ready**: First-class support for the official Google Cloud Terraform provider via custom endpoint routing.
+- **🚀 Registered service domains**: Compatibility ranges from bounded executable
+  slices to metadata-only control planes, Docker passthroughs, and explicit
+  deferred behavior. See the service matrix before selecting a workflow.
+- **🖥️ Embedded Dashboard**: A light management shell with intentionally dark
+  Logging, Monitoring, terminal, and log-output operational views.
+- **🛠️ Bounded Terraform gates**: The pinned Google provider is tested only for
+  the resources listed in `docs/terraform-compatibility.md`.
 - **🔌 Dynamic Registry**: Modular Go shim registry for community-led service contributions.
-- **📦 Single Binary**: Developed entirely in Go. A single, ultra-lightweight binary where all services are lazy-loaded for maximum efficiency and sub-100ms startup times.
+- **📦 Single binary**: Go shims and the built dashboard are packaged together;
+  selected services still require Docker, emulator images, Kind, Pack, or
+  DuckDB/CGO.
 
 ## 📋 Prerequisites
-MiniSky requires the following tools installed and running on your local machine:
-- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)**: Used for high-fidelity service emulation (Compute, SQL, etc.).
+Install the tools required by the slices you use:
+- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)**: Required
+  for Docker-backed services such as bounded Compute and Cloud SQL data planes,
+  but not for daemon startup or in-process shims.
 - **[Git](https://git-scm.com/downloads)**: Required when building or contributing from source.
 
 ## 🚀 Quick Start
@@ -103,7 +115,8 @@ execution.
 
 | Feature | Linux amd64 | Linux arm64 | macOS arm64 | Windows amd64 | Windows WSL2 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| Compute / GKE / Storage | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Compute / Storage bounded slices | ✅ | ✅ | ✅ | ✅ | ✅ |
+| GKE metadata / Kind backend | ✅ / opt-in | ✅ / opt-in | ✅ / opt-in | ✅ / unsupported | ✅ / opt-in |
 | Pub/Sub / Cloud SQL / VPC | ✅ | ✅ | ✅ | ✅ | ✅ |
 | BigQuery SQL execution | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* | ✅ DuckDB\* |
 | CGO build | Yes | Yes | Yes | Yes | Yes |
@@ -134,17 +147,77 @@ Set any override to `simulation` to disable that real backend even under the
 `full` profile. Invalid profile or backend values also fall back to simulation
 with a diagnostic in startup logs, `minisky doctor`, and dashboard API state.
 
+If Docker is unavailable, MiniSky continues with the public gateway, dashboard,
+diagnostics, and in-process shims; Docker-backed service requests fail
+explicitly. Docker configuration or ownership conflicts still fail closed.
+Native Windows builds support GKE metadata, but secure Kind kubeconfig
+ownership/publish operations are intentionally unsupported; the guarded Kind
+lifecycle evidence is Unix/Linux.
+
+The gateway validator is a curated, allow-by-default subset for selected
+mutating method/path pairs. It is not full Discovery Document validation.
+
 Published v1.2.x macOS and Windows artifacts predate native CGO support.
 Upgrade to v1.3.0 or later for native DuckDB, or run the Linux build through
-Docker Desktop or WSL2:
+Docker Desktop or WSL2. MiniSky publishes no GHCR tags (including exact
+versions, `latest`, major, or minor aliases); download the release's
+checksummed digest evidence and run the immutable index. The evidence also
+records the source commit SHA for independent verification:
 
 ```bash
+VERSION=v1.3.0
+gh release download "${VERSION}" \
+  --repo qamarudeenm/minisky \
+  --pattern checksums.txt \
+  --pattern container-digests.json
+test "$(awk '$2 == "container-digests.json" { count++ } END { print count+0 }' checksums.txt)" -eq 1
+awk '$2 == "container-digests.json"' checksums.txt |
+  sha256sum --check --strict -
+IMAGE="$(jq -r .image container-digests.json)"
+DIGEST="$(jq -r .indexDigest container-digests.json)"
+
 docker run --rm \
   -e MINISKY_BQ_BACKEND=duckdb \
   -p 8080:8080 -p 8081:8081 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  'ghcr.io/qamarudeenm/minisky@sha256:<verified-release-digest>'
+  "${IMAGE}@${DIGEST}"
 ```
+
+On macOS, keep the exact-line filter and replace
+`sha256sum --check --strict -` with `shasum -a 256 --check -`.
+
+### Current compatibility boundaries
+
+- App Engine and Dataproc resource metadata is profile-persisted. App Engine
+  observation does not create missing apps; Dataproc preserves exact cluster
+  identity, marks interrupted jobs terminal, and executes only supported jobs
+  against exactly owned containers.
+- Artifact Registry persists repositories and bounded terminal operation
+  outcomes. Package/version views come from Registry v2; blobs and manifests
+  are not part of metadata export/import.
+- Cloud SQL persists instance, database, and user metadata. Restored instances
+  are metadata-only with stale endpoints removed. The guarded provider gate
+  covers one PostgreSQL lifecycle, not SQL data durability or broad API parity.
+- Compute covers bounded instance CRUD, one custom IPv4
+  network/subnetwork/owned bridge, and a classic global HTTP load balancer with
+  one unmanaged zonal group and default-service routing. Managed/regional
+  groups, host/path routing, HTTPS/non-HTTP proxies, IPv6, NAT, peering, and PSC
+  remain unsupported.
+- Bigtable cluster create/get/list/delete is metadata-only. Its exact
+  instance/cluster-scoped operations are already terminal and persist typed
+  polling metadata; no cluster nodes are created.
+- Cloud Tasks resumes persisted nonterminal work once per API lifetime with a
+  stable task ID and remaining retry budget. Logging similarly replays
+  unacknowledged sink deliveries and cancels pending work when a sink is
+  deleted. Both have an at-least-once crash window after target acceptance but
+  before acknowledgement persistence, so consumers must tolerate duplicates.
+- Scheduler cron and manual deliveries belong to the Scheduler API lifetime,
+  not the triggering request. Shutdown cancels and bounded-waits for active
+  deliveries; missed schedules are not replayed.
+
+The complete executable and unsupported boundaries are in
+[`docs/service-compatibility.md`](docs/service-compatibility.md) and
+[`docs/terraform-compatibility.md`](docs/terraform-compatibility.md).
 
 ---
 
@@ -188,8 +261,6 @@ require network access; the command does not prune global Docker resources.
 - **Test complete workflows:** acceptance gates cover create, observe, update,
   restart, and destroy—not only successful HTTP status codes.
 
-### Planned execution
-
 | Phase | Feature set | Verification | Status |
 | :--- | :--- | :--- | :---: |
 | 6 | Service support/fidelity baseline and compatibility matrices | Manifest and docs agree on implemented/deferred status; implemented domains have an executable in-process or backend-gated contract, while deferred domains return deterministic unsupported responses | ✅ Baseline |
@@ -227,9 +298,10 @@ require network access; the command does not prune global Docker resources.
   that covers every documented custom endpoint without ambiguous `/v1` routes.
 - Expand the Terraform example only where the provider-visible lifecycle is
   proven. The current fixture includes BigQuery, IAM, Storage, cross-project
-  Pub/Sub, optional Phase-10 Compute/Artifact Registry resources, and optional
-  Phase-15 Memorystore/Spanner and Phase-16 custom-network/subnetwork resources;
-  Cloud SQL and serverless remain outside this fixture.
+  Pub/Sub, optional Phase-10 Compute/Artifact Registry resources, optional
+  Phase-15 Memorystore/Spanner and Phase-16 network/subnetwork/instance
+  resources, plus guarded Cloud SQL and Unix Kind/GKE switches. Serverless
+  remains outside the fixture.
 - Run `terraform apply`, resource assertions, a no-drift plan, and
   `terraform destroy` in CI.
 - Publish `docs/terraform-compatibility.md` with provider resources, endpoint
@@ -282,8 +354,9 @@ service create API and does not demonstrate Terraform-managed serverless.
 Unsupported boundaries remain full Cloud Run v2 source build and Terraform
 serverless, Eventarc and CloudEvents envelopes, Pub/Sub push, Cloud Tasks OIDC,
 task-header, redirect, and dead-letter-queue parity, durable event queueing,
-ordering, exactly-once delivery, interrupted task replay, and production
-serverless operation.
+ordering, exactly-once delivery, target-side deduplication, and production
+serverless operation. Interrupted Cloud Tasks are replayed at least once with a
+stable ID; the crash-before-acknowledgement window can duplicate delivery.
 
 ### Phase 10 — Networking and artifact workflows
 
@@ -461,9 +534,11 @@ sink metadata. It then deleted the sink, restarted a third time, and confirmed
 the entries remained while the deletion persisted in 15 seconds. The slice
 supports at most 1,000 entries per write, 100 resource names, 1 MiB request
 bodies, deterministic timestamp ordering, validation-only `dryRun`, and
-create/get/list/delete sink lifecycle. Pagination, `partialSuccess`, sink
-patch/update, per-entry errors, durable sink-delivery replay, log-based metrics,
-and alerting policies remain unsupported.
+create/get/list/delete sink lifecycle. Unacknowledged file/Pub/Sub sink
+deliveries are persisted and replayed after restart; sink deletion cancels its
+pending deliveries, and the external-acceptance/acknowledgement window can
+duplicate delivery. Pagination, `partialSuccess`, sink patch/update, per-entry
+errors, log-based metrics, and alerting policies remain unsupported.
 
 A guarded Cloud DNS gate used the official generated REST client to create and
 read a public managed zone and A record, restarted MiniSky against the same

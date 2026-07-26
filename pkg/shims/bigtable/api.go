@@ -22,6 +22,7 @@ import (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(bigtableStateEntry, state.StrictEntryValidator[bigtableMetadata](nil))
 	f := func(ctx *registry.Context) http.Handler {
 		return ctx.SharedHandler("bigtable", func() http.Handler {
 			return NewAPI(ctx.OpMgr, ctx.SvcMgr)
@@ -39,6 +40,22 @@ type Instance struct {
 	Type          string            `json:"type"`  // PRODUCTION, DEVELOPMENT
 	Labels        map[string]string `json:"labels"`
 	BackendStatus string            `json:"backendStatus,omitempty"`
+}
+
+// Cluster mirrors the bounded Bigtable Cluster admin resource.
+type Cluster struct {
+	Name               string `json:"name"`
+	Location           string `json:"location"`
+	State              string `json:"state"`
+	ServeNodes         int    `json:"serveNodes,omitempty"`
+	DefaultStorageType string `json:"defaultStorageType"`
+}
+
+type BigtableOperation struct {
+	Name     string                 `json:"name"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	Done     bool                   `json:"done"`
+	Response map[string]interface{} `json:"response,omitempty"`
 }
 
 // Table mirrors the Bigtable Table resource.
@@ -67,7 +84,9 @@ type API struct {
 	backend    bigtableBackend
 	stateStore bigtableStore
 	instances  map[string]*Instance // key: projects/{p}/instances/{i}
-	tables     map[string]*Table    // key: projects/{p}/instances/{i}/tables/{t}
+	clusters   map[string]*Cluster  // key: projects/{p}/instances/{i}/clusters/{c}
+	operations map[string]*BigtableOperation
+	tables     map[string]*Table // key: projects/{p}/instances/{i}/tables/{t}
 }
 
 type bigtableBackend interface {
@@ -115,7 +134,8 @@ func newAPI(
 ) *API {
 	return &API{
 		opMgr: opMgr, svcMgr: svcMgr, backend: backend, stateStore: store,
-		instances: make(map[string]*Instance), tables: make(map[string]*Table),
+		instances: make(map[string]*Instance), clusters: make(map[string]*Cluster),
+		operations: make(map[string]*BigtableOperation), tables: make(map[string]*Table),
 	}
 }
 
@@ -132,6 +152,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case strings.HasPrefix(path, "/v2/operations/"):
+		api.getClusterOperation(w, path)
 	case strings.Contains(path, "/clusters"):
 		api.routeClusters(w, r, path)
 	case strings.Contains(path, "/instances") && !strings.Contains(path, "/tables"):
@@ -239,7 +261,14 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		removedTables := make(map[string]*Table)
+		removedClusters := make(map[string]*Cluster)
 		delete(api.instances, name)
+		for clusterName := range api.clusters {
+			if strings.HasPrefix(clusterName, name+"/clusters/") {
+				removedClusters[clusterName] = api.clusters[clusterName]
+				delete(api.clusters, clusterName)
+			}
+		}
 		for tableName := range api.tables {
 			if strings.HasPrefix(tableName, name+"/tables/") {
 				removedTables[tableName] = api.tables[tableName]
@@ -250,6 +279,9 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 		if err := api.persistMetadata(); err != nil {
 			api.mu.Lock()
 			api.instances[name] = instance
+			for clusterName, cluster := range removedClusters {
+				api.clusters[clusterName] = cluster
+			}
 			for tableName, table := range removedTables {
 				api.tables[tableName] = table
 			}
@@ -397,7 +429,156 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (api *API) routeClusters(w http.ResponseWriter, r *http.Request, path string) {
-	writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Bigtable cluster administration is not implemented")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 6 || parts[0] != "v2" || parts[1] != "projects" ||
+		parts[3] != "instances" || parts[5] != "clusters" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid Bigtable cluster path")
+		return
+	}
+	parent := fmt.Sprintf("projects/%s/instances/%s", parts[2], parts[4])
+	clusterID := ""
+	if len(parts) == 7 {
+		clusterID = parts[6]
+	} else if len(parts) != 6 {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable cluster resource not found")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		if clusterID != "" {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable cluster resource not found")
+			return
+		}
+		var clusterBody Cluster
+		if err := json.NewDecoder(r.Body).Decode(&clusterBody); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+			return
+		}
+		clusterID := r.URL.Query().Get("clusterId")
+		if clusterID == "" || clusterBody.Location == "" {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "clusterId and cluster.location are required")
+			return
+		}
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
+		api.mu.RLock()
+		_, parentExists := api.instances[parent]
+		api.mu.RUnlock()
+		if !parentExists {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable instance not found: "+parent)
+			return
+		}
+		name := parent + "/clusters/" + clusterID
+		cluster := &Cluster{
+			Name: name, Location: clusterBody.Location, State: metadataOnlyInstanceState,
+			ServeNodes: clusterBody.ServeNodes, DefaultStorageType: clusterBody.DefaultStorageType,
+		}
+		if cluster.ServeNodes == 0 {
+			cluster.ServeNodes = 1
+		}
+		if cluster.DefaultStorageType == "" {
+			cluster.DefaultStorageType = "SSD"
+		}
+		api.mu.Lock()
+		if api.clusters[name] != nil {
+			api.mu.Unlock()
+			writeError(w, http.StatusConflict, "ALREADY_EXISTS", "Bigtable cluster already exists: "+name)
+			return
+		}
+		api.clusters[name] = cluster
+		operation := &BigtableOperation{
+			Name: scopedClusterOperationName(name, "create"),
+			Metadata: clusterOperationMetadata(
+				"type.googleapis.com/google.bigtable.admin.v2.CreateClusterMetadata",
+				parent, clusterID, cluster,
+			),
+			Done: true, Response: clusterOperationResponse(cluster),
+		}
+		api.operations[operation.Name] = operation
+		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			delete(api.clusters, name)
+			delete(api.operations, operation.Name)
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable cluster: "+err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(operation)
+	case http.MethodGet:
+		if clusterID == "" {
+			api.mu.RLock()
+			clusters := make([]*Cluster, 0)
+			for name, cluster := range api.clusters {
+				if strings.HasPrefix(name, parent+"/clusters/") {
+					clusters = append(clusters, cloneCluster(cluster))
+				}
+			}
+			api.mu.RUnlock()
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"clusters": clusters})
+			return
+		}
+		name := parent + "/clusters/" + clusterID
+		api.mu.RLock()
+		cluster := cloneCluster(api.clusters[name])
+		api.mu.RUnlock()
+		if cluster == nil {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable cluster not found: "+name)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(cluster)
+	case http.MethodDelete:
+		if clusterID == "" {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "cluster name is required")
+			return
+		}
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
+		name := parent + "/clusters/" + clusterID
+		api.mu.Lock()
+		cluster := api.clusters[name]
+		operation := &BigtableOperation{
+			Name: scopedClusterOperationName(name, "delete"),
+			Metadata: clusterOperationMetadata(
+				"type.googleapis.com/google.bigtable.admin.v2.DeleteClusterMetadata",
+				parent, clusterID, cluster,
+			),
+			Done: true,
+		}
+		if cluster != nil {
+			delete(api.clusters, name)
+			api.operations[operation.Name] = operation
+		}
+		api.mu.Unlock()
+		if cluster == nil {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable cluster not found: "+name)
+			return
+		}
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			delete(api.operations, operation.Name)
+			api.clusters[name] = cluster
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable cluster deletion: "+err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(operation)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+	}
+}
+
+func (api *API) getClusterOperation(w http.ResponseWriter, path string) {
+	name := strings.TrimPrefix(path, "/v2/")
+	api.mu.RLock()
+	operation := cloneBigtableOperation(api.operations[name])
+	api.mu.RUnlock()
+	if operation == nil || !validScopedClusterOperation(operation) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable operation not found: "+name)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(operation)
 }
 
 // handleReadRows implements the REST-to-gRPC bridge for Bigtable Data exploration.
@@ -512,6 +693,85 @@ func cloneTable(table *Table) *Table {
 		}
 	}
 	return &clone
+}
+
+func cloneCluster(cluster *Cluster) *Cluster {
+	if cluster == nil {
+		return nil
+	}
+	clone := *cluster
+	return &clone
+}
+
+func cloneBigtableOperation(operation *BigtableOperation) *BigtableOperation {
+	if operation == nil {
+		return nil
+	}
+	clone := *operation
+	clone.Metadata = cloneJSONMap(operation.Metadata)
+	clone.Response = cloneJSONMap(operation.Response)
+	return &clone
+}
+
+func scopedClusterOperationName(clusterName, verb string) string {
+	return "operations/" + clusterName + "/" + verb + "-" + fmt.Sprint(time.Now().UnixNano())
+}
+
+func clusterOperationMetadata(
+	typeName, parent, clusterID string,
+	cluster *Cluster,
+) map[string]interface{} {
+	originalRequest := map[string]interface{}{}
+	if strings.HasSuffix(typeName, "CreateClusterMetadata") {
+		originalRequest["parent"] = parent
+		originalRequest["clusterId"] = clusterID
+		originalRequest["cluster"] = clusterOperationValue(cluster)
+	} else {
+		originalRequest["name"] = cluster.Name
+	}
+	return map[string]interface{}{
+		"@type":           typeName,
+		"originalRequest": originalRequest,
+		"requestTime":     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func clusterOperationResponse(cluster *Cluster) map[string]interface{} {
+	response := clusterOperationValue(cluster)
+	response["@type"] = "type.googleapis.com/google.bigtable.admin.v2.Cluster"
+	return response
+}
+
+func clusterOperationValue(cluster *Cluster) map[string]interface{} {
+	value := make(map[string]interface{})
+	encoded, _ := json.Marshal(cluster)
+	_ = json.Unmarshal(encoded, &value)
+	return value
+}
+
+func validScopedClusterOperation(operation *BigtableOperation) bool {
+	parts := strings.Split(operation.Name, "/")
+	if len(parts) < 8 || parts[0] != "operations" || parts[1] != "projects" ||
+		parts[3] != "instances" || parts[5] != "clusters" {
+		return false
+	}
+	original, _ := operation.Metadata["originalRequest"].(map[string]interface{})
+	parent, _ := original["parent"].(string)
+	clusterID, _ := original["clusterId"].(string)
+	name, _ := original["name"].(string)
+	expectedParent := strings.Join(parts[1:5], "/")
+	expectedName := strings.Join(parts[1:7], "/")
+	return (parent == expectedParent && clusterID == parts[6]) || name == expectedName
+}
+
+func cloneJSONMap(value map[string]interface{}) map[string]interface{} {
+	if value == nil {
+		return nil
+	}
+	encoded, _ := json.Marshal(value)
+	var clone map[string]interface{}
+	_ = json.Unmarshal(encoded, &clone)
+	return clone
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

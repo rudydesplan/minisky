@@ -226,10 +226,10 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
             >
               Deploy
             </Button>
-            <IconButton onClick={() => { fetchServices(); fetchVersions(); }} disabled={loading} size="small">
+            <IconButton aria-label="Refresh" onClick={() => { fetchServices(); fetchVersions(); }} disabled={loading} size="small">
               <RefreshIcon fontSize="small" />
             </IconButton>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
         </Box>
 
@@ -297,12 +297,12 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
                       </TableCell>
                       <TableCell align="right">
                         <Tooltip title="View Versions">
-                          <IconButton size="small" onClick={e => { e.stopPropagation(); setSelectedService(s.id); setTab(1); fetchVersions(s.id); }}>
+                          <IconButton aria-label="Layers" size="small" onClick={e => { e.stopPropagation(); setSelectedService(s.id); setTab(1); fetchVersions(s.id); }}>
                             <LayersIcon fontSize="small" sx={{ color: '#1a73e8' }} />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="View Logs">
-                          <IconButton size="small" onClick={e => { e.stopPropagation(); onClose(); navigate('/logging'); }}>
+                          <IconButton aria-label={`View logs for service ${s.id}`} size="small" onClick={e => { e.stopPropagation(); onClose(); navigate('/logging'); }}>
                             <TerminalIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>
@@ -392,12 +392,12 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
                         </TableCell>
                         <TableCell align="right">
                           <Tooltip title="View Logs">
-                            <IconButton size="small" sx={{ mr: 0.5 }} onClick={() => { onClose(); navigate('/logging'); }}>
+                            <IconButton aria-label={`View logs for version ${v.id}`} size="small" sx={{ mr: 0.5 }} onClick={() => { onClose(); navigate('/logging'); }}>
                               <TerminalIcon fontSize="small" />
                             </IconButton>
                           </Tooltip>
                           <Tooltip title="Delete Version">
-                            <IconButton size="small" color="error" onClick={() => handleDeleteVersion(v.id)}>
+                            <IconButton aria-label={`Delete version ${v.id}`} size="small" color="error" onClick={() => handleDeleteVersion(v.id)}>
                               <DeleteIcon fontSize="small" />
                             </IconButton>
                           </Tooltip>

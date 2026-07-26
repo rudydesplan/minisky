@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useCallback, useState, useEffect, useRef } from 'react';
 import {
   Box, Typography, Chip, TextField, Select, MenuItem, FormControl,
   InputLabel, IconButton, Tooltip, CircularProgress,
@@ -14,7 +14,7 @@ import MemoryIcon from '@mui/icons-material/Memory';
 import StorageIcon from '@mui/icons-material/Storage';
 import CodeIcon from '@mui/icons-material/Code';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
-import { checkedMutation, safeRequestError } from '../apiClient';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 type LogEntry = {
   insertId: string;
@@ -27,6 +27,39 @@ type LogEntry = {
 };
 
 type ContainerItem = { name: string; status: string; image: string };
+
+function isLogEntry(value: unknown): value is LogEntry {
+  if (typeof value !== 'object' || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry.insertId === 'string'
+    && typeof entry.timestamp === 'string'
+    && typeof entry.severity === 'string'
+    && typeof entry.logName === 'string'
+    && (entry.textPayload === undefined || typeof entry.textPayload === 'string')
+    && (entry.jsonPayload === undefined || isStringRecord(entry.jsonPayload, false))
+    && (entry.resource === undefined || isLogResource(entry.resource));
+}
+
+function isStringRecord(value: unknown, stringValues: boolean): value is Record<string, unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value)
+    && (!stringValues || Object.values(value).every(item => typeof item === 'string'));
+}
+
+function isLogResource(value: unknown): value is NonNullable<LogEntry['resource']> {
+  if (!isStringRecord(value, false)) return false;
+  return typeof value.type === 'string'
+    && (value.labels === undefined || isStringRecord(value.labels, true));
+}
+
+function isContainerItem(value: unknown): value is ContainerItem {
+  if (typeof value !== 'object' || value === null) return false;
+  const container = value as Record<string, unknown>;
+  return typeof container.name === 'string'
+    && typeof container.status === 'string'
+    && typeof container.image === 'string';
+}
 
 const SEVERITY_COLOR: Record<string, string> = {
   DEBUG:     '#9aa0a6',
@@ -62,48 +95,106 @@ export default function LogExplorer() {
   const [viewMode, setViewMode] = useState<'centralized' | 'container'>('centralized');
   const [selectedContainer, setSelectedContainer] = useState('');
   const [containerLogs, setContainerLogs] = useState('');
+  const [containerLogsFor, setContainerLogsFor] = useState('');
   const [containerLoading, setContainerLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const streamTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [entriesLoaded, setEntriesLoaded] = useState(false);
+  const [containerLogsLoaded, setContainerLogsLoaded] = useState(false);
+  const [entryError, setEntryError] = useState<string | null>(null);
+  const [containerError, setContainerError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const containerControllerRef = useRef<AbortController | undefined>(undefined);
+  const containerGenerationRef = useRef(0);
 
-  const fetchEntries = async () => {
+  const fetchEntries = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/manage/logging/entries');
-      if (res.ok) {
-        const data = await res.json();
-        setEntries((data.entries as LogEntry[]) ?? []);
+      const res = await fetch('/api/manage/logging/entries', { signal });
+      await requireOk(res, 'Unable to load centralized logs. Verify that logging is available.');
+      const data: unknown = await res.json();
+      if (typeof data !== 'object' || data === null || !Array.isArray((data as { entries?: unknown }).entries)) {
+        throw new Error('Centralized logs returned an invalid response.');
       }
+      const parsed = (data as { entries: unknown[] }).entries;
+      if (!parsed.every(isLogEntry)) throw new Error('Centralized logs returned an invalid entry.');
+      setEntries(parsed);
+      setEntriesLoaded(true);
+      setEntryError(null);
+    } catch (cause: unknown) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') return;
+      setEntryError(
+        cause instanceof Error && !(cause instanceof TypeError)
+          ? cause.message
+          : safeRequestError(cause, 'Unable to connect while loading centralized logs.'),
+      );
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const fetchContainers = async () => {
-    const res = await fetch('/api/manage/logging/container');
-    if (res.ok) {
-      const data = await res.json();
-      setContainers(Array.isArray(data) ? data : []);
-    }
-  };
-
-  const fetchContainerLogs = async (name: string) => {
-    if (!name) return;
-    setContainerLoading(true);
+  const fetchContainers = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch(`/api/manage/logging/container?name=${encodeURIComponent(name)}`);
-      if (res.ok) setContainerLogs(await res.text());
-      else setContainerLogs('No logs available.');
-    } finally {
-      setContainerLoading(false);
+      const res = await fetch('/api/manage/logging/container', { signal });
+      await requireOk(res, 'Unable to load managed containers. Verify that Docker is available.');
+      const data: unknown = await res.json();
+      if (!Array.isArray(data) || !data.every(isContainerItem)) {
+        throw new Error('Managed containers returned an invalid response.');
+      }
+      setContainers(data);
+      setContainerError(null);
+    } catch (cause: unknown) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') return;
+      setContainerError(
+        cause instanceof Error && !(cause instanceof TypeError)
+          ? cause.message
+          : safeRequestError(cause, 'Unable to connect while loading managed containers.'),
+      );
     }
-  };
+  }, []);
+
+  const fetchContainerLogs = useCallback(async (name: string, signal?: AbortSignal) => {
+    if (!name) return;
+    containerControllerRef.current?.abort();
+    const controller = new AbortController();
+    containerControllerRef.current = controller;
+    const generation = ++containerGenerationRef.current;
+    if (signal?.aborted) controller.abort();
+    signal?.addEventListener('abort', () => controller.abort(), { once: true });
+    setContainerLoading(true);
+    setContainerError(null);
+    try {
+      const res = await fetch(`/api/manage/logging/container?name=${encodeURIComponent(name)}`, { signal: controller.signal });
+      await requireOk(res, 'Unable to load container output. Verify that the container is running.');
+      const output = await res.text();
+      if (generation !== containerGenerationRef.current || controller.signal.aborted) return;
+      setContainerLogs(output);
+      setContainerLogsFor(name);
+      setContainerLogsLoaded(true);
+      setContainerError(null);
+    } catch (cause: unknown) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') return;
+      if (generation !== containerGenerationRef.current) return;
+      setContainerError(
+        cause instanceof Error && !(cause instanceof TypeError)
+          ? cause.message
+          : safeRequestError(cause, 'Unable to connect while loading container output.'),
+      );
+    } finally {
+      if (generation === containerGenerationRef.current) setContainerLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    fetchEntries();
-    fetchContainers();
-  }, []);
+    const containerGeneration = containerGenerationRef;
+    const controller = new AbortController();
+    void fetchEntries(controller.signal);
+    void fetchContainers(controller.signal);
+    return () => {
+      controller.abort();
+      containerControllerRef.current?.abort();
+      containerGeneration.current++;
+    };
+  }, [fetchContainers, fetchEntries]);
 
   // Auto-scroll to bottom when streaming
   useEffect(() => {
@@ -112,15 +203,10 @@ export default function LogExplorer() {
 
   const startStream = () => {
     setStreaming(true);
-    streamTimer.current = setInterval(() => {
-      if (viewMode === 'centralized') fetchEntries();
-      else if (selectedContainer) fetchContainerLogs(selectedContainer);
-    }, 2000);
   };
 
   const stopStream = () => {
     setStreaming(false);
-    if (streamTimer.current) clearInterval(streamTimer.current);
   };
 
   const handleReset = async () => {
@@ -130,14 +216,32 @@ export default function LogExplorer() {
       await checkedMutation('/api/manage/system/reset-logs', { method: 'POST' },
         'Log reset failed. Check dashboard permissions and retry.');
       setEntries([]);
+      setMutationError(null);
     } catch (cause) {
-      setError(safeRequestError(cause, 'Unable to connect while resetting logs.'));
+      setMutationError(safeRequestError(cause, 'Unable to connect while resetting logs.'));
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => () => { if (streamTimer.current) clearInterval(streamTimer.current); }, []);
+  useEffect(() => {
+    if (!streaming) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      controller = new AbortController();
+      if (viewMode === 'centralized') await fetchEntries(controller.signal);
+      else if (selectedContainer) await fetchContainerLogs(selectedContainer, controller.signal);
+      if (!stopped) timer = setTimeout(poll, 2000);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [fetchContainerLogs, fetchEntries, selectedContainer, streaming, viewMode]);
 
   const filteredEntries = [...entries].filter(e => {
     if (filterSeverity !== 'ALL' && e.severity?.toUpperCase() !== filterSeverity) return false;
@@ -155,10 +259,26 @@ export default function LogExplorer() {
 
   const defaultResources = ['cloud_function', 'cloud_run_revision', 'gce_instance', 'global'];
   const resourceTypes = ['ALL', ...Array.from(new Set([...defaultResources, ...entries.map(e => e.resource?.type ?? 'global')]))];
+  const error = mutationError ?? (viewMode === 'centralized' ? entryError : containerError);
+  const selectedContainerLogsLoaded = containerLogsFor === selectedContainer && containerLogsLoaded;
+  const showingStaleData = viewMode === 'centralized'
+    ? entryError !== null && entriesLoaded
+    : containerError !== null && selectedContainerLogsLoaded;
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0d1117', color: '#c9d1d9' }}>
-      {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
+      {error && (
+        <Alert
+          severity="error"
+          onClose={() => {
+            if (mutationError) setMutationError(null);
+            else if (viewMode === 'centralized') setEntryError(null);
+            else setContainerError(null);
+          }}
+        >
+          {showingStaleData ? `Showing stale data. ${error}` : error}
+        </Alert>
+      )}
       {/* Header */}
       <Box sx={{
         px: 3, py: 2,
@@ -204,18 +324,21 @@ export default function LogExplorer() {
 
         <Tooltip title={streaming ? 'Stop streaming' : 'Stream logs (2s refresh)'}>
           <IconButton size="small" onClick={streaming ? stopStream : startStream}
+            aria-label={streaming ? 'Stop log streaming' : 'Start log streaming'}
             sx={{ color: streaming ? '#f28b82' : '#81c995', border: '1px solid', borderColor: 'currentColor' }}>
             {streaming ? <StopIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
           </IconButton>
         </Tooltip>
         <Tooltip title="Clear log history">
           <IconButton size="small" onClick={handleReset} disabled={loading}
+            aria-label="Clear log history"
             sx={{ color: '#f28b82', border: '1px solid', borderColor: '#f28b8240' }}>
             <DeleteSweepIcon fontSize="small" />
           </IconButton>
         </Tooltip>
         <Tooltip title="Refresh now">
           <IconButton size="small" onClick={() => { fetchEntries(); fetchContainers(); }}
+            aria-label="Refresh logs and containers"
             sx={{ color: '#8b949e' }}>
             <RefreshIcon fontSize="small" />
           </IconButton>
@@ -235,12 +358,13 @@ export default function LogExplorer() {
             value={filterText}
             onChange={e => setFilterText(e.target.value)}
             sx={{
-              minWidth: 200,
+              width: { xs: '100%', sm: 'auto' },
+              minWidth: { sm: 200 },
               '& .MuiInputBase-root': { background: '#0d1117', color: '#c9d1d9', fontSize: '0.8rem' },
               '& .MuiOutlinedInput-notchedOutline': { borderColor: '#30363d' },
             }}
           />
-          <FormControl size="small" sx={{ minWidth: 130 }}>
+          <FormControl size="small" sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 130 } }}>
             <InputLabel sx={{ color: '#8b949e', fontSize: '0.8rem' }}>Severity</InputLabel>
             <Select value={filterSeverity} label="Severity" onChange={e => setFilterSeverity(e.target.value)}
               sx={{ color: '#c9d1d9', background: '#0d1117', fontSize: '0.8rem',
@@ -250,7 +374,7 @@ export default function LogExplorer() {
               ))}
             </Select>
           </FormControl>
-          <FormControl size="small" sx={{ minWidth: 160 }}>
+          <FormControl size="small" sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 160 } }}>
             <InputLabel sx={{ color: '#8b949e', fontSize: '0.8rem' }}>Resource</InputLabel>
             <Select value={filterResource} label="Resource" onChange={e => setFilterResource(e.target.value)}
               sx={{ color: '#c9d1d9', background: '#0d1117', fontSize: '0.8rem',
@@ -269,10 +393,10 @@ export default function LogExplorer() {
 
       {/* Container selector bar */}
       {viewMode === 'container' && (
-        <Box sx={{ px: 3, py: 1.5, background: '#161b27', borderBottom: '1px solid #21262d', display: 'flex', gap: 2, alignItems: 'center' }}>
-          <FormControl size="small" sx={{ minWidth: 280 }}>
-            <InputLabel sx={{ color: '#8b949e', fontSize: '0.8rem' }}>Select Container</InputLabel>
-            <Select value={selectedContainer} label="Select Container"
+        <Box sx={{ px: { xs: 2, sm: 3 }, py: 1.5, background: '#161b27', borderBottom: '1px solid #21262d', display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+          <FormControl size="small" sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 280 } }}>
+            <InputLabel id="container-log-selector-label" sx={{ color: '#8b949e', fontSize: '0.8rem' }}>Select Container</InputLabel>
+            <Select value={selectedContainer} label="Select Container" labelId="container-log-selector-label"
               onChange={e => { setSelectedContainer(e.target.value); fetchContainerLogs(e.target.value); }}
               sx={{ color: '#c9d1d9', background: '#0d1117', fontSize: '0.8rem',
                 '& .MuiOutlinedInput-notchedOutline': { borderColor: '#30363d' } }}>
@@ -293,7 +417,12 @@ export default function LogExplorer() {
           </FormControl>
           {selectedContainer && (
             <Tooltip title="Refresh container logs">
-              <IconButton size="small" onClick={() => fetchContainerLogs(selectedContainer)} sx={{ color: '#8b949e' }}>
+              <IconButton
+                size="small"
+                aria-label={`Refresh logs for ${selectedContainer}`}
+                onClick={() => fetchContainerLogs(selectedContainer)}
+                sx={{ color: '#8b949e' }}
+              >
                 <RefreshIcon fontSize="small" />
               </IconButton>
             </Tooltip>
@@ -312,7 +441,7 @@ export default function LogExplorer() {
               <CircularProgress size={32} sx={{ color: '#1e88e5' }} />
               <Typography variant="body2" sx={{ color: '#8b949e' }}>Fetching log entries...</Typography>
             </Box>
-          ) : filteredEntries.length === 0 ? (
+          ) : entriesLoaded && !entryError && filteredEntries.length === 0 ? (
             <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%', flexDirection: 'column', gap: 2 }}>
               <TerminalIcon sx={{ fontSize: 48, color: '#21262d' }} />
               <Typography variant="body2" sx={{ color: '#8b949e' }}>No log entries yet.</Typography>
@@ -320,7 +449,7 @@ export default function LogExplorer() {
                 Deploy a function or service and logs will appear here automatically.
               </Typography>
             </Box>
-          ) : (
+          ) : filteredEntries.length > 0 ? (
             <Box sx={{ fontFamily: 'monospace' }}>
               {filteredEntries.map((entry, idx) => {
                 const sev = (entry.severity ?? 'INFO').toUpperCase();
@@ -366,7 +495,7 @@ export default function LogExplorer() {
               })}
               <div ref={logEndRef} />
             </Box>
-          )
+          ) : null
         ) : (
           /* Container raw logs */
           !selectedContainer ? (
@@ -378,9 +507,9 @@ export default function LogExplorer() {
             <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>
               <CircularProgress size={28} sx={{ color: '#1e88e5' }} />
             </Box>
-          ) : (
+          ) : containerError && !selectedContainerLogsLoaded ? null : (
             <Box sx={{ p: 2, fontFamily: 'monospace', fontSize: '0.8rem', whiteSpace: 'pre-wrap', color: '#c9d1d9', lineHeight: 1.6 }}>
-              {containerLogs || 'No output captured yet.'}
+              {selectedContainerLogsLoaded ? (containerLogs || 'No output captured yet.') : null}
               <div ref={logEndRef} />
             </Box>
           )

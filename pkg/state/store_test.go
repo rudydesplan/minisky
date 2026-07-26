@@ -135,6 +135,49 @@ func TestMutationCreatesPinnedProfileHierarchyFromFreshRoot(t *testing.T) {
 	}
 }
 
+func TestAcquireOwnershipCreatesSecureMissingStateRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fresh-state-root")
+	store, err := New(root, "fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatalf("AcquireOwnership on missing root: %v", err)
+	}
+	defer ownership.Close()
+
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("state root mode = %v, want directory 0700", info.Mode())
+	}
+}
+
+func TestImportRejectsOversizedSnapshotBeforeReplacement(t *testing.T) {
+	store, err := New(t.TempDir(), "import-limit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("existing/value", map[string]string{"status": "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"format":"minisky-state-snapshot","version":1,"entries":{}}` +
+		strings.Repeat(" ", int(maxImportSize))
+	if err := store.Import(strings.NewReader(payload)); err == nil {
+		t.Fatal("oversized snapshot was accepted")
+	}
+	var value map[string]string
+	if err := store.Load("existing/value", &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["status"] != "preserved" {
+		t.Fatalf("existing state was replaced: %#v", value)
+	}
+}
+
 func TestOptionalReadRefreshesHierarchyAfterTransactionLock(t *testing.T) {
 	if os.Getenv("MINISKY_OPTIONAL_READ_WRITER_HELPER") == "1" {
 		store, err := New(os.Getenv("MINISKY_STATE_ROOT"), "fresh")
@@ -257,6 +300,59 @@ func TestImportValidationDoesNotReplaceActiveState(t *testing.T) {
 	}
 	if got["value"] != "active" {
 		t.Fatalf("active state changed after failed import: %#v", got)
+	}
+}
+
+func TestImportEntryValidatorRejectsWrongSchemaBeforeReplacement(t *testing.T) {
+	const entry = "test-validator/metadata"
+	MustRegisterEntryValidator(entry, func(_ EntryValidationContext, payload json.RawMessage) error {
+		var value struct {
+			Items []string `json:"items"`
+		}
+		return json.Unmarshal(payload, &value)
+	})
+
+	store, err := New(t.TempDir(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("service/value", map[string]string{"value": "active"}); err != nil {
+		t.Fatal(err)
+	}
+
+	badSnapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"test-validator/metadata":{"items":"wrong"}}}`)
+	if err := store.Import(bytes.NewReader(badSnapshot)); err == nil ||
+		!strings.Contains(err.Error(), `state entry "test-validator/metadata"`) {
+		t.Fatalf("Import error = %v, want entry schema rejection", err)
+	}
+
+	var got map[string]string
+	if err := store.Load("service/value", &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["value"] != "active" {
+		t.Fatalf("active state changed after failed schema validation: %#v", got)
+	}
+}
+
+func TestImportEntryValidatorReceivesTargetStore(t *testing.T) {
+	const entry = "context-validator/metadata"
+	MustRegisterEntryValidator(entry, func(context EntryValidationContext, _ json.RawMessage) error {
+		if context.Store == nil || context.Profile != context.Store.Profile() {
+			return errors.New("validator did not receive target store context")
+		}
+		if context.Profile != "destination" {
+			return fmt.Errorf("validator profile = %q", context.Profile)
+		}
+		return nil
+	})
+	store, err := New(t.TempDir(), "destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"context-validator/metadata":{}}}`)
+	if err := store.Import(bytes.NewReader(snapshot)); err != nil {
+		t.Fatalf("Import error = %v", err)
 	}
 }
 

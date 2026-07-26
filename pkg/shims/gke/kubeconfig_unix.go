@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -101,11 +100,27 @@ func securePrepareKubeconfigUnlocked(path string) (*secureKubeconfigTarget, erro
 }
 
 func secureKubeconfigCommandPath(target *secureKubeconfigTarget, cmd *exec.Cmd) (string, error) {
-	if target == nil || target.file == nil {
+	if target == nil || target.file == nil || target.dir == nil || cmd == nil {
 		return "", os.ErrInvalid
 	}
-	cmd.ExtraFiles = append(cmd.ExtraFiles, target.file)
-	return "/dev/fd/" + strconv.Itoa(3+len(cmd.ExtraFiles)-1), nil
+	fileInfo, fileErr := os.Lstat(target.path)
+	descriptorInfo, descriptorErr := target.file.Stat()
+	dirInfo, dirErr := os.Stat(filepath.Dir(target.path))
+	descriptorDirInfo, descriptorDirErr := target.dir.Stat()
+	if err := errors.Join(fileErr, descriptorErr, dirErr, descriptorDirErr); err != nil {
+		return "", err
+	}
+	if !fileInfo.Mode().IsRegular() || fileInfo.Mode().Perm() != 0o600 ||
+		!os.SameFile(target.fileInfo, fileInfo) || !os.SameFile(target.fileInfo, descriptorInfo) ||
+		!dirInfo.IsDir() || dirInfo.Mode().Perm() != 0o700 ||
+		!os.SameFile(target.dirInfo, dirInfo) || !os.SameFile(target.dirInfo, descriptorDirInfo) {
+		return "", os.ErrPermission
+	}
+	// Kind's client-go writer creates a sibling ".lock" file, so an inherited
+	// file descriptor cannot be used as the path. The regular path remains in a
+	// pinned 0700 directory with an O_EXCL/O_NOFOLLOW 0600 inode; publication
+	// revalidates both inode identities and the final content digest.
+	return target.path, nil
 }
 
 // securePublishKubeconfig guarantees that no attacker-controlled inode is

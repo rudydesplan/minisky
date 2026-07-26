@@ -16,10 +16,17 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	localsecurity "minisky/pkg/security"
 	_ "minisky/pkg/shims"
+	"minisky/pkg/shims/appengine"
 	"minisky/pkg/shims/bigquery"
+	"minisky/pkg/shims/bigtable"
+	"minisky/pkg/shims/cloudsql"
+	"minisky/pkg/shims/compute"
+	"minisky/pkg/shims/serverless"
+	"minisky/pkg/shims/vertexai"
 	"minisky/pkg/state"
 )
 
@@ -220,7 +227,7 @@ func TestStrictGatewayAuditUsesOnlyVerifiedPrincipal(t *testing.T) {
 			if response.Code != test.wantStatus {
 				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
 			}
-			if test.wantComplete != "" && !strings.Contains(response.Body.String(), "bigquery.datasets.update") {
+			if test.wantComplete != "" && !strings.Contains(response.Body.String(), "bigquery.datasets.create") {
 				t.Fatalf("verified denial did not name mapped permission: %s", response.Body.String())
 			}
 			var exported bytes.Buffer
@@ -304,13 +311,8 @@ func TestUnknownProjectEnforcementIsOptional(t *testing.T) {
 	}
 }
 
-func TestStrictAuthorizationDefaultDeniesUnmappedMutations(t *testing.T) {
+func TestStrictAuthorizationDefaultDeniesEveryUnmappedRoute(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
-	router := NewProxyRouterWithManager(nil)
-	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
 	token, _, err := issuer.Issue(localsecurity.TokenRequest{
 		Subject: "user:admin@example.com", Audience: "gateway",
 		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
@@ -318,17 +320,52 @@ func TestStrictAuthorizationDefaultDeniesUnmappedMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			dispatched := false
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim("unmapped.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatched = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			router.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+			request := httptest.NewRequest(
+				method,
+				"http://localhost/_minisky/unmapped/v1/projects/demo/resources",
+				bytes.NewBufferString(`{"name":"denied"}`),
+			)
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden ||
+				!strings.Contains(response.Body.String(), `"PERMISSION_DENIED"`) ||
+				!strings.Contains(response.Body.String(), "unmapped route") {
+				t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+			}
+			if dispatched {
+				t.Fatal("unmapped strict route reached shim")
+			}
+		})
+	}
+}
+
+func TestPermissiveDevelopmentModeDispatchesUnmappedRoute(t *testing.T) {
+	dispatched := false
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("unmapped.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatched = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
 	request := httptest.NewRequest(
-		http.MethodPost,
-		"http://localhost/_minisky/logging/v2/entries:write",
-		bytes.NewBufferString(`{"entries":[{"logName":"projects/demo/logs/app","textPayload":"denied"}]}`),
+		http.MethodGet,
+		"http://localhost/_minisky/unmapped/v1/projects/demo/resources",
+		nil,
 	)
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "unmapped mutation") {
-		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	if response.Code != http.StatusNoContent || !dispatched {
+		t.Fatalf("permissive response=%d dispatched=%v", response.Code, dispatched)
 	}
 }
 
@@ -406,6 +443,251 @@ func TestStrictSTSBootstrapReachesSubjectTokenValidation(t *testing.T) {
 	}
 }
 
+func TestDockerDegradedPurePassthroughShimsReturnCanonicalUnavailable(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "docker-degraded-router")
+	shims, lazyDomains := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	proxy := NewProxyRouterWithManager(nil)
+	for domain, handler := range shims {
+		proxy.RegisterShim(domain, registry.RuntimeHandler(domain, handler, false))
+	}
+	for _, domain := range lazyDomains {
+		proxy.RegisterLazyDocker(domain)
+	}
+
+	var canonicalBody string
+	for _, domain := range []string{
+		"storage.googleapis.com",
+		"pubsub.googleapis.com",
+		"identitytoolkit.googleapis.com",
+		"firebasehosting.googleapis.com",
+		"project.firebaseio.com",
+		"firestore.googleapis.com",
+	} {
+		request := httptest.NewRequest(http.MethodGet, "https://"+domain+"/", nil)
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status=%d body=%s", domain, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"code":503`) ||
+			!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+			t.Fatalf("%s body=%s", domain, response.Body.String())
+		}
+		if canonicalBody == "" {
+			canonicalBody = response.Body.String()
+		} else if response.Body.String() != canonicalBody {
+			t.Fatalf("%s returned non-canonical body %q, want %q", domain, response.Body.String(), canonicalBody)
+		}
+	}
+}
+
+func TestDockerDegradedHybridShimsPreserveControlPlaneAndGateMutations(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "docker-degraded-hybrid")
+	shims, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	if _, ok := shims["compute.googleapis.com"].(*compute.API); !ok {
+		t.Fatalf("Compute factory was replaced by %T", shims["compute.googleapis.com"])
+	}
+	if _, ok := shims["sqladmin.googleapis.com"].(*cloudsql.API); !ok {
+		t.Fatalf("Cloud SQL factory was replaced by %T", shims["sqladmin.googleapis.com"])
+	}
+	if _, ok := shims["appengine.googleapis.com"].(*appengine.API); !ok {
+		t.Fatalf("App Engine factory was replaced by %T", shims["appengine.googleapis.com"])
+	}
+	if _, ok := shims["bigtable.googleapis.com"].(*bigtable.API); !ok {
+		t.Fatalf("Bigtable factory was replaced by %T", shims["bigtable.googleapis.com"])
+	}
+	if _, ok := shims["aiplatform.googleapis.com"].(*vertexai.API); !ok {
+		t.Fatalf("Vertex AI factory was replaced by %T", shims["aiplatform.googleapis.com"])
+	}
+	if _, ok := shims["cloudfunctions.googleapis.com"].(*serverless.API); !ok {
+		t.Fatalf("Serverless factory was replaced by %T", shims["cloudfunctions.googleapis.com"])
+	}
+
+	proxy := NewProxyRouterWithManager(nil)
+	for domain, handler := range shims {
+		proxy.RegisterShim(domain, registry.RuntimeHandler(domain, handler, false))
+	}
+	for _, test := range []struct {
+		domain string
+		path   string
+	}{
+		{"compute.googleapis.com", "/compute/v1/projects/project-a/zones/us-central1-a/instances"},
+		{"sqladmin.googleapis.com", "/sql/v1beta4/projects/project-a/instances"},
+		{"appengine.googleapis.com", "/v1/apps/project-a"},
+		{"bigtable.googleapis.com", "/v2/projects/project-a/instances"},
+		{"aiplatform.googleapis.com", "/v1/projects/project-a/locations/us-central1/endpoints"},
+	} {
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://"+test.domain+test.path, nil))
+		if response.Code == http.StatusServiceUnavailable || response.Code >= http.StatusInternalServerError {
+			t.Fatalf("%s metadata status=%d body=%s", test.domain, response.Code, response.Body.String())
+		}
+	}
+
+	createBody := `{
+		"name":"web",
+		"machineType":"e2-micro",
+		"disks":[{"boot":true,"autoDelete":true,"initializeParams":{"sourceImage":"projects/debian-cloud/global/images/debian-12"}}],
+		"networkInterfaces":[{"subnetwork":"primary"}]
+	}`
+	request := httptest.NewRequest(http.MethodPost,
+		"https://compute.googleapis.com/compute/v1/projects/project-a/zones/us-central1-a/instances",
+		strings.NewReader(createBody))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+		t.Fatalf("Compute backend mutation status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost,
+		"https://compute.googleapis.com/compute/v1/projects/project-a/global/networks",
+		strings.NewReader(`{"name":"control-plane","autoCreateSubnetworks":false}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("Compute local network mutation status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, test := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{
+			http.MethodPost,
+			"/compute/v1/projects/project-a/global/firewalls",
+			`{"name":"allow-http","network":"projects/project-a/global/networks/control-plane","allowed":[{"IPProtocol":"tcp","ports":["80"]}]}`,
+		},
+		{http.MethodPatch, "/compute/v1/projects/project-a/global/firewalls/allow-http", `{}`},
+		{http.MethodPut, "/compute/v1/projects/project-a/global/firewalls/allow-http", `{}`},
+		{http.MethodDelete, "/compute/v1/projects/project-a/global/firewalls/allow-http", ""},
+		{http.MethodDelete, "/compute/v1/projects/project-a/global/networks/control-plane", ""},
+		{
+			http.MethodPost,
+			"/compute/v1/projects/project-a/regions/us-central1/subnetworks",
+			`{"name":"subnet-a","ipCidrRange":"10.10.0.0/24","network":"projects/project-a/global/networks/control-plane"}`,
+		},
+		{http.MethodDelete, "/compute/v1/projects/project-a/regions/us-central1/subnetworks/subnet-a", ""},
+	} {
+		request = httptest.NewRequest(test.method, "https://compute.googleapis.com"+test.path,
+			strings.NewReader(test.body))
+		request.Header.Set("Content-Type", "application/json")
+		response = httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable ||
+			!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) ||
+			!strings.Contains(response.Body.String(), `"message":"MiniSky: Docker backend unavailable"`) {
+			t.Fatalf("%s %s status=%d body=%s", test.method, test.path, response.Code, response.Body.String())
+		}
+	}
+
+	for _, path := range []string{
+		"/compute/v1/projects/project-a/global/networks",
+		"/compute/v1/projects/project-a/global/networks/control-plane",
+	} {
+		response = httptest.NewRecorder()
+		proxy.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"https://compute.googleapis.com"+path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+
+	request = httptest.NewRequest(http.MethodPost,
+		"https://compute.googleapis.com/compute/v1/projects/project-a/zones/us-central1-a/instances/missing/start",
+		nil)
+	response = httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code == http.StatusServiceUnavailable {
+		t.Fatalf("local instance action was Docker-gated: body=%s", response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost,
+		"https://cloudbuild.googleapis.com/v1/projects/project-a/triggers", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusNotImplemented ||
+		!strings.Contains(response.Body.String(), `"status":"UNIMPLEMENTED"`) {
+		t.Fatalf("Cloud Build local trigger status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestDockerDegradedVertexPostsRemainLocallyAvailable(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "docker-degraded-vertex")
+	shims, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	vertex, ok := shims["aiplatform.googleapis.com"].(*vertexai.API)
+	if !ok {
+		t.Fatalf("Vertex AI factory was replaced by %T", shims["aiplatform.googleapis.com"])
+	}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("aiplatform.googleapis.com",
+		registry.RuntimeHandler("aiplatform.googleapis.com", vertex, false))
+
+	post := func(path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "https://aiplatform.googleapis.com"+path,
+			strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		return response
+	}
+
+	predictPath := "/v1/projects/project-a/locations/us-central1/endpoints/test:predict"
+	predictBody := `{"instances":[{"feature":2},{"feature":1}],"parameters":{"temperature":0}}`
+	first := post(predictPath, predictBody)
+	second := post(predictPath, predictBody)
+	if first.Code != http.StatusOK || first.Body.String() != second.Body.String() ||
+		!strings.Contains(first.Body.String(), `"predictions"`) {
+		t.Fatalf("deterministic prediction status=%d/%d bodies=%s / %s",
+			first.Code, second.Code, first.Body.String(), second.Body.String())
+	}
+
+	generatePath := "/v1/projects/project-a/locations/us-central1/publishers/google/models/gemini:generateContent"
+	generateBody := `{"contents":[{"role":"user","parts":[{"text":"hello local model"}]}]}`
+	generate := post(generatePath, generateBody)
+	if generate.Code != http.StatusOK || !strings.Contains(generate.Body.String(), "hello local model") {
+		t.Fatalf("mock generation status=%d body=%s", generate.Code, generate.Body.String())
+	}
+
+	configureMock := post("/v1/internal/config",
+		`{"provider":"mock","model":"gemini-test","mockResponse":"configured response"}`)
+	if configureMock.Code != http.StatusOK {
+		t.Fatalf("mock config status=%d body=%s", configureMock.Code, configureMock.Body.String())
+	}
+	configured := post(generatePath, generateBody)
+	if configured.Code != http.StatusOK || !strings.Contains(configured.Body.String(), "configured response") {
+		t.Fatalf("configured mock status=%d body=%s", configured.Code, configured.Body.String())
+	}
+
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			t.Errorf("Ollama path=%s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"message": map[string]string{"role": "assistant", "content": "loopback response"},
+		})
+	}))
+	defer ollama.Close()
+	configureOllama := post("/v1/internal/config",
+		`{"provider":"ollama","endpoint":"`+ollama.URL+`","model":"test"}`)
+	if configureOllama.Code != http.StatusOK {
+		t.Fatalf("Ollama config status=%d body=%s", configureOllama.Code, configureOllama.Body.String())
+	}
+	ollamaGenerate := post(generatePath, generateBody)
+	if ollamaGenerate.Code != http.StatusOK ||
+		!strings.Contains(ollamaGenerate.Body.String(), "loopback response") {
+		t.Fatalf("Ollama generation status=%d body=%s", ollamaGenerate.Code, ollamaGenerate.Body.String())
+	}
+}
+
 func TestStrictIAMCredentialsUsesBearerPrincipalAndDefersAuthorization(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
 	router := NewProxyRouterWithManager(nil)
@@ -462,6 +744,302 @@ func TestIAMMutationsHaveExplicitProjectScopedPermissions(t *testing.T) {
 			permission, resource := routePermission("iam.googleapis.com", httptest.NewRequest(test.method, test.path, nil))
 			if permission != test.permission || resource != "projects/demo" {
 				t.Fatalf("permission=%q resource=%q", permission, resource)
+			}
+		})
+	}
+}
+
+func TestManifestImplementedDomainsHaveStrictIAMMappings(t *testing.T) {
+	type routeCase struct {
+		method, path, permission string
+	}
+	routes := map[string][]routeCase{
+		"aiplatform.googleapis.com":           {{http.MethodPost, "/v1/projects/demo/locations/us/endpoints", "aiplatform.endpoints.create"}},
+		"appengine.googleapis.com":            {{http.MethodGet, "/v1/projects/demo/apps/app/services", "appengine.services.list"}},
+		"artifactregistry.googleapis.com":     {{http.MethodPatch, "/v1/projects/demo/locations/us/repositories/repo", "artifactregistry.repositories.update"}},
+		"bigquery.googleapis.com":             {{http.MethodDelete, "/bigquery/v2/projects/demo/datasets/data", "bigquery.datasets.delete"}},
+		"bigtable.googleapis.com":             {{http.MethodGet, "/v2/projects/demo/instances/i/tables/t", "bigtable.tables.get"}},
+		"bigtableadmin.googleapis.com":        {{http.MethodGet, "/v2/projects/demo/instances", "bigtable.instances.list"}},
+		"cloudbuild.googleapis.com":           {{http.MethodPost, "/v1/projects/demo/builds", "cloudbuild.builds.create"}},
+		"cloudfunctions.googleapis.com":       {{http.MethodDelete, "/v2/projects/demo/locations/us/functions/f", "cloudfunctions.functions.delete"}},
+		"cloudkms.googleapis.com":             {{http.MethodPost, "/v1/projects/demo/locations/us/keyRings/r/cryptoKeys", "cloudkms.cryptoKeys.create"}},
+		"cloudresourcemanager.googleapis.com": {{http.MethodGet, "/v3/projects", "resourcemanager.projects.list"}},
+		"cloudscheduler.googleapis.com":       {{http.MethodPost, "/v1/projects/demo/locations/us/jobs/j:run", "cloudscheduler.jobs.run"}},
+		"cloudtasks.googleapis.com":           {{http.MethodDelete, "/v2/projects/demo/locations/us/queues/q/tasks/t", "cloudtasks.tasks.delete"}},
+		"compute.googleapis.com":              {{http.MethodPost, "/compute/v1/projects/demo/zones/us/instances", "compute.instances.create"}},
+		"container.googleapis.com":            {{http.MethodDelete, "/v1/projects/demo/locations/us/clusters/c", "container.clusters.delete"}},
+		"dataproc.googleapis.com":             {{http.MethodPost, "/v1/projects/demo/regions/us/jobs:submit", "dataproc.jobs.submit"}},
+		"datastore.googleapis.com":            {{http.MethodPost, "/v1/projects/demo:runQuery", "datastore.entities.list"}},
+		"dns.googleapis.com":                  {{http.MethodPost, "/dns/v1/projects/demo/managedZones", "dns.managedZones.create"}},
+		"firebasehosting.googleapis.com":      {{http.MethodGet, "/v1beta1/projects/demo/sites", "firebasehosting.sites.list"}},
+		"firebaseio.com":                      {{http.MethodPatch, "/projects/demo.json", "firebasedatabase.instances.update"}},
+		"firestore.googleapis.com":            {{http.MethodGet, "/v1/projects/demo/databases/(default)/documents", "datastore.entities.list"}},
+		"iam.googleapis.com":                  {{http.MethodGet, "/v1/projects/demo/serviceAccounts", "iam.serviceAccounts.list"}},
+		"iamcredentials.googleapis.com":       {{http.MethodPost, "/v1/projects/-/serviceAccounts/a@example.test:generateAccessToken", "iam.serviceAccounts.getAccessToken"}},
+		"identitytoolkit.googleapis.com":      {{http.MethodPost, "/v1/accounts:lookup", "firebaseauth.users.get"}},
+		"logging.googleapis.com":              {{http.MethodPost, "/v2/entries:list", "logging.logEntries.list"}},
+		"metadata.google.internal":            {{http.MethodGet, "/computeMetadata/v1/instance/id", "compute.instances.get"}},
+		"monitoring.googleapis.com":           {{http.MethodPost, "/v3/projects/demo/timeSeries", "monitoring.timeSeries.create"}},
+		"pubsub.googleapis.com":               {{http.MethodPost, "/v1/projects/demo/topics/t:publish", "pubsub.topics.publish"}},
+		"redis.googleapis.com":                {{http.MethodGet, "/v1/projects/demo/locations/us/instances", "redis.instances.list"}},
+		"run.googleapis.com":                  {{http.MethodPost, "/v2/projects/demo/locations/us/services", "run.services.create"}},
+		"secretmanager.googleapis.com":        {{http.MethodGet, "/v1/projects/demo/secrets/s/versions/latest:access", "secretmanager.versions.access"}},
+		"spanner.googleapis.com":              {{http.MethodPost, "/v1/projects/demo/instances/i/databases/d/sessions", "spanner.sessions.create"}},
+		"sqladmin.googleapis.com":             {{http.MethodDelete, "/sql/v1beta4/projects/demo/instances/db", "cloudsql.instances.delete"}},
+		"storage.googleapis.com":              {{http.MethodGet, "/storage/v1/b", "storage.buckets.list"}},
+		"sts.googleapis.com":                  {{http.MethodPost, "/v1/token", "iam.serviceAccounts.getAccessToken"}},
+	}
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range services {
+		if service.Support != registry.SupportImplemented {
+			continue
+		}
+		cases := routes[service.Domain]
+		if len(cases) == 0 {
+			t.Errorf("implemented domain %s has no route-specific IAM case", service.Domain)
+			continue
+		}
+		t.Run(service.Domain, func(t *testing.T) {
+			for _, test := range cases {
+				request := httptest.NewRequest(test.method, test.path, nil)
+				permission, resource := routePermission(service.Domain, request)
+				if permission != test.permission {
+					t.Errorf("%s %s permission = %q, want %q", test.method, test.path, permission, test.permission)
+				}
+				if strings.Contains(test.path, "/projects/demo") {
+					wantResource := "projects/demo"
+					if service.Domain == "pubsub.googleapis.com" {
+						wantResource = "projects/demo/topics/t"
+					}
+					if resource != wantResource {
+						t.Errorf("%s %s resource = %q, want %q", test.method, test.path, resource, wantResource)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestManifestImplementedDomainsHaveExplicitStrictDispatchPolicy(t *testing.T) {
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	customDomains := make(map[string]bool)
+	for _, route := range strictIAMCustomRoutes {
+		customDomains[route.domain] = true
+	}
+	for _, service := range services {
+		if service.Support != registry.SupportImplemented {
+			continue
+		}
+		explicit := len(strictIAMResourceRoutes[service.Domain]) > 0 || customDomains[service.Domain]
+		switch service.Domain {
+		case "firebaseio.com", "sts.googleapis.com":
+			explicit = true
+		}
+		if !explicit {
+			t.Errorf("implemented domain %s has no explicit strict dispatch policy", service.Domain)
+		}
+	}
+
+	if !strictIAMPublicExemption("sts.googleapis.com", httptest.NewRequest(http.MethodPost, "/v1/token", nil)) {
+		t.Fatal("STS token exchange lost its explicit public exemption")
+	}
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/v1/token", nil),
+		httptest.NewRequest(http.MethodPost, "/v1/other", nil),
+	} {
+		if strictIAMPublicExemption("sts.googleapis.com", request) {
+			t.Fatalf("unexpected public exemption for %s %s", request.Method, request.URL.Path)
+		}
+	}
+}
+
+func TestStrictIAMRouteClassificationSemanticsAndDenials(t *testing.T) {
+	tests := []struct {
+		name, domain, method, path, permission string
+	}{
+		{"list", "cloudtasks.googleapis.com", http.MethodGet, "/v2/projects/demo/locations/us/queues", "cloudtasks.queues.list"},
+		{"get", "cloudtasks.googleapis.com", http.MethodGet, "/v2/projects/demo/locations/us/queues/q", "cloudtasks.queues.get"},
+		{"create", "cloudtasks.googleapis.com", http.MethodPost, "/v2/projects/demo/locations/us/queues", "cloudtasks.queues.create"},
+		{"update", "cloudtasks.googleapis.com", http.MethodPatch, "/v2/projects/demo/locations/us/queues/q", "cloudtasks.queues.update"},
+		{"delete", "cloudtasks.googleapis.com", http.MethodDelete, "/v2/projects/demo/locations/us/queues/q", "cloudtasks.queues.delete"},
+		{"logging post read", "logging.googleapis.com", http.MethodPost, "/v2/entries:list", "logging.logEntries.list"},
+		{"scheduler action", "cloudscheduler.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/jobs/j:run", "cloudscheduler.jobs.run"},
+		{"build action", "cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/demo/triggers/t:run", "cloudbuild.builds.create"},
+		{"iam post read", "iam.googleapis.com", http.MethodPost, "/v1/projects/demo/serviceAccounts/a:testIamPermissions", "iam.serviceAccounts.get"},
+		{"unknown path denied", "logging.googleapis.com", http.MethodPost, "/v2/unmapped", ""},
+		{"unknown action denied", "cloudtasks.googleapis.com", http.MethodPost, "/v2/projects/demo/locations/us/queues/q:explode", ""},
+		{"known action on wrong resource denied", "cloudtasks.googleapis.com", http.MethodPost, "/v2/projects/demo/locations/us/queues/q:run", ""},
+		{"collection delete denied", "cloudtasks.googleapis.com", http.MethodDelete, "/v2/projects/demo/locations/us/queues", ""},
+		{"item post denied", "cloudtasks.googleapis.com", http.MethodPost, "/v2/projects/demo/locations/us/queues/q", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			permission, _ := routePermission(test.domain, httptest.NewRequest(test.method, test.path, nil))
+			if permission != test.permission {
+				t.Fatalf("permission = %q, want %q", permission, test.permission)
+			}
+		})
+	}
+}
+
+func TestStrictIAMResourceRoutesExhaustEveryOperation(t *testing.T) {
+	for domain, routes := range strictIAMResourceRoutes {
+		for _, route := range routes {
+			for _, template := range route.collectionTemplates {
+				collection := materializeIAMTemplate(template)
+				item := collection + "/resource"
+				itemPostPermission := ""
+				if domain == "firestore.googleapis.com" && route.permissionRoot == "datastore.entities" {
+					itemPostPermission = "datastore.entities.create"
+				}
+				tests := []struct {
+					operation, method, path, permission string
+				}{
+					{"list", http.MethodGet, collection, route.permissionRoot + ".list"},
+					{"get", http.MethodGet, item, route.permissionRoot + ".get"},
+					{"create", http.MethodPost, collection, route.permissionRoot + ".create"},
+					{"update", http.MethodPatch, item, route.permissionRoot + ".update"},
+					{"delete", http.MethodDelete, item, route.permissionRoot + ".delete"},
+					{"item post", http.MethodPost, item, itemPostPermission},
+					{"deny collection delete", http.MethodDelete, collection, ""},
+				}
+				for _, test := range tests {
+					t.Run(domain+"/"+route.permissionRoot+"/"+test.operation, func(t *testing.T) {
+						permission, _ := routePermission(domain, httptest.NewRequest(test.method, test.path, nil))
+						if permission != test.permission {
+							t.Fatalf("permission = %q, want %q", permission, test.permission)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func materializeIAMTemplate(template string) string {
+	for {
+		open := strings.IndexByte(template, '{')
+		if open < 0 {
+			return template
+		}
+		close := strings.IndexByte(template[open:], '}')
+		if close < 0 {
+			return template
+		}
+		close += open
+		value := "resource"
+		if template[open+1:close] == "project" {
+			value = "demo"
+		}
+		template = template[:open] + value + template[close+1:]
+	}
+}
+
+func TestStrictIAMExecutableCustomRouteTable(t *testing.T) {
+	tests := []struct {
+		name, domain, method, path, permission string
+	}{
+		{"bigtable read rows", "bigtable.googleapis.com", http.MethodPost, "/v2/projects/demo/instances/i/tables/t:readRows", "bigtable.tables.readRows"},
+		{"bigquery query by job", "bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/demo/queries/job", "bigquery.jobs.get"},
+		{"bigquery job results", "bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/demo/jobs/job/results", "bigquery.jobs.get"},
+		{"bigquery insert all", "bigquery.googleapis.com", http.MethodPost, "/bigquery/v2/projects/demo/datasets/d/tables/t/insertAll", "bigquery.tables.updateData"},
+		{"kms encrypt", "cloudkms.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/global/keyRings/r/cryptoKeys/k:encrypt", "cloudkms.cryptoKeyVersions.useToEncrypt"},
+		{"kms decrypt", "cloudkms.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/global/keyRings/r/cryptoKeys/k:decrypt", "cloudkms.cryptoKeyVersions.useToDecrypt"},
+		{"kms destroy", "cloudkms.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/global/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:destroy", "cloudkms.cryptoKeyVersions.destroy"},
+		{"instance start", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/instances/vm/start", "compute.instances.start"},
+		{"instance stop", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/instances/vm/stop", "compute.instances.stop"},
+		{"instance group add", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/instanceGroups/g/addInstances", "compute.instanceGroups.update"},
+		{"instance group named ports", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/instanceGroups/g/setNamedPorts", "compute.instanceGroups.update"},
+		{"instance group list read", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/instanceGroups/g/listInstances", "compute.instanceGroups.get"},
+		{"logging list post read", "logging.googleapis.com", http.MethodPost, "/v2/entries:list", "logging.logEntries.list"},
+		{"monitoring query post read", "monitoring.googleapis.com", http.MethodPost, "/v3/projects/demo/timeSeries:query", "monitoring.timeSeries.list"},
+		{"monitoring prometheus get", "monitoring.googleapis.com", http.MethodGet, "/v1/projects/demo/location/global/prometheus/api/v1/query", "monitoring.timeSeries.list"},
+		{"secret access get", "secretmanager.googleapis.com", http.MethodGet, "/v1/projects/demo/secrets/s/versions/latest:access", "secretmanager.versions.access"},
+		{"scheduler run", "cloudscheduler.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/jobs/j:run", "cloudscheduler.jobs.run"},
+		{"iam get policy read", "iam.googleapis.com", http.MethodGet, "/v1/projects/demo/serviceAccounts/a:getIamPolicy", "iam.serviceAccounts.get"},
+		{"vertex generate content", "aiplatform.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/publishers/google/models/gemini:generateContent", "aiplatform.endpoints.predict"},
+		{"vertex predict", "aiplatform.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/endpoints/e:predict", "aiplatform.endpoints.predict"},
+		{"pubsub publish", "pubsub.googleapis.com", http.MethodPost, "/v1/projects/demo/topics/t:publish", "pubsub.topics.publish"},
+		{"cloudbuild trigger run", "cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/demo/triggers/t:run", "cloudbuild.builds.create"},
+		{"dataproc submit", "dataproc.googleapis.com", http.MethodPost, "/v1/projects/demo/regions/us/jobs:submit", "dataproc.jobs.submit"},
+		{"iam credentials token", "iamcredentials.googleapis.com", http.MethodPost, "/v1/projects/-/serviceAccounts/a@example.test:generateAccessToken", "iam.serviceAccounts.getAccessToken"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			permission, _ := routePermission(test.domain, httptest.NewRequest(test.method, test.path, nil))
+			if permission != test.permission {
+				t.Fatalf("permission = %q, want %q", permission, test.permission)
+			}
+		})
+	}
+}
+
+func TestStrictIAMCustomRouteTableIsExhaustivelyMatched(t *testing.T) {
+	seen := make(map[string]struct{}, len(strictIAMCustomRoutes))
+	for _, route := range strictIAMCustomRoutes {
+		key := route.domain + " " + route.method + " " + route.template
+		if _, duplicate := seen[key]; duplicate {
+			t.Errorf("duplicate strict-IAM custom route %s", key)
+			continue
+		}
+		seen[key] = struct{}{}
+		path := materializeIAMTemplate(route.template)
+		t.Run(key, func(t *testing.T) {
+			permission, _ := routePermission(route.domain, httptest.NewRequest(route.method, path, nil))
+			if permission != route.permission {
+				t.Fatalf("permission = %q, want %q", permission, route.permission)
+			}
+		})
+	}
+}
+
+func TestStrictIAMAlternateHandlerRoutes(t *testing.T) {
+	tests := []struct {
+		name, domain, method, path, permission, resource string
+	}{
+		{"pubsub topic create", "pubsub.googleapis.com", http.MethodPut, "/projects/demo/topics/t", "pubsub.topics.create", "projects/demo"},
+		{"pubsub topic delete", "pubsub.googleapis.com", http.MethodDelete, "/projects/demo/topics/t", "pubsub.topics.delete", "projects/demo"},
+		{"pubsub subscription create", "pubsub.googleapis.com", http.MethodPut, "/projects/demo/subscriptions/s", "pubsub.subscriptions.create", "projects/demo"},
+		{"pubsub subscription delete", "pubsub.googleapis.com", http.MethodDelete, "/projects/demo/subscriptions/s", "pubsub.subscriptions.delete", "projects/demo"},
+		{"pubsub publish", "pubsub.googleapis.com", http.MethodPost, "/projects/demo/topics/t:publish", "pubsub.topics.publish", "projects/demo/topics/t"},
+		{"cloud build location create", "cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/builds", "cloudbuild.builds.create", "projects/demo"},
+		{"storage resumable upload put", "storage.googleapis.com", http.MethodPut, "/upload/storage/v1/b/bucket/o", "storage.objects.create", "projects/"},
+		{"bigquery resumable upload put", "bigquery.googleapis.com", http.MethodPut, "/upload/bigquery/v2/projects/demo/jobs", "bigquery.jobs.create", "projects/demo"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			permission, resource := routePermission(test.domain, httptest.NewRequest(test.method, test.path, nil))
+			if permission != test.permission || resource != test.resource {
+				t.Fatalf("permission/resource = (%q, %q), want (%q, %q)",
+					permission, resource, test.permission, test.resource)
+			}
+		})
+	}
+}
+
+func TestStrictIAMNormalizedTemplatesRejectPathConfusion(t *testing.T) {
+	tests := []struct {
+		name, domain, method, path, permission string
+	}{
+		{"unknown prefix", "cloudtasks.googleapis.com", http.MethodGet, "/v2/unmapped/projects/demo/locations/us/queues", ""},
+		{"wrong hierarchy", "cloudtasks.googleapis.com", http.MethodGet, "/v2/projects/demo/locations/us/widgets/queues/item", ""},
+		{"unknown version", "cloudtasks.googleapis.com", http.MethodGet, "/v9/projects/demo/locations/us/queues", ""},
+		{"unknown metadata route", "metadata.google.internal", http.MethodGet, "/v2/unmapped/instance/id", ""},
+		{"queue named queues is item", "cloudtasks.googleapis.com", http.MethodGet, "/v2/projects/demo/locations/us/queues/queues", "cloudtasks.queues.get"},
+		{"instance named instances is item", "compute.googleapis.com", http.MethodGet, "/compute/v1/projects/demo/zones/us/instances/instances", "compute.instances.get"},
+		{"custom action on wrong template", "compute.googleapis.com", http.MethodPost, "/compute/v1/projects/demo/zones/us/widgets/vm/start", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			permission, _ := routePermission(test.domain, httptest.NewRequest(test.method, test.path, nil))
+			if permission != test.permission {
+				t.Fatalf("permission = %q, want %q", permission, test.permission)
 			}
 		})
 	}
@@ -1351,6 +1929,9 @@ func TestClassifyRequestUsesCanonicalDomainAndBoundedRoute(t *testing.T) {
 	if labels.Route != "/v1/projects/{id}/zones/{id}/instances/{id}" {
 		t.Fatalf("route = %q", labels.Route)
 	}
+	if labels.Project != "demo" {
+		t.Fatalf("project = %q", labels.Project)
+	}
 }
 
 func TestServeHTTPRoutesCanonicalEndpointByRegisteredDomain(t *testing.T) {
@@ -1468,6 +2049,7 @@ func TestServeHTTPPreservesLegacyLocalPathAliases(t *testing.T) {
 		{name: "cloud functions v2", domain: "cloudfunctions.googleapis.com", path: "/v2/projects/demo/locations/us-central1/functions"},
 		{name: "cloud functions v1", domain: "cloudfunctions.googleapis.com", path: "/v1/projects/demo/locations/us-central1/functions"},
 		{name: "compute", domain: "compute.googleapis.com", path: "/compute/v1/projects/demo/global/networks"},
+		{name: "sql admin", domain: "sqladmin.googleapis.com", path: "/sql/v1beta4/projects/demo/instances"},
 	}
 
 	for _, tt := range tests {

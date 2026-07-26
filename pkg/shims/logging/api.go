@@ -31,6 +31,7 @@ const (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(loggingStateEntry, state.StrictEntryValidator[loggingMetadata](nil))
 	registry.Register("logging.googleapis.com", func(ctx *registry.Context) http.Handler {
 		pubsub := ctx.GetShim("pubsub.googleapis.com")
 		return NewAPIWithDelivery(newLocalSinkDeliverer(config.GetRuntimeDir(), pubsub))
@@ -71,19 +72,29 @@ type stateStore interface {
 }
 
 type loggingMetadata struct {
-	Entries []LogEntry         `json:"entries"`
-	Sinks   map[string]LogSink `json:"sinks"`
+	Entries           []LogEntry         `json:"entries"`
+	Sinks             map[string]LogSink `json:"sinks"`
+	PendingDeliveries []sinkDelivery     `json:"pendingDeliveries,omitempty"`
+}
+
+type sinkDelivery struct {
+	ID      string   `json:"id"`
+	SinkKey string   `json:"sinkKey,omitempty"`
+	Sink    LogSink  `json:"sink"`
+	Entry   LogEntry `json:"entry"`
 }
 
 type API struct {
-	mu        sync.RWMutex
-	persistMu sync.Mutex
-	entries   []LogEntry
-	sinks     map[string]LogSink
-	maxSize   int
-	store     stateStore
-	deliverer sinkDeliverer
-	initErr   error
+	mu         sync.RWMutex
+	persistMu  sync.Mutex
+	deliveryMu sync.Mutex
+	entries    []LogEntry
+	sinks      map[string]LogSink
+	pending    []sinkDelivery
+	maxSize    int
+	store      stateStore
+	deliverer  sinkDeliverer
+	initErr    error
 }
 
 func NewAPI() *API {
@@ -116,6 +127,7 @@ func NewAPIWithStore(store stateStore, legacyPath string, deliverer sinkDelivere
 			if saved.Sinks != nil {
 				api.sinks = saved.Sinks
 			}
+			api.pending = append([]sinkDelivery(nil), saved.PendingDeliveries...)
 			return api, nil
 		} else if !errors.Is(err, state.ErrNotFound) {
 			return nil, fmt.Errorf("load Logging metadata: %w", err)
@@ -149,6 +161,7 @@ func newAPI(store stateStore, deliverer sinkDeliverer) *API {
 	return &API{
 		entries:   make([]LogEntry, 0),
 		sinks:     make(map[string]LogSink),
+		pending:   make([]sinkDelivery, 0),
 		maxSize:   5000,
 		store:     store,
 		deliverer: deliverer,
@@ -247,7 +260,7 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sinks := make([]LogSink, 0)
+	pending := make([]sinkDelivery, 0)
 	if err := api.commitMutation(func() error {
 		api.entries = append(api.entries, entries...)
 		if len(api.entries) > api.maxSize {
@@ -255,7 +268,21 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		}
 		for key, sink := range api.sinks {
 			sink.project = strings.SplitN(key, ":", 2)[0]
-			sinks = append(sinks, sink)
+			for index, entry := range entries {
+				if entry.Labels[sinkLoopLabel] == "true" || sink.project != entryProject(entry.LogName) {
+					continue
+				}
+				matches, _ := matchesFilter(entry, sink.Filter)
+				if !matches {
+					continue
+				}
+				delivery := sinkDelivery{
+					ID:      fmt.Sprintf("%s:%s:%d:%d", key, entry.InsertId, now.UnixNano(), index),
+					SinkKey: key, Sink: sink, Entry: entry,
+				}
+				api.pending = append(api.pending, delivery)
+				pending = append(pending, delivery)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -263,22 +290,9 @@ func (api *API) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if api.deliverer != nil {
-		for _, entry := range entries {
-			if entry.Labels[sinkLoopLabel] == "true" {
-				continue
-			}
-			for _, sink := range sinks {
-				if sink.project != entryProject(entry.LogName) {
-					continue
-				}
-				matches, _ := matchesFilter(entry, sink.Filter)
-				if matches {
-					if err := api.deliverer.Deliver(sink, entry); err != nil {
-						log.Printf("[Shim: Logging] sink %s delivery failed: %v", sink.Name, err)
-					}
-				}
-			}
+	for _, delivery := range pending {
+		if err := api.deliverPending(delivery); err != nil {
+			log.Printf("[Shim: Logging] sink %s delivery failed: %v", delivery.Sink.Name, err)
 		}
 	}
 	_, _ = w.Write([]byte("{}"))
@@ -414,11 +428,20 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 			return
 		}
+		api.deliveryMu.Lock()
+		defer api.deliveryMu.Unlock()
 		err := api.commitMutation(func() error {
 			if _, ok := api.sinks[key]; !ok {
 				return errLoggingNotFound
 			}
 			delete(api.sinks, key)
+			kept := api.pending[:0]
+			for _, delivery := range api.pending {
+				if deliverySinkKey(delivery) != key {
+					kept = append(kept, delivery)
+				}
+			}
+			api.pending = kept
 			return nil
 		})
 		if errors.Is(err, errLoggingNotFound) {
@@ -433,6 +456,17 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
+}
+
+func deliverySinkKey(delivery sinkDelivery) string {
+	if delivery.SinkKey != "" {
+		return delivery.SinkKey
+	}
+	parts := strings.Split(delivery.Entry.LogName, "/")
+	if len(parts) >= 2 && parts[0] == "projects" {
+		return parts[1] + ":" + delivery.Sink.Name
+	}
+	return ":" + delivery.Sink.Name
 }
 
 func (api *API) handleInternalLogs(w http.ResponseWriter) {
@@ -486,7 +520,57 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 	if local, ok := api.deliverer.(*localSinkDeliverer); ok {
 		local.pubsub = ctx.GetShim("pubsub.googleapis.com")
 	}
+	if err := api.ReplayPendingDeliveries(); err != nil {
+		log.Printf("[Shim: Logging] pending sink delivery replay incomplete: %v", err)
+	}
 	api.StartHarvester(ctx.SvcMgr)
+}
+
+// ReplayPendingDeliveries retries durable sink deliveries that were not
+// acknowledged before shutdown. Successful deliveries are removed durably.
+func (api *API) ReplayPendingDeliveries() error {
+	api.mu.RLock()
+	pending := append([]sinkDelivery(nil), api.pending...)
+	api.mu.RUnlock()
+	var replayErr error
+	for _, delivery := range pending {
+		if err := api.deliverPending(delivery); err != nil {
+			replayErr = errors.Join(replayErr, fmt.Errorf("deliver %s: %w", delivery.ID, err))
+		}
+	}
+	return replayErr
+}
+
+func (api *API) deliverPending(delivery sinkDelivery) error {
+	api.deliveryMu.Lock()
+	defer api.deliveryMu.Unlock()
+	api.mu.RLock()
+	stillPending := false
+	for _, current := range api.pending {
+		if current.ID == delivery.ID && api.sinks[deliverySinkKey(current)].Name != "" {
+			stillPending = true
+			break
+		}
+	}
+	api.mu.RUnlock()
+	if !stillPending {
+		return nil
+	}
+	if api.deliverer == nil {
+		return fmt.Errorf("sink deliverer is unavailable")
+	}
+	if err := api.deliverer.Deliver(delivery.Sink, delivery.Entry); err != nil {
+		return err
+	}
+	return api.commitMutation(func() error {
+		for index := range api.pending {
+			if api.pending[index].ID == delivery.ID {
+				api.pending = append(api.pending[:index], api.pending[index+1:]...)
+				break
+			}
+		}
+		return nil
+	})
 }
 
 func (api *API) StartHarvester(sm *orchestrator.ServiceManager) {
@@ -543,7 +627,9 @@ func (api *API) persist() error {
 	api.persistMu.Lock()
 	defer api.persistMu.Unlock()
 	api.mu.RLock()
-	payload, err := json.Marshal(loggingMetadata{Entries: api.entries, Sinks: api.sinks})
+	payload, err := json.Marshal(loggingMetadata{
+		Entries: api.entries, Sinks: api.sinks, PendingDeliveries: api.pending,
+	})
 	api.mu.RUnlock()
 	if err != nil {
 		return err
@@ -566,11 +652,14 @@ func (api *API) commitMutation(mutate func() error) error {
 	for key, sink := range api.sinks {
 		previousSinks[key] = sink
 	}
+	previousPending := append([]sinkDelivery(nil), api.pending...)
 	if err := mutate(); err != nil {
 		api.mu.Unlock()
 		return err
 	}
-	payload, err := json.Marshal(loggingMetadata{Entries: api.entries, Sinks: api.sinks})
+	payload, err := json.Marshal(loggingMetadata{
+		Entries: api.entries, Sinks: api.sinks, PendingDeliveries: api.pending,
+	})
 	api.mu.Unlock()
 	if err == nil && api.store != nil {
 		err = api.store.Save(loggingStateEntry, json.RawMessage(payload))
@@ -579,6 +668,7 @@ func (api *API) commitMutation(mutate func() error) error {
 		api.mu.Lock()
 		api.entries = previousEntries
 		api.sinks = previousSinks
+		api.pending = previousPending
 		api.mu.Unlock()
 	}
 	return err

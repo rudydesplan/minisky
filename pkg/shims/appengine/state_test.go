@@ -73,7 +73,7 @@ func TestAppEngineSaveFailureReturnsGCPErrorAndRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.fail = true
-	response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+	response := appEngineDeployRequest(api, "test")
 	assertAppEngineError(t, response, http.StatusInternalServerError, "INTERNAL")
 
 	api.mu.RLock()
@@ -81,6 +81,42 @@ func TestAppEngineSaveFailureReturnsGCPErrorAndRollsBack(t *testing.T) {
 	api.mu.RUnlock()
 	if exists {
 		t.Fatal("failed save left app in memory")
+	}
+}
+
+func TestAppEngineMissingAppGetIsPureNotFound(t *testing.T) {
+	store := newAppEngineFailingStore()
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, nil, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+	assertAppEngineError(t, response, http.StatusNotFound, "NOT_FOUND")
+	if store.saves != 0 {
+		t.Fatalf("missing-resource GET performed %d state saves", store.saves)
+	}
+	api.mu.RLock()
+	_, exists := api.apps["test"]
+	api.mu.RUnlock()
+	if exists {
+		t.Fatal("missing-resource GET created an app")
+	}
+}
+
+func TestAppEngineOperationPollingIsProjectAndServiceScoped(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api := newAPI(manager, nil, nil, nil, nil)
+	operations := []*orchestrator.Operation{
+		manager.Register("appengine#operation", "CREATE",
+			"apps/other/services/default/versions/v1", "", "us-central1"),
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/test/zones/us/instances/vm", "us", ""),
+	}
+	for _, operation := range operations {
+		response := appEngineRequest(api, http.MethodGet,
+			"/v1/projects/test/operations/"+operation.Name, "")
+		assertAppEngineError(t, response, http.StatusNotFound, "NOT_FOUND")
 	}
 }
 
@@ -92,7 +128,7 @@ func TestAppEngineAmbiguousSaveReadbackReconcilesTruth(t *testing.T) {
 			t.Fatal(err)
 		}
 		store.failAfterCommit = true
-		response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+		response := appEngineDeployRequest(api, "test")
 		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 		}
@@ -111,7 +147,7 @@ func TestAppEngineAmbiguousSaveReadbackReconcilesTruth(t *testing.T) {
 			t.Fatal(err)
 		}
 		store.fail = true
-		response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+		response := appEngineDeployRequest(api, "test")
 		assertAppEngineError(t, response, http.StatusInternalServerError, "INTERNAL")
 		if api.PersistenceError() != nil {
 			t.Fatalf("definite previous degraded API: %v", api.PersistenceError())
@@ -126,7 +162,7 @@ func TestAppEngineAmbiguousSaveReadbackReconcilesTruth(t *testing.T) {
 		}
 		store.fail = true
 		store.loadErr = errors.New("readback unavailable")
-		response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+		response := appEngineDeployRequest(api, "test")
 		assertAppEngineError(t, response, http.StatusInternalServerError, "INTERNAL")
 		if api.PersistenceError() == nil {
 			t.Fatal("unknown save outcome did not degrade API")
@@ -152,14 +188,14 @@ func TestAppEngineAdmittedMutationRechecksDegradationAfterLock(t *testing.T) {
 
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		firstDone <- appEngineRequest(api, http.MethodGet, "/v1/projects/first/apps", "")
+		firstDone <- appEngineDeployRequest(api, "first")
 	}()
 	<-admitted
 	<-store.saveEntered
 
 	secondDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		secondDone <- appEngineRequest(api, http.MethodGet, "/v1/projects/second/apps", "")
+		secondDone <- appEngineDeployRequest(api, "second")
 	}()
 	<-admitted
 	close(store.releaseSave)
@@ -367,8 +403,7 @@ func TestAppEngineConcurrentAppCreatesPersist(t *testing.T) {
 		requests.Add(1)
 		go func(i int) {
 			defer requests.Done()
-			response := appEngineRequest(api, http.MethodGet,
-				"/v1/projects/project-"+string(rune('a'+i))+"/apps", "")
+			response := appEngineDeployRequest(api, "project-"+string(rune('a'+i)))
 			if response.Code != http.StatusOK {
 				t.Errorf("create status = %d, body = %s", response.Code, response.Body.String())
 			}
@@ -397,7 +432,7 @@ func TestAppEngineMetadataIsProfileScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response := appEngineRequest(first, http.MethodGet, "/v1/projects/first/apps", ""); response.Code != http.StatusOK {
+	if response := appEngineDeployRequest(first, "first"); response.Code != http.StatusOK {
 		t.Fatalf("first profile create = %d, body = %s", response.Code, response.Body.String())
 	}
 
@@ -499,6 +534,11 @@ func appEngineRequest(handler http.Handler, method, path, body string) *httptest
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func appEngineDeployRequest(handler http.Handler, project string) *httptest.ResponseRecorder {
+	return appEngineRequest(handler, http.MethodPost, "/deploy",
+		`{"project":"`+project+`","service":"default","version":"v1","runtime":"python312","code":"print(1)"}`)
 }
 
 func decodeAppEngineResponse(t *testing.T, response *httptest.ResponseRecorder, target any) {

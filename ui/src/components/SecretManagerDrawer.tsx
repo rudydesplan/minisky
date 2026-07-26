@@ -191,7 +191,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
       <Box sx={{ width: 550, p: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
           <Typography variant="h5" sx={{ fontWeight: 500 }}>Secret Manager</Typography>
-          <IconButton onClick={onClose}><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
         </Box>
 
         <Divider sx={{ mb: 4 }} />
@@ -249,7 +249,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
                 return (
                   <Box key={s.name} sx={{ mb: 1, borderBottom: '1px solid #eee' }}>
                     <ListItem sx={{ px: 1 }}>
-                      <IconButton size="small" onClick={() => toggleExpand(s.name)} sx={{ mr: 1 }}>
+                      <IconButton aria-label={`${isExpanded ? 'Collapse' : 'Expand'} secret ${id}`} size="small" onClick={() => toggleExpand(s.name)} sx={{ mr: 1 }}>
                         {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                       </IconButton>
                       <ListItemText 
@@ -258,11 +258,11 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
                       />
                       <ListItemSecondaryAction>
                         <Tooltip title="Copy Resource Name">
-                          <IconButton size="small" onClick={() => copyToClipboard(s.name)}>
+                          <IconButton aria-label={`Copy resource name for secret ${id}`} size="small" onClick={() => copyToClipboard(s.name)}>
                             <ContentCopyIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>
-                        <IconButton size="small" color="error" onClick={() => handleDelete(s.name)}>
+                        <IconButton aria-label={`Delete secret ${id}`} size="small" color="error" onClick={() => handleDelete(s.name)}>
                           <DeleteIcon fontSize="small" />
                         </IconButton>
                       </ListItemSecondaryAction>
@@ -291,7 +291,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
                                       </Typography>
                                     )}
                                     <Tooltip title={isRevealed ? "Hide Value" : "Reveal Value"}>
-                                      <IconButton size="small" onClick={() => handleAccessVersion(v.name)}>
+                                      <IconButton aria-label="Visibility Off" size="small" onClick={() => handleAccessVersion(v.name)}>
                                         {isRevealed ? <VisibilityOffIcon fontSize="inherit" /> : <VisibilityIcon fontSize="inherit" />}
                                       </IconButton>
                                     </Tooltip>

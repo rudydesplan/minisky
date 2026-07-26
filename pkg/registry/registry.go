@@ -43,9 +43,11 @@ func (c *Context) GetShim(domain string) http.Handler {
 type Factory func(ctx *Context) http.Handler
 
 var (
-	registryMu sync.Mutex
-	factories  = make(map[string]Factory)
-	lazyDocker = make(map[string]bool)
+	registryMu       sync.RWMutex
+	factories        = make(map[string]Factory)
+	lazyDocker       = make(map[string]bool)
+	requiresDocker   = make(map[string]bool)
+	dockerOperations = make(map[string]func(*http.Request) bool)
 )
 
 // Register maps a domain to a shim factory.
@@ -62,6 +64,64 @@ func RegisterLazyDocker(domain string) {
 	defer registryMu.Unlock()
 	lazyDocker[domain] = true
 	log.Printf("[Registry] Registered Lazy Docker Factory for %s", domain)
+}
+
+// RequireDocker marks registered custom shims whose entire public surface
+// requires an initialized Docker backend. BootAll substitutes one canonical
+// unavailable handler without invoking their factories when Docker is absent.
+func RequireDocker(domains ...string) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	for _, domain := range domains {
+		metadata, ok := serviceManifest[domain]
+		if !ok || metadata.fidelity != FidelityPassthrough ||
+			metadata.persistence != PersistenceDocker {
+			panic("registry.RequireDocker is restricted to pure Docker passthrough services: " + domain)
+		}
+		requiresDocker[domain] = true
+	}
+}
+
+// RequireDockerMutations marks in-process factories whose read-only control
+// plane remains available while backend mutations require Docker.
+func RequireDockerMutations(domains ...string) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	for _, domain := range domains {
+		dockerOperations[domain] = func(request *http.Request) bool {
+			return request.Method != http.MethodGet && request.Method != http.MethodHead
+		}
+	}
+}
+
+// RequireDockerOperations records the exact request boundary at which a
+// hybrid factory needs its Docker-backed service manager.
+func RequireDockerOperations(domain string, requiresDocker func(*http.Request) bool) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	dockerOperations[domain] = requiresDocker
+}
+
+func requiresDockerMutation(domain string, request *http.Request) bool {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	requiresDocker := dockerOperations[domain]
+	if requiresDocker == nil {
+		return false
+	}
+	return requiresDocker(request)
+}
+
+func WriteDockerUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(`{"error":{"code":503,"message":"MiniSky: Docker backend unavailable","status":"UNAVAILABLE"}}`))
+}
+
+func dockerUnavailableHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		WriteDockerUnavailable(w)
+	})
 }
 
 // PostBoot is implemented by shims that need to wire themselves to other services
@@ -87,6 +147,10 @@ func BootAll(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceM
 	// First pass: Instantiate all shims
 	registryMu.Lock()
 	for domain, factory := range factories {
+		if svcMgr == nil && requiresDocker[domain] {
+			ctx.shims[domain] = dockerUnavailableHandler()
+			continue
+		}
 		shim := factory(ctx)
 		ctx.shims[domain] = shim
 	}

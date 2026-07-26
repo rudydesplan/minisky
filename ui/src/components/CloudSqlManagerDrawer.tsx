@@ -149,8 +149,8 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
               <Typography variant="caption" sx={{ color: '#5f6368' }}>Database Instances mapped to Local Docker Volumes • {activeProject}</Typography>
             </Box>
             <Box>
-              <IconButton onClick={() => loadInstances()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh" onClick={() => loadInstances()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 
@@ -159,7 +159,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
             <Box sx={{ width: 280, borderRight: '1px solid #dadce0', bgcolor: 'white', display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, borderBottom: '1px solid #dadce0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>Instances</Typography>
-                <IconButton size="small" onClick={() => setNewInstanceOpen(true)}><AddIcon fontSize="small" /></IconButton>
+                <IconButton aria-label="Add" size="small" onClick={() => setNewInstanceOpen(true)}><AddIcon fontSize="small" /></IconButton>
               </Box>
               <List sx={{ flex: 1, overflow: 'auto', p: 0 }}>
                 {instances.map(inst => (
@@ -173,7 +173,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
                       primary={<Typography sx={{ fontSize: '0.85rem', fontWeight: activeInstance?.name === inst.name ? 600 : 400 }}>{inst.name}</Typography>} 
                       secondary={<Typography variant="caption" sx={{ color: inst.state === 'RUNNABLE' ? 'success.main' : 'warning.main' }}>{inst.state}</Typography>}
                     />
-                    <IconButton size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteInstance(inst.name); }}>
+                    <IconButton aria-label={`Delete instance ${inst.name}`} size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteInstance(inst.name); }}>
                       <DeleteIcon fontSize="inherit" />
                     </IconButton>
                   </ListItemButton>
@@ -203,14 +203,14 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
                     <Box sx={{ display: 'grid', gridTemplateColumns: '120px 1fr auto', gap: 2, alignItems: 'center', mb: 1.5 }}>
                       <Typography variant="body2" sx={{ fontWeight: 500 }}>Connection Name:</Typography>
                       <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{activeInstance.connectionName}</Typography>
-                      <IconButton size="small" onClick={() => copyToClipboard(activeInstance.connectionName)}><ContentCopyIcon fontSize="small" /></IconButton>
+                      <IconButton aria-label="Copy" size="small" onClick={() => copyToClipboard(activeInstance.connectionName)}><ContentCopyIcon fontSize="small" /></IconButton>
                     </Box>
 
                     {activeInstance.ipAddresses && activeInstance.ipAddresses.map((ip, idx) => (
                       <Box key={idx} sx={{ display: 'grid', gridTemplateColumns: '120px 1fr auto', gap: 2, alignItems: 'center', mb: 1.5 }}>
                         <Typography variant="body2" sx={{ fontWeight: 500 }}>IP Address:</Typography>
                         <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{ip.ipAddress}</Typography>
-                        <IconButton size="small" onClick={() => copyToClipboard(ip.ipAddress)}><ContentCopyIcon fontSize="small" /></IconButton>
+                        <IconButton aria-label={`Copy IP address ${ip.ipAddress}`} size="small" onClick={() => copyToClipboard(ip.ipAddress)}><ContentCopyIcon fontSize="small" /></IconButton>
                       </Box>
                     ))}
 
@@ -219,13 +219,13 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
                       <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
                         {activeInstance.databaseVersion.startsWith('POSTGRES') ? 'postgres' : 'root'}
                       </Typography>
-                      <IconButton size="small" onClick={() => copyToClipboard(activeInstance.databaseVersion.startsWith('POSTGRES') ? 'postgres' : 'root')}><ContentCopyIcon fontSize="small" /></IconButton>
+                      <IconButton aria-label="Copy" size="small" onClick={() => copyToClipboard(activeInstance.databaseVersion.startsWith('POSTGRES') ? 'postgres' : 'root')}><ContentCopyIcon fontSize="small" /></IconButton>
                     </Box>
 
                     <Box sx={{ display: 'grid', gridTemplateColumns: '120px 1fr auto', gap: 2, alignItems: 'center' }}>
                       <Typography variant="body2" sx={{ fontWeight: 500 }}>Root Password:</Typography>
                       <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>minisky</Typography>
-                      <IconButton size="small" onClick={() => copyToClipboard('minisky')}><ContentCopyIcon fontSize="small" /></IconButton>
+                      <IconButton aria-label="Copy" size="small" onClick={() => copyToClipboard('minisky')}><ContentCopyIcon fontSize="small" /></IconButton>
                     </Box>
                   </Paper>
 

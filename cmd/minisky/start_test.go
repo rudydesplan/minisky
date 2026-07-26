@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"minisky/pkg/config"
 	localsecurity "minisky/pkg/security"
 	"minisky/pkg/state"
 )
@@ -87,7 +88,7 @@ func TestGatewayMuxExposesReadinessWithoutDispatching(t *testing.T) {
 	dispatched := false
 	handler := gatewayMux(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		dispatched = true
-	}))
+	}), strings.Repeat("a", 64))
 	request := httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -115,7 +116,7 @@ func TestGatewayDefaultsToLoopbackAndRequiresExplicitRemoteBind(t *testing.T) {
 
 func TestGatewayHealthReportsPersistenceDegradation(t *testing.T) {
 	const sensitive = "/Users/private/.minisky/profiles/prod/state.json: permission denied"
-	handler := gatewayMux(http.NotFoundHandler(), degradedHealth{err: errors.New(sensitive)})
+	handler := gatewayMux(http.NotFoundHandler(), strings.Repeat("a", 64), degradedHealth{err: errors.New(sensitive)})
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil))
 	if response.Code != http.StatusServiceUnavailable ||
@@ -123,6 +124,36 @@ func TestGatewayHealthReportsPersistenceDegradation(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"message":"persistence is degraded"`) ||
 		strings.Contains(response.Body.String(), sensitive) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestDaemonReadinessProofAuthenticatesListenerRole(t *testing.T) {
+	token := strings.Repeat("a", 64)
+	nonce := strings.Repeat("b", 64)
+	api := daemonReadinessHandler("api", token)
+	ui := daemonReadinessHandler("ui", token)
+
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/_minisky/control/readiness", nil)
+	request.Header.Set("X-MiniSky-Readiness-Nonce", nonce)
+	apiResponse := httptest.NewRecorder()
+	api.ServeHTTP(apiResponse, request)
+	if apiResponse.Code != http.StatusNoContent {
+		t.Fatalf("API readiness status = %d", apiResponse.Code)
+	}
+	apiProof := apiResponse.Header().Get("X-MiniSky-Readiness-Proof")
+	if err := verifyDaemonReadinessProof("api", token, nonce, apiProof); err != nil {
+		t.Fatalf("API readiness proof: %v", err)
+	}
+	if err := verifyDaemonReadinessProof("ui", token, nonce, apiProof); err == nil {
+		t.Fatal("API listener proof authenticated as UI listener")
+	}
+
+	uiResponse := httptest.NewRecorder()
+	ui.ServeHTTP(uiResponse, request)
+	if err := verifyDaemonReadinessProof(
+		"ui", token, nonce, uiResponse.Header().Get("X-MiniSky-Readiness-Proof"),
+	); err != nil {
+		t.Fatalf("UI readiness proof: %v", err)
 	}
 }
 
@@ -175,6 +206,43 @@ func TestNativeIntegrationDockerBypassIsNarrow(t *testing.T) {
 type shutdownHandler struct {
 	http.Handler
 	called atomic.Bool
+}
+
+type shutdownServerStub struct {
+	called atomic.Bool
+}
+
+func (server *shutdownServerStub) Shutdown(context.Context) error {
+	server.called.Store(true)
+	return nil
+}
+
+func TestDaemonServersHaveTimeoutsAndShutDownGracefully(t *testing.T) {
+	server := newDaemonHTTPServer("127.0.0.1:0", http.NotFoundHandler(), nil)
+	if server.ReadHeaderTimeout <= 0 || server.ReadTimeout <= 0 ||
+		server.WriteTimeout <= 0 || server.IdleTimeout <= 0 {
+		t.Fatalf("daemon server timeouts are not bounded: %#v", server)
+	}
+	first := &shutdownServerStub{}
+	second := &shutdownServerStub{}
+	if err := shutdownHTTPServers(context.Background(), first, second); err != nil {
+		t.Fatal(err)
+	}
+	if !first.called.Load() || !second.called.Load() {
+		t.Fatal("graceful shutdown did not reach both servers")
+	}
+}
+
+func TestDaemonListenerFailurePropagatesFromCommand(t *testing.T) {
+	if startCmd.RunE == nil {
+		t.Fatal("start command cannot return listener failures")
+	}
+	sentinel := errors.New("bind failed")
+	results := make(chan error, 1)
+	results <- sentinel
+	if err := waitForDaemonListener(context.Background(), results); !errors.Is(err, sentinel) {
+		t.Fatalf("listener result = %v, want %v", err, sentinel)
+	}
 }
 
 func (h *shutdownHandler) Shutdown(context.Context) error {
@@ -315,6 +383,38 @@ func TestOpenDaemonStateClaimsProfileOwnership(t *testing.T) {
 		t.Fatalf("open daemon state after release: %v", err)
 	}
 	if err := nextOwnership.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartupFailureRunsIdentityBeforeOwnershipCleanup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MINISKY_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("MINISKY_PROFILE", "startup-cleanup")
+	t.Setenv("MINISKY_PHASE16_LOGGING_INTEGRATION", "1")
+	originalArgs := os.Args
+	os.Args = []string{"minisky", "start", "--services=does-not-exist"}
+	t.Cleanup(func() { os.Args = originalArgs })
+	originalServices := enabledServices
+	enabledServices = "does-not-exist"
+	t.Cleanup(func() { enabledServices = originalServices })
+
+	err := startCmd.RunE(startCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "select service domains") {
+		t.Fatalf("startup error = %v, want service selection failure", err)
+	}
+	if _, err := os.Stat(daemonIdentityPath(config.GetProfileDir())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("daemon identity survived failed startup: %v", err)
+	}
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatalf("profile ownership survived failed startup: %v", err)
+	}
+	if err := ownership.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -169,7 +169,7 @@ export default function ComputeManagerDrawer({ open, onClose }: ComputeManagerDr
           {/* Header */}
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
             <Typography variant="h5" sx={{ fontWeight: 500 }}>Compute Engine</Typography>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
           <Typography variant="body2" sx={{ color: '#5f6368', mb: 3 }}>
             Project:{' '}
@@ -279,7 +279,7 @@ export default function ComputeManagerDrawer({ open, onClose }: ComputeManagerDr
                     <TableCell align="right">
                       <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'flex-end' }}>
                         <Tooltip title={`SSH into ${inst.name}`}>
-                          <IconButton
+                          <IconButton aria-label={`Open terminal for ${inst.name}`}
                             size="small"
                             sx={{ color: '#1a73e8' }}
                             onClick={() => setTerminalContainer(`minisky-vm-${inst.name}`)}
@@ -288,25 +288,25 @@ export default function ComputeManagerDrawer({ open, onClose }: ComputeManagerDr
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="Copy SSH command (bash)">
-                          <IconButton size="small" onClick={() => copyToClipboard(sshCommand(inst.name))}>
+                          <IconButton aria-label={`Copy SSH command for ${inst.name}`} size="small" onClick={() => copyToClipboard(sshCommand(inst.name))}>
                             <ContentCopyIcon sx={{ fontSize: 14 }} />
                           </IconButton>
                         </Tooltip>
                         {inst.status === 'TERMINATED' ? (
                           <Tooltip title="Start instance">
-                            <IconButton size="small" color="success" onClick={() => handleAction(inst.name, 'start')}>
+                            <IconButton aria-label={`Start ${inst.name}`} size="small" color="success" onClick={() => handleAction(inst.name, 'start')}>
                               <PlayArrowIcon fontSize="small" />
                             </IconButton>
                           </Tooltip>
                         ) : (
                           <Tooltip title="Stop instance">
-                            <IconButton size="small" color="warning" onClick={() => handleAction(inst.name, 'stop')}>
+                            <IconButton aria-label={`Stop ${inst.name}`} size="small" color="warning" onClick={() => handleAction(inst.name, 'stop')}>
                               <StopIcon fontSize="small" />
                             </IconButton>
                           </Tooltip>
                         )}
                         <Tooltip title="Delete instance">
-                          <IconButton size="small" color="error" onClick={() => handleDelete(inst.name)}>
+                          <IconButton aria-label="Delete instance" size="small" color="error" onClick={() => handleDelete(inst.name)}>
                             <DeleteIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>

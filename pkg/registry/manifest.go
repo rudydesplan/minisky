@@ -68,9 +68,9 @@ var serviceManifest = map[string]serviceMetadata{
 	"bigtable.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
 	"bigtableadmin.googleapis.com":        {FidelityStandard, PersistenceFile, true},
 	"cloudbuild.googleapis.com":           {FidelityStandard, PersistenceHybrid, true},
-	"cloudresourcemanager.googleapis.com": {FidelityStandard, PersistenceFile, true},
 	"cloudfunctions.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
 	"cloudkms.googleapis.com":             {FidelityStandard, PersistenceFile, true},
+	"cloudresourcemanager.googleapis.com": {FidelityStandard, PersistenceFile, true},
 	"cloudscheduler.googleapis.com":       {FidelityStandard, PersistenceFile, true},
 	"cloudtasks.googleapis.com":           {FidelityStandard, PersistenceFile, true},
 	"compute.googleapis.com":              {FidelityStandard, PersistenceHybrid, true},
@@ -218,5 +218,22 @@ func ContractHandler(domain string, next http.Handler) http.Handler {
 				"status":  "UNIMPLEMENTED",
 			},
 		})
+	})
+}
+
+// RuntimeHandler applies the executable service contract for one boot. Hybrid
+// factories remain concrete during construction, while Docker-dependent
+// mutations are rejected centrally when that boot has no Docker backend.
+func RuntimeHandler(domain string, next http.Handler, dockerAvailable bool) http.Handler {
+	contract := ContractHandler(domain, next)
+	if dockerAvailable {
+		return contract
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requiresDockerMutation(domain, r) {
+			WriteDockerUnavailable(w)
+			return
+		}
+		contract.ServeHTTP(w, r)
 	})
 }

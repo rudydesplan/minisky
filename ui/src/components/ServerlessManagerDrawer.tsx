@@ -237,10 +237,10 @@ export default function ServerlessManagerDrawer({
             >
               Deploy New
             </Button>
-            <IconButton onClick={() => fetchResources()} disabled={loading} size="small" sx={{ mr: 1 }}>
+            <IconButton aria-label="Refresh" onClick={() => fetchResources()} disabled={loading} size="small" sx={{ mr: 1 }}>
               <RefreshIcon fontSize="small" />
             </IconButton>
-            <IconButton onClick={onClose}>
+            <IconButton aria-label="Close" onClick={onClose}>
               <CloseIcon />
             </IconButton>
           </Box>
@@ -349,22 +349,22 @@ export default function ServerlessManagerDrawer({
                       </TableCell>
                       <TableCell align="right">
                         <Tooltip title="View Build Logs">
-                          <IconButton size="small" sx={{ mr: 0.5 }} onClick={() => handleViewLogs(r.name)}>
+                          <IconButton aria-label={`View build logs for ${r.name}`} size="small" sx={{ mr: 0.5 }} onClick={() => handleViewLogs(r.name)}>
                             <TerminalIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="Edit & Redeploy">
-                          <IconButton size="small" sx={{ mr: 0.5 }} onClick={() => handleEdit(r)}>
+                          <IconButton aria-label="Build" size="small" sx={{ mr: 0.5 }} onClick={() => handleEdit(r)}>
                             <BuildIcon fontSize="small" sx={{ color: '#1a73e8' }} />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="View Runtime Logs">
-                          <IconButton size="small" sx={{ mr: 0.5 }} onClick={() => { onClose(); navigate('/logging'); }}>
+                          <IconButton aria-label="Monitor Heart" size="small" sx={{ mr: 0.5 }} onClick={() => { onClose(); navigate('/logging'); }}>
                             <MonitorHeartIcon fontSize="small" sx={{ color: '#81c995' }} />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="Deprovision Resource">
-                          <IconButton size="small" color="error" onClick={() => handleDelete(resourceType, r.name)}>
+                          <IconButton aria-label={`Delete ${resourceType} ${r.name}`} size="small" color="error" onClick={() => handleDelete(resourceType, r.name)}>
                             <DeleteIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>

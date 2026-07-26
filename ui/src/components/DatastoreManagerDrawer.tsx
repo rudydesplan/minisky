@@ -18,7 +18,7 @@ export default function DatastoreManagerDrawer({ open, onClose }: Props) {
             <Typography variant="h6" sx={{ fontWeight: 500, color: '#f9ab00' }}>Cloud Datastore</Typography>
             <Typography variant="caption" sx={{ color: '#5f6368' }}>Legacy NoSQL Console • {activeProject}</Typography>
           </Box>
-          <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
         </Box>
 
         <Box sx={{ p: 3 }}>

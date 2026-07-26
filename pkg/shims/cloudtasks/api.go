@@ -9,32 +9,39 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/state"
 )
 
 func init() {
+	state.MustRegisterEntryValidator(cloudTasksStateEntry, state.StrictEntryValidator[cloudTasksMetadata](nil))
 	registry.Register("cloudtasks.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI()
 	})
 }
 
 type Task struct {
-	Name           string       `json:"name"`
-	HTTPRequest    *HTTPRequest `json:"httpRequest,omitempty"`
-	CreateTime     string       `json:"createTime"`
-	ScheduleTime   string       `json:"scheduleTime,omitempty"`
-	Status         string       `json:"status"` // Internal use
-	AttemptCount   int          `json:"attemptCount,omitempty"`
-	LastStatusCode int          `json:"lastStatusCode,omitempty"`
-	LastError      string       `json:"lastError,omitempty"`
+	Name             string       `json:"name"`
+	HTTPRequest      *HTTPRequest `json:"httpRequest,omitempty"`
+	CreateTime       string       `json:"createTime"`
+	ScheduleTime     string       `json:"scheduleTime,omitempty"`
+	Status           string       `json:"status"` // Internal use
+	AttemptCount     int          `json:"attemptCount,omitempty"`
+	LastStatusCode   int          `json:"lastStatusCode,omitempty"`
+	LastError        string       `json:"lastError,omitempty"`
+	FirstAttemptTime string       `json:"firstAttemptTime,omitempty"`
+	LastAttemptTime  string       `json:"lastAttemptTime,omitempty"`
 }
 
 type HTTPRequest struct {
@@ -63,20 +70,23 @@ type deliveryJob struct {
 }
 
 type API struct {
-	mu        sync.RWMutex
-	persistMu sync.Mutex
-	store     stateStore
-	queues    map[string]*Queue
-	tasks     map[string][]*Task
-	jobs      map[string]*deliveryJob
-	logAPI    *logging.API
-	client    *http.Client
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-	closed    bool
-	initErr   error
+	mu                sync.RWMutex
+	persistMu         sync.Mutex
+	store             stateStore
+	queues            map[string]*Queue
+	tasks             map[string][]*Task
+	jobs              map[string]*deliveryJob
+	logAPI            *logging.API
+	client            *http.Client
+	lookupIP          func(context.Context, string) ([]net.IP, error)
+	dial              func(context.Context, string, string) (net.Conn, error)
+	allowLocalTargets bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	closeOnce         sync.Once
+	closed            bool
+	initErr           error
 }
 
 type stateStore interface {
@@ -125,37 +135,38 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	if persisted.Tasks != nil {
 		api.tasks = persisted.Tasks
 	}
-	interrupted := false
-	for _, tasks := range api.tasks {
-		for _, task := range tasks {
-			if task.Status == "PENDING" || task.Status == "RETRYING" {
-				task.Status = "FAILED"
-				task.LastError = "delivery interrupted by MiniSky restart"
-				interrupted = true
-			}
-		}
-	}
-	if interrupted {
-		if err := api.persistMetadata(); err != nil {
-			return nil, fmt.Errorf("persist interrupted Cloud Tasks metadata: %w", err)
-		}
-	}
 	return api, nil
 }
 
 func newAPI(store stateStore) *API {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &API{
-		store:  store,
-		queues: make(map[string]*Queue),
-		tasks:  make(map[string][]*Task),
-		jobs:   make(map[string]*deliveryJob),
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
-		ctx:    ctx,
-		cancel: cancel,
+	api := &API{
+		store:             store,
+		queues:            make(map[string]*Queue),
+		tasks:             make(map[string][]*Task),
+		jobs:              make(map[string]*deliveryJob),
+		allowLocalTargets: os.Getenv("MINISKY_CLOUDTASKS_ALLOW_LOCAL_TARGETS") == "1",
+		ctx:               ctx,
+		cancel:            cancel,
 	}
+	api.lookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		result := make([]net.IP, 0, len(addresses))
+		for _, address := range addresses {
+			result = append(result, address.IP)
+		}
+		return result, err
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	api.dial = dialer.DialContext
+	api.client = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext:       api.dialTaskTarget,
+			DisableKeepAlives: true,
+		},
+	}
+	return api
 }
 
 func (api *API) persistMetadata() error {
@@ -213,6 +224,7 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 	if logShim, ok := ctx.GetShim("logging.googleapis.com").(*logging.API); ok {
 		api.logAPI = logShim
 	}
+	api.ResumePendingDeliveries()
 }
 
 func (api *API) pushLog(projectId, severity, resourceName, text string) {
@@ -460,15 +472,11 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 
 	api.mu.Lock()
 	if shouldExecute && !api.closed {
-		ctx, cancel := context.WithCancel(api.ctx)
-		job := &deliveryJob{cancel: cancel}
-		api.jobs[task.Name] = job
-		api.wg.Add(1)
 		retryConfig := RetryConfig{}
 		if queue != nil {
 			retryConfig = queue.RetryConfig
 		}
-		go api.executeTask(ctx, project, queueName, task, retryConfig, job)
+		api.scheduleDeliveryLocked(project, queueName, task, retryConfig)
 	}
 	api.mu.Unlock()
 
@@ -478,49 +486,132 @@ func (api *API) createTask(w http.ResponseWriter, r *http.Request, project, queu
 	json.NewEncoder(w).Encode(createdTask)
 }
 
-func (api *API) executeTask(ctx context.Context, project, queueName string, task *Task, config RetryConfig, job *deliveryJob) {
+// ResumePendingDeliveries schedules persisted nonterminal work exactly once per
+// API lifetime. Terminal tasks and tasks whose queue was deleted are ignored.
+func (api *API) ResumePendingDeliveries() {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.closed {
+		return
+	}
+	for queueName, tasks := range api.tasks {
+		queue := api.queues[queueName]
+		if queue == nil || queue.State != "RUNNING" {
+			continue
+		}
+		project := projectFromQueueName(queueName)
+		for _, task := range tasks {
+			if task == nil || task.HTTPRequest == nil ||
+				task.Status != "PENDING" && task.Status != "RETRYING" {
+				continue
+			}
+			api.scheduleDeliveryLocked(project, queueName, task, queue.RetryConfig)
+		}
+	}
+}
+
+func (api *API) scheduleDeliveryLocked(
+	project, queueName string,
+	task *Task,
+	config RetryConfig,
+) {
+	if api.closed || api.jobs[task.Name] != nil {
+		return
+	}
+	request := *task.HTTPRequest
+	request.Headers = make(map[string]string, len(task.HTTPRequest.Headers))
+	for name, value := range task.HTTPRequest.Headers {
+		request.Headers[name] = value
+	}
+	ctx, cancel := context.WithCancel(api.ctx)
+	job := &deliveryJob{cancel: cancel}
+	api.jobs[task.Name] = job
+	api.wg.Add(1)
+	go api.executeTask(ctx, project, queueName, task.Name, task.ScheduleTime, request, config, job)
+}
+
+func (api *API) executeTask(
+	ctx context.Context,
+	project, queueName, taskName, scheduleTime string,
+	request HTTPRequest,
+	config RetryConfig,
+	job *deliveryJob,
+) {
 	defer api.wg.Done()
 	defer func() {
 		api.mu.Lock()
-		if api.jobs[task.Name] == job {
-			delete(api.jobs, task.Name)
+		if api.jobs[taskName] == job {
+			delete(api.jobs, taskName)
 		}
 		api.mu.Unlock()
 	}()
 
-	body, err := base64.StdEncoding.DecodeString(task.HTTPRequest.Body)
-	if err != nil {
-		api.recordAttempt(queueName, task.Name, 0, fmt.Errorf("decode HTTP body: %w", err), true)
-		return
+	if scheduled, err := time.Parse(time.RFC3339Nano, scheduleTime); err == nil {
+		delay := time.Until(scheduled)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-timer.C:
+			}
+		}
 	}
 
 	maxAttempts, minBackoff, maxBackoff, maxRetryDuration := normalizedRetryConfig(config)
-	started := time.Now()
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for {
 		if ctx.Err() != nil {
-			api.markCanceled(queueName, task.Name)
 			return
 		}
 
-		method := task.HTTPRequest.HTTPMethod
+		attempt, firstAttempt, exhausted, err := api.recordAttemptStart(
+			queueName, taskName, maxAttempts, maxRetryDuration,
+		)
+		if err != nil {
+			log.Printf("[Shim: Cloud Tasks] persist attempt start: %v", err)
+			return
+		}
+		if exhausted {
+			return
+		}
+
+		body, err := decodeTaskBody(request.Body)
+		if err != nil {
+			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			return
+		}
+		if err = validateTaskHTTPRequest(request); err != nil {
+			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			return
+		}
+		pinnedContext, err := api.pinTaskTarget(ctx, request.URL)
+		if err != nil {
+			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			return
+		}
+
+		method := request.HTTPMethod
 		if method == "" {
 			method = http.MethodPost
 		}
-		req, err := http.NewRequestWithContext(ctx, method, task.HTTPRequest.URL, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(pinnedContext, method, request.URL, bytes.NewReader(body))
 		if err == nil {
-			for name, value := range task.HTTPRequest.Headers {
+			for name, value := range request.Headers {
 				req.Header.Set(name, value)
 			}
 		}
 
 		statusCode := 0
 		if err == nil {
-			log.Printf("[Shim: Cloud Tasks] Executing task %s -> %s %s (attempt %d)", task.Name, method, task.HTTPRequest.URL, attempt)
+			log.Printf("[Shim: Cloud Tasks] Executing task %s -> %s %s (attempt %d)", taskName, method, request.URL, attempt)
 			var response *http.Response
-			response, err = api.client.Do(req)
+			response, err = observability.Do(api.client, req)
 			if response != nil {
 				statusCode = response.StatusCode
-				_, _ = io.Copy(io.Discard, response.Body)
+				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
 				_ = response.Body.Close()
 				if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
 					err = fmt.Errorf("HTTP status %d", statusCode)
@@ -528,18 +619,21 @@ func (api *API) executeTask(ctx context.Context, project, queueName string, task
 			}
 		}
 
+		if ctx.Err() != nil {
+			return
+		}
 		if err == nil {
-			api.recordAttempt(queueName, task.Name, statusCode, nil, true)
-			api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", task.Name, task.HTTPRequest.URL))
+			api.recordAttemptOutcome(queueName, taskName, statusCode, nil, true)
+			api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", taskName, request.URL))
 			return
 		}
 
 		delay := retryDelay(minBackoff, maxBackoff, config.MaxDoublings, attempt)
-		retryDurationExpired := maxRetryDuration > 0 && time.Since(started)+delay >= maxRetryDuration
+		retryDurationExpired := maxRetryDuration > 0 && time.Since(firstAttempt)+delay >= maxRetryDuration
 		terminal := attempt >= maxAttempts || retryDurationExpired
-		api.recordAttempt(queueName, task.Name, statusCode, err, terminal)
+		api.recordAttemptOutcome(queueName, taskName, statusCode, err, terminal)
 		if terminal {
-			api.pushLog(project, "ERROR", queueName, fmt.Sprintf("Task failed after %d attempts: %s (%v)", attempt, task.Name, err))
+			api.pushLog(project, "ERROR", queueName, fmt.Sprintf("Task failed after %d attempts: %s (%v)", attempt, taskName, err))
 			return
 		}
 
@@ -549,7 +643,6 @@ func (api *API) executeTask(ctx context.Context, project, queueName string, task
 			if !timer.Stop() {
 				<-timer.C
 			}
-			api.markCanceled(queueName, task.Name)
 			return
 		case <-timer.C:
 		}
@@ -618,13 +711,63 @@ func retryDelay(minBackoff, maxBackoff time.Duration, maxDoublings, attempt int)
 	return delay
 }
 
-func (api *API) recordAttempt(queueName, taskName string, statusCode int, err error, terminal bool) {
+func (api *API) recordAttemptStart(
+	queueName, taskName string,
+	maxAttempts int,
+	maxRetryDuration time.Duration,
+) (int, time.Time, bool, error) {
+	now := time.Now().UTC()
+	api.mu.Lock()
+	var task *Task
+	for _, candidate := range api.tasks[queueName] {
+		if candidate.Name == taskName {
+			task = candidate
+			break
+		}
+	}
+	if task == nil || task.Status != "PENDING" && task.Status != "RETRYING" {
+		api.mu.Unlock()
+		return 0, time.Time{}, true, nil
+	}
+	previous := *task
+	firstAttempt := parseAttemptTime(task.FirstAttemptTime)
+	exhausted := task.AttemptCount >= maxAttempts ||
+		maxRetryDuration > 0 && !firstAttempt.IsZero() && now.Sub(firstAttempt) >= maxRetryDuration
+	if exhausted {
+		task.Status = "FAILED"
+		task.LastError = "delivery retry budget exhausted before replay"
+	} else {
+		if firstAttempt.IsZero() {
+			firstAttempt = now
+			task.FirstAttemptTime = now.Format(time.RFC3339Nano)
+		}
+		task.AttemptCount++
+		task.LastAttemptTime = now.Format(time.RFC3339Nano)
+		task.Status = "RETRYING"
+	}
+	attempt := task.AttemptCount
+	api.mu.Unlock()
+
+	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		for _, current := range api.tasks[queueName] {
+			if current.Name == taskName && current.AttemptCount == attempt {
+				*current = previous
+				break
+			}
+		}
+		api.mu.Unlock()
+		return 0, time.Time{}, true, err
+	}
+	return attempt, firstAttempt, exhausted, nil
+}
+
+func (api *API) recordAttemptOutcome(queueName, taskName string, statusCode int, err error, terminal bool) {
 	api.mu.Lock()
 	for _, task := range api.tasks[queueName] {
 		if task.Name != taskName {
 			continue
 		}
-		task.AttemptCount++
 		task.LastStatusCode = statusCode
 		if err == nil {
 			task.Status = "COMPLETED"
@@ -645,18 +788,139 @@ func (api *API) recordAttempt(queueName, taskName string, statusCode int, err er
 	}
 }
 
-func (api *API) markCanceled(queueName, taskName string) {
-	api.mu.Lock()
-	for _, task := range api.tasks[queueName] {
-		if task.Name == taskName {
-			task.Status = "CANCELED"
-			break
+func parseAttemptTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+func decodeTaskBody(encoded string) ([]byte, error) {
+	const maxTaskBodyBytes = 1 << 20
+	if base64.StdEncoding.DecodedLen(len(encoded)) > maxTaskBodyBytes {
+		return nil, fmt.Errorf("decode HTTP body: body exceeds %d bytes", maxTaskBodyBytes)
+	}
+	body, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode HTTP body: %w", err)
+	}
+	if len(body) > maxTaskBodyBytes {
+		return nil, fmt.Errorf("decode HTTP body: body exceeds %d bytes", maxTaskBodyBytes)
+	}
+	return body, nil
+}
+
+type pinnedTaskTarget struct {
+	host      string
+	port      string
+	addresses []net.IP
+}
+
+type pinnedTaskTargetContextKey struct{}
+
+func (api *API) pinTaskTarget(ctx context.Context, rawURL string) (context.Context, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return ctx, errors.New("unsafe Cloud Tasks HTTP target")
+	}
+	host := strings.TrimSuffix(strings.ToLower(target.Hostname()), ".")
+	port := target.Port()
+	if port == "" {
+		if target.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
 		}
 	}
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		log.Printf("[Shim: Cloud Tasks] persist canceled task: %v", err)
+	addresses := []net.IP(nil)
+	if literal := net.ParseIP(host); literal != nil {
+		addresses = append(addresses, literal)
+	} else {
+		addresses, err = api.lookupIP(ctx, host)
+		if err != nil {
+			return ctx, fmt.Errorf("resolve Cloud Tasks HTTP target: %w", err)
+		}
 	}
+	if len(addresses) == 0 {
+		return ctx, errors.New("resolve Cloud Tasks HTTP target: no addresses")
+	}
+	for _, address := range addresses {
+		if !safeTaskTargetAddress(address, target.Scheme, api.allowLocalTargets) {
+			return ctx, errors.New("unsafe Cloud Tasks HTTP target address")
+		}
+	}
+	pinned := &pinnedTaskTarget{
+		host: host, port: port, addresses: append([]net.IP(nil), addresses...),
+	}
+	return context.WithValue(ctx, pinnedTaskTargetContextKey{}, pinned), nil
+}
+
+func safeTaskTargetAddress(address net.IP, scheme string, allowLocal bool) bool {
+	if address == nil || address.IsUnspecified() || address.IsMulticast() ||
+		address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() ||
+		address.IsPrivate() {
+		return false
+	}
+	if address.IsLoopback() {
+		return allowLocal && scheme == "http"
+	}
+	return address.IsGlobalUnicast()
+}
+
+func (api *API) dialTaskTarget(
+	ctx context.Context,
+	network, address string,
+) (net.Conn, error) {
+	pinned, _ := ctx.Value(pinnedTaskTargetContextKey{}).(*pinnedTaskTarget)
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || pinned == nil ||
+		strings.TrimSuffix(strings.ToLower(host), ".") != pinned.host || port != pinned.port {
+		return nil, errors.New("Cloud Tasks target was not resolved and pinned")
+	}
+	var dialErrors []error
+	for _, ip := range pinned.addresses {
+		connection, dialErr := api.dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return connection, nil
+		}
+		dialErrors = append(dialErrors, dialErr)
+	}
+	return nil, errors.Join(dialErrors...)
+}
+
+func validateTaskHTTPRequest(request HTTPRequest) error {
+	target, err := url.Parse(request.URL)
+	if err != nil || target.Scheme != "http" && target.Scheme != "https" ||
+		target.Host == "" || target.User != nil {
+		return errors.New("unsafe Cloud Tasks HTTP target")
+	}
+	host := strings.TrimSuffix(strings.ToLower(target.Hostname()), ".")
+	if host == "metadata.google.internal" || host == "metadata.google" {
+		return errors.New("unsafe Cloud Tasks HTTP target")
+	}
+	if len(request.Headers) > 100 {
+		return errors.New("Cloud Tasks HTTP headers exceed limit")
+	}
+	totalHeaderBytes := 0
+	for name, value := range request.Headers {
+		totalHeaderBytes += len(name) + len(value)
+		if totalHeaderBytes > 64<<10 || strings.ContainsAny(name+value, "\r\n") {
+			return errors.New("Cloud Tasks HTTP headers exceed limit")
+		}
+	}
+	return nil
+}
+
+func projectFromQueueName(queueName string) string {
+	parts := strings.Split(queueName, "/")
+	if len(parts) >= 2 && parts[0] == "projects" {
+		return parts[1]
+	}
+	return ""
 }
 
 func (api *API) deleteTask(w http.ResponseWriter, r *http.Request, project, queueId, taskId string) {

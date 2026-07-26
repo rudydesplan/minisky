@@ -1,7 +1,7 @@
 
 import { useEffect, useState } from 'react';
 import { Link, Route, Switch, useLocation } from 'wouter';
-import { Alert, Box, Button, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography } from '@mui/material';
+import { Alert, Box, Button, Drawer, IconButton, List, ListItemButton, ListItemIcon, ListItemText, Typography, useMediaQuery } from '@mui/material';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import StorageIcon from '@mui/icons-material/Storage';
 import ComputeIcon from '@mui/icons-material/Computer';
@@ -14,6 +14,7 @@ import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import ScheduleIcon from '@mui/icons-material/Schedule';
 import SecurityIcon from '@mui/icons-material/Security';
 import HttpIcon from '@mui/icons-material/Http';
+import MenuIcon from '@mui/icons-material/Menu';
 import Dashboard from './components/Dashboard';
 import StoragePage from './components/StoragePage';
 import ComputePage from './components/ComputePage';
@@ -46,13 +47,19 @@ const NAV_ITEMS = [
   { to: '/tasks',       label: 'Integration & CI/CD',     icon: <ScheduleIcon /> },
 ];
 
-function NavItem({ to, label, icon }: { to: string; label: string; icon: React.ReactNode }) {
+function NavItem({ to, label, icon, onNavigate }: {
+  to: string;
+  label: string;
+  icon: React.ReactNode;
+  onNavigate?: () => void;
+}) {
   const [pathname] = useLocation();
   const active = pathname === to;
   return (
     <ListItemButton
       component={Link}
       to={to}
+      onClick={onNavigate}
       aria-current={active ? 'page' : undefined}
       sx={{
         borderRadius: '8px', mb: 1,
@@ -74,6 +81,9 @@ function NavigationContent() {
   const isGatewayRequests = pathname === '/gateway-requests';
   const [version, setVersion] = useState('...');
   const [authError, setAuthError] = useState<string | null>(null);
+  const compactNavigation = useMediaQuery('(max-width:900px)');
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const closeNavigation = () => setNavigationOpen(false);
 
   useEffect(() => {
     fetch('/api/system/info')
@@ -101,14 +111,26 @@ function NavigationContent() {
       >
         Skip to main content
       </Button>
+      {compactNavigation && (
+        <IconButton
+          aria-label="Open primary navigation"
+          onClick={() => setNavigationOpen(true)}
+          sx={{ position: 'fixed', top: 8, left: 8, zIndex: theme => theme.zIndex.drawer + 1, backgroundColor: '#fff' }}
+        >
+          <MenuIcon />
+        </IconButton>
+      )}
       {/* Sidebar */}
       <Drawer
-        variant="permanent"
-        component="nav"
-        aria-label="Primary navigation"
+        variant={compactNavigation ? 'temporary' : 'permanent'}
+        open={!compactNavigation || navigationOpen}
+        onClose={closeNavigation}
+        slotProps={{ paper: { component: 'nav', role: 'navigation', 'aria-label': 'Primary navigation' } }}
+        ModalProps={{ keepMounted: true }}
         sx={{
-          width: DRAWER_WIDTH, flexShrink: 0,
-          '& .MuiDrawer-paper': { width: DRAWER_WIDTH, boxSizing: 'border-box' },
+          width: compactNavigation ? 0 : DRAWER_WIDTH,
+          flexShrink: 0,
+          '& .MuiDrawer-paper': { width: DRAWER_WIDTH, maxWidth: '100vw', boxSizing: 'border-box' },
         }}
       >
         {/* Logo */}
@@ -121,7 +143,7 @@ function NavigationContent() {
 
         {/* Nav */}
         <List sx={{ px: 2, mt: 2 }}>
-          {NAV_ITEMS.map(n => <NavItem key={n.to} {...n} />)}
+          {NAV_ITEMS.map(n => <NavItem key={n.to} {...n} onNavigate={closeNavigation} />)}
 
           {/* Divider before Operations section */}
           <Box sx={{ my: 1.5, mx: 1, borderTop: '1px solid #e0e0e0' }} />
@@ -133,6 +155,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/gateway-requests"
+            onClick={closeNavigation}
             aria-current={isGatewayRequests ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 1,
@@ -153,6 +176,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/logging"
+            onClick={closeNavigation}
             aria-current={isLogging ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 1,
@@ -173,6 +197,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/monitoring"
+            onClick={closeNavigation}
             aria-current={isMonitoring ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 0.5,
@@ -193,10 +218,18 @@ function NavigationContent() {
 
       {/* Main content */}
       <Box component="main" id="main-content" tabIndex={-1} sx={{
-        flexGrow: 1,
+        flexGrow: 1, minWidth: 0,
         // Log Explorer gets full height with no padding
-        ...(isLogging || isMonitoring || isGatewayRequests ? { p: 0, height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }
-                                          : { p: 6, position: 'relative' })
+        ...(isLogging || isMonitoring || isGatewayRequests ? {
+          p: 0,
+          pt: compactNavigation ? 7 : 0,
+          boxSizing: 'border-box',
+          height: '100vh',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }
+                                          : { p: { xs: 2, md: 6 }, pt: compactNavigation ? 8 : undefined, position: 'relative' })
       }}>
         {!isLogging && !isMonitoring && !isGatewayRequests && <ProjectSelector />}
         {(authError || projectError) && (

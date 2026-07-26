@@ -105,6 +105,27 @@ func TestCreateBackendFailureFailsOperationAndRemovesCluster(t *testing.T) {
 	}
 }
 
+func TestGKEOperationPollingIsFullyScoped(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api := newAPIWithBackend(manager, &fakeGKEBackend{}, "", http.DefaultClient, nil)
+	operations := []*orchestrator.Operation{
+		manager.Register("container#operation", "CREATE_CLUSTER",
+			"https://container.googleapis.com/v1/projects/other/zones/us/clusters/c", "us", ""),
+		manager.Register("container#operation", "CREATE_CLUSTER",
+			"https://container.googleapis.com/v1/projects/demo/zones/eu/clusters/c", "eu", ""),
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/demo/zones/us/instances/c", "us", ""),
+	}
+	for _, operation := range operations {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"/v1/projects/demo/zones/us/operations/"+operation.Name, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("foreign operation %s status=%d body=%s", operation.Kind, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestDeleteBackendFailureFailsOperationAndRetainsCluster(t *testing.T) {
 	backend := &fakeGKEBackend{deleteErr: errors.New("kind delete failed")}
 	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, "", http.DefaultClient, nil)
@@ -182,6 +203,17 @@ func TestNodeRegistrationUsesConfiguredGateway(t *testing.T) {
 	op := waitGKEOperation(t, api.opMgr, initial.Name)
 	if op.Error != nil {
 		t.Fatalf("create operation failed: %#v", op.Error)
+	}
+	clusterResponse := httptest.NewRecorder()
+	api.ServeHTTP(clusterResponse, httptest.NewRequest(http.MethodGet,
+		"/v1/projects/demo/zones/us-central1-c/clusters/cluster", nil))
+	var providerCluster Cluster
+	if err := json.Unmarshal(clusterResponse.Body.Bytes(), &providerCluster); err != nil {
+		t.Fatal(err)
+	}
+	if providerCluster.LegacyAbac == nil || providerCluster.NetworkConfig == nil ||
+		providerCluster.ShieldedNodes == nil || providerCluster.DefaultMaxPodsConstraint == nil {
+		t.Fatalf("provider-required cluster objects = %#v", providerCluster)
 	}
 	mu.Lock()
 	defer mu.Unlock()

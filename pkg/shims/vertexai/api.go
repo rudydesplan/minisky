@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
@@ -405,7 +406,7 @@ func (api *API) generateWithOllama(r *http.Request, current vertexConfig, reques
 		return "", err
 	}
 	outbound.Header.Set("Content-Type", "application/json")
-	response, err := api.httpClient.Do(outbound)
+	response, err := observability.Do(api.httpClient, outbound)
 	if err != nil {
 		return "", err
 	}

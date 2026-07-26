@@ -1,0 +1,161 @@
+name: Critical integration evidence
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  pull_request:
+    paths:
+      - ".github/workflows/critical-integration.yml"
+      - "cmd/minisky/**"
+      - "pkg/orchestrator/**"
+      - "pkg/router/**"
+      - "pkg/shims/**"
+      - "pkg/state/**"
+      - "scripts/state-durability-integration.sh"
+      - "scripts/kind-integration.sh"
+      - "scripts/terraform-integration.sh"
+      - "terraform/**"
+      - "go.mod"
+      - "go.sum"
+      - "ui/package-lock.json"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/critical-integration.yml"
+      - "cmd/minisky/**"
+      - "pkg/orchestrator/**"
+      - "pkg/router/**"
+      - "pkg/shims/**"
+      - "pkg/state/**"
+      - "scripts/state-durability-integration.sh"
+      - "scripts/kind-integration.sh"
+      - "scripts/terraform-integration.sh"
+      - "terraform/**"
+      - "go.mod"
+      - "go.sum"
+      - "ui/package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: critical-integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    name: Build integration assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI from lockfile
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  terraform-provider:
+    name: Critical Terraform provider lifecycle
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Run guarded Terraform provider lifecycle
+        env:
+          MINISKY_TERRAFORM_INTEGRATION: "1"
+          MINISKY_TERRAFORM_CLOUDSQL: "1"
+          MINISKY_TERRAFORM_GKE: "1"
+          MINISKY_TERRAFORM_JAVA_SMOKE: "1"
+        run: ./scripts/terraform-integration.sh
+
+  state-durability:
+    name: Critical state durability lifecycle
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Run guarded state durability lifecycle
+        env:
+          MINISKY_STATE_DURABILITY_INTEGRATION: "1"
+        run: ./scripts/state-durability-integration.sh
+
+  kind-lifecycle:
+    name: Critical Kind lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run pinned isolated Kind lifecycle
+        env:
+          MINISKY_KIND_INTEGRATION: "1"
+          MINISKY_KIND_CLUSTER: minisky-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./scripts/kind-integration.sh

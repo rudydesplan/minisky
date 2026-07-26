@@ -17,6 +17,7 @@ import (
 
 	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
+	"minisky/pkg/registry"
 	localsecurity "minisky/pkg/security"
 	"minisky/pkg/validator"
 )
@@ -225,7 +226,6 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.checkQuota(w, r, targetDomain) {
 		return
 	}
-
 	// 2. Check if this is a lazy-loaded Docker backend
 	p.mu.RLock()
 	isLazy := p.lazyDomains[targetDomain]
@@ -392,7 +392,7 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 		return true
 	}
 	suppliedPrincipal, _ := r.Context().Value(callerSuppliedPrincipalContextKey{}).(callerSuppliedPrincipal)
-	if domain == "sts.googleapis.com" && r.Method == http.MethodPost && r.URL.Path == "/v1/token" {
+	if strictIAMPublicExemption(domain, r) {
 		return true
 	}
 
@@ -429,11 +429,8 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 
 	permission, resource := routePermission(domain, r)
 	if permission == "" {
-		if isMutationMethod(r.Method) {
-			p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED", "Strict IAM denied unmapped mutation route")
-			return false
-		}
-		return true
+		p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED", "Strict IAM denied unmapped route")
+		return false
 	}
 	if !authorizer.Authorize(resource, principal, permission) {
 		p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED", "Caller lacks permission "+permission)
@@ -455,6 +452,12 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 		}
 	}
 	return true
+}
+
+func strictIAMPublicExemption(domain string, r *http.Request) bool {
+	return domain == "sts.googleapis.com" &&
+		r.Method == http.MethodPost &&
+		r.URL.Path == "/v1/token"
 }
 
 func pubsubTopicFromBody(r *http.Request) (topic, project string, valid bool) {
@@ -501,93 +504,373 @@ func (p *ProxyRouter) validateProject(w http.ResponseWriter, r *http.Request, do
 func routePermission(domain string, r *http.Request) (string, string) {
 	project := projectFromRequest(r)
 	resource := "projects/" + project
-	switch domain {
-	case "bigquery.googleapis.com":
-		if r.Method == http.MethodGet {
-			return "bigquery.datasets.get", resource
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	for _, route := range strictIAMCustomRoutes {
+		if route.domain == domain && route.method == r.Method && matchIAMRouteTemplate(path, route.template) {
+			if domain == "pubsub.googleapis.com" && route.permission == "pubsub.topics.publish" {
+				topic := strings.TrimPrefix(path, "/v1/")
+				topic = strings.TrimPrefix(topic, "/")
+				return route.permission, strings.TrimSuffix(topic, ":publish")
+			}
+			return route.permission, resource
 		}
-		return "bigquery.datasets.update", resource
-	case "compute.googleapis.com":
-		if strings.Contains(r.URL.Path, "/instances") {
+	}
+	specs := strictIAMResourceRoutes[domain]
+	for _, spec := range specs {
+		for _, collectionTemplate := range spec.collectionTemplates {
 			switch {
-			case r.Method == http.MethodGet && strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/instances"):
-				return "compute.instances.list", resource
-			case r.Method == http.MethodGet:
-				return "compute.instances.get", resource
-			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
-				return "compute.instances.start", resource
-			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
-				return "compute.instances.stop", resource
-			case r.Method == http.MethodPost:
-				return "compute.instances.create", resource
-			case r.Method == http.MethodDelete:
-				return "compute.instances.delete", resource
-			}
-		}
-	case "pubsub.googleapis.com":
-		switch {
-		case strings.Contains(r.URL.Path, ":publish"):
-			return "pubsub.topics.publish", strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/"), ":publish")
-		case strings.Contains(r.URL.Path, "/subscriptions"):
-			switch r.Method {
-			case http.MethodGet:
-				return "pubsub.subscriptions.get", resource
-			case http.MethodPut, http.MethodPost:
-				return "pubsub.subscriptions.create", resource
-			case http.MethodDelete:
-				return "pubsub.subscriptions.delete", resource
-			}
-		case strings.Contains(r.URL.Path, "/topics"):
-			switch r.Method {
-			case http.MethodGet:
-				return "pubsub.topics.get", resource
-			case http.MethodPut, http.MethodPost:
-				return "pubsub.topics.create", resource
-			case http.MethodDelete:
-				return "pubsub.topics.delete", resource
-			}
-		}
-	case "storage.googleapis.com":
-		if r.Method == http.MethodGet {
-			return "storage.objects.get", resource
-		}
-		switch r.Method {
-		case http.MethodPost:
-			if strings.Contains(r.URL.Path, "/o") {
-				return "storage.objects.create", resource
-			}
-			return "storage.buckets.create", resource
-		case http.MethodPut, http.MethodPatch:
-			return "storage.objects.update", resource
-		case http.MethodDelete:
-			if strings.Contains(r.URL.Path, "/o/") {
-				return "storage.objects.delete", resource
-			}
-			return "storage.buckets.delete", resource
-		}
-	case "iam.googleapis.com":
-		switch {
-		case strings.HasSuffix(r.URL.Path, ":setIamPolicy"):
-			return "iam.serviceAccounts.setIamPolicy", resource
-		case strings.Contains(r.URL.Path, "/keys/") && strings.HasSuffix(r.URL.Path, ":disable"):
-			return "iam.serviceAccountKeys.disable", resource
-		case strings.Contains(r.URL.Path, "/keys"):
-			switch r.Method {
-			case http.MethodPost:
-				return "iam.serviceAccountKeys.create", resource
-			case http.MethodDelete:
-				return "iam.serviceAccountKeys.delete", resource
-			}
-		case strings.Contains(r.URL.Path, "/serviceAccounts"):
-			switch r.Method {
-			case http.MethodPost:
-				return "iam.serviceAccounts.create", resource
-			case http.MethodDelete:
-				return "iam.serviceAccounts.delete", resource
+			case matchIAMRouteTemplate(path, collectionTemplate):
+				switch r.Method {
+				case http.MethodGet, http.MethodHead:
+					return spec.permissionRoot + ".list", resource
+				case http.MethodPost:
+					return spec.permissionRoot + ".create", resource
+				}
+			case matchIAMRouteTemplate(path, collectionTemplate+"/{resource}"):
+				switch r.Method {
+				case http.MethodGet, http.MethodHead:
+					return spec.permissionRoot + ".get", resource
+				case http.MethodPut:
+					if spec.putCreates {
+						return spec.permissionRoot + ".create", resource
+					}
+					return spec.permissionRoot + ".update", resource
+				case http.MethodPatch:
+					return spec.permissionRoot + ".update", resource
+				case http.MethodDelete:
+					return spec.permissionRoot + ".delete", resource
+				}
 			}
 		}
 	}
+	if permission := strictIAMRootRoutePermission(domain, r.Method, path); permission != "" {
+		return permission, resource
+	}
 	return "", resource
+}
+
+type strictIAMResourceRoute struct {
+	collectionTemplates []string
+	permissionRoot      string
+	putCreates          bool
+}
+
+type strictIAMCustomRoute struct {
+	domain     string
+	method     string
+	template   string
+	permission string
+}
+
+var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
+	"aiplatform.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/endpoints"}, "aiplatform.endpoints", false},
+	},
+	"appengine.googleapis.com": {
+		{[]string{"/v1/projects/{project}/apps/{app}/services"}, "appengine.services", false},
+		{[]string{"/v1/projects/{project}/apps/{app}/services/{service}/versions"}, "appengine.versions", false},
+		{[]string{"/v1/projects/{project}/apps/{app}/operations"}, "appengine.applications", false},
+	},
+	"artifactregistry.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/repositories"}, "artifactregistry.repositories", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/repositories/{repository}/packages"}, "artifactregistry.packages", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/repositories/{repository}/packages/{package}/versions"}, "artifactregistry.versions", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "artifactregistry.repositories", false},
+	},
+	"bigquery.googleapis.com": {
+		{[]string{"/bigquery/v2/projects/{project}/datasets", "/v2/projects/{project}/datasets"}, "bigquery.datasets", false},
+		{[]string{"/bigquery/v2/projects/{project}/datasets/{dataset}/tables", "/v2/projects/{project}/datasets/{dataset}/tables"}, "bigquery.tables", false},
+		{[]string{"/bigquery/v2/projects/{project}/jobs", "/v2/projects/{project}/jobs"}, "bigquery.jobs", false},
+	},
+	"bigtable.googleapis.com": {
+		{[]string{"/v2/projects/{project}/instances/{instance}/tables"}, "bigtable.tables", false},
+	},
+	"bigtableadmin.googleapis.com": {
+		{[]string{"/v2/projects/{project}/instances"}, "bigtable.instances", false},
+		{[]string{"/v2/projects/{project}/instances/{instance}/clusters"}, "bigtable.clusters", false},
+		{[]string{"/v2/projects/{project}/instances/{instance}/tables"}, "bigtable.tables", false},
+	},
+	"cloudbuild.googleapis.com": {
+		{[]string{"/v1/projects/{project}/builds", "/v1/projects/{project}/locations/{location}/builds"}, "cloudbuild.builds", false},
+		{[]string{"/v1/projects/{project}/triggers"}, "cloudbuild.builds", false},
+	},
+	"cloudfunctions.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/functions", "/v2/projects/{project}/locations/{location}/functions"}, "cloudfunctions.functions", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations", "/v2/projects/{project}/locations/{location}/operations"}, "cloudfunctions.functions", false},
+	},
+	"cloudkms.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/keyRings"}, "cloudkms.keyRings", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys"}, "cloudkms.cryptoKeys", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions"}, "cloudkms.cryptoKeyVersions", false},
+	},
+	"cloudresourcemanager.googleapis.com": {
+		{[]string{"/v3/projects"}, "resourcemanager.projects", false},
+		{[]string{"/v3/folders"}, "resourcemanager.folders", false},
+		{[]string{"/v3/organizations"}, "resourcemanager.organizations", false},
+	},
+	"cloudscheduler.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/jobs"}, "cloudscheduler.jobs", false},
+	},
+	"cloudtasks.googleapis.com": {
+		{[]string{"/v2/projects/{project}/locations/{location}/queues"}, "cloudtasks.queues", false},
+		{[]string{"/v2/projects/{project}/locations/{location}/queues/{queue}/tasks"}, "cloudtasks.tasks", false},
+	},
+	"compute.googleapis.com": {
+		{[]string{"/compute/v1/projects/{project}/zones"}, "compute.zones", false},
+		{[]string{"/compute/v1/projects/{project}/zones/{zone}/instances"}, "compute.instances", false},
+		{[]string{"/compute/v1/projects/{project}/zones/{zone}/instanceGroups"}, "compute.instanceGroups", false},
+		{[]string{"/compute/v1/projects/{project}/regions/{region}/subnetworks"}, "compute.subnetworks", false},
+		{[]string{"/compute/v1/projects/{project}/global/networks"}, "compute.networks", false},
+		{[]string{"/compute/v1/projects/{project}/global/firewalls"}, "compute.firewalls", false},
+		{[]string{"/compute/v1/projects/{project}/global/securityPolicies"}, "compute.securityPolicies", false},
+		{[]string{"/compute/v1/projects/{project}/global/backendServices"}, "compute.backendServices", false},
+		{[]string{"/compute/v1/projects/{project}/global/healthChecks"}, "compute.healthChecks", false},
+		{[]string{"/compute/v1/projects/{project}/global/urlMaps"}, "compute.urlMaps", false},
+		{[]string{"/compute/v1/projects/{project}/global/targetHttpProxies"}, "compute.targetHttpProxies", false},
+		{[]string{"/compute/v1/projects/{project}/global/forwardingRules"}, "compute.forwardingRules", false},
+		{[]string{"/compute/v1/projects/{project}/global/images"}, "compute.images", false},
+		{[]string{"/compute/v1/projects/{project}/zones/{zone}/operations", "/compute/v1/projects/{project}/regions/{region}/operations", "/compute/v1/projects/{project}/global/operations"}, "compute.operations", false},
+	},
+	"container.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/clusters", "/v1/projects/{project}/zones/{zone}/clusters"}, "container.clusters", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations", "/v1/projects/{project}/zones/{zone}/operations"}, "container.operations", false},
+	},
+	"dataproc.googleapis.com": {
+		{[]string{"/v1/projects/{project}/regions/{region}/clusters"}, "dataproc.clusters", false},
+		{[]string{"/v1/projects/{project}/regions/{region}/jobs"}, "dataproc.jobs", false},
+		{[]string{"/v1/projects/{project}/regions/{region}/operations"}, "dataproc.operations", false},
+	},
+	"dns.googleapis.com": {
+		{[]string{"/dns/v1/projects/{project}/managedZones"}, "dns.managedZones", false},
+		{[]string{"/dns/v1/projects/{project}/managedZones/{zone}/rrsets"}, "dns.resourceRecordSets", false},
+		{[]string{"/dns/v1/projects/{project}/managedZones/{zone}/changes"}, "dns.changes", false},
+	},
+	"firebasehosting.googleapis.com": {
+		{[]string{"/v1beta1/projects/{project}/sites"}, "firebasehosting.sites", false},
+		{[]string{"/v1beta1/sites/{site}/releases"}, "firebasehosting.releases", false},
+		{[]string{"/v1beta1/sites/{site}/versions"}, "firebasehosting.versions", false},
+	},
+	"firestore.googleapis.com": {
+		{[]string{"/v1/projects/{project}/databases/{database}/documents"}, "datastore.entities", false},
+		{[]string{"/v1/projects/{project}/databases/{database}/collectionGroups/{group}/indexes"}, "datastore.indexes", false},
+	},
+	"iam.googleapis.com": {
+		{[]string{"/v1/projects/{project}/serviceAccounts"}, "iam.serviceAccounts", false},
+		{[]string{"/v1/projects/{project}/serviceAccounts/{account}/keys"}, "iam.serviceAccountKeys", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/workloadIdentityPools"}, "iam.workloadIdentityPools", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/workloadIdentityPools/{pool}/providers"}, "iam.workloadIdentityPoolProviders", false},
+	},
+	"logging.googleapis.com": {
+		{[]string{"/v2/projects/{project}/sinks"}, "logging.sinks", false},
+	},
+	"monitoring.googleapis.com": {
+		{[]string{"/v3/projects/{project}/metricDescriptors"}, "monitoring.metricDescriptors", false},
+		{[]string{"/v3/projects/{project}/timeSeries"}, "monitoring.timeSeries", false},
+	},
+	"pubsub.googleapis.com": {
+		{[]string{"/v1/projects/{project}/topics", "/projects/{project}/topics"}, "pubsub.topics", true},
+		{[]string{"/v1/projects/{project}/subscriptions", "/projects/{project}/subscriptions"}, "pubsub.subscriptions", true},
+		{[]string{"/v1/projects/{project}/snapshots", "/projects/{project}/snapshots"}, "pubsub.snapshots", true},
+	},
+	"redis.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/instances"}, "redis.instances", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "redis.operations", false},
+	},
+	"run.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/services", "/v2/projects/{project}/locations/{location}/services"}, "run.services", false},
+		{[]string{"/v2/projects/{project}/locations/{location}/jobs"}, "run.jobs", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations", "/v2/projects/{project}/locations/{location}/operations"}, "run.operations", false},
+	},
+	"secretmanager.googleapis.com": {
+		{[]string{"/v1/projects/{project}/secrets"}, "secretmanager.secrets", false},
+		{[]string{"/v1/projects/{project}/secrets/{secret}/versions"}, "secretmanager.versions", false},
+	},
+	"spanner.googleapis.com": {
+		{[]string{"/v1/projects/{project}/instances"}, "spanner.instances", false},
+		{[]string{"/v1/projects/{project}/instances/{instance}/databases"}, "spanner.databases", false},
+		{[]string{"/v1/projects/{project}/instances/{instance}/databases/{database}/sessions"}, "spanner.sessions", false},
+	},
+	"sqladmin.googleapis.com": {
+		{[]string{"/sql/v1beta4/projects/{project}/instances"}, "cloudsql.instances", false},
+		{[]string{"/sql/v1beta4/projects/{project}/instances/{instance}/databases"}, "cloudsql.databases", false},
+		{[]string{"/sql/v1beta4/projects/{project}/instances/{instance}/users"}, "cloudsql.users", false},
+		{[]string{"/sql/v1beta4/projects/{project}/operations"}, "cloudsql.operations", false},
+	},
+	"storage.googleapis.com": {
+		{[]string{"/storage/v1/b"}, "storage.buckets", false},
+		{[]string{"/storage/v1/b/{bucket}/o"}, "storage.objects", false},
+	},
+}
+
+var strictIAMCustomRoutes = []strictIAMCustomRoute{
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/endpoints/{endpoint}:predict", "aiplatform.endpoints.predict"},
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent", "aiplatform.endpoints.predict"},
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent", "aiplatform.endpoints.predict"},
+	{"aiplatform.googleapis.com", http.MethodGet, "/v1/internal/config", "aiplatform.endpoints.get"},
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/internal/config", "aiplatform.endpoints.update"},
+	{"aiplatform.googleapis.com", http.MethodGet, "/v1/internal/models", "aiplatform.models.list"},
+	{"appengine.googleapis.com", http.MethodGet, "/v1/projects/{project}/apps", "appengine.applications.get"},
+	{"appengine.googleapis.com", http.MethodPost, "/v1/projects/{project}/apps", "appengine.applications.create"},
+	{"appengine.googleapis.com", http.MethodPost, "/deploy", "appengine.versions.create"},
+	{"bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/{project}/queries/{job}", "bigquery.jobs.get"},
+	{"bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/{project}/jobs/{job}/results", "bigquery.jobs.get"},
+	{"bigquery.googleapis.com", http.MethodPost, "/bigquery/v2/projects/{project}/datasets/{dataset}/tables/{table}/insertAll", "bigquery.tables.updateData"},
+	{"bigquery.googleapis.com", http.MethodPost, "/upload/bigquery/v2/projects/{project}/jobs", "bigquery.jobs.create"},
+	{"bigquery.googleapis.com", http.MethodPut, "/upload/bigquery/v2/projects/{project}/jobs", "bigquery.jobs.create"},
+	{"bigtable.googleapis.com", http.MethodPost, "/v2/projects/{project}/instances/{instance}/tables/{table}:readRows", "bigtable.tables.readRows"},
+	{"bigtableadmin.googleapis.com", http.MethodGet, "/v2/operations/{operation}", "bigtable.instances.get"},
+	{"cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/{project}/triggers/{trigger}:run", "cloudbuild.builds.create"},
+	{"cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/{project}/builds/{build}:cancel", "cloudbuild.builds.update"},
+	{"cloudfunctions.googleapis.com", http.MethodPost, "/v2/deploy", "cloudfunctions.functions.create"},
+	{"cloudfunctions.googleapis.com", http.MethodDelete, "/v2/delete", "cloudfunctions.functions.delete"},
+	{"cloudfunctions.googleapis.com", http.MethodGet, "/v2/logs/{resource}", "cloudfunctions.functions.get"},
+	{"cloudkms.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:encrypt", "cloudkms.cryptoKeyVersions.useToEncrypt"},
+	{"cloudkms.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:decrypt", "cloudkms.cryptoKeyVersions.useToDecrypt"},
+	{"cloudkms.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions/{version}:destroy", "cloudkms.cryptoKeyVersions.destroy"},
+	{"cloudscheduler.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/jobs/{job}:run", "cloudscheduler.jobs.run"},
+	{"cloudscheduler.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/jobs/{job}:pause", "cloudscheduler.jobs.pause"},
+	{"cloudscheduler.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/jobs/{job}:resume", "cloudscheduler.jobs.resume"},
+	{"compute.googleapis.com", http.MethodPost, "/compute/v1/projects/{project}/zones/{zone}/instances/{instance}/start", "compute.instances.start"},
+	{"compute.googleapis.com", http.MethodPost, "/compute/v1/projects/{project}/zones/{zone}/instances/{instance}/stop", "compute.instances.stop"},
+	{"compute.googleapis.com", http.MethodPost, "/compute/v1/projects/{project}/zones/{zone}/instanceGroups/{group}/addInstances", "compute.instanceGroups.update"},
+	{"compute.googleapis.com", http.MethodPost, "/compute/v1/projects/{project}/zones/{zone}/instanceGroups/{group}/setNamedPorts", "compute.instanceGroups.update"},
+	{"compute.googleapis.com", http.MethodPost, "/compute/v1/projects/{project}/zones/{zone}/instanceGroups/{group}/listInstances", "compute.instanceGroups.get"},
+	{"compute.googleapis.com", http.MethodGet, "/compute/v1/projects/{project}/global/images/family/{family}", "compute.images.get"},
+	{"dataproc.googleapis.com", http.MethodPost, "/v1/projects/{project}/regions/{region}/jobs:submit", "dataproc.jobs.submit"},
+	{"dataproc.googleapis.com", http.MethodPost, "/v1/projects/{project}/regions/{region}/jobs/{job}:cancel", "dataproc.jobs.cancel"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:runQuery", "datastore.entities.list"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:lookup", "datastore.entities.get"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:commit", "datastore.entities.update"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:allocateIds", "datastore.entities.create"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:beginTransaction", "datastore.entities.get"},
+	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:rollback", "datastore.entities.update"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents:runQuery", "datastore.entities.list"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents:batchGet", "datastore.entities.get"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents:commit", "datastore.entities.update"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents:batchWrite", "datastore.entities.update"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents:listCollectionIds", "datastore.entities.list"},
+	{"firestore.googleapis.com", http.MethodGet, "/v1/projects/{project}/databases/{database}/documents/{document...}", "datastore.entities.get"},
+	{"firestore.googleapis.com", http.MethodPost, "/v1/projects/{project}/databases/{database}/documents/{parent...}", "datastore.entities.create"},
+	{"firestore.googleapis.com", http.MethodPatch, "/v1/projects/{project}/databases/{database}/documents/{document...}", "datastore.entities.update"},
+	{"firestore.googleapis.com", http.MethodDelete, "/v1/projects/{project}/databases/{database}/documents/{document...}", "datastore.entities.delete"},
+	{"iam.googleapis.com", http.MethodPost, "/v1/projects/{project}/serviceAccounts/{account}:setIamPolicy", "iam.serviceAccounts.setIamPolicy"},
+	{"iam.googleapis.com", http.MethodGet, "/v1/projects/{project}/serviceAccounts/{account}:getIamPolicy", "iam.serviceAccounts.get"},
+	{"iam.googleapis.com", http.MethodPost, "/v1/projects/{project}/serviceAccounts/{account}:testIamPermissions", "iam.serviceAccounts.get"},
+	{"iam.googleapis.com", http.MethodPost, "/v1/projects/{project}/serviceAccounts/{account}/keys/{key}:disable", "iam.serviceAccountKeys.disable"},
+	{"iamcredentials.googleapis.com", http.MethodPost, "/v1/projects/{project}/serviceAccounts/{account}:generateAccessToken", "iam.serviceAccounts.getAccessToken"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:lookup", "firebaseauth.users.get"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:signUp", "firebaseauth.users.create"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:update", "firebaseauth.users.update"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:delete", "firebaseauth.users.delete"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:signInWithPassword", "firebaseauth.users.get"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:signInWithCustomToken", "firebaseauth.users.get"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:signInWithIdp", "firebaseauth.users.get"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:sendOobCode", "firebaseauth.users.get"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:resetPassword", "firebaseauth.users.update"},
+	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:createAuthUri", "firebaseauth.users.get"},
+	{"logging.googleapis.com", http.MethodPost, "/v2/entries:list", "logging.logEntries.list"},
+	{"logging.googleapis.com", http.MethodPost, "/v2/entries:write", "logging.logEntries.create"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/project-id", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/numeric-project-id", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/attributes", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/attributes/{attribute}", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/name", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/id", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/zone", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/machine-type", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/hostname", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/attributes", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/attributes/{attribute}", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts/{account}/email", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts/{account}/aliases", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts/{account}/scopes", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts/{account}/token", "compute.instances.get"},
+	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/instance/service-accounts/{account}/identity", "compute.instances.get"},
+	{"monitoring.googleapis.com", http.MethodPost, "/v3/projects/{project}/timeSeries:query", "monitoring.timeSeries.list"},
+	{"monitoring.googleapis.com", http.MethodGet, "/v1/projects/{project}/location/{location}/prometheus/api/v1/query", "monitoring.timeSeries.list"},
+	{"monitoring.googleapis.com", http.MethodPost, "/v1/projects/{project}/location/{location}/prometheus/api/v1/query", "monitoring.timeSeries.list"},
+	{"monitoring.googleapis.com", http.MethodGet, "/v1/projects/{project}/location/{location}/prometheus/api/v1/query_range", "monitoring.timeSeries.list"},
+	{"pubsub.googleapis.com", http.MethodPost, "/v1/projects/{project}/topics/{topic}:publish", "pubsub.topics.publish"},
+	{"pubsub.googleapis.com", http.MethodPost, "/projects/{project}/topics/{topic}:publish", "pubsub.topics.publish"},
+	{"pubsub.googleapis.com", http.MethodPost, "/v1/projects/{project}/subscriptions/{subscription}:pull", "pubsub.subscriptions.consume"},
+	{"pubsub.googleapis.com", http.MethodPost, "/v1/projects/{project}/subscriptions/{subscription}:acknowledge", "pubsub.subscriptions.consume"},
+	{"pubsub.googleapis.com", http.MethodPost, "/v1/projects/{project}/subscriptions/{subscription}:modifyAckDeadline", "pubsub.subscriptions.consume"},
+	{"run.googleapis.com", http.MethodPost, "/v2/deploy", "run.services.create"},
+	{"run.googleapis.com", http.MethodDelete, "/v2/delete", "run.services.delete"},
+	{"run.googleapis.com", http.MethodGet, "/v2/logs/{resource}", "run.services.get"},
+	{"redis.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/instances/{instance}:export", "redis.instances.export"},
+	{"redis.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/instances/{instance}:import", "redis.instances.import"},
+	{"redis.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/instances/{instance}:failover", "redis.instances.failover"},
+	{"redis.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/instances/{instance}:upgrade", "redis.instances.update"},
+	{"secretmanager.googleapis.com", http.MethodPost, "/v1/projects/{project}/secrets/{secret}:addVersion", "secretmanager.versions.add"},
+	{"secretmanager.googleapis.com", http.MethodGet, "/v1/projects/{project}/secrets/{secret}/versions/{version}:access", "secretmanager.versions.access"},
+	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions:batchCreate", "spanner.sessions.create"},
+	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:executeSql", "spanner.databases.read"},
+	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:executeStreamingSql", "spanner.databases.read"},
+	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:commit", "spanner.databases.write"},
+	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:rollback", "spanner.databases.write"},
+	{"storage.googleapis.com", http.MethodPost, "/upload/storage/v1/b/{bucket}/o", "storage.objects.create"},
+	{"storage.googleapis.com", http.MethodPut, "/upload/storage/v1/b/{bucket}/o", "storage.objects.create"},
+}
+
+func matchIAMRouteTemplate(path, template string) bool {
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+	templateParts := strings.Split(strings.Trim(template, "/"), "/")
+	variadic := len(templateParts) > 0 && strings.HasSuffix(templateParts[len(templateParts)-1], "...}")
+	if variadic {
+		if len(pathParts) < len(templateParts) {
+			return false
+		}
+	} else if len(pathParts) != len(templateParts) {
+		return false
+	}
+	for i, expected := range templateParts {
+		if variadic && i == len(templateParts)-1 {
+			return pathParts[i] != ""
+		}
+		actual := pathParts[i]
+		open := strings.IndexByte(expected, '{')
+		close := strings.IndexByte(expected, '}')
+		if open < 0 || close < open {
+			if actual != expected {
+				return false
+			}
+			continue
+		}
+		if strings.Count(expected, "{") != 1 || strings.Count(expected, "}") != 1 {
+			return false
+		}
+		prefix, suffix := expected[:open], expected[close+1:]
+		if !strings.HasPrefix(actual, prefix) || !strings.HasSuffix(actual, suffix) ||
+			len(actual) <= len(prefix)+len(suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+func strictIAMRootRoutePermission(domain, method, path string) string {
+	switch domain {
+	case "firebaseio.com":
+		if !strings.HasSuffix(path, ".json") {
+			return ""
+		}
+		switch method {
+		case http.MethodGet, http.MethodHead:
+			return "firebasedatabase.instances.get"
+		case http.MethodPut, http.MethodPatch:
+			return "firebasedatabase.instances.update"
+		case http.MethodDelete:
+			return "firebasedatabase.instances.delete"
+		}
+	case "sts.googleapis.com":
+		if method == http.MethodPost && strings.TrimSuffix(path, "/") == "/v1/token" {
+			return "iam.serviceAccounts.getAccessToken"
+		}
+	}
+	return ""
 }
 
 func isMutationMethod(method string) bool {
@@ -621,6 +904,8 @@ func projectsFromRequest(r *http.Request) []string {
 	var projects []string
 	add := func(project string) {
 		project = strings.TrimSpace(strings.TrimSuffix(project, ":"))
+		project, _, _ = strings.Cut(project, ":")
+		project = strings.TrimSuffix(project, ".json")
 		if project == "" {
 			return
 		}
@@ -755,6 +1040,7 @@ func (p *ProxyRouter) ClassifyRequest(r *http.Request) observability.RequestLabe
 	return observability.RequestLabels{
 		Service: domain,
 		Route:   observability.NormalizeRoute(servicePath),
+		Project: ProjectFromRequest(r),
 	}
 }
 
@@ -838,12 +1124,17 @@ func legacyLocalDomain(path, fallbackDomain string) string {
 		(strings.Contains(path, "/topics") || strings.Contains(path, "/subscriptions")) {
 		return "pubsub.googleapis.com"
 	}
+	if strings.HasPrefix(path, "/compute/") {
+		return "compute.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/sql/") {
+		return "sqladmin.googleapis.com"
+	}
+
+	// Fallback: Cloud Functions / Cloud Run catch-all for /v1 or /v2 with locations
 	if strings.HasPrefix(path, "/v2/") ||
 		(strings.HasPrefix(path, "/v1/projects/") && strings.Contains(path, "/locations/")) {
 		return "cloudfunctions.googleapis.com"
-	}
-	if strings.HasPrefix(path, "/compute/") {
-		return "compute.googleapis.com"
 	}
 	return fallbackDomain
 }
@@ -855,7 +1146,5 @@ func (p *ProxyRouter) writeUnimplemented(w http.ResponseWriter, service string) 
 }
 
 func (p *ProxyRouter) writeColdStartUnavailable(w http.ResponseWriter, domain string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	w.Write([]byte(`{"error":{"code":503,"message":"MiniSky: Cold-start failed for ` + domain + `","status":"UNAVAILABLE"}}`))
+	registry.WriteDockerUnavailable(w)
 }

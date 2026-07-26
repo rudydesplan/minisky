@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"minisky/pkg/registry"
 	"minisky/pkg/router"
 	_ "minisky/pkg/shims"
+	"minisky/pkg/state"
 )
 
 func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
@@ -128,6 +130,39 @@ func TestManifestTruthForPersistedAndDeferredServices(t *testing.T) {
 				want.persistence,
 			)
 		}
+	}
+}
+
+func TestChangedDurableEntriesRegisterImportValidators(t *testing.T) {
+	entries := []string{
+		"appengine/metadata",
+		"artifactregistry/metadata",
+		"bigtable/metadata",
+		"cloudsql/metadata",
+		"cloudtasks/metadata",
+		"compute/metadata",
+		"dataproc/metadata",
+		"gke/metadata",
+		"logging/metadata",
+		"scheduler/metadata",
+	}
+	for _, entry := range entries {
+		t.Run(entry, func(t *testing.T) {
+			store, err := state.New(t.TempDir(), "schema-validation")
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := fmt.Sprintf(
+				`{"format":"%s","version":%d,"entries":{%q:"wrong-schema"}}`,
+				state.SnapshotFormat,
+				state.Version,
+				entry,
+			)
+			if err := store.Import(bytes.NewBufferString(snapshot)); err == nil ||
+				!strings.Contains(err.Error(), `invalid schema for state entry "`+entry+`"`) {
+				t.Fatalf("Import error = %v, want registered schema rejection", err)
+			}
+		})
 	}
 }
 
@@ -289,7 +324,7 @@ func TestLazyDockerContractsFailColdStartDeterministically(t *testing.T) {
 			}
 			if envelope.Error.Code != http.StatusServiceUnavailable ||
 				envelope.Error.Status != "UNAVAILABLE" ||
-				!strings.Contains(envelope.Error.Message, service.Domain) {
+				envelope.Error.Message != "MiniSky: Docker backend unavailable" {
 				t.Fatalf("unexpected cold-start error: %+v", envelope.Error)
 			}
 		})

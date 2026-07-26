@@ -56,6 +56,7 @@ export const googleTheme = createTheme({
         paper: {
           backgroundColor: '#ffffff',
           borderRight: '1px solid #dadce0',
+          maxWidth: '100vw',
         },
       },
     },

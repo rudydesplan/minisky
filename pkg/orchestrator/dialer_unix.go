@@ -4,11 +4,27 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+func validateDockerHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil
+	}
+	parsed, err := url.Parse(host)
+	if err != nil || parsed.Scheme != "unix" || parsed.Host != "" ||
+		!filepath.IsAbs(parsed.Path) || parsed.Path == string(os.PathSeparator) ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%w: unsupported Unix DOCKER_HOST %q", ErrDockerConfiguration, host)
+	}
+	return nil
+}
 
 func resolveDockerSocket() string {
 	// 1. Explicit DOCKER_HOST env var

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -23,6 +24,7 @@ import (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(computeStateEntry, state.StrictEntryValidator[computeMetadata](nil))
 	registry.Register("compute.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -1627,7 +1629,17 @@ func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path str
 	}
 
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	targetProjectPrefix := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/", project)
+	requestedZone := extractSegmentAfter(path, "zones")
+	requestedScopeValid := false
+	switch {
+	case strings.Contains(path, "/global/operations/"):
+		requestedScopeValid = op != nil && op.Zone == "" && op.Region == ""
+	case requestedZone != "":
+		requestedScopeValid = op != nil && op.Zone == requestedZone && op.Region == ""
+	}
+	if op == nil || op.Kind != "compute#operation" || !requestedScopeValid ||
+		!strings.HasPrefix(op.TargetLink, targetProjectPrefix) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
@@ -1861,7 +1873,9 @@ func (api *API) proxyLoadBalancerRequest(
 	forwardingRuleName string,
 	proxyPath string,
 ) {
-	backends, backendService, err := api.resolveLoadBalancerBackends(project, forwardingRuleName)
+	backends, backendService, err := api.resolveLoadBalancerBackends(
+		project, forwardingRuleName, r.Host, proxyPath,
+	)
 	if err != nil {
 		writeLoadBalancerUnavailable(w, err.Error())
 		return
@@ -1904,6 +1918,8 @@ func (api *API) proxyLoadBalancerRequest(
 func (api *API) resolveLoadBalancerBackends(
 	project string,
 	forwardingRuleName string,
+	host string,
+	requestPath string,
 ) ([]loadBalancerBackend, string, error) {
 	api.mu.RLock()
 	forwardingRule := api.loadBalancers[loadBalancerKey(project, "forwardingRules", forwardingRuleName)]
@@ -1923,11 +1939,11 @@ func (api *API) resolveLoadBalancerBackends(
 		api.mu.RUnlock()
 		return nil, "", fmt.Errorf("target HTTP proxy %q does not resolve to a URL map", targetProxyName)
 	}
-	if hasNonEmptyList(urlMap["hostRules"]) || hasNonEmptyList(urlMap["pathMatchers"]) {
+	backendServiceName, routeErr := resolveURLMapService(urlMap, host, requestPath)
+	if routeErr != nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("URL map %q uses unsupported host or path rules; only defaultService routing is supported", urlMapName)
+		return nil, "", fmt.Errorf("URL map %q cannot route request: %w", urlMapName, routeErr)
 	}
-	backendServiceName := resourceReferenceName(urlMap["defaultService"])
 	backendService := api.loadBalancers[loadBalancerKey(project, "backendServices", backendServiceName)]
 	if backendService == nil {
 		api.mu.RUnlock()
@@ -2117,7 +2133,7 @@ func (api *API) backendIsHealthy(r *http.Request, backend loadBalancerBackend) b
 	if err != nil {
 		return false
 	}
-	response, err := api.httpClient.Do(request)
+	response, err := observability.Do(api.httpClient, request)
 	if err != nil {
 		return false
 	}
@@ -2263,6 +2279,245 @@ func hasNonEmptyList(value interface{}) bool {
 	return ok && len(items) > 0
 }
 
+func resolveURLMapService(urlMap map[string]interface{}, requestHost, requestPath string) (string, error) {
+	defaultService := resourceReferenceName(urlMap["defaultService"])
+	if defaultService == "" {
+		return "", fmt.Errorf("defaultService is required")
+	}
+	rawHostRules, _ := urlMap["hostRules"].([]interface{})
+	rawPathMatchers, _ := urlMap["pathMatchers"].([]interface{})
+	if len(rawHostRules) == 0 && len(rawPathMatchers) == 0 {
+		return defaultService, nil
+	}
+
+	pathMatchers := make(map[string]map[string]interface{}, len(rawPathMatchers))
+	for _, raw := range rawPathMatchers {
+		matcher, ok := raw.(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("pathMatcher must be an object")
+		}
+		name, _ := matcher["name"].(string)
+		if name == "" || pathMatchers[name] != nil {
+			return "", fmt.Errorf("pathMatcher names must be non-empty and unique")
+		}
+		if resourceReferenceName(matcher["defaultService"]) == "" {
+			return "", fmt.Errorf("pathMatcher %q requires defaultService", name)
+		}
+		pathMatchers[name] = matcher
+	}
+
+	host := strings.ToLower(requestHost)
+	if parsedHost, _, err := net.SplitHostPort(requestHost); err == nil {
+		host = strings.ToLower(parsedHost)
+	}
+	for _, raw := range rawHostRules {
+		rule, ok := raw.(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("hostRule must be an object")
+		}
+		matcherName, _ := rule["pathMatcher"].(string)
+		matcher := pathMatchers[matcherName]
+		if matcher == nil {
+			return "", fmt.Errorf("hostRule references unknown pathMatcher %q", matcherName)
+		}
+		rawHosts, ok := rule["hosts"].([]interface{})
+		if !ok || len(rawHosts) == 0 {
+			return "", fmt.Errorf("hostRule requires hosts")
+		}
+		matched := false
+		for _, rawPattern := range rawHosts {
+			pattern, ok := rawPattern.(string)
+			if !ok || !supportedURLMapHost(pattern) {
+				return "", fmt.Errorf("unsupported host pattern")
+			}
+			if urlMapHostMatches(strings.ToLower(pattern), host) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		service, err := resolveURLMapPathMatcher(matcher, requestPath)
+		if err != nil {
+			return "", err
+		}
+		return service, nil
+	}
+	return defaultService, nil
+}
+
+func resolveURLMapPathMatcher(matcher map[string]interface{}, requestPath string) (string, error) {
+	selected := resourceReferenceName(matcher["defaultService"])
+	selectedLength := -1
+	rawRules, _ := matcher["pathRules"].([]interface{})
+	for _, raw := range rawRules {
+		rule, ok := raw.(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("pathRule must be an object")
+		}
+		service := resourceReferenceName(rule["service"])
+		rawPaths, ok := rule["paths"].([]interface{})
+		if service == "" || !ok || len(rawPaths) == 0 {
+			return "", fmt.Errorf("pathRule requires paths and service")
+		}
+		for _, rawPattern := range rawPaths {
+			pattern, ok := rawPattern.(string)
+			if !ok || !supportedURLMapPath(pattern) {
+				return "", fmt.Errorf("unsupported path pattern")
+			}
+			prefix := strings.TrimSuffix(pattern, "*")
+			matches := requestPath == pattern
+			if strings.HasSuffix(pattern, "*") {
+				matches = strings.HasPrefix(requestPath, prefix)
+			}
+			if matches && len(prefix) > selectedLength {
+				selected = service
+				selectedLength = len(prefix)
+			}
+		}
+	}
+	return selected, nil
+}
+
+func supportedURLMapHost(pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		pattern = strings.TrimPrefix(pattern, "*.")
+	}
+	return pattern != "" && !strings.ContainsAny(pattern, "/*:")
+}
+
+func urlMapHostMatches(pattern, host string) bool {
+	switch {
+	case pattern == "*":
+		return true
+	case strings.HasPrefix(pattern, "*."):
+		suffix := strings.TrimPrefix(pattern, "*")
+		return strings.HasSuffix(host, suffix) && host != strings.TrimPrefix(suffix, ".")
+	default:
+		return host == pattern
+	}
+}
+
+func supportedURLMapPath(pattern string) bool {
+	if !strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, "?#") {
+		return false
+	}
+	return !strings.Contains(pattern[:max(0, len(pattern)-1)], "*")
+}
+
+func (api *API) validateURLMap(project string, urlMap map[string]interface{}) error {
+	validateService := func(value interface{}) error {
+		name, err := backendServiceReferenceName(value, project)
+		if err != nil {
+			return err
+		}
+		api.mu.RLock()
+		exists := api.loadBalancers[loadBalancerKey(project, "backendServices", name)] != nil
+		api.mu.RUnlock()
+		if !exists {
+			return fmt.Errorf("backend service %q does not exist in project %q", name, project)
+		}
+		return nil
+	}
+	if err := validateService(urlMap["defaultService"]); err != nil {
+		return fmt.Errorf("defaultService: %w", err)
+	}
+	rawMatchers, _ := urlMap["pathMatchers"].([]interface{})
+	matchers := make(map[string]struct{}, len(rawMatchers))
+	for _, raw := range rawMatchers {
+		matcher, ok := raw.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("pathMatcher must be an object")
+		}
+		name, _ := matcher["name"].(string)
+		if name == "" {
+			return fmt.Errorf("pathMatcher name is required")
+		}
+		if _, duplicate := matchers[name]; duplicate {
+			return fmt.Errorf("pathMatcher names must be unique")
+		}
+		matchers[name] = struct{}{}
+		if err := validateService(matcher["defaultService"]); err != nil {
+			return fmt.Errorf("pathMatcher %q defaultService: %w", name, err)
+		}
+		rawRules, _ := matcher["pathRules"].([]interface{})
+		for _, rawRule := range rawRules {
+			rule, ok := rawRule.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("pathMatcher %q pathRule must be an object", name)
+			}
+			paths, ok := rule["paths"].([]interface{})
+			if !ok || len(paths) == 0 {
+				return fmt.Errorf("pathMatcher %q pathRule requires paths", name)
+			}
+			for _, rawPath := range paths {
+				path, ok := rawPath.(string)
+				if !ok || !supportedURLMapPath(path) {
+					return fmt.Errorf("pathMatcher %q has unsupported path pattern", name)
+				}
+			}
+			if err := validateService(rule["service"]); err != nil {
+				return fmt.Errorf("pathMatcher %q pathRule service: %w", name, err)
+			}
+		}
+	}
+	rawHostRules, _ := urlMap["hostRules"].([]interface{})
+	for _, raw := range rawHostRules {
+		rule, ok := raw.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("hostRule must be an object")
+		}
+		matcher, _ := rule["pathMatcher"].(string)
+		if _, ok := matchers[matcher]; !ok {
+			return fmt.Errorf("hostRule references unknown pathMatcher %q", matcher)
+		}
+		hosts, ok := rule["hosts"].([]interface{})
+		if !ok || len(hosts) == 0 {
+			return fmt.Errorf("hostRule requires hosts")
+		}
+		for _, rawHost := range hosts {
+			host, ok := rawHost.(string)
+			if !ok || !supportedURLMapHost(host) {
+				return fmt.Errorf("hostRule has unsupported host pattern")
+			}
+		}
+	}
+	return nil
+}
+
+func backendServiceReferenceName(value interface{}, project string) (string, error) {
+	reference, _ := value.(string)
+	if reference == "" {
+		return "", fmt.Errorf("reference is required")
+	}
+	if !strings.Contains(reference, "/") {
+		return reference, nil
+	}
+	path := reference
+	if parsed, err := url.Parse(reference); err == nil && parsed.Path != "" {
+		path = parsed.Path
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for index := range parts {
+		if parts[index] != "projects" || index+4 >= len(parts) {
+			continue
+		}
+		if parts[index+1] != project {
+			return "", fmt.Errorf("reference project %q does not match %q", parts[index+1], project)
+		}
+		if parts[index+2] != "global" || parts[index+3] != "backendServices" ||
+			parts[index+4] == "" || index+5 != len(parts) {
+			return "", fmt.Errorf("reference must target the global backendServices collection")
+		}
+		return parts[index+4], nil
+	}
+	return "", fmt.Errorf("reference must be a backend service name or canonical self link")
+}
+
 func (api *API) createLoadBalancerResource(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -2281,12 +2536,13 @@ func (api *API) createLoadBalancerResource(
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'name' is required")
 		return
 	}
-	if collection.canonical == "urlMaps" &&
-		(hasNonEmptyList(resource["hostRules"]) || hasNonEmptyList(resource["pathMatchers"])) {
-		w.WriteHeader(http.StatusNotImplemented)
-		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
-			"Only URL map defaultService routing is supported; hostRules and pathMatchers are not implemented")
-		return
+	if collection.canonical == "urlMaps" {
+		if err := api.validateURLMap(project, resource); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+				"invalid URL map routing configuration: "+err.Error())
+			return
+		}
 	}
 
 	selfLink := loadBalancerSelfLink(project, collection.canonical, name)

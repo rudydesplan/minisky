@@ -159,38 +159,28 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "POST" && strings.HasSuffix(path, "/triggers") {
-		parts := strings.Split(path, "/")
-		var project string
-		for i, p := range parts {
-			if p == "projects" && i+1 < len(parts) {
-				project = parts[i+1]
-				break
-			}
-		}
-		if project == "" {
-			project = "local-dev-project"
-		}
-		api.handleCreateTrigger(w, r, project)
+		writeUnimplemented(w, "Cloud Build triggers are not implemented")
 		return
 	}
 
 	if r.Method == "POST" && strings.Contains(path, "/triggers/") && strings.HasSuffix(path, ":run") {
-		parts := strings.Split(path, "/")
-		var project, triggerId string
-		for i, p := range parts {
-			if p == "projects" && i+1 < len(parts) {
-				project = parts[i+1]
-			}
-			if p == "triggers" && i+1 < len(parts) {
-				triggerId = parts[i+1]
-			}
-		}
-		triggerId = strings.Split(triggerId, ":")[0]
-		api.handleRunTrigger(w, r, project, triggerId)
+		writeUnimplemented(w, "Cloud Build trigger runs are not implemented")
 		return
 	}
 
 	w.WriteHeader(http.StatusNotFound)
+}
+
+func writeUnimplemented(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":    http.StatusNotImplemented,
+			"message": message,
+			"status":  "UNIMPLEMENTED",
+		},
+	})
 }
 
 func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, project string) {

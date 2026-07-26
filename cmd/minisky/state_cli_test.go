@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -113,4 +116,89 @@ func TestStateImportRejectsActiveDaemonProfile(t *testing.T) {
 	if !strings.Contains(err.Error(), "state profile is in use: active") {
 		t.Fatalf("state import error = %q, want profile context", err)
 	}
+}
+
+func TestStateImportCLIUsesExplicitDestinationProfileForGKEOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "ambient")
+	root := t.TempDir()
+	valid := gkeSnapshotForCLITest(t, "destination")
+	command := newStateCommand(root)
+	command.SetArgs([]string{"import", "-", "--profile", "destination"})
+	command.SetIn(bytes.NewReader(valid))
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	if err := command.Execute(); err != nil {
+		t.Fatalf("valid destination import failed: %v", err)
+	}
+
+	command = newStateCommand(root)
+	command.SetArgs([]string{"import", "-", "--profile", "destination"})
+	command.SetIn(bytes.NewReader(gkeSnapshotForCLITest(t, "ambient")))
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	if err := command.Execute(); err == nil {
+		t.Fatal("ambient-profile ownership was accepted for explicit destination")
+	}
+
+	store, err := state.New(root, "destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata struct {
+		Ownerships map[string]struct {
+			Profile string `json:"profile"`
+		} `json:"kubeconfigOwnerships"`
+	}
+	if err := store.Load("gke/metadata", &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if got := metadata.Ownerships["demo:us-central1-c:cluster"].Profile; got != "destination" {
+		t.Fatalf("rejected CLI import replaced destination ownership with %q", got)
+	}
+}
+
+func gkeSnapshotForCLITest(t *testing.T, profile string) []byte {
+	t.Helper()
+	key := "demo:us-central1-c:cluster"
+	type ownership struct {
+		Profile     string `json:"profile"`
+		Project     string `json:"project"`
+		Zone        string `json:"zone"`
+		Cluster     string `json:"cluster"`
+		BackendName string `json:"backendName,omitempty"`
+		SHA256      string `json:"sha256,omitempty"`
+		Device      uint64 `json:"device"`
+		Inode       uint64 `json:"inode"`
+	}
+	ownerships := map[string]ownership{
+		key: {
+			Profile: profile, Project: "demo", Zone: "us-central1-c", Cluster: "cluster",
+			BackendName: "minisky-owned-" + strings.Repeat("a", 32),
+			SHA256:      strings.Repeat("b", 64), Device: 1, Inode: 2,
+		},
+	}
+	ownershipPayload, err := json.Marshal(ownerships)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(ownershipPayload)
+	entry, err := json.Marshal(map[string]any{
+		"backend": "kind",
+		"clusters": map[string]any{
+			key: map[string]any{"name": "cluster", "location": "us-central1-c"},
+		},
+		"kubeconfigOwnerships":        ownerships,
+		"kubeconfigOwnershipChecksum": hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(state.Snapshot{
+		Format: state.SnapshotFormat, Version: state.Version,
+		Entries: map[string]json.RawMessage{"gke/metadata": entry},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }

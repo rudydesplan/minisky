@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,12 +14,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"minisky/pkg/config"
@@ -67,10 +68,36 @@ var (
 	auditStrict     bool
 )
 
+type shutdownHTTPServer interface {
+	Shutdown(context.Context) error
+}
+
+func newDaemonHTTPServer(addr string, handler http.Handler, tlsConfig *tls.Config) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
+func shutdownHTTPServers(ctx context.Context, servers ...shutdownHTTPServer) error {
+	var result error
+	for _, server := range servers {
+		if server != nil {
+			result = errors.Join(result, server.Shutdown(ctx))
+		}
+	}
+	return result
+}
+
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Starts the MiniSky Daemon and API Router",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) (result error) {
 		log.Printf("Starting MiniSky Daemon (API :%s, UI :%s)...", apiPort, uiPort)
 		if os.Getenv("DOCKER_API_VERSION") == "" {
 			os.Setenv("DOCKER_API_VERSION", "1.44")
@@ -98,18 +125,32 @@ var startCmd = &cobra.Command{
 
 		operationStore, profileOwnership, err := openDaemonState(config.GetStateDir(), config.GetProfile())
 		if err != nil {
-			log.Fatalf("[FATAL] Cannot acquire profile state ownership: %v", err)
+			return fmt.Errorf("acquire profile state ownership: %w", err)
 		}
-		defer profileOwnership.Close()
+		defer func() {
+			result = errors.Join(result, profileOwnership.Close())
+		}()
 		if err := reconcileOwnedSpools(operationStore, profileOwnership); err != nil {
-			log.Fatalf("[FATAL] Cannot reconcile profile request spools: %v", err)
+			return fmt.Errorf("reconcile profile request spools: %w", err)
 		}
-
-		// Write PID file
-		pidFile := filepath.Join(miniskyDir, "minisky.pid")
-		if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
-			log.Printf("[WARN] Failed to write PID file: %v", err)
+		if err := writeDaemonRuntime(config.GetProfileDir(), currentDaemonRuntime()); err != nil {
+			return fmt.Errorf("persist restart configuration: %w", err)
 		}
+		identity, err := newDaemonIdentity(config.GetProfile())
+		if err != nil {
+			return fmt.Errorf("capture daemon identity: %w", err)
+		}
+		if err := writeDaemonIdentity(config.GetProfileDir(), identity); err != nil {
+			return fmt.Errorf("persist daemon identity: %w", err)
+		}
+		defer func() {
+			result = errors.Join(result, removeDaemonIdentity(config.GetProfileDir(), identity))
+		}()
+		ctx, stopSignals, err := daemonSignalContext(context.Background(), identity.ControlToken)
+		if err != nil {
+			return fmt.Errorf("initialize daemon process control: %w", err)
+		}
+		defer stopSignals()
 
 		// ── Orchestrator boot ───────────────────────────────────────────────
 		// 1. Shared LRO state machine — passed into every shim that needs async ops.
@@ -117,27 +158,33 @@ var startCmd = &cobra.Command{
 		// and is never replayed.
 		opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
 		if err != nil {
-			log.Fatalf("[FATAL] Cannot restore operation state: %v", err)
+			return fmt.Errorf("restore operation state: %w", err)
 		}
 
-		ctx := context.Background()
 		// 2. Docker service manager — creates the isolated minisky-net bridge network
 		//    and handles cold-starting long-lived emulator containers (GCS, Pub/Sub, etc.).
 		//    Guarded native-only integration gates do not use Docker.
-		var svcMgr *orchestrator.ServiceManager
-		if nativeIntegrationDisablesDocker() {
-			log.Printf("[WARN] Docker orchestration disabled; Docker-backed services are unavailable")
-		} else {
-			svcMgr, err = orchestrator.NewServiceManager()
-			if err != nil {
-				log.Fatalf("[FATAL] Cannot connect to Docker: %v", err)
-			}
-			if err := svcMgr.EnsureNetwork(ctx); err != nil {
-				log.Fatalf("[FATAL] Cannot create isolated minisky-net network: %v", err)
-			}
-			if err := svcMgr.ReconcileBuildResources(ctx); err != nil {
-				log.Fatalf("[FATAL] Cannot reconcile Cloud Build resources: %v", err)
-			}
+		svcMgr, err := initializeDockerOrchestration(
+			ctx,
+			nativeIntegrationDisablesDocker(),
+			productionDockerStartup,
+		)
+		if err != nil {
+			return fmt.Errorf("initialize Docker orchestration: %w", err)
+		}
+		dockerClosed := false
+		if svcMgr != nil {
+			defer func() {
+				if dockerClosed {
+					return
+				}
+				dockerShutdownCtx, cancelDockerShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancelDockerShutdown()
+				if err := svcMgr.Teardown(dockerShutdownCtx); err != nil {
+					log.Printf("[WARN] Docker teardown did not complete cleanly: %v", err)
+					result = errors.Join(result, err)
+				}
+			}()
 		}
 
 		// ── Router ──────────────────────────────────────────────────────────
@@ -151,7 +198,7 @@ var startCmd = &cobra.Command{
 			ServerName: "localhost",
 		})
 		if err != nil {
-			log.Fatalf("[FATAL] Invalid TLS configuration: %v", err)
+			return fmt.Errorf("prepare TLS configuration: %w", err)
 		}
 		telemetryShutdown, telemetryErr := observability.SetupTelemetry(ctx, observability.TelemetryConfig{
 			Enabled:        otelEnabled,
@@ -162,6 +209,15 @@ var startCmd = &cobra.Command{
 			log.Printf("[WARN] OpenTelemetry disabled after setup failure: %v", telemetryErr)
 			telemetryShutdown = func(context.Context) error { return nil }
 		}
+		telemetryClosed := false
+		defer func() {
+			if telemetryClosed {
+				return
+			}
+			telemetryCtx, cancelTelemetry := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancelTelemetry()
+			result = errors.Join(result, telemetryShutdown(telemetryCtx))
+		}()
 		gatewayObservability := observability.New(observability.Config{
 			Capacity:           1000,
 			ReplayEnabled:      replayEnabled,
@@ -169,17 +225,27 @@ var startCmd = &cobra.Command{
 		})
 		quotaLimiter, err := router.ParseQuotaConfigJSON(quotaConfigJSON, time.Now)
 		if err != nil {
-			log.Fatalf("[FATAL] Invalid quota configuration: %v", err)
+			return fmt.Errorf("parse quota configuration: %w", err)
 		}
 		var auditLog *localsecurity.AuditLog
+		var auditHealth persistenceHealth
 		if auditEnabled || auditStrict {
 			auditLog, err = localsecurity.OpenAuditLog(config.GetProfileDir(), config.GetProfile(), auditStrict)
 			if err != nil {
 				if auditStrict {
-					log.Fatalf("[FATAL] Strict mutation audit unavailable: %v", err)
+					return fmt.Errorf("open strict mutation audit: %w", err)
 				}
 				log.Printf("[WARN] Mutation audit disabled after integrity/open failure: %v", err)
+				auditHealth = fixedPersistenceHealth{err: err}
 				auditLog = nil
+			} else {
+				auditHealth = auditLog
+				defer func() {
+					if auditLog != nil {
+						result = errors.Join(result, auditLog.Close())
+						auditLog = nil
+					}
+				}()
 			}
 		}
 
@@ -189,7 +255,7 @@ var startCmd = &cobra.Command{
 		shims, lazyDomains := registry.BootAll(opMgr, svcMgr)
 		exposedShims, exposedLazyDomains, err := selectServiceDomains(shims, lazyDomains, enabledServices)
 		if err != nil {
-			log.Fatalf("[FATAL] Invalid service selection: %v", err)
+			return fmt.Errorf("select service domains: %w", err)
 		}
 		iamAPI := shims["iam.googleapis.com"].(*iam.API)
 		projectAPI := shims["cloudresourcemanager.googleapis.com"].(*resourcemanager.API)
@@ -197,7 +263,7 @@ var startCmd = &cobra.Command{
 		proxyRouter.ConfigureQuota(quotaLimiter, gatewayObservability.ObserveQuotaRejection)
 
 		for domain, handler := range exposedShims {
-			proxyRouter.RegisterShim(domain, registry.ContractHandler(domain, handler))
+			proxyRouter.RegisterShim(domain, registry.RuntimeHandler(domain, handler, svcMgr != nil))
 		}
 		for _, domain := range exposedLazyDomains {
 			proxyRouter.RegisterLazyDocker(domain)
@@ -206,13 +272,15 @@ var startCmd = &cobra.Command{
 		// Resolve shims needed for Dashboard
 		logShim := shims["logging.googleapis.com"].(*logging.API)
 		monShim := shims["monitoring.googleapis.com"].(*monitoring.API)
-		serverlessShim := shims["cloudfunctions.googleapis.com"].(*serverless.API)
 		bqAPI := shims["bigquery.googleapis.com"].(*bigquery.API)
 		gkeAPI := shims["container.googleapis.com"].(*gke.API)
-		appEngineAPI := shims["appengine.googleapis.com"].(*appengine.API)
-		memoAPI := shims["redis.googleapis.com"].(*memorystore.API)
 		schedulerAPI := shims["cloudscheduler.googleapis.com"].(*scheduler.API)
-		computeAPI := shims["compute.googleapis.com"].(*compute.API)
+		gatewayObservability.RegisterResourceCounter("logging.googleapis.com", "log_entry", func() int {
+			return len(logShim.GetEntries())
+		})
+		gatewayObservability.RegisterResourceCounter("minisky.local", "operation", func() int {
+			return len(opMgr.List())
+		})
 		gatewayScheme := "http"
 		if gatewayTLS != nil {
 			gatewayScheme = "https"
@@ -221,7 +289,7 @@ var startCmd = &cobra.Command{
 		schedulerAPI.SetGatewayBaseURL(gatewayURL)
 		gatewayClient, err := gatewayLoopbackClient(gatewayTLS, tlsDiagnostics.CertificateFile, tlsClientCert, tlsClientKey)
 		if err != nil {
-			log.Fatalf("[FATAL] Cannot configure internal gateway client: %v", err)
+			return fmt.Errorf("configure internal gateway client: %w", err)
 		}
 		gkeAPI.ConfigureGateway(gatewayURL, gatewayClient)
 		var publicGateway http.Handler = gatewayObservability.Wrap(proxyRouter, proxyRouter.ClassifyRequest)
@@ -238,126 +306,141 @@ var startCmd = &cobra.Command{
 			})
 		}
 		healthChecks := []persistenceHealth{opMgr}
+		if auditHealth != nil {
+			healthChecks = append(healthChecks, auditHealth)
+		}
 		for _, handler := range shims {
 			if health, ok := handler.(persistenceHealth); ok {
 				healthChecks = append(healthChecks, health)
 			}
 		}
-		gatewayHandler := gatewayMux(publicGateway, healthChecks...)
+		gatewayHandler := gatewayMux(publicGateway, identity.ControlToken, healthChecks...)
 		gatewayObservability.SetReplayTarget(gatewayHandler)
 
-		// ── Graceful Shutdown ────────────────────────────────────────────────
-		go func() {
-			quit := make(chan os.Signal, 1)
-			signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-			<-quit
-			log.Println("⏹️  MiniSky shutting down — tearing down isolated network...")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			telemetryErr, pluginErr := shutdownTelemetryAndPlugins(shutdownCtx, telemetryShutdown, shims)
-			if telemetryErr != nil {
-				log.Printf("[WARN] OpenTelemetry shutdown did not complete cleanly: %v", telemetryErr)
-			}
-			if pluginErr != nil {
-				log.Printf("[WARN] Plugin shutdown did not complete cleanly: %v", pluginErr)
-			}
-			if auditLog != nil {
-				if err := auditLog.Close(); err != nil {
-					log.Printf("[WARN] Audit log close failed: %v", err)
-				}
-			}
-			cancel()
-			if svcMgr != nil {
-				svcMgr.Teardown(context.Background())
-			}
-			if err := profileOwnership.Close(); err != nil {
-				log.Printf("[WARN] Failed to release profile state ownership: %v", err)
-			}
-			os.Remove(pidFile)
-			os.Exit(0)
-		}()
-
 		// ── Dashboard UI ─────────────────────────────────────────────────────
-		go func() {
-			addr := net.JoinHostPort("127.0.0.1", uiPort)
-			log.Printf("✨ MiniSky Dashboard available at %s://localhost:%s", gatewayScheme, uiPort)
-
-			uiMux := http.NewServeMux()
-
-			// REST API for dynamic dashboard control
-			var apiHandler http.Handler
-			if svcMgr == nil {
-				apiHandler = dashboardUnavailableHandler()
-			} else {
-				apiHandler = dashboard.NewAPIHandler(
-					svcMgr,
-					bqAPI.GetBackend(),
-					gkeAPI.GetBackend(),
-					gkeAPI,
-					serverlessShim.GetBackend(),
-					logShim,
-					monShim,
-					appEngineAPI,
-					memoAPI,
-					schedulerAPI,
-					computeAPI,
-					projectAPI,
-					gatewayURL,
-					gatewayObservability.DiagnosticsHandler(),
-					iamAPI,
-					tokenAudience,
-				)
-			}
-			if auditLog != nil {
-				apiHandler = auditLog.Wrap(apiHandler, func(r *http.Request) localsecurity.AuditEvent {
-					return localsecurity.AuditEvent{
-						Principal: r.Header.Get("X-MiniSky-Principal"),
-						Method:    r.Method,
-						Service:   "dashboard",
-						Route:     observability.NormalizeRoute(r.URL.Path),
-						Project:   dashboardAuditProject(r),
-					}
-				})
-			}
-			uiMux.Handle("/api/", apiHandler)
-			// Fallback to static dist
-			uiMux.Handle("/", ui.Handler())
-
-			uiServer := &http.Server{Addr: addr, Handler: uiMux}
-			if gatewayTLS != nil {
-				uiServer.TLSConfig = gatewayTLS.Clone()
-				uiServer.TLSConfig.ClientAuth = tls.NoClientCert
-				uiServer.TLSConfig.ClientCAs = nil
-			}
-			var serveErr error
-			if uiServer.TLSConfig != nil {
-				serveErr = uiServer.ListenAndServeTLS("", "")
-			} else {
-				serveErr = uiServer.ListenAndServe()
-			}
-			if serveErr != nil {
-				log.Fatalf("UI Server crashed: %v", serveErr)
-			}
-		}()
+		uiAddr := net.JoinHostPort("127.0.0.1", uiPort)
+		log.Printf("✨ MiniSky Dashboard available at %s://localhost:%s", gatewayScheme, uiPort)
+		uiMux := http.NewServeMux()
+		uiMux.Handle("/_minisky/control/readiness", daemonReadinessHandler("ui", identity.ControlToken))
+		var apiHandler http.Handler
+		if svcMgr == nil {
+			apiHandler = dashboardAPIWithoutDocker(
+				gatewayObservability.DiagnosticsHandler(),
+				iamAPI,
+				tokenAudience,
+			)
+		} else {
+			serverlessShim := shims["cloudfunctions.googleapis.com"].(*serverless.API)
+			appEngineAPI := shims["appengine.googleapis.com"].(*appengine.API)
+			memoAPI := shims["redis.googleapis.com"].(*memorystore.API)
+			computeAPI := shims["compute.googleapis.com"].(*compute.API)
+			apiHandler = dashboard.NewAPIHandler(
+				svcMgr, bqAPI.GetBackend(), gkeAPI.GetBackend(), gkeAPI,
+				serverlessShim.GetBackend(), logShim, monShim, appEngineAPI,
+				memoAPI, schedulerAPI, computeAPI, projectAPI, gatewayURL,
+				gatewayObservability.DiagnosticsHandler(), iamAPI, tokenAudience,
+			)
+		}
+		if auditLog != nil {
+			apiHandler = auditLog.Wrap(apiHandler, func(r *http.Request) localsecurity.AuditEvent {
+				return localsecurity.AuditEvent{
+					Principal: r.Header.Get("X-MiniSky-Principal"),
+					Method:    r.Method, Service: "dashboard",
+					Route:   observability.NormalizeRoute(r.URL.Path),
+					Project: dashboardAuditProject(r),
+				}
+			})
+		}
+		uiMux.Handle("/api/", apiHandler)
+		uiMux.Handle("/", ui.Handler())
+		uiServer := newDaemonHTTPServer(uiAddr, uiMux, nil)
+		if gatewayTLS != nil {
+			uiServer.TLSConfig = gatewayTLS.Clone()
+			uiServer.TLSConfig.ClientAuth = tls.NoClientCert
+			uiServer.TLSConfig.ClientCAs = nil
+		}
 
 		// ── API Proxy Gateway ────────────────────────────────────────────────
 		addr := gatewayListenAddress(apiBind, apiPort)
 		log.Printf("🚀 MiniSky API Gateway listening on %s://%s (mTLS=%t)", gatewayScheme, addr, tlsDiagnostics.ClientCAEnabled)
-		server := &http.Server{Addr: addr, Handler: gatewayHandler, TLSConfig: gatewayTLS}
-		var serveErr error
-		if gatewayTLS != nil {
-			serveErr = server.ListenAndServeTLS("", "")
+		server := newDaemonHTTPServer(addr, gatewayHandler, gatewayTLS)
+		serveErrors := make(chan error, 2)
+		serve := func(name string, current *http.Server) {
+			var err error
+			if current.TLSConfig != nil {
+				err = current.ListenAndServeTLS("", "")
+			} else {
+				err = current.ListenAndServe()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErrors <- fmt.Errorf("%s server: %w", name, err)
+				return
+			}
+			serveErrors <- nil
+		}
+		go serve("dashboard", uiServer)
+		go serve("gateway", server)
+
+		listenerErr := waitForDaemonListener(ctx, serveErrors)
+		if listenerErr != nil {
+			log.Printf("[ERROR] %v", listenerErr)
+			stopSignals()
 		} else {
-			serveErr = server.ListenAndServe()
+			log.Println("⏹️  MiniSky shutting down gracefully...")
 		}
-		if serveErr != nil {
-			log.Fatalf("Failed to start router: %v", serveErr)
+
+		var shutdownErr error
+		httpShutdownCtx, cancelHTTPShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := shutdownHTTPServers(httpShutdownCtx, server, uiServer); err != nil {
+			log.Printf("[WARN] HTTP server shutdown did not complete cleanly: %v", err)
+			shutdownErr = errors.Join(shutdownErr, err)
 		}
+		cancelHTTPShutdown()
+		pluginShutdownCtx, cancelPluginShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+		telemetryErr, pluginErr := shutdownTelemetryAndPlugins(pluginShutdownCtx, telemetryShutdown, shims)
+		telemetryClosed = true
+		cancelPluginShutdown()
+		if telemetryErr != nil {
+			log.Printf("[WARN] OpenTelemetry shutdown did not complete cleanly: %v", telemetryErr)
+			shutdownErr = errors.Join(shutdownErr, telemetryErr)
+		}
+		if pluginErr != nil {
+			log.Printf("[WARN] Plugin shutdown did not complete cleanly: %v", pluginErr)
+			shutdownErr = errors.Join(shutdownErr, pluginErr)
+		}
+		if auditLog != nil {
+			if err := auditLog.Close(); err != nil {
+				log.Printf("[WARN] Audit log close failed: %v", err)
+				shutdownErr = errors.Join(shutdownErr, err)
+			}
+			auditLog = nil
+		}
+		if svcMgr != nil {
+			dockerShutdownCtx, cancelDockerShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+			dockerErr := svcMgr.Teardown(dockerShutdownCtx)
+			cancelDockerShutdown()
+			dockerClosed = true
+			if dockerErr != nil {
+				log.Printf("[WARN] Docker teardown did not complete cleanly: %v", dockerErr)
+				shutdownErr = errors.Join(shutdownErr, dockerErr)
+			}
+		}
+		return errors.Join(listenerErr, shutdownErr)
 	},
+}
+
+func waitForDaemonListener(ctx context.Context, results <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-results:
+		return err
+	}
 }
 
 func gatewayLoopbackClient(serverTLS *tls.Config, certificateFile, clientCertFile, clientKeyFile string) (*http.Client, error) {
 	if serverTLS == nil {
-		return &http.Client{}, nil
+		return &http.Client{Timeout: 30 * time.Second}, nil
 	}
 	pemBytes, err := os.ReadFile(certificateFile)
 	if err != nil {
@@ -382,7 +465,10 @@ func gatewayLoopbackClient(serverTLS *tls.Config, certificateFile, clientCertFil
 		}
 		clientTLS.Certificates = []tls.Certificate{clientCertificate}
 	}
-	return &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}, nil
+	return &http.Client{
+		Transport: &http.Transport{TLSClientConfig: clientTLS},
+		Timeout:   30 * time.Second,
+	}, nil
 }
 
 func openDaemonState(root, profile string) (*state.Store, *state.Ownership, error) {
@@ -568,6 +654,14 @@ type persistenceHealth interface {
 	PersistenceError() error
 }
 
+type fixedPersistenceHealth struct {
+	err error
+}
+
+func (health fixedPersistenceHealth) PersistenceError() error {
+	return health.err
+}
+
 func gatewayListenAddress(bind, port string) string {
 	bind = strings.TrimSpace(bind)
 	if bind == "" {
@@ -576,8 +670,9 @@ func gatewayListenAddress(bind, port string) string {
 	return net.JoinHostPort(bind, port)
 }
 
-func gatewayMux(gateway http.Handler, healthChecks ...persistenceHealth) http.Handler {
+func gatewayMux(gateway http.Handler, controlToken string, healthChecks ...persistenceHealth) http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("/_minisky/control/readiness", daemonReadinessHandler("api", controlToken))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -602,6 +697,21 @@ func gatewayMux(gateway http.Handler, healthChecks ...persistenceHealth) http.Ha
 	})
 	mux.Handle("/", gateway)
 	return mux
+}
+
+func daemonReadinessHandler(role, controlToken string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce := r.Header.Get("X-MiniSky-Readiness-Nonce")
+		nonceBytes, err := hex.DecodeString(nonce)
+		if r.Method != http.MethodGet || err != nil || len(nonceBytes) != 32 || len(controlToken) != 64 {
+			http.NotFound(w, r)
+			return
+		}
+		proof := hmac.New(sha256.New, []byte(controlToken))
+		_, _ = proof.Write([]byte(role + ":" + nonce))
+		w.Header().Set("X-MiniSky-Readiness-Proof", hex.EncodeToString(proof.Sum(nil)))
+		w.WriteHeader(http.StatusNoContent)
+	})
 }
 
 func dashboardUnavailableHandler() http.Handler {

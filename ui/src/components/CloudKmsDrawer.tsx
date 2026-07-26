@@ -233,7 +233,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
             <KeyIcon sx={{ color: '#4285f4' }} />
             <Typography variant="h5" sx={{ fontWeight: 600 }}>Cloud KMS</Typography>
           </Box>
-          <IconButton onClick={onClose}><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
         </Box>
         <Typography variant="body2" sx={{ color: 'text.secondary', mb: 2 }}>
           Native AES-256-GCM key management. No external Docker container required.
@@ -342,7 +342,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
                       return (
                         <Box key={ck.name} sx={{ mb: 1, border: '1px solid #e0e0e0', borderRadius: 1, overflow: 'hidden' }}>
                           <ListItem sx={{ px: 2 }}>
-                            <IconButton size="small" onClick={() => toggleVersions(selectedKr, ckId)} sx={{ mr: 1 }}>
+                            <IconButton aria-label={`${isExpanded ? 'Collapse' : 'Expand'} key ${ckId}`} size="small" onClick={() => toggleVersions(selectedKr, ckId)} sx={{ mr: 1 }}>
                               {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                             </IconButton>
                             <ListItemText
@@ -356,12 +356,12 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
                             />
                             <ListItemSecondaryAction>
                               <Tooltip title="Rotate Key (add new version)">
-                                <IconButton size="small" onClick={() => handleRotateKey(selectedKr, ckId)}>
+                                <IconButton aria-label="Lock Open" size="small" onClick={() => handleRotateKey(selectedKr, ckId)}>
                                   <LockOpenIcon fontSize="small" />
                                 </IconButton>
                               </Tooltip>
                               <Tooltip title="Copy Resource Name">
-                                <IconButton size="small" onClick={() => navigator.clipboard.writeText(ck.name)}>
+                                <IconButton aria-label={`Copy resource name for key ${ckId}`} size="small" onClick={() => navigator.clipboard.writeText(ck.name)}>
                                   <ContentCopyIcon fontSize="small" />
                                 </IconButton>
                               </Tooltip>
@@ -387,7 +387,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
                                           <Chip label={v.state} size="small" color={stateColor(v.state)} />
                                           {v.state === 'ENABLED' && (
                                             <Tooltip title="Destroy Version">
-                                              <IconButton size="small" color="error" onClick={() => handleDestroyVersion(selectedKr, ckId, v.name)}>
+                                              <IconButton aria-label={`Destroy key version ${vId}`} size="small" color="error" onClick={() => handleDestroyVersion(selectedKr, ckId, v.name)}>
                                                 <DeleteIcon fontSize="inherit" />
                                               </IconButton>
                                             </Tooltip>
@@ -458,7 +458,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
                       {encryptResult}
                     </Typography>
                     <Tooltip title="Copy ciphertext">
-                      <IconButton size="small" onClick={() => navigator.clipboard.writeText(encryptResult)}>
+                      <IconButton aria-label="Copy" size="small" onClick={() => navigator.clipboard.writeText(encryptResult)}>
                         <ContentCopyIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>

@@ -48,6 +48,7 @@ type requestIDKey struct{}
 type RequestLabels struct {
 	Service string
 	Route   string
+	Project string
 }
 
 type Record struct {
@@ -58,6 +59,7 @@ type Record struct {
 	Method     string    `json:"method"`
 	Route      string    `json:"route"`
 	Service    string    `json:"service"`
+	Project    string    `json:"project,omitempty"`
 	Status     int       `json:"status"`
 	LatencyMS  float64   `json:"latencyMs"`
 	Replayable bool      `json:"replayable"`
@@ -70,6 +72,7 @@ type Query struct {
 	Method  string
 	Status  int
 	TraceID string
+	Project string
 }
 
 type Store struct {
@@ -102,6 +105,9 @@ func (s *Store) Query(query Query) []Record {
 	result := make([]Record, 0, len(s.records))
 	for i := len(s.records) - 1; i >= 0; i-- {
 		record := s.records[i]
+		if query.Project != "" && record.Project != query.Project {
+			continue
+		}
 		if query.Service != "" && record.Service != query.Service {
 			continue
 		}
@@ -120,11 +126,11 @@ func (s *Store) Query(query Query) []Record {
 	return result
 }
 
-func (s *Store) find(requestID string) (Record, bool) {
+func (s *Store) find(project, requestID string) (Record, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for i := len(s.records) - 1; i >= 0; i-- {
-		if s.records[i].RequestID == requestID {
+		if s.records[i].Project == project && s.records[i].RequestID == requestID {
 			return s.records[i], true
 		}
 	}
@@ -217,6 +223,7 @@ func (m *Manager) Wrap(next http.Handler, resolve func(*http.Request) RequestLab
 			Method:     r.Method,
 			Route:      labels.Route,
 			Service:    labels.Service,
+			Project:    strings.TrimSpace(labels.Project),
 			Status:     status,
 			LatencyMS:  float64(latency.Microseconds()) / 1000,
 			Replayable: payload != nil && payloadErr == nil,
@@ -389,16 +396,22 @@ type quotaMetricKey struct {
 	service, route, scope string
 }
 
+type resourceMetricKey struct {
+	service, resourceKind string
+}
+
 type Metrics struct {
-	mu              sync.RWMutex
-	values          map[metricKey]metricValue
-	quotaRejections map[quotaMetricKey]uint64
+	mu               sync.RWMutex
+	values           map[metricKey]metricValue
+	quotaRejections  map[quotaMetricKey]uint64
+	resourceCounters map[resourceMetricKey]func() int
 }
 
 func NewMetrics() *Metrics {
 	return &Metrics{
-		values:          make(map[metricKey]metricValue),
-		quotaRejections: make(map[quotaMetricKey]uint64),
+		values:           make(map[metricKey]metricValue),
+		quotaRejections:  make(map[quotaMetricKey]uint64),
+		resourceCounters: make(map[resourceMetricKey]func() int),
 	}
 }
 
@@ -434,6 +447,35 @@ func (m *Manager) ObserveQuotaRejection(labels RequestLabels, scope string) {
 	m.metrics.mu.Unlock()
 }
 
+// RegisterResourceCounter adds a scrape-time gauge keyed only by a stable
+// service and resource kind. Project IDs and resource names are intentionally
+// excluded to keep the metric cardinality bounded.
+func (m *Manager) RegisterResourceCounter(service, resourceKind string, counter func() int) {
+	if counter == nil {
+		return
+	}
+	key := resourceMetricKey{
+		service:      normalizeService(service),
+		resourceKind: normalizeResourceKind(resourceKind),
+	}
+	m.metrics.mu.Lock()
+	m.metrics.resourceCounters[key] = counter
+	m.metrics.mu.Unlock()
+}
+
+func normalizeResourceKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "" || len(kind) > 64 {
+		return "unknown"
+	}
+	for _, char := range kind {
+		if !(char == '_' || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')) {
+			return "unknown"
+		}
+	}
+	return kind
+}
+
 func normalizeMethod(method string) string {
 	switch method {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
@@ -460,11 +502,16 @@ func (m *Manager) DiagnosticsHandler() http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		project, ok := diagnosticsProject(w, r)
+		if !ok {
+			return
+		}
 		status, _ := strconv.Atoi(r.URL.Query().Get("status"))
 		writeJSON(w, http.StatusOK, map[string]any{"requests": m.store.Query(Query{
 			Service: r.URL.Query().Get("service"),
 			Method:  strings.ToUpper(r.URL.Query().Get("method")),
 			Status:  status,
+			Project: project,
 		})})
 	})
 	mux.HandleFunc("/api/diagnostics/traces", func(w http.ResponseWriter, r *http.Request) {
@@ -472,7 +519,11 @@ func (m *Manager) DiagnosticsHandler() http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		records := m.store.Query(Query{TraceID: r.URL.Query().Get("traceId")})
+		project, ok := diagnosticsProject(w, r)
+		if !ok {
+			return
+		}
+		records := m.store.Query(Query{TraceID: r.URL.Query().Get("traceId"), Project: project})
 		traces := records[:0]
 		for _, record := range records {
 			if record.TraceID != "" {
@@ -491,7 +542,11 @@ func (m *Manager) DiagnosticsHandler() http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request ID"})
 			return
 		}
-		result, err := m.Replay(r.Context(), requestID)
+		project, ok := diagnosticsProject(w, r)
+		if !ok {
+			return
+		}
+		result, err := m.Replay(r.Context(), project, requestID)
 		if err != nil {
 			status := http.StatusConflict
 			if errors.Is(err, ErrRecordNotFound) {
@@ -503,6 +558,18 @@ func (m *Manager) DiagnosticsHandler() http.Handler {
 		writeJSON(w, http.StatusOK, result)
 	})
 	return localOnly(mux)
+}
+
+func diagnosticsProject(w http.ResponseWriter, r *http.Request) (string, bool) {
+	headerProject := strings.TrimSpace(r.Header.Get("X-MiniSky-Project"))
+	queryProject := strings.TrimSpace(r.URL.Query().Get("project"))
+	if headerProject == "" || queryProject == "" || headerProject != queryProject {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "diagnostics require matching X-MiniSky-Project and project query values",
+		})
+		return "", false
+	}
+	return headerProject, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -530,9 +597,18 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		quotaKeys = append(quotaKeys, key)
 		quotaValues[key] = value
 	}
+	resourceKeys := make([]resourceMetricKey, 0, len(m.resourceCounters))
+	resourceCounters := make(map[resourceMetricKey]func() int, len(m.resourceCounters))
+	for key, counter := range m.resourceCounters {
+		resourceKeys = append(resourceKeys, key)
+		resourceCounters[key] = counter
+	}
 	m.mu.RUnlock()
 	sort.Slice(quotaKeys, func(i, j int) bool {
 		return fmt.Sprint(quotaKeys[i]) < fmt.Sprint(quotaKeys[j])
+	})
+	sort.Slice(resourceKeys, func(i, j int) bool {
+		return fmt.Sprint(resourceKeys[i]) < fmt.Sprint(resourceKeys[j])
 	})
 
 	fmt.Fprintln(w, "# HELP minisky_gateway_requests_total Total public gateway requests.")
@@ -560,6 +636,21 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 			key.route,
 			key.scope,
 			quotaValues[key],
+		)
+	}
+	fmt.Fprintln(w, "# HELP minisky_resources Current locally emulated resource count.")
+	fmt.Fprintln(w, "# TYPE minisky_resources gauge")
+	for _, key := range resourceKeys {
+		count := resourceCounters[key]()
+		if count < 0 {
+			count = 0
+		}
+		fmt.Fprintf(
+			w,
+			"minisky_resources{service=%q,resource_kind=%q} %d\n",
+			key.service,
+			key.resourceKind,
+			count,
 		)
 	}
 }
@@ -600,6 +691,11 @@ type replayPayload struct {
 	captureErr error
 }
 
+type replayRestoreBody struct {
+	io.Reader
+	io.Closer
+}
+
 type ReplayResult struct {
 	Status    int    `json:"status"`
 	RequestID string `json:"requestId,omitempty"`
@@ -624,12 +720,19 @@ func (m *Manager) captureReplay(r *http.Request, labels RequestLabels) (*replayP
 	if r.Body == nil || r.Body == http.NoBody {
 		return payload, nil
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, m.replayMaxBytes+1))
+	originalBody := r.Body
+	body, err := io.ReadAll(io.LimitReader(originalBody, m.replayMaxBytes+1))
 	if err != nil {
+		r.Body = &replayRestoreBody{
+			Reader: io.MultiReader(bytes.NewReader(body), originalBody),
+			Closer: originalBody,
+		}
 		return nil, ErrPayloadOmitted
 	}
-	r.Body.Close()
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = &replayRestoreBody{
+		Reader: io.MultiReader(bytes.NewReader(body), originalBody),
+		Closer: originalBody,
+	}
 	if int64(len(body)) > m.replayMaxBytes {
 		return nil, ErrPayloadOmitted
 	}
@@ -704,6 +807,9 @@ func containsSensitiveJSON(value any) bool {
 
 func isSensitiveName(name string) bool {
 	normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, "_", ""), "-", ""))
+	if normalized == "key" {
+		return true
+	}
 	for _, sensitive := range []string{"authorization", "cookie", "password", "passwd", "token", "secret", "apikey", "privatekey", "credential"} {
 		if strings.Contains(normalized, sensitive) {
 			return true
@@ -718,11 +824,11 @@ func (m *Manager) SetReplayTarget(target http.Handler) {
 	m.replayMu.Unlock()
 }
 
-func (m *Manager) Replay(ctx context.Context, requestID string) (ReplayResult, error) {
+func (m *Manager) Replay(ctx context.Context, project, requestID string) (ReplayResult, error) {
 	if !m.replayEnabled {
 		return ReplayResult{}, ErrReplayDisabled
 	}
-	record, ok := m.store.find(requestID)
+	record, ok := m.store.find(strings.TrimSpace(project), requestID)
 	if !ok {
 		return ReplayResult{}, ErrRecordNotFound
 	}
@@ -749,6 +855,7 @@ func (m *Manager) Replay(ctx context.Context, requestID string) (ReplayResult, e
 	}
 	request.Host = payload.host
 	request.Header = payload.headers.Clone()
+	request.Header.Set("X-MiniSky-Project", record.Project)
 	request.Header.Set(replayHeader, "1")
 	response := httptest.NewRecorder()
 	target.ServeHTTP(response, request)
@@ -758,11 +865,30 @@ func (m *Manager) Replay(ctx context.Context, requestID string) (ReplayResult, e
 	}, nil
 }
 
+type instrumentedTransport struct {
+	http.RoundTripper
+}
+
 func InstrumentTransport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return otelhttp.NewTransport(base)
+	switch base.(type) {
+	case *instrumentedTransport, *otelhttp.Transport:
+		return base
+	}
+	return &instrumentedTransport{RoundTripper: otelhttp.NewTransport(base)}
+}
+
+// Do instruments a single request while retaining every setting and behavior
+// of the caller-supplied client, including timeouts and redirect policy.
+func Do(client *http.Client, request *http.Request) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	instrumented := *client
+	instrumented.Transport = InstrumentTransport(client.Transport)
+	return instrumented.Do(request)
 }
 
 func NewReverseProxy(target *url.URL) *httputil.ReverseProxy {

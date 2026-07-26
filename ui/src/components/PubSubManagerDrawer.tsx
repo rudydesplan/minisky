@@ -216,8 +216,8 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
               <Typography variant="caption" sx={{ color: '#5f6368' }}>Event Stream Sandbox • {activeProject}</Typography>
             </Box>
             <Box>
-              <IconButton onClick={() => { loadTopics(); loadSubscriptions(); }} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh" onClick={() => { loadTopics(); loadSubscriptions(); }} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 
@@ -226,7 +226,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
             <Box sx={{ width: 280, borderRight: '1px solid #dadce0', bgcolor: 'white', display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, borderBottom: '1px solid #dadce0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>Topics</Typography>
-                <IconButton size="small" onClick={() => setNewTopicOpen(true)}><AddIcon fontSize="small" /></IconButton>
+                <IconButton aria-label="Add" size="small" onClick={() => setNewTopicOpen(true)}><AddIcon fontSize="small" /></IconButton>
               </Box>
               <List sx={{ flex: 1, overflow: 'auto', p: 0 }}>
                 {topics.map(t => {
@@ -239,7 +239,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
                       sx={{ borderBottom: '1px solid #f1f3f4', py: 1.5 }}
                     >
                       <ListItemText primary={<Typography sx={{ fontSize: '0.85rem', fontWeight: activeTopic === t.name ? 600 : 400 }}>{tId}</Typography>} />
-                      <IconButton size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteTopic(t.name); }}>
+                      <IconButton aria-label={`Delete topic ${tId}`} size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteTopic(t.name); }}>
                         <DeleteIcon fontSize="inherit" />
                       </IconButton>
                     </ListItemButton>
@@ -252,7 +252,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
             <Box sx={{ width: 300, borderRight: '1px solid #dadce0', bgcolor: '#fff', display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, borderBottom: '1px solid #dadce0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>Subscriptions</Typography>
-                <IconButton size="small" onClick={() => setNewSubOpen(true)} disabled={!activeTopic} color="primary">
+                <IconButton aria-label="Add" size="small" onClick={() => setNewSubOpen(true)} disabled={!activeTopic} color="primary">
                   <AddIcon fontSize="small" />
                 </IconButton>
               </Box>
@@ -280,7 +280,7 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
                         <ListItemText 
                           primary={<Typography sx={{ fontSize: '0.85rem', fontWeight: activeSubscription === s.name ? 600 : 400 }}>{sId}</Typography>} 
                         />
-                        <IconButton size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteSub(s.name); }}>
+                        <IconButton aria-label={`Delete subscription ${sId}`} size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteSub(s.name); }}>
                           <DeleteIcon fontSize="inherit" />
                         </IconButton>
                       </ListItemButton>

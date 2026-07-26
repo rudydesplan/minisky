@@ -107,7 +107,7 @@ export default function TerminalDrawer({ open, onClose, containerName }: Termina
           <Typography variant="subtitle2" sx={{ fontFamily: 'monospace', opacity: 0.8 }}>
             Terminal: {containerName} (container default user)
           </Typography>
-          <IconButton onClick={onClose} size="small" sx={{ color: '#999' }}>
+          <IconButton aria-label="Close" onClick={onClose} size="small" sx={{ color: '#999' }}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </Box>

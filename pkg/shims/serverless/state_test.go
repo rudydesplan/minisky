@@ -2,8 +2,10 @@ package serverless
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
 )
 
@@ -48,5 +50,29 @@ func TestFunctionAndServiceMetadataRehydrateWithoutWorkers(t *testing.T) {
 	}
 	if restarted.client != http.DefaultClient {
 		t.Fatal("transient HTTP client must not be persisted")
+	}
+}
+
+func TestServerlessOperationPollingIsFullyScoped(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api, err := NewAPIWithStore(manager, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := []*orchestrator.Operation{
+		manager.Register("cloudfunctions#operation", "CREATE",
+			"projects/other/locations/us/functions/fn", "", "us"),
+		manager.Register("cloudfunctions#operation", "CREATE",
+			"projects/demo/locations/eu/functions/fn", "", "eu"),
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/demo/zones/us/instances/vm", "us", ""),
+	}
+	for _, operation := range operations {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"/v1/projects/demo/locations/us/operations/"+operation.Name, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("foreign operation %s status=%d body=%s", operation.Kind, response.Code, response.Body.String())
+		}
 	}
 }

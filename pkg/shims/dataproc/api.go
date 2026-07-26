@@ -3,6 +3,7 @@ package dataproc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 const dataprocStateEntry = "dataproc/metadata"
 
 func init() {
+	state.MustRegisterEntryValidator(dataprocStateEntry, state.StrictEntryValidator[dataprocMetadata](nil))
 	registry.Register("dataproc.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -393,7 +395,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 			"BIGQUERY_REST_ENDPOINT=http://host.docker.internal:8080/bigquery/v2",
 		}
 
-		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterStr)
+		masterName := dataprocDockerName(project, region, clusterStr, "m", 0)
 		if api.svcMgr == nil {
 			return fmt.Errorf("Dataproc Docker backend is unavailable")
 		}
@@ -425,7 +427,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 			numWorkers = cfg.WorkerConfig.NumInstances
 		}
 		for i := 0; i < numWorkers; i++ {
-			workerName := fmt.Sprintf("minisky-dataproc-%s-w-%d", clusterStr, i)
+			workerName := dataprocDockerName(project, region, clusterStr, "w", i)
 			if err := api.PersistenceError(); err != nil {
 				compensationErr := api.compensateProvisionedCluster(created)
 				return errors.Join(
@@ -565,7 +567,7 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, r
 		if err := api.PersistenceError(); err != nil {
 			return fmt.Errorf("Dataproc persistence unavailable before deletion: %w", err)
 		}
-		if err := api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-m", name)); err != nil {
+		if err := api.svcMgr.DeleteComputeVM(dataprocDockerName(project, region, name, "m", 0)); err != nil {
 			deleteErr := fmt.Errorf("delete Dataproc master: %w", err)
 			if persistErr := api.setClusterStatus(key, "ERROR", "Master deletion failed: "+err.Error()); persistErr != nil {
 				api.degrade(persistErr)
@@ -577,7 +579,7 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, r
 			if err := api.PersistenceError(); err != nil {
 				return fmt.Errorf("Dataproc persistence unavailable during deletion: %w", err)
 			}
-			if err := api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-w-%d", name, i)); err != nil {
+			if err := api.svcMgr.DeleteComputeVM(dataprocDockerName(project, region, name, "w", i)); err != nil {
 				deleteErr := fmt.Errorf("delete Dataproc worker %d: %w", i, err)
 				if persistErr := api.setClusterStatus(key, "ERROR", "Worker deletion failed: "+err.Error()); persistErr != nil {
 					api.degrade(persistErr)
@@ -633,6 +635,34 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 	}
 
 	job := body.Job
+	supportedTypes := 0
+	if job.PysparkJob != nil {
+		supportedTypes++
+	}
+	if job.SparkJob != nil {
+		supportedTypes++
+	}
+	if supportedTypes != 1 || job.HiveJob != nil {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "only Spark and PySpark jobs are supported")
+		return
+	}
+	clusterIdentity := clusterKey(project, region, job.Placement.ClusterName)
+	api.mu.RLock()
+	cluster := cloneCluster(api.clusters[clusterIdentity])
+	api.mu.RUnlock()
+	if cluster == nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Cluster "+job.Placement.ClusterName+" not found")
+		return
+	}
+	if cluster.Status.State != "RUNNING" {
+		writeError(w, http.StatusConflict, "FAILED_PRECONDITION", "Cluster "+job.Placement.ClusterName+" is not running")
+		return
+	}
+	if job.Placement.ClusterUuid != "" && job.Placement.ClusterUuid != cluster.ClusterUuid {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Cluster identity does not match")
+		return
+	}
+	job.Placement.ClusterUuid = cluster.ClusterUuid
 	jobId := fmt.Sprintf("job-%x", time.Now().UnixNano())
 	job.Reference.ProjectId = project
 	job.Reference.JobId = jobId
@@ -680,7 +710,21 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 			return
 		}
 
-		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterName)
+		api.mu.RLock()
+		currentCluster := cloneCluster(api.clusters[clusterIdentity])
+		api.mu.RUnlock()
+		if currentCluster == nil || currentCluster.Status.State != "RUNNING" ||
+			currentCluster.ClusterUuid != j.Placement.ClusterUuid {
+			j.Status.State = "ERROR"
+			j.Status.Details = "Dataproc cluster identity changed before execution"
+			j.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
+			if err := api.persistJob(key, j); err != nil {
+				api.degrade(err)
+			}
+			return
+		}
+
+		masterName := dataprocDockerName(project, region, clusterName, "m", 0)
 
 		var cmd []string
 		if j.PysparkJob != nil {
@@ -777,7 +821,13 @@ func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string
 	opName := extractSegmentAfter(path, "operations")
 
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	targetPrefix := fmt.Sprintf(
+		"https://dataproc.googleapis.com/v1/projects/%s/regions/%s/",
+		project,
+		region,
+	)
+	if op == nil || op.Kind != "dataproc#operation" || op.Region != region ||
+		!strings.HasPrefix(op.TargetLink, targetPrefix) {
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
 	}
@@ -806,6 +856,16 @@ func toLRO(op *orchestrator.Operation, project, region string) map[string]interf
 
 func clusterKey(project, region, name string) string { return project + ":" + region + ":" + name }
 func jobKey(project, region, id string) string       { return project + ":" + region + ":" + id }
+
+func dataprocDockerName(project, region, cluster, role string, index int) string {
+	identity := config.GetProfile() + "\x00" + clusterKey(project, region, cluster)
+	sum := sha256.Sum256([]byte(identity))
+	name := fmt.Sprintf("minisky-dataproc-%x-%s", sum[:8], role)
+	if role == "w" {
+		name += fmt.Sprintf("-%d", index)
+	}
+	return name
+}
 
 func extractSegmentAfter(path, keyword string) string {
 	parts := strings.Split(path, "/")

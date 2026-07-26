@@ -16,6 +16,18 @@ variable "enable_phase15_resources" {
   default     = false
 }
 
+variable "enable_fidelity_cloudsql_resources" {
+  description = "Create the guarded local Cloud SQL instance, database, and user lifecycle gate"
+  type        = bool
+  default     = false
+}
+
+variable "enable_fidelity_gke_resources" {
+  description = "Create the guarded local GKE cluster lifecycle gate"
+  type        = bool
+  default     = false
+}
+
 variable "enable_phase10_lb_resources" {
   description = "Create the optional local classic global HTTP load-balancer compatibility graph"
   type        = bool

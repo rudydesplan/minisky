@@ -139,7 +139,7 @@ export default function CloudTasksDrawer({ open, onClose }: Props) {
       <Box sx={{ width: 550, p: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
           <Typography variant="h5" sx={{ fontWeight: 500 }}>Cloud Tasks</Typography>
-          <IconButton onClick={onClose}><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
         </Box>
 
         <Divider sx={{ mb: 4 }} />
@@ -188,7 +188,7 @@ export default function CloudTasksDrawer({ open, onClose }: Props) {
                 return (
                   <Box key={q.name} sx={{ mb: 1, borderBottom: '1px solid #eee' }}>
                     <ListItem sx={{ px: 1 }}>
-                      <IconButton size="small" onClick={() => toggleExpand(q.name)} sx={{ mr: 1 }}>
+                      <IconButton aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queue ${id}`} size="small" onClick={() => toggleExpand(q.name)} sx={{ mr: 1 }}>
                         {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                       </IconButton>
                       <ListItemText 
@@ -196,7 +196,7 @@ export default function CloudTasksDrawer({ open, onClose }: Props) {
                         secondary={`State: ${q.state}`}
                       />
                       <ListItemSecondaryAction>
-                        <IconButton size="small" color="error" onClick={() => handleDeleteQueue(q.name)}>
+                        <IconButton aria-label={`Delete queue ${id}`} size="small" color="error" onClick={() => handleDeleteQueue(q.name)}>
                           <DeleteIcon fontSize="small" />
                         </IconButton>
                       </ListItemSecondaryAction>

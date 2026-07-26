@@ -509,12 +509,8 @@ func TestCorruptMainOwnershipChecksumFailsClosedAfterRestart(t *testing.T) {
 	if err := store.Save(gkeStateEntry, metadata); err != nil {
 		t.Fatal(err)
 	}
-	api, err := NewAPIWithStore(nil, store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := api.GetBackend().ReadKubeconfig(identity); err == nil {
-		t.Fatal("corrupt main ownership checksum authorized read")
+	if _, err := NewAPIWithStore(nil, store); err == nil {
+		t.Fatal("corrupt main ownership checksum was silently discarded")
 	}
 	data, err := os.ReadFile(final)
 	if err != nil || string(data) != "credential" {
@@ -548,21 +544,25 @@ func TestKindFailurePropagatesAmbiguousCleanup(t *testing.T) {
 	}
 }
 
-func TestKindWritesOnlyInheritedKubeconfigTarget(t *testing.T) {
+func TestKindWritesOnlyPrivateOwnedKubeconfigTarget(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	root = filepath.Join(root, "private")
 	final := filepath.Join(root, "cluster.kubeconfig")
 	target, err := securePrepareKubeconfig(final)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer secureDiscardKubeconfig(target)
-	cmd := exec.Command("sh", "-c", `printf complete > "$1"`, "sh")
+	cmd := exec.Command("sh", "-c", `printf lock > "$1.lock"; printf complete > "$1"; rm "$1.lock"`, "sh")
 	commandPath, err := secureKubeconfigCommandPath(target, cmd)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if commandPath != target.path {
+		t.Fatalf("command path=%q want private owned path %q", commandPath, target.path)
 	}
 	cmd.Args = append(cmd.Args, commandPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -890,7 +890,7 @@ func TestRestartReloadsOwnershipForExpectedDeletion(t *testing.T) {
 	if !ok || ownership == nil {
 		t.Fatal("missing original ownership")
 	}
-	store, err := state.New(t.TempDir(), "restart-owned")
+	store, err := state.New(t.TempDir(), identity.Profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,7 +1046,7 @@ func TestPostKindCleanupFailureRetriesAfterRestart(t *testing.T) {
 	if err := backend.DeleteClusterContext(t.Context(), identity); !errors.Is(err, injected) {
 		t.Fatalf("first delete error=%v", err)
 	}
-	store, err := state.New(t.TempDir(), "restart-delete")
+	store, err := state.New(t.TempDir(), identity.Profile)
 	if err != nil {
 		t.Fatal(err)
 	}

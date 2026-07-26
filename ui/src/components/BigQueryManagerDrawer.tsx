@@ -330,8 +330,8 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
             <Typography variant="caption" sx={{ color: '#5f6368' }}>{activeProject} • DuckDB Analytical Engine</Typography>
           </Box>
           <Box>
-            <IconButton onClick={loadResources} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-            <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+            <IconButton aria-label="Refresh" onClick={loadResources} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
           </Box>
         </Box>
 
@@ -379,7 +379,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
                           <ListItem key={tb.id} sx={{ pl: 7 }}>
                             <ListItemIcon sx={{ minWidth: 32 }}><TableChartIcon sx={{ fontSize: 18, color: '#5f6368' }} /></ListItemIcon>
                             <ListItemText primary={<Typography variant="body2">{tb.tableReference.tableId}</Typography>} />
-                            <IconButton size="small" onClick={() => {
+                            <IconButton aria-label={`Query table ${tb.tableReference.tableId}`} size="small" onClick={() => {
                               setSqlQuery(`SELECT * FROM ${dsId}__${tb.tableReference.tableId} LIMIT 10;`);
                               setTabValue(1);
                             }}><PlayArrowIcon sx={{ fontSize: 16 }} /></IconButton>
@@ -606,7 +606,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
                         <MenuItem value="REQUIRED">REQUIRED</MenuItem>
                       </Select>
                     </FormControl>
-                    <IconButton size="small" color="error" onClick={() => handleRemoveField(i)}><DeleteIcon fontSize="small" /></IconButton>
+                    <IconButton aria-label={`Remove schema field ${i + 1}`} size="small" color="error" onClick={() => handleRemoveField(i)}><DeleteIcon fontSize="small" /></IconButton>
                   </Box>
                 ))}
               </Box>

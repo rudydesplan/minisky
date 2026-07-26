@@ -1,22 +1,121 @@
-# Service compatibility
+# Service Compatibility
 
-This matrix is the human-readable view of the registration and support manifest
-in `pkg/registry`. The contract gate derives its service list from runtime
-registrations, so adding or removing a registered domain requires updating the
-manifest and this document.
+This document lists every GCP service domain registered in MiniSky with its
+fidelity tier, persistence model, and current implementation status.
 
-Fidelity tiers:
+## Fidelity Tiers
 
-- **high**: broad protocol and behavior compatibility for the documented API.
-- **standard**: selected resource operations with GCP-shaped responses.
-- **passthrough**: requests are delegated to a Docker-backed emulator.
+| Tier | Meaning |
+|------|---------|
+| **High** | The registered local contract has stronger fidelity for its deliberately narrow surface; it does not mean full GCP parity |
+| **Standard** | A bounded custom API surface is implemented; consult the service notes for executable versus metadata-only behavior |
+| **Passthrough** | Requests are proxied to a Docker-backed emulator; compatibility is limited by that backend and MiniSky routing |
 
-Persistence categories describe where service state lives: **memory**, **file**,
-**docker**, **hybrid** (control-plane metadata plus a data-plane backend), or
-**static**.
+## Persistence Models
 
-| Domain | Fidelity | Persistence |
-| --- | --- | --- |
+| Model | Meaning |
+|-------|---------|
+| **File** | Versioned JSON state survives restarts |
+| **Memory** | In-memory only; state lost on restart (persistence planned) |
+| **Docker** | Runtime data belongs to a Docker-backed emulator; it may be ephemeral unless a profile runtime mount is documented |
+| **Hybrid** | Metadata in JSON + data in Docker containers/volumes |
+| **Static** | No mutable state; configuration-only |
+
+## Service Catalog
+
+### Core Infrastructure (Phases 6–11)
+
+| Domain | Service | Fidelity | Persistence | LRO | Terraform |
+|--------|---------|----------|-------------|-----|-----------|
+| compute.googleapis.com | Compute Engine | Standard | Hybrid | ✅ | ✅ |
+| container.googleapis.com | GKE | Standard | File | ✅ | Guarded opt-in |
+| storage.googleapis.com | Cloud Storage | Passthrough | Docker | — | ✅ |
+| bigquery.googleapis.com | BigQuery | Standard | File | — | ✅ |
+| pubsub.googleapis.com | Pub/Sub | Passthrough | Docker | — | ✅ |
+| sqladmin.googleapis.com | Cloud SQL | Standard | Hybrid | ✅ | Guarded opt-in |
+| cloudfunctions.googleapis.com | Cloud Functions | Standard | Hybrid | ✅ | — |
+| run.googleapis.com | Cloud Run | Standard | Hybrid | ✅ | — |
+| iam.googleapis.com | IAM | Standard | File | — | ✅ |
+| iamcredentials.googleapis.com | IAM Credentials | Standard | Static | — | — |
+| dns.googleapis.com | Cloud DNS | Standard | File | — | ✅ |
+| cloudkms.googleapis.com | Cloud KMS | Standard | File | — | ✅ |
+| secretmanager.googleapis.com | Secret Manager | Standard | File | — | ✅ |
+| cloudscheduler.googleapis.com | Cloud Scheduler | Standard | File | — | ✅ |
+| cloudtasks.googleapis.com | Cloud Tasks | Standard | File | — | ✅ |
+| cloudbuild.googleapis.com | Cloud Build | Standard | Hybrid | ✅ | ✅ |
+| artifactregistry.googleapis.com | Artifact Registry | Standard | File | ✅ | Guarded opt-in |
+| bigtableadmin.googleapis.com | Bigtable Admin | Standard | File | Terminal scoped cluster operations | — |
+| bigtable.googleapis.com | Bigtable Data | Standard | Hybrid | — | Backend-limited |
+| dataproc.googleapis.com | Dataproc | Standard | Hybrid | ✅ | — |
+| appengine.googleapis.com | App Engine | Standard | Hybrid | ✅ | — |
+| redis.googleapis.com | Memorystore (Redis) | Standard | Hybrid | ✅ | ✅ |
+| aiplatform.googleapis.com | Vertex AI | Standard | File | — | ✅ |
+| monitoring.googleapis.com | Cloud Monitoring | Standard | File | — | ✅ |
+| logging.googleapis.com | Cloud Logging | Standard | File | — | ✅ |
+| cloudresourcemanager.googleapis.com | Resource Manager | Standard | File | — | ✅ |
+| sts.googleapis.com | Security Token Service | Standard | Static | — | — |
+| metadata.google.internal | Metadata Server | High | Static | — | — |
+
+The checkmarks and guarded labels above identify only a tested slice, not an
+entire service API. Important boundaries:
+
+- `Example only` in the Terraform column means optional HCL exists but no
+  provider apply/no-drift/destroy claim is made. The authoritative accepted
+  resource list is `docs/terraform-compatibility.md`.
+
+- App Engine and Dataproc resource metadata now survives restart. App Engine
+  does not create missing apps on observation; Dataproc marks interrupted jobs
+  terminal and executes only supported Spark/PySpark jobs against exactly owned
+  cluster containers.
+- Artifact Registry persists repository metadata and bounded terminal operation
+  outcomes. Package/version views come from the profile-owned Registry v2
+  backend; blobs and manifests are not in metadata snapshots.
+- Compute covers bounded instance CRUD, one custom network/subnetwork/bridge
+  slice, and a classic global HTTP load-balancer graph using one unmanaged zonal
+  instance group and default-service routing. Managed/regional groups,
+  host/path routing, HTTPS and non-HTTP proxies, IPv6, NAT, peering, PSC, and
+  general VPC/load-balancer parity remain unsupported.
+- Bigtable cluster create/get/list/delete is metadata-only. Its scoped terminal
+  operations carry typed metadata and responses but create no cluster nodes.
+- Cloud SQL persists instance/database/user control-plane metadata. Database and
+  user lifecycle is tested only through the guarded provider gate; database
+  files remain container runtime data and restored instances have no stale
+  endpoint.
+- Cloud Tasks replays persisted nonterminal tasks once per API lifetime with the
+  same task ID and retry budget. This is at-least-once: a crash between target
+  acceptance and acknowledgement persistence can duplicate a delivery.
+- Logging persists unacknowledged sink deliveries, retries them after restart,
+  and cancels pending work when a sink is deleted. The same acknowledgement
+  window permits duplicates.
+- Scheduler deliveries are tied to the Scheduler API lifetime, not the incoming
+  `:run` request context; shutdown cancels and bounded-waits for active work.
+- Native Windows binaries support the in-process GKE metadata surface, but the
+  secure Kind kubeconfig ownership/publish path is fail-safe unsupported on
+  Windows. The guarded Kind lifecycle evidence is Unix/Linux.
+- The gateway validator is a curated allow-by-default set of selected mutating
+  method/path rules. It is not full Discovery Document schema validation.
+
+### Docker-Backed Emulators
+
+| Domain | Service | Fidelity | Persistence | Notes |
+|--------|---------|----------|-------------|-------|
+| firestore.googleapis.com | Firestore | Passthrough | Docker | Official emulator |
+| datastore.googleapis.com | Datastore | Passthrough | Docker | Official emulator |
+| spanner.googleapis.com | Spanner | Passthrough | Docker | Official emulator |
+| identitytoolkit.googleapis.com | Firebase Auth | Passthrough | Docker | Firebase emulator |
+| firebasehosting.googleapis.com | Firebase Hosting | Passthrough | Docker | Firebase emulator |
+| firebaseio.com | Firebase RTDB | Passthrough | Docker | Firebase emulator |
+
+## Deferred Services
+
+| Domain | Reason |
+|--------|--------|
+| memcache.googleapis.com | Returns 501 UNIMPLEMENTED for all operations |
+
+## Machine-Readable Manifest
+
+<!-- This section is parsed by pkg/registry/manifest_test.go — do not change the format -->
+
 | `aiplatform.googleapis.com` | standard | file |
 | `appengine.googleapis.com` | standard | hybrid |
 | `artifactregistry.googleapis.com` | standard | file |
@@ -24,9 +123,9 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `bigtable.googleapis.com` | standard | hybrid |
 | `bigtableadmin.googleapis.com` | standard | file |
 | `cloudbuild.googleapis.com` | standard | hybrid |
-| `cloudresourcemanager.googleapis.com` | standard | file |
 | `cloudfunctions.googleapis.com` | standard | hybrid |
 | `cloudkms.googleapis.com` | standard | file |
+| `cloudresourcemanager.googleapis.com` | standard | file |
 | `cloudscheduler.googleapis.com` | standard | file |
 | `cloudtasks.googleapis.com` | standard | file |
 | `compute.googleapis.com` | standard | hybrid |
@@ -41,6 +140,7 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `iamcredentials.googleapis.com` | standard | static |
 | `identitytoolkit.googleapis.com` | passthrough | docker |
 | `logging.googleapis.com` | standard | file |
+| `memcache.googleapis.com` | deferred | static |
 | `metadata.google.internal` | high | static |
 | `monitoring.googleapis.com` | standard | file |
 | `pubsub.googleapis.com` | passthrough | docker |
@@ -51,189 +151,3 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `sqladmin.googleapis.com` | standard | hybrid |
 | `storage.googleapis.com` | passthrough | docker |
 | `sts.googleapis.com` | standard | static |
-
-## Deferred registered domains
-
-Deferred domains are registered only to provide a deterministic unsupported
-response. They have no fidelity tier and do not count as implemented or
-passthrough services.
-
-| Domain | Support | Persistence |
-| --- | --- | --- |
-| `memcache.googleapis.com` | deferred | static |
-
-## Security and project boundaries
-
-- IAM Credentials supports direct and ordered delegated, one-hour-or-shorter
-  local `generateAccessToken` with at most four delegates. Longer chains,
-  `generateIdToken`, `signJwt`, and `signBlob` are unsupported.
-- Security Token Service supports MiniSky local-token exchange plus one bounded
-  workload identity path: a local project-ID canonical audience (not a project
-  number), an OIDC provider with static inline JWKS, RS256 JWT verification,
-  exact issuer/audience matching and temporal checks, and only
-  `google.subject=assertion.sub`. The bounded `sub` value is preserved exactly
-  in the escaped federated principal, whose IAM binding must match. The result
-  is a local `ms1` token, not a Google credential.
-- AWS, SAML, X.509, workforce federation, remote OIDC discovery/JWKS, CEL
-  conditions or arbitrary mappings, non-RS256 signatures, Google trust roots,
-  credential portability/revocation, and WIF undelete/soft-delete recovery
-  remain unsupported. WIF exchange performs no network or discovery calls.
-- Resource Manager persists project metadata and the
-  minimal local organization/folder parent chain. It does not claim complete
-  Resource Manager LRO, search, undelete, tag, lien, or org-policy parity.
-- Representative in-process state such as BigQuery datasets is keyed by
-  project. Docker passthrough services remain shared profile backends unless
-  their upstream emulator provides and the integration suite proves project
-  isolation.
-
-The unsupported-route contract uses
-`/__minisky_contract__/unsupported`. Probe-safe registered handlers must return
-HTTP 501 with a GCP JSON error envelope and `UNIMPLEMENTED` status. Docker
-wrappers can still execute that reserved probe without starting a container.
-The pure lazy domains—Datastore, Firestore, and Spanner—have explicit manifest
-rationale and a deterministic router contract: without an available backend
-manager they return HTTP 503 `UNAVAILABLE`; a real cold-start failure returns
-the same envelope. CRUD/data-plane claims remain backend-gated:
-
-- Datastore and Firestore require their Google emulators.
-- Firebase Auth, Realtime Database, and Hosting require Firebase emulators.
-- Pub/Sub requires the Google Pub/Sub emulator.
-- Spanner requires the Cloud Spanner emulator.
-- Storage requires `fake-gcs-server`.
-
-## Evidence boundaries
-
-The manifest is a registration and unsupported-route contract, not a claim of
-complete method parity. BigQuery has the deepest native conformance coverage.
-The tracked Terraform and SDK smoke suites exercise BigQuery dataset/table
-resources, IAM service accounts, and a Docker-backed Storage bucket. The
-separate durability gate covers only persisted BigQuery/IAM metadata; Storage
-emulator data is outside metadata export/import. Broader compatibility must be
-supported by focused executable tests before its manifest fidelity is raised.
-The separate guarded Phase-13 gate passed Google provider 7.41.0 apply,
-restart/no-drift, static-JWKS JWT exchange, one-delegate impersonation,
-authenticated target-token use, destroy, and post-destroy `404` checks. Public
-JWKS appeared in Terraform and MiniSky state as expected; the harness verified
-that its private key and signed subject JWT were not persisted or logged.
-
-## Phase 9–11 boundaries
-
-- Scheduler cross-shim delivery uses the daemon's configured gateway port.
-  Its HTTP end-to-end evidence is a manual `:run` invocation, not scheduled
-  clock execution.
-- Cloud Tasks queue and task metadata, including terminal attempts, persists.
-  After restart, persisted `PENDING` or `RETRYING` work becomes a terminal
-  interruption failure and is not replayed. This is metadata durability, not a
-  durable delivery queue or payload replay guarantee.
-- Simulation stores Serverless metadata without claiming to run code. Requested
-  Buildpacks execution fails explicitly when dependencies, source, or an image
-  are missing; no Cloud SDK utility image is substituted.
-- The guarded Pack v0.40.8 gate uses MiniSky's local `POST /v2/deploy` source
-  helper for both functions and Cloud Run-style `type=service` handlers. That
-  path is not the Cloud Run v2 image API and does not establish full Cloud Run
-  v2 source-build or Terraform serverless compatibility.
-- Event delivery is a synchronous local bridge with native MiniSky payloads.
-  Eventarc/CloudEvents envelopes, Pub/Sub push, a durable event queue, ordering,
-  exactly-once delivery, and production serverless operation are unsupported.
-- Cloud Tasks does not claim OIDC, task-header, redirect, or dead-letter-queue
-  parity, and interrupted deliveries are not replayed.
-- Strict IAM (`MINISKY_IAM_MODE=strict`) covers only Storage bucket/object,
-  Pub/Sub topic/subscription/publish, and Compute instance mutations. Callers
-  provide `X-MiniSky-Principal`; default mode remains permissive.
-- Artifact Registry package/version listing comes from a lazily started,
-  profile-owned `registry:2` container on a dynamic loopback port. GCP package
-  and version listing is scoped to the repository prefix. Registry v2 manifest
-  deletion is enabled and requires a digest; GCP package/version deletion stays
-  `501 UNIMPLEMENTED`.
-- The pinned Terraform fixture optionally exercises Artifact Registry repository
-  create/read/no-drift/destroy and the bounded Compute load-balancer graph.
-
-See [State model](state-model.md) for restart and export behavior and
-[Terraform compatibility](terraform-compatibility.md) for tested provider and
-SDK coverage.
-
-## Phase 15–16 bounded slices
-
-- Memorystore for Redis validates create requests, exposes GCP-shaped
-  create/delete operations, persists profile metadata, reconciles only
-  profile-owned Docker containers, and publishes Redis on a Docker-assigned
-  loopback port. Redis uses an owned named volume with AOF enabled. The separate
-  Memcached domain is a static deferred boundary: every request returns
-  `501 UNIMPLEMENTED`. Redis failover, import/export, and upgrade APIs also
-  remain `501 UNIMPLEMENTED`.
-- Firestore and Datastore remain official Google emulator passthroughs.
-  Their data directories are profile-scoped under the non-portable runtime
-  tree. The guarded phase 15 SDK smoke covers Firestore document CRUD/query and
-  Datastore entity CRUD/ancestor query when Docker collision checks pass.
-  Firestore listeners and security rules are not claimed.
-- Spanner remains official emulator passthrough. MiniSky publishes both the
-  emulator REST/admin port and its gRPC data port on dynamic loopback ports.
-  The guarded SDK smoke covers instance/database creation, DDL, insert, read,
-  row delete, and database/instance cleanup. The emulator does not provide
-  production IAM, TLS, backups, multi-region replication, or production query
-  performance, and its data is not included in MiniSky state export.
-- Monitoring implements profile-persisted metric descriptor CRUD, a bounded
-  time-series write/list subset with `metric.type` equality filters, and
-  project-scoped PromQL instant queries for one exact
-  `{__name__="<metric-type>"}` selector. The instant-query slice returns the
-  latest DOUBLE or INT64 point at or before the evaluation time. Label matchers,
-  operators, functions, aggregations, ranges, Boolean samples, and
-  `query_range` are unsupported. Monitoring Query Language remains
-  `501 UNIMPLEMENTED`.
-- Logging migrates the legacy global log file into profile state and supports
-  generated-client entries write/list plus sink create/get/list/delete across
-  restart. Entry listing is project-scoped when `resourceNames` is supplied,
-  supports bounded `severity`, `logName`, and `resource.type` filters, and
-  accepts only timestamp ascending/descending ordering. Writes inherit
-  top-level log name, resource, and labels; `dryRun` validates without
-  persistence or delivery. Safe relative file sinks and exact Pub/Sub topic
-  destinations are supported with a delivery-loop marker. Pagination,
-  `partialSuccess`, sink patch/update, per-entry errors, alerting, and log-based
-  metrics remain unsupported.
-- Vertex AI supports the generated Go client's canonical endpoint `predict`
-  call with at most 100 instances, optional parameters, and ignored billing
-  labels. Its ordered `{instance,score}` predictions and model metadata are a
-  MiniSky-specific deterministic local simulation, not model-semantic parity or
-  real inference. Fixed requests remain byte-identical across restart because
-  prediction is stateless; no endpoint deployment or prediction persistence is
-  implied. The profile-configurable mock/Ollama settings apply to
-  `generateContent`, not deterministic endpoint prediction. Optional Ollama
-  calls are restricted to loopback HTTP endpoints; API keys remain
-  process-memory only. Streaming, batch prediction, and feature stores are
-  `501 UNIMPLEMENTED`.
-- Cloud DNS retains its persisted managed-zone/RRSet control plane and can run
-  an opt-in loopback-only UDP resolver through `MINISKY_DNS_ADDR`. Ports below
-  1024 and non-loopback binds are rejected. Generated Go client
-  managed-zone and RRSet create/get/list/delete calls are covered across
-  restart, including exact RRSet item GET and filtered collection listing.
-  Mutation JSON is strict and limited to 1 MiB; RRSet data is limited to 1,000
-  values, and a change is limited to 1,000 total additions plus deletions as a
-  MiniSky-specific safety boundary. Managed-zone and RRSet names are validated
-  as absolute DNS names, stored lowercase, and matched case-insensitively;
-  records outside their managed zone are rejected. The resolver currently
-  serves A, AAAA, and CNAME records with stored TTL/update/delete/restart
-  behavior. Pagination and
-  `maxResults`, DNSSEC signing, policies and response policies,
-  forwarding/peering/service-directory targets, recursion, TCP/DoH/DoT,
-  MX/TXT/NS/SOA/PTR/SRV resolution, CNAME chaining, EDNS0, and private-network
-  enforcement are unsupported.
-- Advanced networking has one generated-client- and Terraform-verified slice:
-  custom-mode global network CRUD and pagination plus one regional primary IPv4
-  subnetwork per VPC, with global/regional operation polling and exact supported
-  metadata across restart and deletion. The pinned provider additionally proves
-  apply, canonical import, no drift before and after restart, and ordered
-  destroy. Each supported VPC maps to one exact
-  project/profile-owned Docker bridge. Reconciliation requires the expected
-  resource identity and ownership labels and preserves the immutable Docker ID,
-  bridge driver, and single CIDR/IPAM; unowned or mismatched bridges are
-  refused, and ambiguous create recovery and attached-endpoint deletion fail
-  closed.
-- The provider claim is limited to `google_compute_network` and
-  `google_compute_subnetwork` within this bounded shape. It does not establish
-  auto-mode networks, updates, multiple VM network interfaces, multiple or
-  secondary ranges, IPv6, routes, workload connectivity, firewall packet
-  isolation, Shared VPC, host routing/iptables, cross-host network semantics,
-  NAT, peering, PSC, VPN/interconnect, or full GCP VPC parity. MiniSky never
-  installs host-global iptables rules. Both guarded gates passed locally on
-  Docker Desktop/macOS; their opt-in Linux CI jobs are configured but have no
-  CI pass evidence.

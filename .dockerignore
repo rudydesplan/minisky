@@ -1,0 +1,9 @@
+.git
+.github
+.claude
+dist
+minisky
+ui/node_modules
+ui/dist
+terraform/.terraform
+terraform/*.tfstate*

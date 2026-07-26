@@ -1,7 +1,6 @@
 package cloudbuild
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -27,61 +26,32 @@ func TestCloudBuildDockerIdentitySeparatesProfileProjectAndBuild(t *testing.T) {
 	}
 }
 
-func TestConcurrentTriggerRunsReceiveDistinctOwnedDockerResources(t *testing.T) {
-	t.Setenv("MINISKY_PROFILE", "trigger-race")
+func TestCloudBuildTriggersReturnExplicitUnimplemented(t *testing.T) {
 	api := newAPI(nil, orchestrator.NewOperationManager())
 	api.runAsync = func(string, func() error) {}
 
-	const requests = 256
-	type result struct {
-		buildID   string
-		resource  string
-		identity  string
-		workspace string
-	}
-	results := make(chan result, requests)
+	const requests = 32
 	var wg sync.WaitGroup
 	for index := 0; index < requests; index++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			request := httptest.NewRequest(http.MethodPost,
-				fmt.Sprintf("/v1/projects/demo/triggers/trigger-%d:run", index), nil)
-			response := httptest.NewRecorder()
-			api.ServeHTTP(response, request)
-			if response.Code != http.StatusOK {
-				t.Errorf("trigger %d status=%d body=%s", index, response.Code, response.Body.String())
-				return
+			for _, path := range []string{
+				"/v1/projects/demo/triggers",
+				fmt.Sprintf("/v1/projects/demo/triggers/trigger-%d:run", index),
+			} {
+				response := httptest.NewRecorder()
+				api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+				if response.Code != http.StatusNotImplemented ||
+					!strings.Contains(response.Body.String(), `"status":"UNIMPLEMENTED"`) {
+					t.Errorf("%s status=%d body=%s", path, response.Code, response.Body.String())
+				}
 			}
-			var operation orchestrator.Operation
-			if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
-				t.Errorf("trigger %d decode: %v", index, err)
-				return
-			}
-			buildID := operation.TargetLink[strings.LastIndex(operation.TargetLink, "/")+1:]
-			resource := "projects/demo/builds/" + buildID
-			identity := cloudBuildDockerIdentity(resource)
-			results <- result{buildID: buildID, resource: resource, identity: identity, workspace: identity + "-workspace"}
 		}(index)
 	}
 	wg.Wait()
-	close(results)
-
-	ids := make(map[string]bool, requests)
-	resources := make(map[string]bool, requests)
-	identities := make(map[string]bool, requests)
-	workspaces := make(map[string]bool, requests)
-	for result := range results {
-		if ids[result.buildID] || resources[result.resource] || identities[result.identity] || workspaces[result.workspace] {
-			t.Fatalf("concurrent trigger collision: %#v", result)
-		}
-		ids[result.buildID] = true
-		resources[result.resource] = true
-		identities[result.identity] = true
-		workspaces[result.workspace] = true
-	}
-	if len(ids) != requests {
-		t.Fatalf("received %d unique trigger builds, want %d", len(ids), requests)
+	if operations := api.opMgr.List(); len(operations) != 0 {
+		t.Fatalf("unsupported triggers created operations: %#v", operations)
 	}
 }
 

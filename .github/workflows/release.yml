@@ -6,20 +6,28 @@ on:
       - "v*"
 
 permissions:
+  checks: read
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-promotion-${{ github.repository }}
+  queue: max
 
 jobs:
   release-metadata:
-    name: Validate release tag
+    name: Validate release tag and quality evidence
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 95
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
 
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+
       - name: Require a stable semantic version tag
+        id: tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -27,6 +35,69 @@ jobs:
             echo "::error::Release tags must match vMAJOR.MINOR.PATCH"
             exit 1
           fi
+          echo "version=${RELEASE_TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Require exact-SHA CI quality evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          required_checks=(
+            "Test, lint, and build"
+            "Scan Go dependencies"
+            "Validate Terraform example"
+            "Compile SDK smoke suites"
+            "Validate release configuration"
+            "Install Linux packages (linux-amd64)"
+            "Install Linux packages (linux-arm64)"
+          )
+          if git diff --name-only "${GITHUB_SHA}^1" "${GITHUB_SHA}" |
+            grep -Eq '^(\.github/workflows/critical-integration\.yml|cmd/minisky/|pkg/(orchestrator|router|shims|state)/|scripts/(kind|state-durability|terraform)-integration\.sh|terraform/|go\.(mod|sum)$|ui/package-lock\.json$)'; then
+            required_checks+=(
+              "Critical Terraform provider lifecycle"
+              "Critical state durability lifecycle"
+              "Critical Kind lifecycle"
+            )
+          fi
+
+          # The longest mandatory CI chain is 75 minutes (quality + native
+          # Linux package validation). Allow 90 minutes plus job teardown.
+          for attempt in {1..270}; do
+            echo "Checking exact-SHA quality evidence (attempt ${attempt}/270)"
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?filter=latest&per_page=100" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' \
+              > check-runs.tsv
+
+            pending=0
+            for required in "${required_checks[@]}"; do
+              result="$(awk -F $'\t' -v name="${required}" '$1 == name { print $2 "\t" $3; exit }' check-runs.tsv)"
+              if [[ -z "${result}" ]]; then
+                echo "Waiting for exact-SHA check: ${required}"
+                pending=1
+                continue
+              fi
+
+              status="${result%%$'\t'*}"
+              conclusion="${result#*$'\t'}"
+              if [[ "${status}" != "completed" ]]; then
+                echo "Waiting for ${required} (${status})"
+                pending=1
+              elif [[ "${conclusion}" != "success" ]]; then
+                echo "::error::${required} concluded ${conclusion} for ${GITHUB_SHA}"
+                exit 1
+              fi
+            done
+
+            if [[ "${pending}" == "0" ]]; then
+              echo "All mandatory checks passed for exact release SHA ${GITHUB_SHA}."
+              exit 0
+            fi
+            sleep 20
+          done
+
+          echo "::error::Timed out waiting for mandatory exact-SHA quality evidence"
+          exit 1
 
   ui:
     name: Build UI assets
@@ -35,19 +106,19 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Build UI
+      - name: Test and build UI
         working-directory: ui
-        run: npm ci && npm run build
+        run: npm ci && npm test && npm run build
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-ui-dist
           path: ui/dist
@@ -63,24 +134,32 @@ jobs:
           - name: linux-amd64
             runner: ubuntu-latest
             expected_arch: x86_64
+            goos: linux
+            goarch: amd64
             cgo: "1"
             cc: gcc
             archive: minisky_linux_amd64.tar.gz
           - name: linux-arm64
             runner: ubuntu-24.04-arm
             expected_arch: aarch64
+            goos: linux
+            goarch: arm64
             cgo: "1"
             cc: gcc
             archive: minisky_linux_arm64.tar.gz
           - name: darwin-arm64
             runner: macos-14
             expected_arch: arm64
+            goos: darwin
+            goarch: arm64
             cgo: "1"
             cc: clang
             archive: minisky_darwin_arm64.tar.gz
           - name: windows-amd64
             runner: windows-latest
             expected_arch: amd64
+            goos: windows
+            goarch: amd64
             cgo: "1"
             cc: gcc
             archive: minisky_windows_amd64.zip
@@ -88,20 +167,20 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: release-ui-dist
           path: ui/dist
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         if: runner.os == 'Windows'
         with:
           msystem: UCRT64
@@ -131,66 +210,102 @@ jobs:
           CC: ${{ matrix.cc }}
         run: go test -count=1 ./pkg/shims/bigquery
 
-      - name: Build and package Unix binary
-        if: runner.os != 'Windows'
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          install-only: true
+
+      - name: Build archive from GoReleaser configuration
         env:
           CGO_ENABLED: ${{ matrix.cgo }}
           CC: ${{ matrix.cc }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          MINISKY_GORELEASER_TARGET: ${{ matrix.name }}
+        run: goreleaser release --clean --skip=announce,publish,before,nfpm,homebrew,scoop
+
+      - name: Validate Unix archive and exact version
+        if: runner.os != 'Windows'
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir package
-          go build -trimpath \
-            -ldflags "-s -w -X minisky/pkg/version.Version=${version}" \
-            -o package/minisky ./cmd/minisky
-          cp README.md CONTRIBUTING.md LICENSE package/
-          cp -R docs package/
-          tar -C package -czf "${{ matrix.archive }}" \
-            minisky README.md CONTRIBUTING.md LICENSE docs
           mkdir installed
-          tar -C installed -xzf "${{ matrix.archive }}"
+          tar -C installed -xzf "dist/${{ matrix.archive }}"
+          test "$(./installed/minisky version)" = "MiniSky ${GITHUB_REF_NAME}"
           ./installed/minisky doctor bigquery
 
-      - name: Build and package Windows binary
+      - name: Validate Windows archive and exact version
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          CGO_ENABLED: ${{ matrix.cgo }}
-          CC: ${{ matrix.cc }}
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
-          New-Item -ItemType Directory package
-          go build -trimpath `
-            -ldflags "-s -w -X minisky/pkg/version.Version=$version" `
-            -o package\minisky.exe ./cmd/minisky
-          Copy-Item README.md, CONTRIBUTING.md, LICENSE package\
-          Copy-Item -Recurse docs package\
-          Compress-Archive -Path package\* -DestinationPath "${{ matrix.archive }}"
           New-Item -ItemType Directory installed
-          Expand-Archive -Path "${{ matrix.archive }}" -DestinationPath installed
+          Expand-Archive -Path "dist\${{ matrix.archive }}" -DestinationPath installed
+          if ((.\installed\minisky.exe version) -ne "MiniSky $env:GITHUB_REF_NAME") {
+            throw 'Packaged binary version does not match release tag'
+          }
           .\installed\minisky.exe doctor bigquery
 
-      - uses: actions/upload-artifact@v7
+      - name: Audit packaged Windows DLL dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dependencies = & objdump -p installed\minisky.exe |
+            Select-String 'DLL Name' |
+            ForEach-Object { $_.Line.Trim() }
+          $dependencies | Tee-Object -FilePath windows-dll-dependencies.txt
+          if ($dependencies -match 'libgcc|libstdc\+\+|libwinpthread') {
+            throw 'MiniSky requires non-system MinGW runtime DLLs'
+          }
+
+      - name: Stage Unix release archive
+        if: runner.os != 'Windows'
+        run: |
+          mkdir release-assets
+          cp "dist/${{ matrix.archive }}" "release-assets/${{ matrix.archive }}"
+
+      - name: Stage Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release-assets
+          Copy-Item "dist\${{ matrix.archive }}" "release-assets\${{ matrix.archive }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.name }}
-          path: ${{ matrix.archive }}
+          path: release-assets/${{ matrix.archive }}
+          if-no-files-found: error
+
+      - name: Upload Windows dependency evidence
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-release-dll-evidence
+          path: windows-dll-dependencies.txt
           if-no-files-found: error
 
   publish:
     name: Publish checksummed release
-    needs: native-binaries
+    needs:
+      - native-binaries
+      - container-publish
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: binary-*
           path: release-assets
           merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: container-release-evidence
+          path: release-assets
 
       - name: Validate native artifact set
         run: |
@@ -207,6 +322,17 @@ jobs:
             LICENSE
             docs/cli_reference.md
           )
+          jq -e \
+            --arg version "${GITHUB_REF_NAME#v}" \
+            '.schemaVersion == 1 and
+             .version == $version and
+             .sourceSHA == env.GITHUB_SHA and
+             (.image | startswith("ghcr.io/")) and
+             (.indexDigest | test("^sha256:[0-9a-f]{64}$")) and
+             (.platformDigests | length == 2) and
+             all(.platformDigests[]; test("^sha256:[0-9a-f]{64}$")) and
+             .publication == "digest-only"' \
+            release-assets/container-digests.json >/dev/null
 
           for artifact in "${artifacts[@]}"; do
             archive="release-assets/${artifact}"
@@ -234,78 +360,107 @@ jobs:
           done
 
           cd release-assets
-          sha256sum "${artifacts[@]}" > checksums.txt
-          test "$(wc -l < checksums.txt)" -eq "${#artifacts[@]}"
+          sha256sum "${artifacts[@]}" container-digests.json > checksums.txt
+          test "$(wc -l < checksums.txt)" -eq "$(( ${#artifacts[@]} + 1 ))"
           sha256sum --check --strict checksums.txt
+
+      - name: Revalidate release tag before upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            release-assets/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --generate-notes \
-            --title "MiniSky ${GITHUB_REF_NAME}"
+          set -euo pipefail
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
+          if gh release create "${GITHUB_REF_NAME}" \
+              release-assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --verify-tag \
+              --generate-notes \
+              --title "MiniSky ${GITHUB_REF_NAME}"; then
+            exit 0
+          fi
+
+          # Release creation and the complete asset set are the fail-closed
+          # exact-identity boundary. A concurrent or retried publisher may
+          # proceed only when every already-published asset is byte-identical.
+          expected_assets=(
+            checksums.txt
+            container-digests.json
+            minisky_darwin_arm64.tar.gz
+            minisky_linux_amd64.tar.gz
+            minisky_linux_arm64.tar.gz
+            minisky_windows_amd64.zip
+          )
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
+          actual_assets="$(
+            gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          test "$(
+            ./scripts/release-tag-policy.sh --release-assets \
+              "${actual_assets}" "${expected_assets[@]}"
+          )" = "identical-set"
+
+          existing_release="$(mktemp -d)"
+          if ! gh release download "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --dir "${existing_release}"; then
+            echo "::error::Release creation failed and complete assets could not be verified"
+            exit 1
+          fi
+          for asset in "${expected_assets[@]}"; do
+            cmp "release-assets/${asset}" "${existing_release}/${asset}"
+          done
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
+          echo "Exact release identity already exists with identical digest evidence."
 
   container-smoke:
     name: Smoke test container (${{ matrix.platform }})
     needs: release-metadata
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
             cache_scope: container-amd64
-            image_tag: minisky-smoke-amd64
+            digest_artifact: container-digest-amd64
+            profile: release-smoke-amd64
           - platform: linux/arm64
             cache_scope: container-arm64
-            image_tag: minisky-smoke-arm64
+            digest_artifact: container-digest-arm64
+            profile: release-smoke-arm64
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build smoke-test image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          load: true
-          push: false
-          tags: ${{ matrix.image_tag }}
-          cache-from: type=gha,scope=${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
-
-      - name: Run container conformance check
-        run: |
-          docker run --rm --entrypoint /app/minisky "${{ matrix.image_tag }}" version
-          docker run --rm --entrypoint /app/minisky "${{ matrix.image_tag }}" doctor bigquery
-
-  container-publish:
-    name: Publish multi-architecture container
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - container-smoke
-      - publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: docker/setup-qemu-action@v4
-
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Resolve lowercase image name
         id: image
@@ -314,35 +469,262 @@ jobs:
         run: echo "name=ghcr.io/${REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
 
       - name: Authenticate to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate container metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
+      - name: Revalidate release tag before platform push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
 
-      - name: Build and publish multi-architecture image
-        uses: docker/build-push-action@v7
+      - name: Build immutable platform image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          platforms: ${{ matrix.platform }}
+          build-args: VERSION=${{ needs.release-metadata.outputs.version }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
-          cache-from: |
-            type=gha,scope=container-amd64
-            type=gha,scope=container-arm64
-          cache-to: type=gha,mode=max,scope=container-release
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.release-metadata.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Pull exact built digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker pull --platform "${{ matrix.platform }}" "${IMAGE}@${DIGEST}"
+          test "$(
+            docker image inspect "${IMAGE}@${DIGEST}" \
+              --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+          )" = "${GITHUB_SHA}"
+
+      - name: Scan image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m0s
+
+      - name: Run container conformance check
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /app/minisky "${IMAGE}@${DIGEST}" version)" = \
+            "MiniSky v${{ needs.release-metadata.outputs.version }}"
+          docker run --rm --platform "${{ matrix.platform }}" --entrypoint /app/minisky \
+            "${IMAGE}@${DIGEST}" doctor bigquery
+
+      - name: Start shipped entrypoint and wait for health
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          container_id="$(
+            docker run --rm --detach \
+              --platform "${{ matrix.platform }}" \
+              --volume /var/run/docker.sock:/var/run/docker.sock \
+              --env "MINISKY_PROFILE=${{ matrix.profile }}" \
+              --env MINISKY_STATE_DIR=/tmp/minisky-state \
+              --publish 127.0.0.1::8080 \
+              "${IMAGE}@${DIGEST}"
+          )"
+          # shellcheck disable=SC2329 # invoked through the EXIT trap
+          cleanup() {
+            docker logs "${container_id}" || true
+            docker stop --time 10 "${container_id}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          host_port="$(docker port "${container_id}" 8080/tcp | awk -F: 'NR == 1 { print $NF }')"
+          test -n "${host_port}"
+          for _ in {1..90}; do
+            if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
+              exit 0
+            fi
+            if ! docker inspect --format '{{.State.Running}}' "${container_id}" | grep -Fqx true; then
+              echo "::error::Container exited before becoming healthy"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::Container entrypoint did not become healthy"
+          exit 1
+
+      - name: Record tested platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          test "${DIGEST}" != ""
+          mkdir container-digest
+          printf '%s\n' "${DIGEST}" > "container-digest/${{ matrix.profile }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.digest_artifact }}
+          path: container-digest/*
+          if-no-files-found: error
+
+  container-publish:
+    name: Promote tested multi-architecture container
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - container-smoke
+      - release-metadata
+      - native-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: container-digest-*
+          path: container-digests
+          merge-multiple: true
+
+      - name: Resolve lowercase image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested digest-only index
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(sort -u container-digests/*)
+          test "${#digests[@]}" -eq 2
+
+          refs=()
+          for digest in "${digests[@]}"; do
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            refs+=("${IMAGE}@${digest}")
+          done
+
+          docker buildx imagetools create --dry-run --progress=none \
+            "${refs[@]}" > tested-index.json
+          jq -e '.manifests' tested-index.json >/dev/null
+          tested_index_digest="$(
+            sha256sum tested-index.json | awk '{print "sha256:" $1}'
+          )"
+          media_type="$(jq -er '.mediaType' tested-index.json)"
+          case "${media_type}" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *)
+              echo "::error::Unsupported index media type: ${media_type}"
+              exit 1
+              ;;
+          esac
+          image_path="${IMAGE#ghcr.io/}"
+          registry_token="$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --user "${GITHUB_ACTOR}:${GH_TOKEN}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${image_path}:pull,push" |
+              jq -er '.token'
+          )"
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
+          registry_status="$(
+            curl --silent --show-error \
+              --connect-timeout 10 --max-time 60 \
+              --output registry-response.json \
+              --dump-header registry-response-headers.txt \
+              --write-out '%{http_code}' \
+              --request PUT \
+              --header "Authorization: Bearer ${registry_token}" \
+              --header "Content-Type: ${media_type}" \
+              --data-binary @tested-index.json \
+              "https://ghcr.io/v2/${image_path}/manifests/${tested_index_digest}"
+          )"
+          test "${registry_status}" = "201"
+          registry_digest="$(
+            awk 'BEGIN { IGNORECASE=1 }
+              /^Docker-Content-Digest:/ { gsub("\r", "", $2); print $2; exit }' \
+              registry-response-headers.txt
+          )"
+          test "${registry_digest}" = "${tested_index_digest}"
+
+          manifest_json="$(
+            docker buildx imagetools inspect "${IMAGE}@${tested_index_digest}" \
+              --format '{{json .Manifest}}'
+          )"
+          expected_digest="$(jq -r '.digest' <<< "${manifest_json}")"
+          [[ "${expected_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "${expected_digest}" = "${tested_index_digest}"
+          jq -e '
+            [.manifests[].platform
+              | select(.os == "linux")
+              | select(.architecture == "amd64" or .architecture == "arm64")
+              | .architecture]
+            | unique
+            | sort == ["amd64", "arm64"]
+          ' <<< "${manifest_json}" >/dev/null
+
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg image "${IMAGE}" \
+            --arg sourceSHA "${GITHUB_SHA}" \
+            --arg indexDigest "${expected_digest}" \
+            --argjson platformDigests "$(printf '%s\n' "${digests[@]}" | jq -R . | jq -s 'sort')" \
+            '{
+              schemaVersion: 1,
+              version: $version,
+              sourceSHA: $sourceSHA,
+              image: $image,
+              indexDigest: $indexDigest,
+              platformDigests: $platformDigests,
+              publication: "digest-only"
+            }' > container-digests.json
+
+      - name: Revalidate release tag before evidence upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(
+            ./scripts/release-tag-policy.sh --verify-tag-sha \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REPOSITORY}"
+          )" = "${GITHUB_SHA}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: container-release-evidence
+          path: container-digests.json
+          if-no-files-found: error

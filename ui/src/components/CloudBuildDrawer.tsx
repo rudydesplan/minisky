@@ -133,7 +133,7 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
       <Box sx={{ width: 600, p: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
           <Typography variant="h5" sx={{ fontWeight: 500 }}>Cloud Build</Typography>
-          <IconButton onClick={onClose}><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
         </Box>
 
         <Divider sx={{ mb: 4 }} />
@@ -203,7 +203,7 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
                 return (
                   <Box key={b.id} sx={{ mb: 1, borderBottom: '1px solid #eee' }}>
                     <ListItem sx={{ px: 1 }}>
-                      <IconButton size="small" onClick={() => setExpandedBuild(isExpanded ? null : b.id)} sx={{ mr: 1 }}>
+                      <IconButton aria-label={`${isExpanded ? 'Collapse' : 'Expand'} build ${b.id}`} size="small" onClick={() => setExpandedBuild(isExpanded ? null : b.id)} sx={{ mr: 1 }}>
                         {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                       </IconButton>
                       <ListItemText 

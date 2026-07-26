@@ -2,6 +2,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,9 +38,10 @@ var (
 	ErrStateRootReplaced        = errors.New("state root directory was replaced")
 	ErrUnsupportedVersion       = errors.New("unsupported state version")
 
-	profilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	entryPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	pathLocks      sync.Map
+	profilePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	entryPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	pathLocks       sync.Map
+	entryValidators sync.Map
 )
 
 type document struct {
@@ -54,6 +56,56 @@ type Snapshot struct {
 	Format  string                     `json:"format"`
 	Version int                        `json:"version"`
 	Entries map[string]json.RawMessage `json:"entries"`
+}
+
+// EntryValidationContext identifies the explicit import destination.
+type EntryValidationContext struct {
+	Store   *Store
+	Profile string
+}
+
+// EntryValidator validates one durable state entry before snapshot replacement.
+type EntryValidator func(EntryValidationContext, json.RawMessage) error
+
+// RegisterEntryValidator registers the schema validator for an exact state entry.
+func RegisterEntryValidator(name string, validator EntryValidator) error {
+	if err := validateEntryName(name); err != nil {
+		return err
+	}
+	if validator == nil {
+		return fmt.Errorf("state entry validator %q is nil", name)
+	}
+	if _, loaded := entryValidators.LoadOrStore(name, validator); loaded {
+		return fmt.Errorf("state entry validator %q is already registered", name)
+	}
+	return nil
+}
+
+// MustRegisterEntryValidator registers a validator or panics during package init.
+func MustRegisterEntryValidator(name string, validator EntryValidator) {
+	if err := RegisterEntryValidator(name, validator); err != nil {
+		panic(err)
+	}
+}
+
+// StrictEntryValidator decodes one entry with unknown-field rejection and then
+// applies optional schema-specific semantic validation.
+func StrictEntryValidator[T any](validate func(EntryValidationContext, *T) error) EntryValidator {
+	return func(context EntryValidationContext, payload json.RawMessage) error {
+		var value T
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+		if err := requireEOF(decoder); err != nil {
+			return err
+		}
+		if validate != nil {
+			return validate(context, &value)
+		}
+		return nil
+	}
 }
 
 // Store persists named JSON entries for one profile.
@@ -122,6 +174,9 @@ func (s *Store) AcquireOwnership() (*Ownership, error) {
 }
 
 func (s *Store) acquireOwnership(registerLocal bool) (*Ownership, error) {
+	if err := s.prepareStateRoot(); err != nil {
+		return nil, err
+	}
 	if err := s.prepareProfileDirectory(); err != nil {
 		return nil, err
 	}
@@ -171,6 +226,30 @@ func (s *Store) acquireOwnership(registerLocal bool) (*Ownership, error) {
 		}
 		return errors.Join(leaseErr, lock.close(), resources.close())
 	}}, nil
+}
+
+func (s *Store) prepareStateRoot() error {
+	created := false
+	if err := os.Mkdir(s.root, 0o700); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create state root: %w", err)
+		}
+	} else {
+		created = true
+	}
+	root, err := openPinnedDirectory(s.root)
+	if err != nil {
+		return fmt.Errorf("pin state root after creation: %w", err)
+	}
+	defer root.close()
+	info, err := os.Stat(s.root)
+	if err != nil {
+		return fmt.Errorf("inspect state root: %w", err)
+	}
+	if created && info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("state root permissions %04o are too broad; want 0700", info.Mode().Perm())
+	}
+	return root.samePath()
 }
 
 // Save atomically replaces one named JSON entry.
@@ -280,6 +359,12 @@ func (s *Store) Import(r io.Reader) error {
 		}
 		if !json.Valid(payload) {
 			return fmt.Errorf("invalid JSON in state entry %q", name)
+		}
+		if registered, ok := entryValidators.Load(name); ok {
+			context := EntryValidationContext{Store: s, Profile: s.profile}
+			if err := registered.(EntryValidator)(context, payload); err != nil {
+				return fmt.Errorf("invalid schema for state entry %q: %w", name, err)
+			}
 		}
 	}
 

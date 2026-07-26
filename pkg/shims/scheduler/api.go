@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,12 +16,14 @@ import (
 
 	"github.com/robfig/cron/v3"
 	configpkg "minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/state"
 )
 
 func init() {
+	state.MustRegisterEntryValidator(schedulerStateEntry, state.StrictEntryValidator[schedulerMetadata](nil))
 	registry.Register("cloudscheduler.googleapis.com", func(ctx *registry.Context) http.Handler {
 		var logAPI *logging.API
 		if l, ok := ctx.GetShim("logging.googleapis.com").(*logging.API); ok {
@@ -94,6 +97,13 @@ type API struct {
 	gatewayBaseURL string
 	now            func() time.Time
 	persistenceErr error
+	ctx            context.Context
+	cancel         context.CancelFunc
+	activeJobs     int
+	idle           chan struct{}
+	shutdownOnce   sync.Once
+	cronStopped    <-chan struct{}
+	closed         bool
 }
 
 type stateStore interface {
@@ -170,6 +180,9 @@ func newAPI(logAPI *logging.API, config Config, store stateStore) *API {
 	if now == nil {
 		now = time.Now
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	idle := make(chan struct{})
+	close(idle)
 	api := &API{
 		store:          store,
 		jobs:           make(map[string]*Job),
@@ -179,6 +192,9 @@ func newAPI(logAPI *logging.API, config Config, store stateStore) *API {
 		client:         &clientCopy,
 		gatewayBaseURL: strings.TrimRight(config.GatewayBaseURL, "/"),
 		now:            now,
+		ctx:            ctx,
+		cancel:         cancel,
+		idle:           idle,
 	}
 	return api
 }
@@ -189,7 +205,40 @@ func startScheduler(api *API) *API {
 }
 
 func (api *API) Close() {
-	<-api.cron.Stop().Done()
+	_ = api.Shutdown(context.Background())
+}
+
+// Shutdown stops cron registration, cancels active deliveries, and waits for
+// tracked work only until the caller's context expires.
+func (api *API) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	api.shutdownOnce.Do(func() {
+		api.mu.Lock()
+		api.closed = true
+		api.cancel()
+		api.mu.Unlock()
+		stopped := api.cron.Stop().Done()
+		api.mu.Lock()
+		api.cronStopped = stopped
+		api.mu.Unlock()
+	})
+	api.mu.RLock()
+	cronStopped := api.cronStopped
+	idle := api.idle
+	api.mu.RUnlock()
+	select {
+	case <-cronStopped:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // SetGatewayBaseURL wires the running daemon gateway used for cross-shim
@@ -282,6 +331,13 @@ func (api *API) pushLog(projectId, severity, jobId, text string) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud Scheduler] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	path := canonicalSchedulerPath(r.URL.Path)
+	if isSchedulerCustomVerb(path) && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		schedulerError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED",
+			"Cloud Scheduler custom job methods require POST")
+		return
+	}
 	api.mu.RLock()
 	persistenceErr := api.persistenceErr
 	api.mu.RUnlock()
@@ -290,8 +346,6 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"Scheduler persistence is unavailable")
 		return
 	}
-
-	path := canonicalSchedulerPath(r.URL.Path)
 
 	// Job verbs (run, pause, resume)
 	switch {
@@ -312,6 +366,12 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNotFound)
+}
+
+func isSchedulerCustomVerb(path string) bool {
+	return strings.HasSuffix(path, ":run") ||
+		strings.HasSuffix(path, ":pause") ||
+		strings.HasSuffix(path, ":resume")
 }
 
 func (api *API) routeJobs(w http.ResponseWriter, r *http.Request, path string) {
@@ -457,7 +517,10 @@ func (api *API) runJob(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	go api.executeJob(job)
+	if !api.startJobExecution(job) {
+		schedulerError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Scheduler is shutting down")
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(result)
@@ -537,7 +600,7 @@ func (api *API) scheduleJobLocked(job *Job) error {
 	}
 
 	id, err := api.cron.AddFunc(job.Schedule, func() {
-		api.executeJob(job)
+		api.startJobExecution(job)
 	})
 
 	if err != nil {
@@ -550,7 +613,35 @@ func (api *API) scheduleJobLocked(job *Job) error {
 	return nil
 }
 
-func (api *API) executeJob(job *Job) {
+func (api *API) startJobExecution(job *Job) bool {
+	api.mu.Lock()
+	if api.closed {
+		api.mu.Unlock()
+		return false
+	}
+	if api.activeJobs == 0 {
+		api.idle = make(chan struct{})
+	}
+	api.activeJobs++
+	ctx := api.ctx
+	api.mu.Unlock()
+	go func() {
+		defer api.finishJobExecution()
+		api.executeJob(ctx, job)
+	}()
+	return true
+}
+
+func (api *API) finishJobExecution() {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	api.activeJobs--
+	if api.activeJobs == 0 {
+		close(api.idle)
+	}
+}
+
+func (api *API) executeJob(ctx context.Context, job *Job) {
 	project := extractProject(job.Name)
 	api.pushLog(project, "INFO", job.Name, "Job started")
 	startTime := api.now()
@@ -558,11 +649,11 @@ func (api *API) executeJob(job *Job) {
 	statusCode := 0
 	var err error
 	if job.HttpTarget != nil {
-		statusCode, err = api.executeHttp(job.HttpTarget)
+		statusCode, err = api.executeHttp(ctx, job.HttpTarget)
 	} else if job.PubsubTarget != nil {
-		statusCode, err = api.executePubsub(job.PubsubTarget)
+		statusCode, err = api.executePubsub(ctx, job.PubsubTarget)
 	} else if job.AppEngineTarget != nil {
-		statusCode, err = api.executeAppEngine(job.AppEngineTarget)
+		statusCode, err = api.executeAppEngine(ctx, job.AppEngineTarget)
 	} else {
 		err = fmt.Errorf("job has no delivery target")
 	}
@@ -589,17 +680,18 @@ func (api *API) executeJob(job *Job) {
 	}
 }
 
-func (api *API) executeHttp(target *HttpTarget) (int, error) {
+func (api *API) executeHttp(ctx context.Context, target *HttpTarget) (int, error) {
 	req, err := newTargetRequest(target.HttpMethod, target.Uri, target.Headers, target.Body)
 	if err != nil {
 		return 0, err
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set("User-Agent", "MiniSky-Cloud-Scheduler")
 
 	return api.deliver(req, "HTTP")
 }
 
-func (api *API) executePubsub(target *PubsubTarget) (int, error) {
+func (api *API) executePubsub(ctx context.Context, target *PubsubTarget) (int, error) {
 	if api.gatewayBaseURL == "" {
 		return 0, fmt.Errorf("PubSub delivery requires MINISKY_GATEWAY_URL or Config.GatewayBaseURL")
 	}
@@ -616,7 +708,7 @@ func (api *API) executePubsub(target *PubsubTarget) (int, error) {
 		return 0, fmt.Errorf("encode PubSub message: %w", err)
 	}
 	uri := api.gatewayBaseURL + "/v1/" + strings.TrimPrefix(target.TopicName, "/") + ":publish"
-	req, err := http.NewRequest(http.MethodPost, uri, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -625,7 +717,7 @@ func (api *API) executePubsub(target *PubsubTarget) (int, error) {
 	return api.deliver(req, "PubSub")
 }
 
-func (api *API) executeAppEngine(target *AppEngineTarget) (int, error) {
+func (api *API) executeAppEngine(ctx context.Context, target *AppEngineTarget) (int, error) {
 	if api.gatewayBaseURL == "" {
 		return 0, fmt.Errorf("App Engine delivery requires MINISKY_GATEWAY_URL or Config.GatewayBaseURL")
 	}
@@ -634,6 +726,7 @@ func (api *API) executeAppEngine(target *AppEngineTarget) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	req = req.WithContext(ctx)
 	return api.deliver(req, "App Engine")
 }
 
@@ -652,7 +745,7 @@ func newTargetRequest(method, uri string, headers map[string]string, body string
 }
 
 func (api *API) deliver(req *http.Request, targetName string) (int, error) {
-	resp, err := api.client.Do(req)
+	resp, err := observability.Do(api.client, req)
 	if err != nil {
 		return 0, err
 	}

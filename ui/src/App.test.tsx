@@ -1,4 +1,5 @@
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { ProjectContext } from './contexts/projectContextValue';
@@ -33,5 +34,27 @@ describe('application routing and landmarks', () => {
     expect(screen.getByRole('navigation', { name: 'Primary navigation' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Skip to main content' })).toHaveAttribute('href', '#main-content');
     expect(document.querySelector('main')).toHaveAttribute('id', 'main-content');
+  });
+
+  it('uses a named temporary navigation control on narrow screens', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
+      matches: query === '(max-width:900px)',
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })));
+    const user = userEvent.setup();
+    render(
+      <ProjectContext.Provider value={projectContext}>
+        <App />
+      </ProjectContext.Provider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Open primary navigation' }));
+    expect(screen.getByRole('navigation', { name: 'Primary navigation' })).toBeVisible();
   });
 });
