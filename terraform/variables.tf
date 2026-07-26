@@ -34,6 +34,52 @@ variable "enable_phase13_wif_resources" {
   default     = false
 }
 
+variable "enable_phase16_network_resources" {
+  description = "Create the optional local Phase-16 custom network and bounded IPv4 subnetwork"
+  type        = bool
+  default     = false
+}
+
+variable "phase16_network_name" {
+  description = "Name of the optional local Phase-16 custom-mode network"
+  type        = string
+  default     = "minisky-phase16"
+
+  validation {
+    condition     = can(regex("^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$", var.phase16_network_name))
+    error_message = "phase16_network_name must follow GCE RFC1035 naming rules."
+  }
+}
+
+variable "phase16_subnetwork_cidr" {
+  description = "Canonical IPv4 CIDR assigned to the optional local Phase-16 subnetwork"
+  type        = string
+  default     = "10.42.0.0/24"
+
+  validation {
+    condition = try(
+      cidrnetmask(var.phase16_subnetwork_cidr) != "" &&
+      cidrhost(var.phase16_subnetwork_cidr, 0) == split("/", var.phase16_subnetwork_cidr)[0] &&
+      tonumber(split("/", var.phase16_subnetwork_cidr)[1]) >= 8 &&
+      tonumber(split("/", var.phase16_subnetwork_cidr)[1]) <= 29 &&
+      can(regex("^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)", var.phase16_subnetwork_cidr)),
+      false,
+    )
+    error_message = "phase16_subnetwork_cidr must be a canonical private IPv4 /8 through /29 prefix."
+  }
+}
+
+variable "phase16_subnetwork_name" {
+  description = "Name of the optional local Phase-16 regional subnetwork"
+  type        = string
+  default     = "minisky-phase16"
+
+  validation {
+    condition     = can(regex("^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$", var.phase16_subnetwork_name))
+    error_message = "phase16_subnetwork_name must follow GCE RFC1035 naming rules."
+  }
+}
+
 variable "phase13_wif_delegate_account_ids" {
   description = "Ordered account IDs for the local Phase-13 delegation chain"
   type        = list(string)

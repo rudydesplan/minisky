@@ -110,6 +110,64 @@ func TestSubnetworkGeneratedClientLifecycleAndPagination(t *testing.T) {
 	}
 }
 
+func TestSubnetworkAcceptsGoogleProviderDefaultCreateShape(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	addCustomNetwork(api, "test-project", "custom")
+	base := "/compute/v1/projects/test-project/regions/us-central1/subnetworks"
+
+	response := performComputeRequest(api, http.MethodPost, base, `{
+		"name":"provider-subnet",
+		"ipCidrRange":"10.42.0.0/24",
+		"network":"projects/test-project/global/networks/custom",
+		"region":"projects/test-project/global/regions/us-central1",
+		"logConfig":{"enable":false}
+	}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("provider-shaped create status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	api.mu.RLock()
+	subnetwork := cloneSubnetwork(api.subnetworks[subnetworkKey("test-project", "us-central1", "provider-subnet")])
+	api.mu.RUnlock()
+	if subnetwork == nil || subnetwork.Network != networkSelfLink("test-project", "custom") ||
+		subnetwork.Region != regionSelfLink("test-project", "us-central1") {
+		t.Fatalf("subnetwork = %#v", subnetwork)
+	}
+}
+
+func TestSubnetworkRejectsUnsupportedGoogleProviderCreateValues(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	addCustomNetwork(api, "test-project", "custom")
+	base := "/compute/v1/projects/test-project/regions/us-central1/subnetworks"
+
+	for _, tc := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{
+			name: "mismatched body region",
+			body: `{"name":"wrong-region","ipCidrRange":"10.43.0.0/24","network":"custom",` +
+				`"region":"projects/test-project/regions/europe-west1"}`,
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "enabled flow logs",
+			body: `{"name":"flow-logs","ipCidrRange":"10.44.0.0/24","network":"custom",` +
+				`"logConfig":{"enable":true}}`,
+			status: http.StatusNotImplemented,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertComputeError(t, performComputeRequest(api, http.MethodPost, base, tc.body),
+				tc.status, map[int]string{
+					http.StatusBadRequest:     "INVALID_ARGUMENT",
+					http.StatusNotImplemented: "UNIMPLEMENTED",
+				}[tc.status])
+		})
+	}
+}
+
 func TestSubnetworkPaginationUsesCollectionBoundNameCursor(t *testing.T) {
 	api, _ := newComputeTestAPI()
 	for _, name := range []string{"network-a", "network-b", "network-zero"} {
@@ -624,6 +682,9 @@ func TestNetworkInsertRejectsDuplicateWithoutReplacingParent(t *testing.T) {
 	if network.ID != "stable" || network.Description != "original" {
 		t.Fatalf("duplicate replaced network: %#v", network)
 	}
+	if operations := api.opMgr.List(); len(operations) != 0 {
+		t.Fatalf("duplicate create persisted operations: %#v", operations)
+	}
 }
 
 func TestNetworkLifecycleIsControlPlaneOnlyUntilSubnetworkExists(t *testing.T) {
@@ -642,6 +703,76 @@ func TestNetworkLifecycleIsControlPlaneOnlyUntilSubnetworkExists(t *testing.T) {
 	if backend.ensureCalls != 0 || backend.deleteCalls != 0 {
 		t.Fatalf("network lifecycle touched IPAM backend: ensure=%d delete=%d",
 			backend.ensureCalls, backend.deleteCalls)
+	}
+}
+
+func TestNetworkPreservesGoogleProviderDefaultEnforcementOrder(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	base := "/compute/v1/projects/test-project/global/networks"
+	create := performComputeRequest(api, http.MethodPost, base, `{
+		"name":"provider-network",
+		"autoCreateSubnetworks":false,
+		"networkFirewallPolicyEnforcementOrder":"AFTER_CLASSIC_FIREWALL"
+	}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", create.Code, create.Body.String())
+	}
+
+	get := performComputeRequest(api, http.MethodGet, base+"/provider-network", "")
+	var network struct {
+		NetworkFirewallPolicyEnforcementOrder string `json:"networkFirewallPolicyEnforcementOrder"`
+	}
+	decodeComputeResponse(t, get, &network)
+	if network.NetworkFirewallPolicyEnforcementOrder != "AFTER_CLASSIC_FIREWALL" {
+		t.Fatalf("networkFirewallPolicyEnforcementOrder = %q", network.NetworkFirewallPolicyEnforcementOrder)
+	}
+}
+
+func TestNetworkOperationRegistrationFailurePreservesMetadataTruth(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		pathSuffix string
+		seed       bool
+		wantExists bool
+	}{
+		{name: "create", method: http.MethodPost, wantExists: false},
+		{name: "delete", method: http.MethodDelete, pathSuffix: "/existing", seed: true, wantExists: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			operationStore := &toggleComputeStore{fail: true}
+			opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadataStore := &toggleComputeStore{}
+			api, err := newTestAPIWithMetadataStore(opMgr, metadataStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.seed {
+				addCustomNetwork(api, "test-project", "existing")
+				if err := api.persistMetadata(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			base := "/compute/v1/projects/test-project/global/networks"
+			response := performComputeRequest(api, tc.method, base+tc.pathSuffix,
+				`{"name":"created","autoCreateSubnetworks":false}`)
+			assertComputeError(t, response, http.StatusInternalServerError, "INTERNAL")
+
+			api.mu.RLock()
+			name := "created"
+			if tc.seed {
+				name = "existing"
+			}
+			_, exists := api.networks["test-project:"+name]
+			api.mu.RUnlock()
+			if exists != tc.wantExists {
+				t.Fatalf("network exists=%t, want %t", exists, tc.wantExists)
+			}
+		})
 	}
 }
 

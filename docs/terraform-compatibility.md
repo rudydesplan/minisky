@@ -32,6 +32,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | :--- | :--- | :--- |
 | `artifact_registry_custom_endpoint` | `http://127.0.0.1:8080/_minisky/artifactregistry/` | `artifactregistry.googleapis.com` |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
+| `compute_custom_endpoint` | `http://127.0.0.1:8080/_minisky/compute/compute/v1/` | `compute.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
 | `iam_credentials_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iamcredentials/v1/` | `iamcredentials.googleapis.com` |
 | `pubsub_custom_endpoint` | `http://127.0.0.1:8080/_minisky/pubsub/v1/` | `pubsub.googleapis.com` |
@@ -59,6 +60,8 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_pubsub_topic` | Primary-project topic in the profile-owned Pub/Sub emulator | Synchronous | Canonical name is read and a unique Go SDK message is published |
 | `google_pubsub_subscription` | Secondary-project subscription referencing the primary topic | Synchronous | Exact topic reference is read, then the published message is pulled and acknowledged |
 | `google_artifact_registry_repository` (optional Phase 10) | In-memory repository metadata plus repository-scoped Registry v2 package/version views | Service LRO | Repository is created, read without drift, destroyed, and returns 404 |
+| `google_compute_network` (optional Phase 16) | Profile-persisted custom-mode network metadata | Global Compute LRO | Canonical import, immediate and post-restart no-drift plans, and ordered destroy pass |
+| `google_compute_subnetwork` (optional Phase 16) | Profile-persisted bounded regional IPv4 metadata plus one exact owned Docker bridge | Regional Compute LRO | Canonical import preserves bridge identity; destroy removes metadata and the exact bridge |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
@@ -71,29 +74,36 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Phase-13 WIF, Artifact Registry, Redis, and Spanner resources are disabled
-by default and local-profile-only. Artifact Registry uses profile-owned Registry v2, and
-`emulator-config` is not a production Spanner configuration. Enable Artifact
-Registry with `enable_phase10_artifact_resources = true`, WIF with
-`enable_phase13_wif_resources = true`, and Redis and Spanner with
-`enable_phase15_resources = true`; their outputs are `null` or empty while
-disabled.
+The Phase-13 WIF, Artifact Registry, Redis, Spanner, and Phase-16 networking
+resources are disabled by default and local-profile-only. Artifact Registry
+uses profile-owned Registry v2, and `emulator-config` is not a production
+Spanner configuration. Enable Artifact Registry with
+`enable_phase10_artifact_resources = true`, WIF with
+`enable_phase13_wif_resources = true`, Redis and Spanner with
+`enable_phase15_resources = true`, and the bounded custom network plus
+subnetwork with `enable_phase16_network_resources = true`; their outputs are
+`null` or empty while disabled.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
 data-plane gate. Resources not listed above are not claimed as
-Terraform-compatible. In particular, the tracked stack excludes Compute,
-Cloud SQL, serverless, GKE/Kind, and Compute load-balancer resources. See
-`docs/service-compatibility.md` for their implementation status; API routes
-alone do not establish provider compatibility.
+Terraform-compatible. In particular, the tracked stack excludes Cloud SQL,
+serverless, GKE/Kind, and the Compute resources beyond the explicitly listed
+bounded slices. See `docs/service-compatibility.md` for implementation status;
+API routes alone do not establish provider compatibility.
 
-The separate Phase-16 subnetwork/IPAM gate uses the official generated
-`google.golang.org/api/compute/v1` client, not the Google Terraform provider.
-Its custom-network and one-subnetwork create/list/get/delete, operation polling,
-restart, and exact Docker-bridge reconciliation evidence is API evidence only.
-It does not establish Terraform schema, import, refresh/no-drift, or destroy
-compatibility; `google_compute_network` and `google_compute_subnetwork` remain
-unclaimed here.
+The separate guarded Phase-16 Terraform gate targets only
+`google_compute_network.phase16[0]` and
+`google_compute_subnetwork.phase16[0]`. It uses provider `7.41.0` to apply,
+require immediate zero drift, restart MiniSky while preserving the exact Docker
+bridge ID, remove both resources from Terraform state without deleting them,
+import their canonical relative IDs, require zero drift before and after another
+restart, then destroy in dependency order and verify API `404` plus bridge
+absence after a final restart. The subnetwork request compatibility is limited
+to the provider's disabled flow-log default, same-path region encoding, and
+same-project relative network reference. Auto-mode networks, updates, multiple
+or secondary ranges, IPv6, workload connectivity, routes, NAT, peering, PSC,
+and general VPC parity remain unclaimed.
 
 ## Go and Python SDK smoke suites
 

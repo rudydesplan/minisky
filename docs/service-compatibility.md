@@ -206,19 +206,23 @@ SDK coverage.
   forwarding/peering/service-directory targets, recursion, TCP/DoH/DoT,
   MX/TXT/NS/SOA/PTR/SRV resolution, CNAME chaining, EDNS0, and private-network
   enforcement are unsupported.
-- Advanced networking has one generated-client-verified slice: custom-mode
-  global network CRUD and pagination plus one regional primary IPv4 subnetwork
-  per VPC, with global/regional operation polling and exact supported metadata
-  across restart and deletion. Each supported VPC maps to one exact
+- Advanced networking has one generated-client- and Terraform-verified slice:
+  custom-mode global network CRUD and pagination plus one regional primary IPv4
+  subnetwork per VPC, with global/regional operation polling and exact supported
+  metadata across restart and deletion. The pinned provider additionally proves
+  apply, canonical import, no drift before and after restart, and ordered
+  destroy. Each supported VPC maps to one exact
   project/profile-owned Docker bridge. Reconciliation requires the expected
   resource identity and ownership labels and preserves the immutable Docker ID,
   bridge driver, and single CIDR/IPAM; unowned or mismatched bridges are
   refused, and ambiguous create recovery and attached-endpoint deletion fail
   closed.
-- This slice does not establish Terraform provider compatibility, auto-mode
-  networks, multiple VM network interfaces, multiple or secondary ranges,
-  IPv6, routes, workload connectivity, firewall packet isolation, Shared VPC,
-  host routing/iptables, cross-host network semantics, NAT, peering, PSC,
-  VPN/interconnect, or full GCP VPC parity. MiniSky never installs host-global
-  iptables rules. The guarded gate passed locally on Docker Desktop/macOS; its
-  opt-in Linux CI job is configured but has no CI pass evidence.
+- The provider claim is limited to `google_compute_network` and
+  `google_compute_subnetwork` within this bounded shape. It does not establish
+  auto-mode networks, updates, multiple VM network interfaces, multiple or
+  secondary ranges, IPv6, routes, workload connectivity, firewall packet
+  isolation, Shared VPC, host routing/iptables, cross-host network semantics,
+  NAT, peering, PSC, VPN/interconnect, or full GCP VPC parity. MiniSky never
+  installs host-global iptables rules. Both guarded gates passed locally on
+  Docker Desktop/macOS; their opt-in Linux CI jobs are configured but have no
+  CI pass evidence.

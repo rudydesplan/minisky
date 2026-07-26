@@ -75,6 +75,15 @@ func newAPIWithMetadataStore(
 	if persisted.Networks != nil {
 		api.networks = persisted.Networks
 	}
+	for key, network := range api.networks {
+		if network == nil {
+			delete(api.networks, key)
+			continue
+		}
+		if network.NetworkFirewallPolicyEnforcementOrder == "" {
+			network.NetworkFirewallPolicyEnforcementOrder = "AFTER_CLASSIC_FIREWALL"
+		}
+	}
 	if persisted.Subnetworks != nil {
 		api.subnetworks = persisted.Subnetworks
 	}
@@ -173,6 +182,12 @@ func validatePersistedSubnetworkGraph(
 	subnetworks map[string]*Subnetwork,
 	nextID uint64,
 ) error {
+	for key, network := range networks {
+		if network != nil && network.NetworkFirewallPolicyEnforcementOrder != "" &&
+			network.NetworkFirewallPolicyEnforcementOrder != "AFTER_CLASSIC_FIREWALL" {
+			return fmt.Errorf("network %q has unsupported firewall policy enforcement order", key)
+		}
+	}
 	type seenSubnet struct {
 		project string
 		prefix  netip.Prefix
