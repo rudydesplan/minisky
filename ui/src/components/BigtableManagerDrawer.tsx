@@ -15,6 +15,7 @@ import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import SearchIcon from '@mui/icons-material/Search';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation } from '../apiClient';
 
 type BigtableManagerDrawerProps = { open: boolean; onClose: () => void };
 
@@ -100,11 +101,11 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
     setDataLoading(true);
     try {
       const [instId, tbId] = selectedTablePath.split('/');
-      const res = await fetch(`${apiRoot}/instances/${instId}/tables/${tbId}:readRows`, {
+      const res = await checkedMutation(`${apiRoot}/instances/${instId}/tables/${tbId}:readRows`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
-      });
+      }, 'Bigtable row read failed. Check the table and emulator status.');
       if (res.ok) {
         const data: { rows?: BigtableRow[] } = await res.json();
         setRows(data.rows || []);
@@ -119,7 +120,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
     if (!newInstanceId) return;
     setLoading(true);
     try {
-      const res = await fetch(`${apiRoot}/instances`, {
+      const res = await checkedMutation(`${apiRoot}/instances`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -129,7 +130,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
             type: 'DEVELOPMENT'
           }
         })
-      });
+      }, 'Bigtable instance creation failed. Check the instance ID and display name.');
       if (res.ok) {
         showToast(`Instance ${newInstanceId} created`);
         loadInstances();
@@ -144,14 +145,14 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
     if (!newTableId || !targetInstance) return;
     setLoading(true);
     try {
-      const res = await fetch(`${apiRoot}/instances/${targetInstance}/tables`, {
+      const res = await checkedMutation(`${apiRoot}/instances/${targetInstance}/tables`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tableId: newTableId,
           table: { columnFamilies: {} }
         })
-      });
+      }, 'Bigtable table creation failed. Check the table ID and instance.');
       if (res.ok) {
         showToast(`Table ${newTableId} created in ${targetInstance}`);
         loadInstances();
@@ -165,7 +166,8 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
   const handleDeleteInstance = async (id: string) => {
     if (!confirm('Are you sure you want to delete this instance?')) return;
     try {
-      const res = await fetch(`${apiRoot}/instances/${id}`, { method: 'DELETE' });
+      const res = await checkedMutation(`${apiRoot}/instances/${id}`, { method: 'DELETE' },
+        'Bigtable instance deletion failed. Remove dependent tables and retry.');
       if (res.ok) {
         showToast(`Instance ${id} deleted`);
         loadInstances();
@@ -175,7 +177,8 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
 
   const handleDeleteTable = async (instId: string, tbId: string) => {
     try {
-      const res = await fetch(`${apiRoot}/instances/${instId}/tables/${tbId}`, { method: 'DELETE' });
+      const res = await checkedMutation(`${apiRoot}/instances/${instId}/tables/${tbId}`, { method: 'DELETE' },
+        'Bigtable table deletion failed. Retry after active operations finish.');
       if (res.ok) {
         showToast(`Table ${tbId} deleted`);
         loadInstances();

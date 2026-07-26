@@ -13,6 +13,7 @@ import PersonIcon from '@mui/icons-material/Person';
 import PsychologyIcon from '@mui/icons-material/Psychology';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 type VertexAiDrawerProps = { open: boolean; onClose: () => void };
 
@@ -83,13 +84,15 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
 
   const saveConfig = async () => {
     try {
-      await fetch(`${apiRoot}/internal/config`, {
+      await checkedMutation(`${apiRoot}/internal/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider, endpoint, apiKey, model })
-      });
+      }, 'Vertex AI provider configuration failed. Check the endpoint, model, and credentials.');
       fetchModels();
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'error', text: safeRequestError(e, 'Unable to connect while saving provider settings.') }]);
+    }
   };
 
   const handleSend = async () => {
@@ -114,17 +117,13 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
         })
       });
 
-      if (res.ok) {
-        const data = await res.json() as GenerateContentResponse;
-        const modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from model.';
-        setMessages(prev => [...prev, { role: 'model', text: modelText }]);
-      } else {
-        const err = await res.text();
-        setMessages(prev => [...prev, { role: 'error', text: `Error: ${err}` }]);
-      }
+      await requireOk(res, 'Model generation failed. Check the provider, model, endpoint, and credentials.');
+      const data = await res.json() as GenerateContentResponse;
+      const modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from model.';
+      setMessages(prev => [...prev, { role: 'model', text: modelText }]);
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
-      setMessages(prev => [...prev, { role: 'error', text: `Connection Error: ${message}` }]);
+      const message = safeRequestError(e, 'Unable to connect to the configured model provider.');
+      setMessages(prev => [...prev, { role: 'error', text: message }]);
     } finally {
       setLoading(false);
     }

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ProjectContext } from './projectContextValue';
+import { requireOk, safeRequestError } from '../apiClient';
 
 export { useProjectContext } from './projectContextValue';
 
@@ -28,8 +29,13 @@ const projectProvider = function ProjectProvider({ children }: { children: React
     const controller = new AbortController();
     fetch('/api/projects', { signal: controller.signal })
       .then(async response => {
-        if (!response.ok) throw new Error('Project registry is unavailable');
-        const value: unknown = await response.json();
+        await requireOk(response, 'Project registry is unavailable. Verify that the Resource Manager shim is running.');
+        let value: unknown;
+        try {
+          value = await response.json();
+        } catch {
+          throw new Error('Project registry returned an invalid response. Start the MiniSky management API and retry.');
+        }
         if (!isProjectList(value)) throw new Error('Project registry returned an invalid response');
         const projects = value.projects.filter(project => project.state === 'ACTIVE').map(project => project.projectId);
         setAvailableProjects(projects);
@@ -49,18 +55,20 @@ const projectProvider = function ProjectProvider({ children }: { children: React
   };
 
   const addProject = async (name: string) => {
-    const response = await fetch('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId: name, displayName: name }),
-    });
-    if (!response.ok) {
-      setProjectError('Project creation failed');
-      throw new Error('Project creation failed');
+    try {
+      await requireOk(await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: name, displayName: name }),
+      }), 'Project creation failed. Check the project ID and retry.');
+      setAvailableProjects(projects => projects.includes(name) ? projects : [...projects, name]);
+      setProjectError(null);
+      setActiveProject(name);
+    } catch (error) {
+      const message = safeRequestError(error, 'Unable to connect while creating the project.');
+      setProjectError(message);
+      throw new Error(message, { cause: error });
     }
-    setAvailableProjects(projects => projects.includes(name) ? projects : [...projects, name]);
-    setProjectError(null);
-    setActiveProject(name);
   };
 
   return (

@@ -435,6 +435,17 @@ func exactLabels(actual, expected map[string]string) bool {
 	return true
 }
 
+// containsLabels requires every ownership label and value while allowing
+// immutable labels inherited from the container image.
+func containsLabels(actual, expected map[string]string) bool {
+	for key, value := range expected {
+		if actual[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
 func dockerStatusError(operation string, response *http.Response) error {
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxDockerErrorBody))
 	if err != nil {

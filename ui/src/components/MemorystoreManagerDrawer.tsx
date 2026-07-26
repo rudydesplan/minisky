@@ -15,6 +15,7 @@ import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, safeRequestError } from '../apiClient';
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -109,7 +110,7 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
       const base = isRedis ? 'redis.googleapis.com' : 'memcache.googleapis.com';
       const endpoint = `/api/manage/memorystore/projects/${activeProject}/locations/us-central1/instances`;
       
-      const res = await fetch(endpoint + `?instanceId=${form.id}`, {
+      await checkedMutation(endpoint + `?instanceId=${form.id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Host': base },
         body: JSON.stringify({
@@ -117,11 +118,10 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
           memorySizeGb: form.memorySizeGb,
           engineVersion: form.engineVersion,
         }),
-      });
-      if (res.ok) fetchInstances();
-      else setError('Create failed');
-    } catch {
-      setError('Network error');
+      }, 'Memorystore instance creation failed. Check the ID, tier, and engine version.');
+      fetchInstances();
+    } catch (error) {
+      setError(safeRequestError(error, 'Unable to connect while creating the Memorystore instance.'));
     } finally {
       setLoading(false);
     }
@@ -132,11 +132,11 @@ export default function MemorystoreManagerDrawer({ open, onClose }: Props) {
     if (!confirm(`Delete instance "${id}"?`)) return;
     setLoading(true);
     try {
-      const res = await fetch(`/api/manage/memorystore/${instanceName}`, { method: 'DELETE' });
-      if (res.ok) fetchInstances();
-      else setError('Delete failed');
-    } catch {
-      setError('Network error');
+      await checkedMutation(`/api/manage/memorystore/${instanceName}`, { method: 'DELETE' },
+        'Memorystore instance deletion failed. Wait for active operations and retry.');
+      fetchInstances();
+    } catch (error) {
+      setError(safeRequestError(error, 'Unable to connect while deleting the Memorystore instance.'));
     } finally {
       setLoading(false);
     }

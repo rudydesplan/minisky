@@ -2,6 +2,7 @@ package validator
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,9 @@ import (
 	"net/http"
 	"strings"
 )
+
+// DefaultMaxBodyBytes is the inherited cap for body-bearing gateway requests.
+const DefaultMaxBodyBytes int64 = 1 << 20
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Validator — the main contract enforcement engine
@@ -34,11 +38,41 @@ func NewValidator() *Validator {
 	return &Validator{rulesIndex: idx}
 }
 
+// RequestBodyLimit returns the route override or the inherited gateway cap.
+func (v *Validator) RequestBodyLimit(domain, method, path string) int64 {
+	if svc, ok := v.rulesIndex[domain]; ok {
+		if rule := v.matchRule(svc, method, path); rule != nil && rule.MaxBodyBytes > 0 {
+			return rule.MaxBodyBytes
+		}
+	}
+	return DefaultMaxBodyBytes
+}
+
 // ValidateRequest checks the request against all applicable Discovery rules.
 // Returns false if the request is invalid and writes a GCP-shaped error response.
 // Returns true if the request passes all checks.
 func (v *Validator) ValidateRequest(w http.ResponseWriter, r *http.Request) bool {
 	return v.ValidateRequestForDomain(w, r, r.Host)
+}
+
+// ValidateRequestPreBodyForDomain validates that an explicitly resolved route
+// exists and that its body-independent contract fields are valid.
+func (v *Validator) ValidateRequestPreBodyForDomain(
+	w http.ResponseWriter,
+	r *http.Request,
+	domain string,
+) bool {
+	svc, ok := v.rulesIndex[domain]
+	if !ok {
+		return v.emitError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"No validation contract is registered for this service route.")
+	}
+	rule := v.matchRule(svc, r.Method, r.URL.Path)
+	if rule == nil {
+		return v.emitError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"No validation contract is registered for this method and path.")
+	}
+	return v.validatePreBody(w, r, rule)
 }
 
 // ValidateRequestForDomain validates a request against an explicitly resolved
@@ -58,41 +92,23 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 		// No specific rule for this (method, path) pair — allow it.
 		return true
 	}
-
-	// ── 3. Content-Type check ─────────────────────────────────────────────────
-	if rule.ContentType != "" && r.Method != http.MethodGet && r.Method != http.MethodDelete {
-		ct := r.Header.Get("Content-Type")
-		// Allow "application/json; charset=utf-8" etc.
-		if !strings.HasPrefix(ct, rule.ContentType) {
-			log.Printf("[Validator] 415 for %s %s — got Content-Type: %q", r.Method, r.URL.Path, ct)
-			return v.emitError(w, 415, "INVALID_ARGUMENT",
-				fmt.Sprintf("Unsupported Content-Type '%s'. Expected '%s'.", ct, rule.ContentType))
-		}
+	if !v.validatePreBody(w, r, rule) {
+		return false
 	}
 
-	// ── 4. Required query parameters ──────────────────────────────────────────
-	for _, qp := range rule.RequiredQuery {
-		if r.URL.Query().Get(qp) == "" {
-			log.Printf("[Validator] 400 for %s %s — missing query param: %s", r.Method, r.URL.Path, qp)
-			return v.emitError(w, 400, "INVALID_ARGUMENT",
-				fmt.Sprintf("Query parameter '%s' is required.", qp))
-		}
-	}
-
+	// Body-independent content-type and query checks completed above.
 	// ── 5. JSON body and required fields ─────────────────────────────────────
 	if len(rule.RequiredBody) > 0 || rule.ContentType == "application/json" {
 		// Read body once, then restore it so the downstream shim can read it too.
-		reader := io.Reader(r.Body)
-		if rule.MaxBodyBytes > 0 {
-			reader = io.LimitReader(r.Body, rule.MaxBodyBytes+1)
-		}
+		maxBodyBytes := v.RequestBodyLimit(domain, r.Method, r.URL.Path)
+		reader := io.LimitReader(r.Body, maxBodyBytes+1)
 		raw, err := io.ReadAll(reader)
 		if err != nil {
 			return v.emitError(w, 400, "INVALID_ARGUMENT", "Cannot read request body: "+err.Error())
 		}
-		if rule.MaxBodyBytes > 0 && int64(len(raw)) > rule.MaxBodyBytes {
+		if int64(len(raw)) > maxBodyBytes {
 			return v.emitError(w, http.StatusRequestEntityTooLarge, "INVALID_ARGUMENT",
-				fmt.Sprintf("Request body exceeds %d bytes.", rule.MaxBodyBytes))
+				fmt.Sprintf("Request body exceeds %d bytes.", maxBodyBytes))
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 
@@ -137,10 +153,40 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 					return v.emitError(w, 400, "INVALID_ARGUMENT", typeErr)
 				}
 			}
+			if boundsErr := checkFieldBounds(req, val); boundsErr != "" {
+				log.Printf("[Validator] 400 for %s %s — bounds error: %s", r.Method, r.URL.Path, boundsErr)
+				return v.emitError(w, 400, "INVALID_ARGUMENT", boundsErr)
+			}
 		}
 	}
 
 	log.Printf("[Validator] ✅ Contract validated: %s %s@%s", r.Method, r.URL.Path, domain)
+	return true
+}
+
+func (v *Validator) validatePreBody(
+	w http.ResponseWriter,
+	r *http.Request,
+	rule *MethodSchema,
+) bool {
+	if rule.ContentType != "" && r.Method != http.MethodGet && r.Method != http.MethodDelete {
+		ct := r.Header.Get("Content-Type")
+		// Allow "application/json; charset=utf-8" etc.
+		if !strings.HasPrefix(ct, rule.ContentType) {
+			log.Printf("[Validator] 415 for %s %s — got Content-Type: %q", r.Method, r.URL.Path, ct)
+			return v.emitError(w, 415, "INVALID_ARGUMENT",
+				fmt.Sprintf("Unsupported Content-Type '%s'. Expected '%s'.", ct, rule.ContentType))
+		}
+	}
+
+	// ── 4. Required query parameters ──────────────────────────────────────────
+	for _, qp := range rule.RequiredQuery {
+		if r.URL.Query().Get(qp) == "" {
+			log.Printf("[Validator] 400 for %s %s — missing query param: %s", r.Method, r.URL.Path, qp)
+			return v.emitError(w, 400, "INVALID_ARGUMENT",
+				fmt.Sprintf("Query parameter '%s' is required.", qp))
+		}
+	}
 	return true
 }
 
@@ -246,6 +292,32 @@ func checkFieldType(fieldPath string, val interface{}, expected string) string {
 	}
 	if !ok {
 		return fmt.Sprintf("Field '%s' must be of type '%s'.", fieldPath, expected)
+	}
+	return ""
+}
+
+func checkFieldBounds(field BodyField, value interface{}) string {
+	if field.MaxItems > 0 {
+		items, ok := value.([]interface{})
+		if ok && len(items) > field.MaxItems {
+			return fmt.Sprintf("Field '%s' must contain at most %d items.", field.Path, field.MaxItems)
+		}
+	}
+	if field.MaxDecodedBytes > 0 {
+		encoded, ok := value.(string)
+		if !ok {
+			return ""
+		}
+		if int64(len(encoded)) > int64(base64.StdEncoding.EncodedLen(int(field.MaxDecodedBytes))) {
+			return fmt.Sprintf("Field '%s' exceeds %d decoded bytes.", field.Path, field.MaxDecodedBytes)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return fmt.Sprintf("Field '%s' must be valid base64.", field.Path)
+		}
+		if int64(len(decoded)) > field.MaxDecodedBytes {
+			return fmt.Sprintf("Field '%s' exceeds %d decoded bytes.", field.Path, field.MaxDecodedBytes)
+		}
 	}
 	return ""
 }

@@ -12,6 +12,7 @@ import {
 } from '@mui/material';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ReplayIcon from '@mui/icons-material/Replay';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type GatewayRequest = {
   timestamp: string;
@@ -51,7 +52,7 @@ export default function GatewayRequestsPage() {
     setLoading(true);
     try {
       const response = await fetch('/api/diagnostics/requests', { signal });
-      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      await requireOk(response, 'Gateway request loading failed. Refresh diagnostics and retry.');
       const data: unknown = await response.json();
       if (typeof data !== 'object' || data === null || !Array.isArray((data as { requests?: unknown }).requests)) {
         throw new Error('Malformed diagnostics response');
@@ -96,10 +97,10 @@ export default function GatewayRequestsPage() {
         `/api/diagnostics/requests/${encodeURIComponent(request.requestId)}/replay`,
         { method: 'POST' },
       );
-      if (!response.ok) throw new Error(`Replay rejected (${response.status})`);
+      await requireOk(response, 'Gateway request replay failed. Refresh diagnostics and retry.');
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Replay failed');
+      setError(safeRequestError(err, 'Unable to connect while replaying the gateway request.'));
     } finally {
       setReplaying('');
     }

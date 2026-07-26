@@ -16,6 +16,7 @@ import LayersIcon from '@mui/icons-material/Layers';
 import MiscellaneousServicesIcon from '@mui/icons-material/MiscellaneousServices';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutlined';
 import PauseCircleOutlineIcon from '@mui/icons-material/PauseCircleOutlined';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -42,10 +43,6 @@ const RUNTIMES = [
   'nodejs22', 'nodejs20', 'nodejs18',
   'go122', 'go121',
 ];
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function statusChip(status: string) {
   const serving = status === 'SERVING';
@@ -165,17 +162,13 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
           code: form.code,
         }),
       });
-      if (res.ok) {
-        const op = await res.json();
-        const opId = op.name?.split('/').pop();
-        if (opId) pollOperation(opId);
-        else { fetchVersions(); fetchServices(); }
-      } else {
-        const txt = await res.text();
-        setError(`Deploy failed: ${txt}`);
-      }
-    } catch (error: unknown) {
-      setError(`Network error: ${errorMessage(error)}`);
+      await requireOk(res, 'App Engine deployment failed. Check the runtime, entry point, and source.');
+      const op = await res.json();
+      const opId = op.name?.split('/').pop();
+      if (opId) pollOperation(opId);
+      else { fetchVersions(); fetchServices(); }
+    } catch (cause: unknown) {
+      setError(safeRequestError(cause, 'Unable to connect while deploying the App Engine version.'));
     } finally {
       setLoading(false);
     }
@@ -189,10 +182,10 @@ export default function AppEngineManagerDrawer({ open, onClose }: Props) {
         `/api/manage/appengine/projects/${activeProject}/services/${selectedService}/versions/${versionId}`,
         { method: 'DELETE' }
       );
-      if (res.ok) fetchVersions();
-      else setError('Delete failed');
-    } catch {
-      setError('Network error');
+      await requireOk(res, 'App Engine version deletion failed. Stop traffic to the version and retry.');
+      fetchVersions();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while deleting the App Engine version.'));
     } finally {
       setLoading(false);
     }

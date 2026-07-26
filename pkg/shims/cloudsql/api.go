@@ -3,6 +3,7 @@ package cloudsql
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -104,13 +105,14 @@ type User struct {
 
 // SqlOperation mirrors the Cloud SQL operations resource.
 type SqlOperation struct {
-	Kind          string `json:"kind"`
-	Name          string `json:"name"`
-	TargetLink    string `json:"targetLink"`
-	Status        string `json:"status"` // PENDING, RUNNING, DONE
-	OperationType string `json:"operationType"`
-	StartTime     string `json:"startTime,omitempty"`
-	EndTime       string `json:"endTime,omitempty"`
+	Kind          string                       `json:"kind"`
+	Name          string                       `json:"name"`
+	TargetLink    string                       `json:"targetLink"`
+	Status        string                       `json:"status"` // PENDING, RUNNING, DONE
+	OperationType string                       `json:"operationType"`
+	StartTime     string                       `json:"startTime,omitempty"`
+	EndTime       string                       `json:"endTime,omitempty"`
+	Error         *orchestrator.OperationError `json:"error,omitempty"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,10 +125,34 @@ type API struct {
 	persistMu  sync.Mutex
 	opMgr      *orchestrator.OperationManager
 	svcMgr     *orchestrator.ServiceManager
-	stateStore *state.Store
+	backend    cloudSQLBackend
+	stateStore cloudSQLStore
 	instances  map[string]*DatabaseInstance // key: project:instanceName
 	databases  map[string][]*Database       // key: project:instanceName
 	users      map[string][]*User           // key: project:instanceName
+}
+
+type cloudSQLBackend interface {
+	Create(context.Context, string, string, string, string) (string, bool, error)
+	Delete(context.Context, string, string) error
+}
+
+type serviceManagerBackend struct {
+	manager *orchestrator.ServiceManager
+}
+
+func (b serviceManagerBackend) Create(ctx context.Context, project, name, version, password string) (string, bool, error) {
+	if b.manager == nil {
+		return "", false, fmt.Errorf("Cloud SQL backend is unavailable")
+	}
+	return b.manager.ProvisionCloudSQLVM(ctx, project, name, version, password)
+}
+
+func (b serviceManagerBackend) Delete(ctx context.Context, project, name string) error {
+	if b.manager == nil {
+		return fmt.Errorf("Cloud SQL backend is unavailable")
+	}
+	return b.manager.DeleteCloudSQLVMContext(ctx, project, name)
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
@@ -143,10 +169,24 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 	return api
 }
 
-func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store *state.Store) *API {
+func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store cloudSQLStore) *API {
+	return newAPIWithDependencies(opMgr, svcMgr, serviceManagerBackend{manager: svcMgr}, store)
+}
+
+func newAPIWithBackend(opMgr *orchestrator.OperationManager, backend cloudSQLBackend, store cloudSQLStore) *API {
+	return newAPIWithDependencies(opMgr, nil, backend, store)
+}
+
+func newAPIWithDependencies(
+	opMgr *orchestrator.OperationManager,
+	svcMgr *orchestrator.ServiceManager,
+	backend cloudSQLBackend,
+	store cloudSQLStore,
+) *API {
 	return &API{
 		opMgr:      opMgr,
 		svcMgr:     svcMgr,
+		backend:    backend,
 		stateStore: store,
 		instances:  make(map[string]*DatabaseInstance),
 		databases:  make(map[string][]*Database),
@@ -211,6 +251,7 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, project, 
 		api.deleteInstance(w, r, project, instanceName)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -286,9 +327,18 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 
 	iKey := instanceKey(project, body.Name)
 	api.mu.Lock()
+	if _, exists := api.instances[iKey]; exists {
+		api.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		writeError(w, 409, "ALREADY_EXISTS", fmt.Sprintf("Instance '%s' already exists", body.Name))
+		return
+	}
 	api.instances[iKey] = inst
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		delete(api.instances, iKey)
+		api.mu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist Cloud SQL instance metadata: "+err.Error())
 		return
@@ -298,17 +348,34 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	targetLink := selfLink
 	op, err := api.opMgr.RegisterDurable("sql#operation", "CREATE", targetLink, "", region)
 	if err != nil {
+		api.mu.Lock()
+		if current := api.instances[iKey]; current != nil {
+			current.State = "ERROR"
+			current.BackendStatus = "operation registration failed: " + err.Error()
+			current.IpAddresses = nil
+		}
+		api.mu.Unlock()
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded instance: %w", persistErr))
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Provision physical Docker container with standard "minisky" root password
-		internalURL, err := api.svcMgr.ProvisionCloudSQLVM(context.Background(), body.Name, dbVersion, "minisky")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		internalURL, created, err := api.backend.Create(ctx, project, body.Name, dbVersion, "minisky")
 		if err != nil {
 			log.Printf("[Shim: Cloud SQL] Provisioning failed: %v", err)
-			return err
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var cleanupErr error
+			if created {
+				cleanupErr = api.backend.Delete(cleanupCtx, project, body.Name)
+			}
+			cleanupCancel()
+			return api.rollbackCreate(iKey, err, cleanupErr)
 		}
 
 		api.mu.Lock()
@@ -323,7 +390,13 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Cloud SQL] persist runnable instance: %v", err)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var cleanupErr error
+			if created {
+				cleanupErr = api.backend.Delete(cleanupCtx, project, body.Name)
+			}
+			cleanupCancel()
+			return api.rollbackCreate(iKey, fmt.Errorf("persist runnable instance: %w", err), cleanupErr)
 		}
 		return nil
 	})
@@ -338,6 +411,7 @@ func (api *API) getInstance(w http.ResponseWriter, project, name string) {
 	key := instanceKey(project, name)
 	api.mu.RLock()
 	inst, ok := api.instances[key]
+	inst = cloneDatabaseInstance(inst)
 	api.mu.RUnlock()
 
 	if !ok {
@@ -355,7 +429,7 @@ func (api *API) listInstances(w http.ResponseWriter, project string) {
 	items := []*DatabaseInstance{}
 	for k, v := range api.instances {
 		if strings.HasPrefix(k, prefix) {
-			items = append(items, v)
+			items = append(items, cloneDatabaseInstance(v))
 		}
 	}
 	api.mu.RUnlock()
@@ -378,8 +452,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 
-	// Mark as DELETED to simulate winding down in the UI
-	inst.State = "DELETED"
+	inst.State = "PENDING_DELETE"
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -390,25 +463,54 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, name)
 	op, err := api.opMgr.RegisterDurable("sql#operation", "DELETE", selfLink, "", "")
 	if err != nil {
+		api.mu.Lock()
+		inst.State = "ERROR"
+		inst.BackendStatus = "delete operation registration failed: " + err.Error()
+		api.mu.Unlock()
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded instance: %w", persistErr))
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Simulate winding down time
-		time.Sleep(3 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := api.backend.Delete(ctx, project, name); err != nil {
+			api.mu.Lock()
+			if current := api.instances[key]; current != nil {
+				current.State = "ERROR"
+				current.BackendStatus = err.Error()
+			}
+			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				return fmt.Errorf("%w; persist failed deletion: %v", err, persistErr)
+			}
+			return err
+		}
 
-		api.svcMgr.DeleteCloudSQLVM(name)
-
-		// Finally remove from memory
+		tombstone := cloneDatabaseInstance(inst)
+		api.mu.RLock()
+		oldDatabases := cloneDatabases(api.databases[key])
+		oldUsers := cloneUsers(api.users[key])
+		api.mu.RUnlock()
 		api.mu.Lock()
 		delete(api.instances, key)
 		delete(api.databases, key)
 		delete(api.users, key)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Cloud SQL] persist deleted instance: %v", err)
+			tombstone.State = "ERROR"
+			tombstone.BackendStatus = "backend deleted; metadata removal persistence failed: " + err.Error()
+			tombstone.IpAddresses = nil
+			api.mu.Lock()
+			api.instances[key] = tombstone
+			api.databases[key] = oldDatabases
+			api.users[key] = oldUsers
+			api.mu.Unlock()
+			return fmt.Errorf("persist deleted instance: %w", err)
 		}
 		return nil
 	})
@@ -416,6 +518,37 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 	sqlOp := toSqlOperation(op, "DELETE", selfLink)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(sqlOp)
+}
+
+func (api *API) rollbackCreate(key string, cause, cleanupErr error) error {
+	api.mu.RLock()
+	tombstone := cloneDatabaseInstance(api.instances[key])
+	api.mu.RUnlock()
+	if cleanupErr == nil {
+		api.mu.Lock()
+		delete(api.instances, key)
+		delete(api.databases, key)
+		delete(api.users, key)
+		api.mu.Unlock()
+		if err := api.persistMetadata(); err == nil {
+			return cause
+		} else {
+			cleanupErr = fmt.Errorf("persist rollback: %w", err)
+		}
+	}
+	combined := errors.Join(cause, cleanupErr)
+	api.mu.Lock()
+	if tombstone != nil {
+		tombstone.State = "ERROR"
+		tombstone.BackendStatus = combined.Error()
+		tombstone.IpAddresses = nil
+		api.instances[key] = tombstone
+	}
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		combined = errors.Join(combined, fmt.Errorf("persist degraded state: %w", err))
+	}
+	return combined
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,6 +610,7 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 		iKey := instanceKey(project, instance)
 		api.mu.RLock()
 		dbs := api.databases[iKey]
+		dbs = cloneDatabases(dbs)
 		api.mu.RUnlock()
 
 		if dbName != "" {
@@ -503,6 +637,7 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -551,6 +686,7 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 		iKey := instanceKey(project, instance)
 		api.mu.RLock()
 		users := api.users[iKey]
+		users = cloneUsers(users)
 		api.mu.RUnlock()
 
 		if users == nil {
@@ -564,6 +700,7 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -604,7 +741,56 @@ func toSqlOperation(op *orchestrator.Operation, opType, targetLink string) *SqlO
 		OperationType: opType,
 		StartTime:     op.StartTime,
 		EndTime:       op.EndTime,
+		Error:         op.Error,
 	}
+}
+
+func cloneDatabaseInstance(instance *DatabaseInstance) *DatabaseInstance {
+	if instance == nil {
+		return nil
+	}
+	clone := *instance
+	clone.IpAddresses = append([]IpMapping(nil), instance.IpAddresses...)
+	clone.Settings.DatabaseFlags = append([]DatabaseFlag(nil), instance.Settings.DatabaseFlags...)
+	if instance.Settings.UserLabels != nil {
+		clone.Settings.UserLabels = make(map[string]string, len(instance.Settings.UserLabels))
+		for key, value := range instance.Settings.UserLabels {
+			clone.Settings.UserLabels[key] = value
+		}
+	}
+	if instance.Settings.BackupConfiguration != nil {
+		backup := *instance.Settings.BackupConfiguration
+		clone.Settings.BackupConfiguration = &backup
+	}
+	if instance.ServerCaCert != nil {
+		cert := *instance.ServerCaCert
+		clone.ServerCaCert = &cert
+	}
+	return &clone
+}
+
+func cloneDatabases(databases []*Database) []*Database {
+	result := make([]*Database, 0, len(databases))
+	for _, database := range databases {
+		if database == nil {
+			continue
+		}
+		clone := *database
+		result = append(result, &clone)
+	}
+	return result
+}
+
+func cloneUsers(users []*User) []*User {
+	result := make([]*User, 0, len(users))
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		clone := *user
+		result = append(result, &clone)
+	}
+	return result
 }
 
 func instanceKey(project, name string) string {

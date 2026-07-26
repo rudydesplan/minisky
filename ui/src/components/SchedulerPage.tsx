@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { 
   Box, Typography, Button, Paper, Table, TableBody, TableCell, 
   TableContainer, TableHead, TableRow, IconButton, Tooltip, 
-  Chip, CircularProgress
+  Alert, Chip, CircularProgress
 } from '@mui/material';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -12,6 +12,7 @@ import AddIcon from '@mui/icons-material/Add';
 import SchedulerManagerDrawer from './SchedulerManagerDrawer';
 
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk } from '../apiClient';
 
 interface Job {
   name: string;
@@ -29,16 +30,19 @@ export default function SchedulerPage() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const location = 'us-central1';
 
   const fetchJobs = useCallback(async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/scheduler/projects/${activeProject}/locations/${location}/jobs`);
+      await requireOk(res, 'Unable to load Scheduler jobs.');
       const data: { jobs?: Job[] } = await res.json();
       setJobs(data.jobs || []);
-    } catch (err) {
-      console.error('Failed to fetch jobs:', err);
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Unable to load Scheduler jobs');
     } finally {
       setLoading(false);
     }
@@ -50,38 +54,42 @@ export default function SchedulerPage() {
 
   const handleRunNow = async (jobName: string) => {
     try {
-      await fetch(`/api/manage/scheduler/${jobName}:run`, { method: 'POST' });
+      await requireOk(await fetch(`/api/manage/scheduler/${jobName}:run`, { method: 'POST' }), 'Failed to run Scheduler job.');
+      setError(null);
       fetchJobs();
-    } catch (err) {
-      console.error('Failed to run job:', err);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to run Scheduler job');
     }
   };
 
   const handlePause = async (jobName: string) => {
     try {
-      await fetch(`/api/manage/scheduler/${jobName}:pause`, { method: 'POST' });
+      await requireOk(await fetch(`/api/manage/scheduler/${jobName}:pause`, { method: 'POST' }), 'Failed to pause Scheduler job.');
+      setError(null);
       fetchJobs();
-    } catch (err) {
-      console.error('Failed to pause job:', err);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to pause Scheduler job');
     }
   };
 
   const handleResume = async (jobName: string) => {
     try {
-      await fetch(`/api/manage/scheduler/${jobName}:resume`, { method: 'POST' });
+      await requireOk(await fetch(`/api/manage/scheduler/${jobName}:resume`, { method: 'POST' }), 'Failed to resume Scheduler job.');
+      setError(null);
       fetchJobs();
-    } catch (err) {
-      console.error('Failed to resume job:', err);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to resume Scheduler job');
     }
   };
 
   const handleDelete = async (jobName: string) => {
     if (!confirm('Are you sure you want to delete this job?')) return;
     try {
-      await fetch(`/api/manage/scheduler/${jobName}`, { method: 'DELETE' });
+      await requireOk(await fetch(`/api/manage/scheduler/${jobName}`, { method: 'DELETE' }), 'Failed to delete Scheduler job.');
+      setError(null);
       fetchJobs();
-    } catch (err) {
-      console.error('Failed to delete job:', err);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to delete Scheduler job');
     }
   };
 
@@ -106,6 +114,7 @@ export default function SchedulerPage() {
           </Button>
         </Box>
       </Box>
+      {error && <Alert severity="error" role="alert" onClose={() => setError(null)} sx={{ mb: 2 }}>{error}</Alert>}
 
       {loading ? (
         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}>
@@ -163,19 +172,19 @@ export default function SchedulerPage() {
                       </TableCell>
                       <TableCell align="right">
                         <Tooltip title="Force run now">
-                          <IconButton onClick={() => handleRunNow(job.name)} color="primary"><PlayArrowIcon /></IconButton>
+                            <IconButton aria-label={`Run ${id} now`} onClick={() => handleRunNow(job.name)} color="primary"><PlayArrowIcon /></IconButton>
                         </Tooltip>
                         {job.state === 'ENABLED' ? (
                           <Tooltip title="Pause">
-                            <IconButton onClick={() => handlePause(job.name)}><PauseIcon /></IconButton>
+                            <IconButton aria-label={`Pause ${id}`} onClick={() => handlePause(job.name)}><PauseIcon /></IconButton>
                           </Tooltip>
                         ) : (
                           <Tooltip title="Resume">
-                            <IconButton onClick={() => handleResume(job.name)} color="success"><PlayArrowIcon /></IconButton>
+                            <IconButton aria-label={`Resume ${id}`} onClick={() => handleResume(job.name)} color="success"><PlayArrowIcon /></IconButton>
                           </Tooltip>
                         )}
                         <Tooltip title="Delete">
-                          <IconButton onClick={() => handleDelete(job.name)} color="error"><DeleteIcon /></IconButton>
+                          <IconButton aria-label={`Delete ${id}`} onClick={() => handleDelete(job.name)} color="error"><DeleteIcon /></IconButton>
                         </Tooltip>
                       </TableCell>
                     </TableRow>

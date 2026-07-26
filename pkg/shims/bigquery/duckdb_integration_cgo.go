@@ -38,9 +38,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
-	_ "github.com/marcboeker/go-duckdb"
+	duckdb "github.com/marcboeker/go-duckdb"
 )
 
 // DuckDBBackend manages an embedded DuckDB database for BigQuery query execution.
@@ -150,26 +151,216 @@ func (d *DuckDBBackend) Close() error {
 // ExecuteQuery runs a BigQuery StandardSQL query and returns rows as a slice of maps.
 // The query is first translated from BigQuery SQL dialect to DuckDB SQL.
 func (d *DuckDBBackend) ExecuteQuery(query string) ([]map[string]interface{}, error) {
+	rows, schema, err := d.ExecuteQueryWithSchema(query)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]map[string]interface{}, len(rows))
+	for rowIndex, row := range rows {
+		result[rowIndex] = make(map[string]interface{}, len(schema.Fields))
+		for fieldIndex, field := range schema.Fields {
+			result[rowIndex][field.Name] = row[fieldIndex]
+		}
+	}
+	return result, nil
+}
+
+// ExecuteQueryWithSchema executes a query and preserves DuckDB's declared
+// column types for BigQuery result encoding.
+func (d *DuckDBBackend) ExecuteQueryWithSchema(query string) ([]QueryValues, *TableSchema, error) {
 	if !d.enabled {
-		return nil, fmt.Errorf("duckdb backend not enabled")
+		return nil, nil, fmt.Errorf("duckdb backend not enabled")
 	}
 	translated := translateBQtoDuck(query)
 	log.Printf("[DuckDBBackend] Executing: %s", translated)
 
 	rows, err := d.db.Query(translated)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	return scanRows(rows)
+	schema, err := duckDBRowsSchema(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := scanRowValues(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, schema, nil
 }
 
-func scanRows(rows *sql.Rows) ([]map[string]interface{}, error) {
+func duckDBRowsSchema(rows *sql.Rows) (*TableSchema, error) {
+	columns, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("read DuckDB result schema: %w", err)
+	}
+	schema := &TableSchema{Fields: make([]FieldSchema, len(columns))}
+	for index, column := range columns {
+		field, err := parseDuckDBResultField(column.Name(), column.DatabaseTypeName())
+		if err != nil {
+			return nil, fmt.Errorf("DuckDB result column %q: %w", column.Name(), err)
+		}
+		if nullable, known := column.Nullable(); known && !nullable && field.Mode != "REPEATED" {
+			field.Mode = "REQUIRED"
+		}
+		schema.Fields[index] = field
+	}
+	return schema, nil
+}
+
+func parseDuckDBResultField(name, typeName string) (FieldSchema, error) {
+	field := FieldSchema{Name: name, Mode: "NULLABLE"}
+	normalized := strings.TrimSpace(typeName)
+	if strings.HasSuffix(normalized, "[]") {
+		element, err := parseDuckDBResultField(name, strings.TrimSpace(strings.TrimSuffix(normalized, "[]")))
+		if err != nil {
+			return FieldSchema{}, err
+		}
+		if element.Mode == "REPEATED" {
+			return FieldSchema{}, fmt.Errorf("nested arrays are not supported")
+		}
+		element.Mode = "REPEATED"
+		return element, nil
+	}
+	upper := strings.ToUpper(normalized)
+	if strings.HasPrefix(upper, "STRUCT(") && strings.HasSuffix(normalized, ")") {
+		field.Type = "RECORD"
+		entries := splitDuckDBTypeList(normalized[len("STRUCT(") : len(normalized)-1])
+		field.Fields = make([]FieldSchema, 0, len(entries))
+		for _, entry := range entries {
+			childName, childType, ok := splitDuckDBStructEntry(entry)
+			if !ok {
+				return FieldSchema{}, fmt.Errorf("unsupported STRUCT entry %q", entry)
+			}
+			child, err := parseDuckDBResultField(childName, childType)
+			if err != nil {
+				return FieldSchema{}, err
+			}
+			field.Fields = append(field.Fields, child)
+		}
+		return field, nil
+	}
+	switch {
+	case upper == "BOOLEAN" || upper == "BOOL":
+		field.Type = "BOOLEAN"
+	case upper == "TINYINT" || upper == "SMALLINT" || upper == "INTEGER" ||
+		upper == "BIGINT" || upper == "UTINYINT" || upper == "USMALLINT" ||
+		upper == "UINTEGER":
+		field.Type = "INTEGER"
+	case upper == "UBIGINT" || upper == "HUGEINT" || upper == "UHUGEINT":
+		field.Type = "BIGNUMERIC"
+	case upper == "FLOAT" || upper == "DOUBLE" || upper == "REAL":
+		field.Type = "FLOAT"
+	case strings.HasPrefix(upper, "DECIMAL("):
+		decimalType, err := bigQueryDecimalType(upper)
+		if err != nil {
+			return FieldSchema{}, err
+		}
+		field.Type = decimalType
+	case upper == "BLOB" || upper == "BYTEA":
+		field.Type = "BYTES"
+	case upper == "DATE":
+		field.Type = "DATE"
+	case upper == "TIME" || strings.HasPrefix(upper, "TIME("):
+		field.Type = "TIME"
+	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
+		field.Type = "TIMESTAMP"
+	case upper == "TIMESTAMP" || strings.HasPrefix(upper, "TIMESTAMP("):
+		field.Type = "DATETIME"
+	case upper == "VARCHAR" || upper == "TEXT" || upper == "UUID" || upper == "JSON" || upper == "ENUM":
+		field.Type = "STRING"
+	default:
+		return FieldSchema{}, fmt.Errorf("unsupported DuckDB result type %q", typeName)
+	}
+	return field, nil
+}
+
+func bigQueryDecimalType(typeName string) (string, error) {
+	if !strings.HasPrefix(typeName, "DECIMAL(") || !strings.HasSuffix(typeName, ")") {
+		return "", fmt.Errorf("unsupported DECIMAL type %q", typeName)
+	}
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(typeName, "DECIMAL("), ")"), ",")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("unsupported DECIMAL type %q", typeName)
+	}
+	precision, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return "", fmt.Errorf("invalid DECIMAL precision in %q", typeName)
+	}
+	scale, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return "", fmt.Errorf("invalid DECIMAL scale in %q", typeName)
+	}
+	if precision < 1 || scale < 0 || scale > precision {
+		return "", fmt.Errorf("invalid DECIMAL precision/scale %q", typeName)
+	}
+	if scale <= 9 && precision <= 29+scale {
+		return "NUMERIC", nil
+	}
+	if scale <= 38 && precision <= 38+scale && precision <= 76 {
+		return "BIGNUMERIC", nil
+	}
+	return "", fmt.Errorf(
+		"DuckDB %s exceeds BigQuery BIGNUMERIC limits (precision <= 38+scale, scale <= 38)",
+		typeName,
+	)
+}
+
+func splitDuckDBTypeList(value string) []string {
+	var parts []string
+	start, depth := 0, 0
+	quoted := false
+	for index, character := range value {
+		switch character {
+		case '"':
+			quoted = !quoted
+		case '(':
+			if !quoted {
+				depth++
+			}
+		case ')':
+			if !quoted {
+				depth--
+			}
+		case ',':
+			if !quoted && depth == 0 {
+				parts = append(parts, strings.TrimSpace(value[start:index]))
+				start = index + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(value[start:]))
+	return parts
+}
+
+func splitDuckDBStructEntry(entry string) (string, string, bool) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", "", false
+	}
+	if entry[0] == '"' {
+		end := strings.Index(entry[1:], `"`)
+		if end < 0 {
+			return "", "", false
+		}
+		end++
+		return entry[1:end], strings.TrimSpace(entry[end+1:]), true
+	}
+	for index, character := range entry {
+		if character == ' ' {
+			return strings.Trim(entry[:index], `"`), strings.TrimSpace(entry[index+1:]), true
+		}
+	}
+	return "", "", false
+}
+
+func scanRowValues(rows *sql.Rows) ([]QueryValues, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
-	var results []map[string]interface{}
+	var results []QueryValues
 	for rows.Next() {
 		columns := make([]interface{}, len(cols))
 		columnPointers := make([]interface{}, len(cols))
@@ -179,20 +370,50 @@ func scanRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 		if err := rows.Scan(columnPointers...); err != nil {
 			return nil, err
 		}
-		rowMap := make(map[string]interface{})
-		for i, colName := range cols {
+		rowValues := make(QueryValues, len(cols))
+		for i := range cols {
 			val := columnPointers[i].(*interface{})
-			// Convert bytes arrays into strings if possible
+			// Normalize driver-specific values into precision-safe result cells.
 			v := *val
-			if b, ok := v.([]byte); ok {
-				rowMap[colName] = string(b)
-			} else {
-				rowMap[colName] = v
+			switch typed := v.(type) {
+			case []byte:
+				rowValues[i] = append([]byte(nil), typed...)
+			case duckdb.Decimal:
+				rowValues[i] = formatDuckDBDecimal(typed)
+			case *duckdb.Decimal:
+				if typed == nil {
+					rowValues[i] = nil
+				} else {
+					rowValues[i] = formatDuckDBDecimal(*typed)
+				}
+			default:
+				rowValues[i] = v
 			}
 		}
-		results = append(results, rowMap)
+		results = append(results, rowValues)
 	}
 	return results, nil
+}
+
+func formatDuckDBDecimal(decimal duckdb.Decimal) string {
+	if decimal.Value == nil {
+		return "0"
+	}
+	digits := decimal.Value.String()
+	sign := ""
+	if strings.HasPrefix(digits, "-") {
+		sign = "-"
+		digits = strings.TrimPrefix(digits, "-")
+	}
+	scale := int(decimal.Scale)
+	if scale == 0 {
+		return sign + digits
+	}
+	if len(digits) <= scale {
+		return sign + "0." + strings.Repeat("0", scale-len(digits)) + digits
+	}
+	point := len(digits) - scale
+	return sign + digits[:point] + "." + digits[point:]
 }
 
 // LoadData ingests a file or URL into a DuckDB table.

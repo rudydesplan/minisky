@@ -19,6 +19,23 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+.skip-link {
+  position: fixed !important;
+  left: 16px;
+  top: 12px;
+  z-index: 2000;
+  transform: translateY(-160%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+:focus-visible {
+  outline: 3px solid #174ea6;
+  outline-offset: 2px;
+}
+
 /* Material Design standard panel to replace the dark glass panels */
 .material-panel {
   background: var(--surface-panel);
@@ -58,4 +75,15 @@ body {
   background-color: #f1f3f4 !important;
   color: #5f6368 !important;
   border: 1px solid #dadce0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }

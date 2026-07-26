@@ -21,6 +21,13 @@ const (
 	FidelityPassthrough FidelityTier = "passthrough"
 )
 
+type SupportStatus string
+
+const (
+	SupportImplemented SupportStatus = "implemented"
+	SupportDeferred    SupportStatus = "deferred"
+)
+
 type PersistenceCategory string
 
 const (
@@ -31,16 +38,20 @@ const (
 	PersistenceStatic PersistenceCategory = "static"
 )
 
-// Service describes the fidelity contract for an actually registered domain.
+// Service describes the support contract for an actually registered domain.
+// Deferred domains have no fidelity tier because they expose only an explicit
+// unsupported response.
 // ProbeUnsupported is false only when constructing or invoking the service
 // would require a lazy Docker backend.
 type Service struct {
 	Domain           string
+	Support          SupportStatus
 	Fidelity         FidelityTier
 	Persistence      PersistenceCategory
 	LazyDocker       bool
 	ProbeUnsupported bool
 	BackendContract  string
+	DeferredReason   string
 }
 
 type serviceMetadata struct {
@@ -52,10 +63,10 @@ type serviceMetadata struct {
 var serviceManifest = map[string]serviceMetadata{
 	"aiplatform.googleapis.com":           {FidelityStandard, PersistenceFile, true},
 	"appengine.googleapis.com":            {FidelityStandard, PersistenceHybrid, true},
-	"artifactregistry.googleapis.com":     {FidelityStandard, PersistenceMemory, true},
+	"artifactregistry.googleapis.com":     {FidelityStandard, PersistenceFile, true},
 	"bigquery.googleapis.com":             {FidelityStandard, PersistenceFile, true},
 	"bigtable.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
-	"bigtableadmin.googleapis.com":        {FidelityStandard, PersistenceHybrid, true},
+	"bigtableadmin.googleapis.com":        {FidelityStandard, PersistenceFile, true},
 	"cloudbuild.googleapis.com":           {FidelityStandard, PersistenceHybrid, true},
 	"cloudresourcemanager.googleapis.com": {FidelityStandard, PersistenceFile, true},
 	"cloudfunctions.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
@@ -74,7 +85,7 @@ var serviceManifest = map[string]serviceMetadata{
 	"iamcredentials.googleapis.com":       {FidelityStandard, PersistenceStatic, true},
 	"identitytoolkit.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
 	"logging.googleapis.com":              {FidelityStandard, PersistenceFile, true},
-	"memcache.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
+	"memcache.googleapis.com":             {"", PersistenceStatic, true},
 	"metadata.google.internal":            {FidelityHigh, PersistenceStatic, true},
 	"monitoring.googleapis.com":           {FidelityStandard, PersistenceFile, true},
 	"pubsub.googleapis.com":               {FidelityPassthrough, PersistenceDocker, true},
@@ -85,6 +96,10 @@ var serviceManifest = map[string]serviceMetadata{
 	"sqladmin.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
 	"storage.googleapis.com":              {FidelityPassthrough, PersistenceDocker, true},
 	"sts.googleapis.com":                  {FidelityStandard, PersistenceStatic, true},
+}
+
+var deferredServiceContracts = map[string]string{
+	"memcache.googleapis.com": "Memorystore for Memcached is not implemented; every request returns 501 UNIMPLEMENTED",
 }
 
 // lazyBackendContracts records why these domains use backend-gated coverage
@@ -131,13 +146,20 @@ func Services() ([]Service, error) {
 	services := make([]Service, 0, len(registered))
 	for domain, lazy := range registered {
 		metadata := serviceManifest[domain]
+		support := SupportImplemented
+		deferredReason := deferredServiceContracts[domain]
+		if deferredReason != "" {
+			support = SupportDeferred
+		}
 		services = append(services, Service{
 			Domain:           domain,
+			Support:          support,
 			Fidelity:         metadata.fidelity,
 			Persistence:      metadata.persistence,
 			LazyDocker:       lazy,
 			ProbeUnsupported: metadata.probeUnsupported,
 			BackendContract:  lazyBackendContracts[domain],
+			DeferredReason:   deferredReason,
 		})
 	}
 	sort.Slice(services, func(i, j int) bool {

@@ -13,6 +13,8 @@ import FolderIcon from '@mui/icons-material/Folder';
 import InventoryIcon from '@mui/icons-material/Inventory';
 import HistoryIcon from '@mui/icons-material/History';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk } from '../apiClient';
+import { artifactPackagesRoute, artifactVersionsRoute } from '../artifactRegistryRoutes';
 
 type ArtifactRegistryDrawerProps = { open: boolean; onClose: () => void };
 
@@ -47,7 +49,7 @@ export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegist
   const [newRepoOpen, setNewRepoOpen] = useState(false);
   const [newRepoName, setNewRepoName] = useState('');
 
-  const apiRoot = `/api/manage/artifactregistry/v1/projects/${activeProject}/locations/us-central1`;
+  const apiRoot = `/api/manage/artifactregistry/projects/${activeProject}/locations/us-central1`;
 
   const showToast = (msg: string, severity: 'success' | 'error' = 'success') =>
     setToast({ msg, open: true, severity });
@@ -55,31 +57,28 @@ export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegist
   const loadRepositories = useCallback(async () => {
     try {
       const res = await fetch(`${apiRoot}/repositories`);
-      if (res.ok) {
-        const data = await res.json();
-        setRepositories(data.repositories || []);
-      }
-    } catch (e) { console.error(e); }
+      await requireOk(res, 'Unable to load repositories. Verify that Artifact Registry is available.');
+      const data = await res.json();
+      setRepositories(data.repositories || []);
+    } catch (e) { showToast(errorMessage(e), 'error'); }
   }, [apiRoot]);
 
   const loadPackages = async (repoName: string) => {
     try {
-      const res = await fetch(`/api/proxy/artifactregistry/v1/${repoName}/packages`);
-      if (res.ok) {
-        const data = await res.json();
-        setPackages(data.packages || []);
-      }
-    } catch (e) { console.error(e); }
+      const res = await fetch(artifactPackagesRoute(repoName));
+      await requireOk(res, 'Unable to load packages from this repository.');
+      const data = await res.json();
+      setPackages(data.packages || []);
+    } catch (e) { showToast(errorMessage(e), 'error'); }
   };
 
   const loadVersions = async (packageName: string) => {
     try {
-      const res = await fetch(`/api/proxy/artifactregistry/v1/${packageName}/versions`);
-      if (res.ok) {
-        const data = await res.json();
-        setVersions(data.versions || []);
-      }
-    } catch (e) { console.error(e); }
+      const res = await fetch(artifactVersionsRoute(packageName));
+      await requireOk(res, 'Unable to load versions for this package.');
+      const data = await res.json();
+      setVersions(data.versions || []);
+    } catch (e) { showToast(errorMessage(e), 'error'); }
   };
 
   useEffect(() => {
@@ -100,13 +99,9 @@ export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegist
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ format: 'DOCKER' })
       });
-      if (res.ok) {
-        showToast('Repository created successfully');
-        loadRepositories();
-      } else {
-        const e = await res.json();
-        showToast(e.error?.message || 'Failed', 'error');
-      }
+      await requireOk(res, 'Repository creation failed. Check the repository name and retry.');
+      showToast('Repository created successfully');
+      loadRepositories();
     } catch (error: unknown) { showToast(errorMessage(error), 'error'); }
     setNewRepoOpen(false);
     setNewRepoName('');
@@ -123,8 +118,8 @@ export default function ArtifactRegistryDrawer({ open, onClose }: ArtifactRegist
               <Typography variant="caption" sx={{ color: '#5f6368' }}>Manage Docker images and language packages • {activeProject}</Typography>
             </Box>
             <Box>
-              <IconButton onClick={() => loadRepositories()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh repositories" onClick={() => loadRepositories()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close Artifact Registry" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 

@@ -1,21 +1,44 @@
 package gke
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
 )
 
 const gkeStateEntry = "gke/metadata"
 
-type gkeMetadata struct {
-	Backend  string              `json:"backend"`
-	Clusters map[string]*Cluster `json:"clusters"`
+type gkeStore interface {
+	Load(string, any) error
+	Save(string, any) error
 }
 
-func NewAPIWithStore(opMgr *orchestrator.OperationManager, store *state.Store) (*API, error) {
+type gkeMetadata struct {
+	Backend           string                          `json:"backend"`
+	Clusters          map[string]*Cluster             `json:"clusters"`
+	Ownerships        map[string]*kubeconfigOwnership `json:"kubeconfigOwnerships,omitempty"`
+	OwnershipChecksum string                          `json:"kubeconfigOwnershipChecksum,omitempty"`
+}
+
+func kubeconfigOwnershipChecksum(ownerships map[string]*kubeconfigOwnership) (string, error) {
+	data, err := json.Marshal(ownerships)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API, error) {
 	api := newAPI(opMgr, store)
 	if store == nil {
 		return api, nil
@@ -30,8 +53,45 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, store *state.Store) (
 	if persisted.Clusters != nil {
 		api.clusters = persisted.Clusters
 	}
+	if persisted.Ownerships != nil {
+		checksum, checksumErr := kubeconfigOwnershipChecksum(persisted.Ownerships)
+		if checksumErr == nil && checksum == persisted.OwnershipChecksum {
+			api.ownerships = persisted.Ownerships
+		} else {
+			log.Printf("[Shim: GKE] ignoring unchecksummed or corrupt kubeconfig ownership metadata")
+		}
+	}
+	if backend, ok := api.backend.(*KindBackend); ok {
+		for key, ownership := range api.ownerships {
+			if ownership != nil && ownership.Profile == config.GetProfile() &&
+				key == clusterKey(ownership.Project, ownership.Zone, ownership.Cluster) {
+				backend.RestoreKubeconfigOwnership(ClusterIdentity{
+					Profile: ownership.Profile, Project: ownership.Project,
+					Zone: ownership.Zone, Cluster: ownership.Cluster,
+				}, ownership)
+			} else {
+				delete(api.ownerships, key)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := backend.ReconcileKubeconfigIntents(ctx, config.GetProfile(), api.ownerships)
+		cancel()
+		if err != nil {
+			log.Printf("[Shim: GKE] kubeconfig reconciliation remains pending: %v", err)
+		}
+	}
 	// Rehydration intentionally restores metadata only. Kind/Docker workloads
 	// are never recreated implicitly when their containers are absent.
+	for key, cluster := range api.clusters {
+		if cluster == nil {
+			delete(api.clusters, key)
+			continue
+		}
+		cluster.Status = "ERROR"
+		cluster.StatusMessage = "metadata restored; backend availability was not reconciled after restart"
+		cluster.Endpoint = ""
+		cluster.MasterAuth = nil
+	}
 	return api, nil
 }
 
@@ -46,11 +106,24 @@ func (api *API) persistMetadata() error {
 	if api.backend.Enabled() {
 		backend = "kind"
 	}
-	snapshot := gkeMetadata{Backend: backend, Clusters: make(map[string]*Cluster, len(api.clusters))}
+	snapshot := gkeMetadata{
+		Backend: backend, Clusters: make(map[string]*Cluster, len(api.clusters)),
+		Ownerships: make(map[string]*kubeconfigOwnership, len(api.ownerships)),
+	}
 	for key, cluster := range api.clusters {
-		copy := *cluster
-		snapshot.Clusters[key] = &copy
+		snapshot.Clusters[key] = cloneCluster(cluster)
+	}
+	for key, ownership := range api.ownerships {
+		if ownership != nil {
+			clone := *ownership
+			snapshot.Ownerships[key] = &clone
+		}
 	}
 	api.mu.RUnlock()
+	checksum, err := kubeconfigOwnershipChecksum(snapshot.Ownerships)
+	if err != nil {
+		return fmt.Errorf("checksum GKE kubeconfig ownership metadata: %w", err)
+	}
+	snapshot.OwnershipChecksum = checksum
 	return api.stateStore.Save(gkeStateEntry, snapshot)
 }

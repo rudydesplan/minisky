@@ -10,6 +10,7 @@ import KeyIcon from '@mui/icons-material/VpnKey';
 import PersonIcon from '@mui/icons-material/Person';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, safeRequestError } from '../apiClient';
 
 type IamManagerDrawerProps = {
   open: boolean;
@@ -75,29 +76,38 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
 
   const handleCreateSA = async () => {
     if (!newAccountId) return;
-    await fetch(`/api/manage/iam/projects/${activeProject}/serviceAccounts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        accountId: newAccountId,
-        serviceAccount: { displayName: `${newAccountId} display`, description: 'Created via UI dashboard' } 
-      })
-    });
-    setNewAccountId('');
-    loadServiceAccounts();
+    try {
+      await checkedMutation(`/api/manage/iam/projects/${activeProject}/serviceAccounts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: newAccountId,
+          serviceAccount: { displayName: `${newAccountId} display`, description: 'Created via UI dashboard' },
+        }),
+      }, 'Service account creation failed. Check the account ID and retry.');
+      setNewAccountId('');
+      loadServiceAccounts();
+    } catch (error) {
+      setToast({ msg: safeRequestError(error, 'Unable to connect while creating the service account.'), open: true });
+    }
   };
 
   const handleDeleteSA = async (email: string) => {
-    await fetch(`/api/manage/iam/projects/${activeProject}/serviceAccounts/${email}`, { method: 'DELETE' });
-    loadServiceAccounts();
+    try {
+      await checkedMutation(`/api/manage/iam/projects/${activeProject}/serviceAccounts/${email}`, { method: 'DELETE' },
+        'Service account deletion failed. Remove dependent keys and bindings before retrying.');
+      loadServiceAccounts();
+    } catch (error) {
+      setToast({ msg: safeRequestError(error, 'Unable to connect while deleting the service account.'), open: true });
+    }
   };
 
   const handleCreateKey = async () => {
     if (!currentSA) return;
-    const res = await fetch(`/api/manage/iam/projects/${activeProject}/serviceAccounts/${currentSA.email}/keys`, {
-      method: 'POST'
-    });
-    if (res.ok) {
+    try {
+      const res = await checkedMutation(`/api/manage/iam/projects/${activeProject}/serviceAccounts/${currentSA.email}/keys`, {
+        method: 'POST',
+      }, 'Service account key creation failed. Check the account state and retry.');
       const keyData: { privateKeyData: string } = await res.json();
       // Auto-trigger fake download of the JSON file
       const decodedKey = atob(keyData.privateKeyData);
@@ -107,8 +117,10 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
       a.href = url;
       a.download = `${activeProject}-${currentSA.email.split('@')[0]}-key.json`;
       a.click();
+      loadKeys(currentSA.email);
+    } catch (error) {
+      setToast({ msg: safeRequestError(error, 'Unable to connect while creating the service account key.'), open: true });
     }
-    loadKeys(currentSA.email);
   };
 
   const copyToClipboard = (text: string) => {

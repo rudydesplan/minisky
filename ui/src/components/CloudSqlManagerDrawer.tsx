@@ -12,6 +12,7 @@ import AddIcon from '@mui/icons-material/Add';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 type CloudSqlManagerDrawerProps = { open: boolean; onClose: () => void };
 
@@ -39,15 +40,6 @@ interface ImagesConfig {
     mysql?: { versions?: Omit<DatabaseVersion, 'engine'>[] };
   };
 }
-
-interface ErrorResponse {
-  error?: {
-    message?: string;
-  };
-}
-
-const getErrorMessage = (error: unknown) =>
-  error instanceof Error ? error.message : String(error);
 
 export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManagerDrawerProps) {
   const { activeProject } = useProjectContext();
@@ -81,6 +73,7 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
     if (open) {
       loadInstances();
       fetch('/api/config/images')
+        .then(r => requireOk(r, 'Unable to load Cloud SQL image configuration.'))
         .then(r => r.json())
         .then((d: ImagesConfig) => {
           const pg: DatabaseVersion[] = (d.sql?.postgres?.versions || []).map(v => ({ ...v, engine: 'POSTGRES' }));
@@ -120,23 +113,24 @@ export default function CloudSqlManagerDrawer({ open, onClose }: CloudSqlManager
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (res.ok) {
-        showToast('Processing Database Instance Creation...');
-        setTimeout(loadInstances, 1000); // Wait for the state to bounce
-      } else {
-        const e: ErrorResponse = await res.json();
-        showToast(e.error?.message || 'Failed', 'error');
-      }
-    } catch (e: unknown) { showToast(getErrorMessage(e), 'error'); }
+      await requireOk(res, 'Cloud SQL instance creation failed. Check the instance name and database version.');
+      showToast('Processing Database Instance Creation...');
+      setTimeout(loadInstances, 1000);
+    } catch (e: unknown) { showToast(safeRequestError(e, 'Unable to connect while creating the Cloud SQL instance.'), 'error'); }
     setNewInstanceOpen(false);
     setNewInstanceName('');
   };
 
   const handleDeleteInstance = async (name: string) => {
-    await fetch(`${apiRoot}/instances/${name}`, { method: 'DELETE' });
-    if (activeInstance?.name === name) setActiveInstance(null);
-    showToast('Tearing down Database...');
-    setTimeout(loadInstances, 1000);
+    try {
+      await checkedMutation(`${apiRoot}/instances/${name}`, { method: 'DELETE' },
+        'Cloud SQL instance deletion failed. Remove dependent connections and retry.');
+      if (activeInstance?.name === name) setActiveInstance(null);
+      showToast('Tearing down Database...');
+      setTimeout(loadInstances, 1000);
+    } catch (error) {
+      showToast(safeRequestError(error, 'Unable to connect while deleting the Cloud SQL instance.'), 'error');
+    }
   };
 
   const copyToClipboard = (text: string) => {

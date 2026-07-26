@@ -16,6 +16,7 @@ import LockIcon from '@mui/icons-material/Lock';
 import LockOpenIcon from '@mui/icons-material/LockOpen';
 import KeyIcon from '@mui/icons-material/Key';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, requireOk } from '../apiClient';
 
 interface KeyRing {
   name: string;
@@ -35,12 +36,6 @@ interface CryptoKeyVersion {
   createTime: string;
   algorithm: string;
   destroyTime?: string;
-}
-
-interface ErrorResponse {
-  error?: {
-    message?: string;
-  };
 }
 
 interface Props {
@@ -93,7 +88,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     setLoadingKR(true);
     try {
       const res = await fetch(krBase);
-      if (!res.ok) throw new Error('Failed to fetch key rings');
+      await requireOk(res, 'KMS key ring loading failed. Check the local service and retry.');
       const data: { keyRings?: KeyRing[] } = await res.json();
       setKeyRings(data.keyRings || []);
     } catch (e: unknown) { setError(getErrorMessage(e)); }
@@ -104,7 +99,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     setLoadingCK(true);
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys`);
-      if (!res.ok) throw new Error('Failed to fetch crypto keys');
+      await requireOk(res, 'KMS crypto key loading failed. Check the key ring and retry.');
       const data: { cryptoKeys?: CryptoKey[] } = await res.json();
       setCryptoKeys(data.cryptoKeys || []);
     } catch (e: unknown) { setError(getErrorMessage(e)); }
@@ -115,7 +110,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     setLoadingVersions(true);
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys/${ckId}/cryptoKeyVersions`);
-      if (!res.ok) throw new Error('Failed to fetch versions');
+      await requireOk(res, 'KMS key version loading failed. Check the crypto key and retry.');
       const data: { cryptoKeyVersions?: CryptoKeyVersion[] } = await res.json();
       setVersions(data.cryptoKeyVersions || []);
     } catch (e: unknown) { setError(getErrorMessage(e)); }
@@ -136,7 +131,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     setCreatingKR(true); setError(null);
     try {
       const res = await fetch(`${krBase}?keyRingId=${newKrId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      if (!res.ok) { const d: ErrorResponse = await res.json(); throw new Error(d.error?.message || 'Failed'); }
+      await requireOk(res, 'KMS key ring creation failed. Check the key ring ID and retry.');
       setNewKrId(''); fetchKeyRings();
     } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setCreatingKR(false); }
@@ -150,7 +145,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ purpose: newCkPurpose })
       });
-      if (!res.ok) { const d: ErrorResponse = await res.json(); throw new Error(d.error?.message || 'Failed'); }
+      await requireOk(res, 'KMS crypto key creation failed. Check the key ID and purpose.');
       setNewCkId(''); fetchCryptoKeys(selectedKr);
     } catch (e: unknown) { setError(getErrorMessage(e)); }
     finally { setCreatingCK(false); }
@@ -158,7 +153,8 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
 
   const handleRotateKey = async (krId: string, ckId: string) => {
     try {
-      const res = await fetch(`${krBase}/${krId}/cryptoKeys/${ckId}/cryptoKeyVersions`, { method: 'POST' });
+      const res = await checkedMutation(`${krBase}/${krId}/cryptoKeys/${ckId}/cryptoKeyVersions`, { method: 'POST' },
+        'KMS key rotation failed. Check the key state and retry.');
       if (!res.ok) throw new Error('Failed to rotate key');
       fetchCryptoKeys(krId);
       if (expandedKey === ckId) fetchVersions(krId, ckId);
@@ -169,7 +165,8 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     const vId = versionName.split('/').pop();
     if (!confirm(`Destroy version ${vId}? This cannot be undone.`)) return;
     try {
-      const res = await fetch(`${BASE}/${versionName}:destroy`, { method: 'POST' });
+      const res = await checkedMutation(`${BASE}/${versionName}:destroy`, { method: 'POST' },
+        'KMS key version destruction failed. Check the version state and retry.');
       if (!res.ok) throw new Error('Failed to destroy version');
       fetchVersions(krId, ckId);
     } catch (e: unknown) { setError(getErrorMessage(e)); }
@@ -186,6 +183,7 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     if (!krId) return;
     try {
       const res = await fetch(`${krBase}/${krId}/cryptoKeys`);
+      await requireOk(res, 'KMS sandbox key loading failed. Check the key ring and retry.');
       const data: { cryptoKeys?: CryptoKey[] } = await res.json();
       setSandboxCkList((data.cryptoKeys || []).filter((k: CryptoKey) => k.purpose === 'ENCRYPT_DECRYPT'));
     } catch (e: unknown) {
@@ -197,10 +195,10 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     if (!sandboxKr || !sandboxCk || !plaintext) return;
     setSandboxLoading(true); setEncryptResult(''); setError(null);
     try {
-      const res = await fetch(`${krBase}/${sandboxKr}/cryptoKeys/${sandboxCk}:encrypt`, {
+      const res = await checkedMutation(`${krBase}/${sandboxKr}/cryptoKeys/${sandboxCk}:encrypt`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plaintext: btoa(plaintext) })
-      });
+      }, 'KMS encryption failed. Check the key and plaintext.');
       if (!res.ok) throw new Error('Encryption failed');
       const data: { ciphertext: string } = await res.json();
       setEncryptResult(data.ciphertext);
@@ -212,10 +210,10 @@ export default function CloudKmsDrawer({ open, onClose }: Props) {
     if (!sandboxKr || !sandboxCk || !ciphertext) return;
     setSandboxLoading(true); setDecryptResult(''); setError(null);
     try {
-      const res = await fetch(`${krBase}/${sandboxKr}/cryptoKeys/${sandboxCk}:decrypt`, {
+      const res = await checkedMutation(`${krBase}/${sandboxKr}/cryptoKeys/${sandboxCk}:decrypt`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ciphertext })
-      });
+      }, 'KMS decryption failed. Check the key and ciphertext.');
       if (!res.ok) throw new Error('Decryption failed — invalid ciphertext or wrong key');
       const data: { plaintext: string } = await res.json();
       setDecryptResult(atob(data.plaintext));

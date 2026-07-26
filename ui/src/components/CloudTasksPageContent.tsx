@@ -12,6 +12,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import SendIcon from '@mui/icons-material/Send';
 import { useProjectContext } from '../contexts/ProjectContext';
 import { Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
+import { requireOk, safeRequestError } from '../apiClient';
 
 interface Queue {
   name: string;
@@ -26,12 +27,6 @@ interface Task {
   };
   createTime: string;
   status?: string;
-}
-
-interface ApiErrorResponse {
-  error?: {
-    message?: string;
-  };
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -64,7 +59,7 @@ export default function CloudTasksPageContent() {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/cloudtasks/projects/${activeProject}/locations/${location}/queues`);
-      if (!res.ok) throw new Error('Failed to fetch queues');
+      await requireOk(res, 'Cloud Tasks queue loading failed. Check the local service and retry.');
       const data = await res.json();
       setQueues(data.queues || []);
     } catch (err: unknown) {
@@ -78,7 +73,7 @@ export default function CloudTasksPageContent() {
     setLoadingTasks(true);
     try {
       const res = await fetch(`/api/manage/cloudtasks/${queueName}/tasks`);
-      if (!res.ok) throw new Error('Failed to fetch tasks');
+      await requireOk(res, 'Cloud Tasks task loading failed. Check the queue and retry.');
       const data = await res.json();
       setTasks(data.tasks || []);
     } catch (err: unknown) {
@@ -103,15 +98,12 @@ export default function CloudTasksPageContent() {
           name: `projects/${activeProject}/locations/${location}/queues/${newQueueId}`
         })
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as ApiErrorResponse;
-        throw new Error(errData.error?.message || 'Failed to create queue');
-      }
+      await requireOk(res, 'Cloud Tasks queue creation failed. Check the queue ID and location.');
 
       setNewQueueId('');
       fetchQueues();
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to create queue'));
+      setError(safeRequestError(err, 'Unable to connect while creating the Cloud Tasks queue.'));
     } finally {
       setCreating(false);
     }
@@ -123,11 +115,11 @@ export default function CloudTasksPageContent() {
     
     try {
       const res = await fetch(`/api/manage/cloudtasks/${name}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error('Failed to delete queue');
+      await requireOk(res, 'Cloud Tasks queue deletion failed. Remove queued tasks and retry.');
       if (expandedQueue === name) setExpandedQueue(null);
       fetchQueues();
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to delete queue'));
+      setError(safeRequestError(err, 'Unable to connect while deleting the Cloud Tasks queue.'));
     }
   };
 
@@ -158,11 +150,11 @@ export default function CloudTasksPageContent() {
           }
         })
       });
-      if (!res.ok) throw new Error('Failed to create task');
+      await requireOk(res, 'Cloud Tasks task creation failed. Check the target URL and payload.');
       setTaskDialogOpen(false);
       if (expandedQueue === targetQueue) fetchTasks(targetQueue);
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to create task'));
+      setError(safeRequestError(err, 'Unable to connect while creating the Cloud Tasks task.'));
     } finally {
       setSubmittingTask(false);
     }
@@ -174,10 +166,10 @@ export default function CloudTasksPageContent() {
 
     try {
       const res = await fetch(`/api/manage/cloudtasks/${taskName}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error('Failed to delete task');
+      await requireOk(res, 'Cloud Tasks task deletion failed. Refresh the queue and retry.');
       fetchTasks(queueName);
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to delete task'));
+      setError(safeRequestError(err, 'Unable to connect while deleting the Cloud Tasks task.'));
     }
   };
 

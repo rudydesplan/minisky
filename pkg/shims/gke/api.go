@@ -1,7 +1,9 @@
 package gke
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -66,15 +68,16 @@ type MasterAuth struct {
 
 // GkeOperation mirrors the GKE Operation resource.
 type GkeOperation struct {
-	Name          string `json:"name"`
-	Zone          string `json:"zone"`
-	OperationType string `json:"operationType"`
-	Status        string `json:"status"` // PENDING, RUNNING, DONE, ABORTING
-	StatusMessage string `json:"statusMessage,omitempty"`
-	SelfLink      string `json:"selfLink"`
-	TargetLink    string `json:"targetLink"`
-	StartTime     string `json:"startTime,omitempty"`
-	EndTime       string `json:"endTime,omitempty"`
+	Name          string                       `json:"name"`
+	Zone          string                       `json:"zone"`
+	OperationType string                       `json:"operationType"`
+	Status        string                       `json:"status"` // PENDING, RUNNING, DONE, ABORTING
+	StatusMessage string                       `json:"statusMessage,omitempty"`
+	SelfLink      string                       `json:"selfLink"`
+	TargetLink    string                       `json:"targetLink"`
+	StartTime     string                       `json:"startTime,omitempty"`
+	EndTime       string                       `json:"endTime,omitempty"`
+	Error         *orchestrator.OperationError `json:"error,omitempty"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,10 +88,25 @@ type GkeOperation struct {
 type API struct {
 	mu         sync.RWMutex
 	persistMu  sync.Mutex
+	configMu   sync.RWMutex
 	opMgr      *orchestrator.OperationManager
-	backend    *KindBackend
-	stateStore *state.Store
+	backend    gkeBackend
+	stateStore gkeStore
 	clusters   map[string]*Cluster // key: project:zone:name
+	ownerships map[string]*kubeconfigOwnership
+	gatewayURL string
+	httpClient *http.Client
+}
+
+type gkeBackend interface {
+	Enabled() bool
+	CreateClusterContext(context.Context, ClusterIdentity) (gkeBackendCreateResult, error)
+	DeleteClusterContext(context.Context, ClusterIdentity) error
+}
+
+type gkeBackendCreateResult struct {
+	Created   bool
+	Ownership *kubeconfigOwnership
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
@@ -105,18 +123,57 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	return api
 }
 
-func newAPI(opMgr *orchestrator.OperationManager, store *state.Store) *API {
+func newAPI(opMgr *orchestrator.OperationManager, store gkeStore) *API {
+	return newAPIWithBackend(opMgr, NewKindBackend(), "", nil, store)
+}
+
+func newAPIWithBackend(
+	opMgr *orchestrator.OperationManager,
+	backend gkeBackend,
+	gatewayURL string,
+	client *http.Client,
+	store gkeStore,
+) *API {
 	return &API{
 		opMgr:      opMgr,
-		backend:    NewKindBackend(),
+		backend:    backend,
 		stateStore: store,
 		clusters:   make(map[string]*Cluster),
+		gatewayURL: strings.TrimRight(gatewayURL, "/"),
+		httpClient: client,
+		ownerships: make(map[string]*kubeconfigOwnership),
 	}
+}
+
+// ConfigureGateway wires the actual running gateway and its TLS-capable client.
+func (api *API) ConfigureGateway(baseURL string, client *http.Client) {
+	api.configMu.Lock()
+	defer api.configMu.Unlock()
+	api.gatewayURL = strings.TrimRight(baseURL, "/")
+	api.httpClient = client
 }
 
 // GetBackend exposes the backend for dynamic dashboard configuration.
 func (api *API) GetBackend() *KindBackend {
-	return api.backend
+	backend, _ := api.backend.(*KindBackend)
+	return backend
+}
+
+// ReadKubeconfig returns a durable kubeconfig only for a persisted logical cluster.
+func (api *API) ReadKubeconfig(project, zone, name string) ([]byte, error) {
+	api.mu.RLock()
+	_, exists := api.clusters[clusterKey(project, zone, name)]
+	api.mu.RUnlock()
+	if !exists {
+		return nil, fmt.Errorf("cluster not found")
+	}
+	backend, ok := api.backend.(*KindBackend)
+	if !ok {
+		return nil, fmt.Errorf("Kind backend unavailable")
+	}
+	return backend.ReadKubeconfig(ClusterIdentity{
+		Profile: config.GetProfile(), Project: project, Zone: zone, Cluster: name,
+	})
 }
 
 // ServeHTTP dispatches GKE container.v1 paths.
@@ -168,6 +225,7 @@ func (api *API) routeClusters(w http.ResponseWriter, r *http.Request, path strin
 		api.deleteCluster(w, r, project, zone, clusterName)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -234,9 +292,18 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 
 	key := clusterKey(project, zone, name)
 	api.mu.Lock()
+	if _, exists := api.clusters[key]; exists {
+		api.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		writeError(w, 409, "ALREADY_EXISTS", fmt.Sprintf("Cluster '%s' already exists", name))
+		return
+	}
 	api.clusters[key] = &cl
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		delete(api.clusters, key)
+		api.mu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist cluster metadata: "+err.Error())
 		return
@@ -245,64 +312,85 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 	targetLink := cl.SelfLink
 	op, err := api.opMgr.RegisterDurable("container#operation", "CREATE_CLUSTER", targetLink, zone, "")
 	if err != nil {
+		api.mu.Lock()
+		if current := api.clusters[key]; current != nil {
+			current.Status = "ERROR"
+			current.StatusMessage = "operation registration failed: " + err.Error()
+			current.Endpoint = ""
+			current.MasterAuth = nil
+		}
+		api.mu.Unlock()
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded cluster: %w", persistErr))
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		backendCreated := false
+		var ownership *kubeconfigOwnership
+		identity := ClusterIdentity{Profile: config.GetProfile(), Project: project, Zone: zone, Cluster: name}
 		if api.backend.Enabled() {
-			api.backend.CreateCluster(name)
+			result, err := api.backend.CreateClusterContext(ctx, identity)
+			backendCreated = result.Created
+			ownership = result.Ownership
+			if err != nil {
+				var cleanupErr error
+				if backendCreated {
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					cleanupErr = cleanupGKEBackend(api.backend, cleanupCtx, identity, ownership != nil)
+					cleanupCancel()
+				}
+				return api.rollbackCreate(key, err, cleanupErr)
+			}
 		} else {
 			// Simulate cluster provision time
 			time.Sleep(5 * time.Second)
 		}
 
+		registeredNodes, err := api.registerNodes(ctx, http.MethodPost, project, zone, &cl)
+		if err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			nodeCleanupErr := api.removeRegisteredNodes(cleanupCtx, project, zone, registeredNodes)
+			var backendCleanupErr error
+			if backendCreated {
+				backendCleanupErr = cleanupGKEBackend(api.backend, cleanupCtx, identity, ownership != nil)
+			}
+			cleanupCancel()
+			return api.rollbackCreate(key, err, errors.Join(nodeCleanupErr, backendCleanupErr))
+		}
+
 		api.mu.Lock()
 		if c, ok := api.clusters[key]; ok {
 			c.Status = "RUNNING"
+			c.StatusMessage = ""
+		}
+		if ownership != nil {
+			api.ownerships[key] = ownership
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: GKE] persist completed cluster: %v", err)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			nodeCleanupErr := api.removeRegisteredNodes(cleanupCtx, project, zone, registeredNodes)
+			var backendCleanupErr error
+			if backendCreated {
+				backendCleanupErr = cleanupGKEBackend(api.backend, cleanupCtx, identity, ownership != nil)
+			}
+			cleanupCancel()
+			return api.rollbackCreate(key, fmt.Errorf("persist completed cluster: %w", err),
+				errors.Join(nodeCleanupErr, backendCleanupErr))
 		}
-
-		// Loopback execution to register nodes in Compute API
-		go func() {
-			var nodeNames []string
-			kindBase := sanitizeKindName(name)
-			nodeNames = append(nodeNames, kindBase+"-control-plane")
-			for i := 1; i <= cl.InitialNodeCount; i++ {
-				if i == 1 {
-					nodeNames = append(nodeNames, kindBase+"-worker")
-				} else {
-					nodeNames = append(nodeNames, fmt.Sprintf("%s-worker%d", kindBase, i))
+		if ownership != nil {
+			if backend, ok := api.backend.(*KindBackend); ok {
+				if err := backend.CommitKubeconfigIntent(identity, ownership); err != nil {
+					return fmt.Errorf("commit kubeconfig ownership intent: %w", err)
 				}
 			}
-
-			for _, n := range nodeNames {
-				body := map[string]interface{}{
-					"name":        n,
-					"machineType": cl.NodeConfig.MachineType,
-					"description": "GKE Managed Node",
-					"labels": map[string]string{
-						"managed-by":  "gke",
-						"gke-cluster": name,
-					},
-				}
-				b, _ := json.Marshal(body)
-				url := fmt.Sprintf("http://localhost:8080/compute/v1/projects/%s/zones/%s/instances", project, zone)
-				req, _ := http.NewRequest("POST", url, strings.NewReader(string(b)))
-				req.Host = "compute.googleapis.com"
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Printf("[Shim: GKE] failed loopback registration for node %s: %v", n, err)
-				} else {
-					resp.Body.Close()
-				}
-			}
-		}()
+		}
 
 		return nil
 	})
@@ -316,6 +404,7 @@ func (api *API) getCluster(w http.ResponseWriter, project, zone, name string) {
 	key := clusterKey(project, zone, name)
 	api.mu.RLock()
 	cl, ok := api.clusters[key]
+	cl = cloneCluster(cl)
 	api.mu.RUnlock()
 
 	if !ok {
@@ -333,7 +422,7 @@ func (api *API) listClusters(w http.ResponseWriter, project, zone string) {
 	items := []*Cluster{}
 	for k, v := range api.clusters {
 		if strings.HasPrefix(k, prefix) {
-			items = append(items, v)
+			items = append(items, cloneCluster(v))
 		}
 	}
 	api.mu.RUnlock()
@@ -354,9 +443,31 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("Cluster '%s' not found", name))
 		return
 	}
+	ownership := api.ownerships[key]
+	identity := ClusterIdentity{Profile: config.GetProfile(), Project: project, Zone: zone, Cluster: name}
+	if ownership != nil && ownership.hasBackendNonce() && !api.backend.Enabled() {
+		api.mu.Unlock()
+		api.respondDeleteUnavailable(w, key, identity, ownership, nil)
+		return
+	}
+	api.mu.Unlock()
+	if ownership != nil && ownership.hasBackendNonce() {
+		if checker, ok := api.backend.(interface {
+			CheckDeleteAvailability(context.Context, ClusterIdentity) error
+		}); ok {
+			if err := checker.CheckDeleteAvailability(r.Context(), identity); isBackendUnavailable(err) {
+				api.respondDeleteUnavailable(w, key, identity, ownership, err)
+				return
+			}
+		}
+	}
 
 	// Mark as STOPPING to simulate winding down in the UI
-	cl.Status = "STOPPING"
+	api.mu.Lock()
+	if current := api.clusters[key]; current != nil {
+		current.Status = "STOPPING"
+		cl = current
+	}
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -366,51 +477,66 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 
 	op, err := api.opMgr.RegisterDurable("container#operation", "DELETE_CLUSTER", cl.SelfLink, zone, "")
 	if err != nil {
+		api.mu.Lock()
+		cl.Status = "ERROR"
+		cl.StatusMessage = "delete operation registration failed: " + err.Error()
+		api.mu.Unlock()
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded cluster: %w", persistErr))
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Simulate winding down time
-		time.Sleep(3 * time.Second)
-
-		if api.backend.Enabled() {
-			api.backend.DeleteCluster(name)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		api.mu.RLock()
+		ownedKind := api.ownerships[key] != nil && api.ownerships[key].hasBackendNonce()
+		api.mu.RUnlock()
+		if ownedKind || api.backend.Enabled() {
+			if err := api.backend.DeleteClusterContext(ctx, identity); err != nil {
+				api.markClusterError(key, err)
+				return err
+			}
+		}
+		if _, err := api.registerNodes(ctx, http.MethodDelete, project, zone, cl); err != nil {
+			api.markClusterError(key, err)
+			return err
 		}
 
-		// Loopback execution to delete nodes in Compute API
-		go func() {
-			kindBase := sanitizeKindName(name)
-			var nodeNames []string
-			nodeNames = append(nodeNames, kindBase+"-control-plane")
-			for i := 1; i <= cl.InitialNodeCount; i++ {
-				if i == 1 {
-					nodeNames = append(nodeNames, kindBase+"-worker")
-				} else {
-					nodeNames = append(nodeNames, fmt.Sprintf("%s-worker%d", kindBase, i))
-				}
-			}
-
-			for _, n := range nodeNames {
-				url := fmt.Sprintf("http://localhost:8080/compute/v1/projects/%s/zones/%s/instances/%s", project, zone, n)
-				req, _ := http.NewRequest("DELETE", url, nil)
-				req.Host = "compute.googleapis.com"
-				req.Header.Set("X-Minisky-GKE-Bypass", "true")
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Printf("[Shim: GKE] failed loopback deletion for node %s: %v", n, err)
-				} else {
-					resp.Body.Close()
-				}
-			}
-		}()
-
 		// Finally remove from memory
+		tombstone := cloneCluster(cl)
 		api.mu.Lock()
+		ownership := api.ownerships[key]
 		delete(api.clusters, key)
+		delete(api.ownerships, key)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: GKE] persist deleted cluster: %v", err)
+			tombstone.Status = "ERROR"
+			tombstone.StatusMessage = "backend deleted; metadata removal persistence failed: " + err.Error()
+			tombstone.Endpoint = ""
+			tombstone.MasterAuth = nil
+			api.mu.Lock()
+			api.clusters[key] = tombstone
+			if ownership != nil {
+				api.ownerships[key] = ownership
+				if backend, ok := api.backend.(*KindBackend); ok {
+					backend.RestoreKubeconfigOwnership(ClusterIdentity{
+						Profile: ownership.Profile, Project: ownership.Project,
+						Zone: ownership.Zone, Cluster: ownership.Cluster,
+					}, ownership)
+				}
+			}
+			api.mu.Unlock()
+			return fmt.Errorf("persist deleted cluster: %w", err)
+		}
+		if ownership != nil {
+			if backend, ok := api.backend.(*KindBackend); ok {
+				if err := backend.FinalizeDeleteIntent(identity, ownership); err != nil {
+					return fmt.Errorf("terminalize durable deletion intent: %w", err)
+				}
+			}
 		}
 
 		return nil
@@ -418,6 +544,40 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 	gkeOp := toGkeOperation(op, "DELETE_CLUSTER", project, zone, cl.SelfLink)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(gkeOp)
+}
+
+func (api *API) respondDeleteUnavailable(
+	w http.ResponseWriter,
+	key string,
+	identity ClusterIdentity,
+	ownership *kubeconfigOwnership,
+	cause error,
+) {
+	message := "Kind backend cleanup is temporarily unavailable; retry deletion later"
+	if cause != nil {
+		message += ": " + cause.Error()
+	}
+	api.mu.Lock()
+	if cluster := api.clusters[key]; cluster != nil {
+		cluster.Status = "ERROR"
+		cluster.StatusMessage = "delete cleanup pending: " + message
+	}
+	api.mu.Unlock()
+	var intentErr error
+	if backend, ok := api.backend.(*KindBackend); ok {
+		intentErr = backend.MarkDeleteUnavailable(identity)
+	} else {
+		intentErr = writeKubeconfigIntentError(
+			identity, ownership, intentDeletePending, "UNAVAILABLE: "+message)
+	}
+	if persistErr := api.persistMetadata(); persistErr != nil {
+		intentErr = errors.Join(intentErr, fmt.Errorf("persist retryable delete state: %w", persistErr))
+	}
+	if intentErr != nil {
+		message += ": " + intentErr.Error()
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", message)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,7 +624,181 @@ func toGkeOperation(op *orchestrator.Operation, opType, project, zone, targetLin
 		TargetLink:    targetLink,
 		StartTime:     op.StartTime,
 		EndTime:       op.EndTime,
+		Error:         op.Error,
 	}
+}
+
+func (api *API) registerNodes(ctx context.Context, method, project, zone string, cluster *Cluster) ([]string, error) {
+	api.configMu.RLock()
+	gatewayURL := api.gatewayURL
+	client := api.httpClient
+	api.configMu.RUnlock()
+	if gatewayURL == "" || client == nil {
+		return nil, fmt.Errorf("MiniSky gateway URL is not configured")
+	}
+	kindBase := sanitizeKindName(cluster.Name)
+	nodeNames := []string{kindBase + "-control-plane"}
+	for i := 1; i <= cluster.InitialNodeCount; i++ {
+		if i == 1 {
+			nodeNames = append(nodeNames, kindBase+"-worker")
+		} else {
+			nodeNames = append(nodeNames, fmt.Sprintf("%s-worker%d", kindBase, i))
+		}
+	}
+	var completed []string
+	for _, nodeName := range nodeNames {
+		url := fmt.Sprintf("%s/compute/v1/projects/%s/zones/%s/instances", gatewayURL, project, zone)
+		var body strings.Reader
+		if method == http.MethodPost {
+			payload, err := json.Marshal(map[string]interface{}{
+				"name": nodeName, "machineType": cluster.NodeConfig.MachineType,
+				"description": "GKE Managed Node",
+				"labels":      map[string]string{"managed-by": "gke", "gke-cluster": cluster.Name},
+			})
+			if err != nil {
+				return completed, err
+			}
+			body = *strings.NewReader(string(payload))
+		} else {
+			url += "/" + nodeName
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, &body)
+		if err != nil {
+			return completed, err
+		}
+		req.Host = "compute.googleapis.com"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Minisky-GKE-Bypass", "true")
+		resp, err := client.Do(req)
+		if err != nil {
+			return completed, fmt.Errorf("register managed node %s: %w", nodeName, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return completed, fmt.Errorf("register managed node %s: gateway returned %s", nodeName, resp.Status)
+		}
+		completed = append(completed, nodeName)
+	}
+	return completed, nil
+}
+
+func (api *API) removeRegisteredNodes(ctx context.Context, project, zone string, names []string) error {
+	api.configMu.RLock()
+	gatewayURL := api.gatewayURL
+	client := api.httpClient
+	api.configMu.RUnlock()
+	if gatewayURL == "" || client == nil {
+		return fmt.Errorf("MiniSky gateway URL is not configured")
+	}
+	var cleanupErr error
+	for i := len(names) - 1; i >= 0; i-- {
+		url := fmt.Sprintf("%s/compute/v1/projects/%s/zones/%s/instances/%s", gatewayURL, project, zone, names[i])
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+		if err == nil {
+			req.Host = "compute.googleapis.com"
+			req.Header.Set("X-Minisky-GKE-Bypass", "true")
+			var resp *http.Response
+			resp, err = client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					err = fmt.Errorf("gateway returned %s", resp.Status)
+				}
+			}
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove managed node %s: %w", names[i], err))
+		}
+	}
+	return cleanupErr
+}
+
+func cleanupGKEBackend(
+	backend gkeBackend,
+	ctx context.Context,
+	identity ClusterIdentity,
+	hasOwnership bool,
+) error {
+	if hasOwnership {
+		return backend.DeleteClusterContext(ctx, identity)
+	}
+	if cleanup, ok := backend.(interface {
+		CleanupClusterContext(context.Context, ClusterIdentity) error
+	}); ok {
+		return cleanup.CleanupClusterContext(ctx, identity)
+	}
+	return backend.DeleteClusterContext(ctx, identity)
+}
+
+func (api *API) rollbackCreate(key string, cause, cleanupErr error) error {
+	api.mu.RLock()
+	tombstone := cloneCluster(api.clusters[key])
+	api.mu.RUnlock()
+	if cleanupErr == nil {
+		api.removeCluster(key)
+		if err := api.persistMetadata(); err == nil {
+			return cause
+		} else {
+			cleanupErr = fmt.Errorf("persist rollback: %w", err)
+		}
+	}
+	combined := errors.Join(cause, cleanupErr)
+	api.mu.Lock()
+	if tombstone != nil {
+		tombstone.Status = "ERROR"
+		tombstone.StatusMessage = combined.Error()
+		tombstone.Endpoint = ""
+		tombstone.MasterAuth = nil
+		api.clusters[key] = tombstone
+	}
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		combined = errors.Join(combined, fmt.Errorf("persist degraded state: %w", err))
+	}
+	return combined
+}
+
+func (api *API) removeCluster(key string) {
+	api.mu.Lock()
+	delete(api.clusters, key)
+	delete(api.ownerships, key)
+	api.mu.Unlock()
+}
+
+func (api *API) markClusterError(key string, err error) {
+	api.mu.Lock()
+	if cluster := api.clusters[key]; cluster != nil {
+		cluster.Status = "ERROR"
+		cluster.StatusMessage = err.Error()
+	}
+	api.mu.Unlock()
+	if persistErr := api.persistMetadata(); persistErr != nil {
+		log.Printf("[Shim: GKE] persist failed cluster: %v", persistErr)
+	}
+}
+
+func cloneCluster(cluster *Cluster) *Cluster {
+	if cluster == nil {
+		return nil
+	}
+	clone := *cluster
+	if cluster.NodeConfig != nil {
+		nodeConfig := *cluster.NodeConfig
+		nodeConfig.OauthScopes = append([]string(nil), cluster.NodeConfig.OauthScopes...)
+		nodeConfig.Tags = append([]string(nil), cluster.NodeConfig.Tags...)
+		if cluster.NodeConfig.Labels != nil {
+			nodeConfig.Labels = make(map[string]string, len(cluster.NodeConfig.Labels))
+			for key, value := range cluster.NodeConfig.Labels {
+				nodeConfig.Labels[key] = value
+			}
+		}
+		clone.NodeConfig = &nodeConfig
+	}
+	if cluster.MasterAuth != nil {
+		auth := *cluster.MasterAuth
+		clone.MasterAuth = &auth
+	}
+	return &clone
 }
 
 func clusterKey(project, zone, name string) string {

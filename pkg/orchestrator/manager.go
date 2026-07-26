@@ -364,6 +364,73 @@ func (sm *ServiceManager) Teardown(ctx context.Context) {
 	}
 }
 
+// ReconcileBuildResources removes only stale Cloud Build containers and
+// workspaces carrying the active profile's exact ownership labels.
+func (sm *ServiceManager) ReconcileBuildResources(ctx context.Context) error {
+	containerResp, err := sm.dockerClient.Get("http://localhost/containers/json?all=true")
+	if err != nil {
+		return err
+	}
+	var containers []struct {
+		ID     string            `json:"Id"`
+		Labels map[string]string `json:"Labels"`
+	}
+	decodeErr := json.NewDecoder(containerResp.Body).Decode(&containers)
+	containerResp.Body.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	for _, container := range containers {
+		if !isOwnedDockerResource(container.Labels) || container.Labels["minisky.service"] != "cloudbuild" ||
+			container.Labels["minisky.resource"] == "" {
+			continue
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/containers/"+url.PathEscape(container.ID)+"?force=true", nil)
+		resp, err := sm.dockerClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("remove stale Cloud Build container returned %d", resp.StatusCode)
+		}
+	}
+
+	volumeResp, err := sm.dockerClient.Get("http://localhost/volumes")
+	if err != nil {
+		return err
+	}
+	var volumes struct {
+		Volumes []struct {
+			Name   string            `json:"Name"`
+			Labels map[string]string `json:"Labels"`
+		} `json:"Volumes"`
+	}
+	decodeErr = json.NewDecoder(volumeResp.Body).Decode(&volumes)
+	volumeResp.Body.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	for _, volume := range volumes.Volumes {
+		if !isOwnedDockerResource(volume.Labels) || volume.Labels["minisky.service"] != "cloudbuild" ||
+			volume.Labels["minisky.resource"] == "" {
+			continue
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/volumes/"+url.PathEscape(volume.Name), nil)
+		resp, err := sm.dockerClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("remove stale Cloud Build workspace returned %d", resp.StatusCode)
+		}
+	}
+	return nil
+}
+
 // PruneExitedContainers removes exited containers owned by the active profile.
 func (sm *ServiceManager) PruneExitedContainers(ctx context.Context) error {
 	resp, err := sm.dockerClient.Get("http://localhost/containers/json?all=true&filters={\"status\":[\"exited\",\"created\",\"dead\"]}")
@@ -468,7 +535,13 @@ func (sm *ServiceManager) checkStatus(name string) (string, error) {
 }
 
 func (sm *ServiceManager) inspectContainer(name string) (string, map[string]string, error) {
-	resp, err := sm.dockerClient.Get(fmt.Sprintf("http://localhost/containers/%s/json", name))
+	return sm.inspectContainerContext(context.Background(), name)
+}
+
+func (sm *ServiceManager) inspectContainerContext(ctx context.Context, name string) (string, map[string]string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://localhost/containers/%s/json", name), nil)
+	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return "", nil, err
 	}
@@ -495,7 +568,14 @@ func (sm *ServiceManager) inspectContainer(name string) (string, map[string]stri
 
 // CheckStatusPublic allows external packages to see if a container is running.
 func (sm *ServiceManager) CheckStatusPublic(name string) (string, error) {
-	return sm.checkStatus(name)
+	status, labels, err := sm.inspectContainer(name)
+	if err != nil || status == "not_found" {
+		return status, err
+	}
+	if !isOwnedDockerResource(labels) {
+		return "", fmt.Errorf("container %q is not owned by the active MiniSky profile", name)
+	}
+	return status, nil
 }
 
 func (sm *ServiceManager) pullImageInternal(ctx context.Context, image string) error {
@@ -589,12 +669,12 @@ func (sm *ServiceManager) provisionComputeVM(ctx context.Context, containerName 
 	if !validDockerResourceName(containerName) {
 		return fmt.Errorf("invalid Compute container name")
 	}
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return fmt.Errorf("inspect Compute container: %w", err)
 	}
 	if status != "not_found" {
-		if !exactLabels(labels, resourceLabels) {
+		if !containsLabels(labels, resourceLabels) {
 			return fmt.Errorf("Compute container %q exists but is not owned by this profile and resource", containerName)
 		}
 		if status != "running" {
@@ -885,8 +965,98 @@ func isOwnedRedisResource(labels map[string]string, resourceID string) bool {
 }
 
 // ProvisionCloudSQLVM starts a fully-interactive PostgreSQL or MySQL docker database data plane.
-func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName string, image string, binds []string, env []string, cmd []string) error {
+func buildResourceLabels(resourceID string) map[string]string {
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "cloudbuild"
+	labels["minisky.resource"] = resourceID
+	return labels
+}
+
+func (sm *ServiceManager) EnsureBuildWorkspace(ctx context.Context, volumeName, resourceID string) error {
+	expected := buildResourceLabels(resourceID)
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusOK {
+		var volume struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&volume)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if !exactLabels(volume.Labels, expected) {
+			return fmt.Errorf("build workspace %q exists but is not owned by this profile and resource", volumeName)
+		}
+		return nil
+	}
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound {
+		return fmt.Errorf("inspect build workspace returned %d", status)
+	}
+	payload, _ := json.Marshal(map[string]any{"Name": volumeName, "Labels": expected})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/volumes/create", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = sm.dockerClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("create build workspace returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (sm *ServiceManager) RemoveBuildWorkspace(ctx context.Context, volumeName, resourceID string) error {
+	expected := buildResourceLabels(resourceID)
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&volume)
+	resp.Body.Close()
+	if decodeErr != nil {
+		return decodeErr
+	}
+	if !exactLabels(volume.Labels, expected) {
+		return fmt.Errorf("refusing to remove unowned build workspace %q", volumeName)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, "http://localhost/volumes/"+url.PathEscape(volumeName), nil)
+	resp, err = sm.dockerClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("remove build workspace returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName, resourceID, image string, binds []string, env []string, cmd []string) error {
 	log.Printf("[Orchestrator] Provisioning build step: %s (image: %s binds: %v cmd: %v)", containerName, image, binds, cmd)
+	expected := buildResourceLabels(resourceID)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, expected) {
+			return fmt.Errorf("build container %q exists but is not owned by this profile and resource", containerName)
+		}
+		return fmt.Errorf("owned build container %q already exists", containerName)
+	}
 
 	exists, _ := sm.ImageExistsPublic(image)
 	if !exists {
@@ -903,17 +1073,14 @@ func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName 
 			"NetworkMode": networkName,
 			"Binds":       binds,
 		},
-		"Labels": map[string]string{
-			"managed-by": "minisky-build",
-			"build-id":   containerName,
-		},
+		"Labels": expected,
 	}
 	if len(cmd) > 0 {
 		payload["Cmd"] = cmd
 	}
 	data, _ := json.Marshal(payload)
-	url := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	createURL := "http://localhost/containers/create?" + url.Values{"name": {containerName}}.Encode()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := sm.dockerClient.Do(req)
@@ -922,15 +1089,48 @@ func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict {
+	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("build step creation rejected %d: %s", resp.StatusCode, b)
 	}
 
-	return sm.startContainer(containerName)
+	if err := sm.startContainer(containerName); err != nil {
+		_ = sm.StopAndRemoveBuildContainer(ctx, containerName, resourceID)
+		return err
+	}
+	return nil
 }
 
-func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName string, version string, rootPassword string) (string, error) {
+func (sm *ServiceManager) StopAndRemoveBuildContainer(ctx context.Context, containerName, resourceID string) error {
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status == "not_found" {
+		return nil
+	}
+	if !exactLabels(labels, buildResourceLabels(resourceID)) {
+		return fmt.Errorf("refusing to remove unowned build container %q", containerName)
+	}
+	stop, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/"+url.PathEscape(containerName)+"/stop?t=2", nil)
+	if response, stopErr := sm.dockerClient.Do(stop); stopErr == nil {
+		response.Body.Close()
+	}
+	remove, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+		"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+	response, err := sm.dockerClient.Do(remove)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("remove build container returned %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, project, instanceName string, version string, rootPassword string) (string, bool, error) {
 	var image string
 	var env []string
 	var expPort string
@@ -977,10 +1177,13 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 		env = append(sm.standardEnv(), "MYSQL_ROOT_PASSWORD="+rootPassword)
 		expPort = "3306/tcp"
 	} else {
-		return "", fmt.Errorf("unsupported database version: %s", version)
+		return "", false, fmt.Errorf("unsupported database version: %s", version)
 	}
 
-	containerName := "minisky-sql-" + instanceName
+	containerName, volName, resourceID := cloudSQLDockerNames(project, instanceName)
+	resourceLabels := ownedDockerLabels()
+	resourceLabels["minisky.service"] = "cloudsql"
+	resourceLabels["minisky.resource"] = resourceID
 	log.Printf("[Orchestrator] Provisioning Cloud SQL VM: %s (image: %s)", containerName, image)
 
 	exists, err := sm.ImageExistsPublic(image)
@@ -989,19 +1192,28 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 	}
 	if !exists {
 		if err := sm.pullImageInternal(ctx, image); err != nil {
-			return "", fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
+			return "", false, fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
 		}
 	} else {
 		log.Printf("[Orchestrator] Image '%s' already exists locally, skipping pull.", image)
 	}
 
-	// Clean up any stale container
-	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://localhost/containers/%s?force=true", containerName), nil)
-	sm.dockerClient.Do(req)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect Cloud SQL container: %w", err)
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, resourceLabels) {
+			return "", false, fmt.Errorf("Cloud SQL container %q exists but is not owned by this profile and resource", containerName)
+		}
+		return "", false, fmt.Errorf("owned Cloud SQL container %q already exists", containerName)
+	}
 
 	// Volumes - mount a docker volume for persistence
-	volName := "minisky-db-" + instanceName
-	sm.dockerClient.Post("http://localhost/volumes/create", "application/json", strings.NewReader(`{"Name": "`+volName+`"}`))
+	volumeCreated, err := sm.ensureCloudSQLVolume(ctx, volName, resourceLabels)
+	if err != nil {
+		return "", false, err
+	}
 
 	var mountTarget string
 	if strings.HasPrefix(version, "MYSQL") {
@@ -1027,10 +1239,7 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 				fmt.Sprintf("%s:%s", volName, mountTarget),
 			},
 		},
-		"Labels": map[string]string{
-			"managed-by": "minisky-sql",
-			"instance":   instanceName,
-		},
+		"Labels": resourceLabels,
 	}
 
 	b, _ := json.Marshal(payload)
@@ -1038,62 +1247,190 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 	cReq.Header.Set("Content-Type", "application/json")
 	resp, err := sm.dockerClient.Do(cReq)
 	if err != nil {
-		return "", fmt.Errorf("create SQL container: %v", err)
+		if volumeCreated {
+			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
+		}
+		return "", false, fmt.Errorf("create SQL container: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		if volumeCreated {
+			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
+		}
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create SQL container %d: %s", resp.StatusCode, string(respBody))
+		return "", false, fmt.Errorf("failed to create SQL container %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	if err := sm.startContainer(containerName); err != nil {
-		return "", fmt.Errorf("start SQL container: %v", err)
+		return "", true, fmt.Errorf("start SQL container: %v", err)
 	}
 
 	config := ContainerConfig{Name: containerName, ContainerPort: expPort}
 	internalURL, err := sm.discoverInternalURL(config)
 	if err != nil {
-		return "", fmt.Errorf("port discovery: %v", err)
+		return "", true, fmt.Errorf("port discovery: %v", err)
 	}
 
 	log.Printf("[Orchestrator] ✅ SQL Instance '%s' ONLINE at %s", instanceName, internalURL)
-	return internalURL, nil
+	return internalURL, true, nil
 }
 
 // DeleteCloudSQLVM stops and forcefully removes a Cloud SQL node.
-func (sm *ServiceManager) DeleteCloudSQLVM(instanceName string) error {
-	containerName := "minisky-sql-" + instanceName
+func (sm *ServiceManager) DeleteCloudSQLVM(project, instanceName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return sm.DeleteCloudSQLVMContext(ctx, project, instanceName)
+}
+
+func (sm *ServiceManager) DeleteCloudSQLVMContext(ctx context.Context, project, instanceName string) error {
+	containerName, volumeName, resourceID := cloudSQLDockerNames(project, instanceName)
+	expected := ownedDockerLabels()
+	expected["minisky.service"] = "cloudsql"
+	expected["minisky.resource"] = resourceID
 	log.Printf("[Orchestrator] Tearing down Cloud SQL VM: %s", containerName)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, expected) {
+			return fmt.Errorf("refusing to delete unowned Cloud SQL container %q", containerName)
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+		resp, err := sm.dockerClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("delete Cloud SQL container returned %d", resp.StatusCode)
+		}
+	}
+	return sm.deleteCloudSQLVolume(ctx, volumeName, expected)
+}
 
-	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", containerName)
-	req, _ := http.NewRequest("POST", stopURL, nil)
-	sm.dockerClient.Do(req)
+func (sm *ServiceManager) ensureCloudSQLVolume(ctx context.Context, name string, labels map[string]string) (bool, error) {
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	if err != nil {
+		return false, fmt.Errorf("inspect Cloud SQL volume: %w", err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		var volume struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		err := json.NewDecoder(resp.Body).Decode(&volume)
+		resp.Body.Close()
+		if err != nil {
+			return false, fmt.Errorf("decode Cloud SQL volume ownership: %w", err)
+		}
+		if !exactLabels(volume.Labels, labels) {
+			return false, fmt.Errorf("Cloud SQL volume %q exists but is not owned by this profile and resource", name)
+		}
+		return false, nil
+	}
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound {
+		return false, fmt.Errorf("inspect Cloud SQL volume returned %d", status)
+	}
+	payload, _ := json.Marshal(map[string]any{"Name": name, "Labels": labels})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/volumes/create", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = sm.dockerClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("create Cloud SQL volume: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("create Cloud SQL volume returned %d", resp.StatusCode)
+	}
+	return true, nil
+}
 
-	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", containerName)
-	req, _ = http.NewRequest("DELETE", rmURL, nil)
-	resp, err := sm.dockerClient.Do(req)
+func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string, labels map[string]string) error {
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		status := resp.StatusCode
+		resp.Body.Close()
+		return fmt.Errorf("inspect Cloud SQL volume returned %d", status)
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&volume)
+	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("decode Cloud SQL volume ownership: %w", err)
+	}
+	if !exactLabels(volume.Labels, labels) {
+		return fmt.Errorf("refusing to delete unowned Cloud SQL volume %q", name)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, "http://localhost/volumes/"+url.PathEscape(name), nil)
+	resp, err = sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete Cloud SQL volume returned %d", resp.StatusCode)
+	}
 	return nil
+}
+
+func cloudSQLDockerNames(project, instance string) (string, string, string) {
+	resourceID := config.GetProfile() + "/" + project + "/" + instance
+	sum := sha256.Sum256([]byte(resourceID))
+	safe := strings.ToLower(instance)
+	safe = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			return r
+		}
+		return '-'
+	}, safe)
+	safe = strings.Trim(safe, "-")
+	if len(safe) > 24 {
+		safe = safe[:24]
+	}
+	if safe == "" {
+		safe = "instance"
+	}
+	suffix := fmt.Sprintf("%x", sum[:6])
+	return "minisky-sql-" + safe + "-" + suffix,
+		"minisky-db-" + safe + "-" + suffix, resourceID
 }
 
 // DeleteComputeVM permanently destroys a physical Data Plane compute instance.
 func (sm *ServiceManager) DeleteComputeVM(containerName string) error {
+	return sm.DeleteComputeVMContext(context.Background(), containerName)
+}
+
+// DeleteComputeVMContext removes only the exact current-profile Compute
+// container identity and bounds all Docker calls by ctx.
+func (sm *ServiceManager) DeleteComputeVMContext(ctx context.Context, containerName string) error {
 	labels := ownedDockerLabels()
 	labels["minisky.service"] = "compute-instance"
 	labels["minisky.resource"] = containerName
-	return sm.deleteComputeVM(containerName, labels)
+	return sm.deleteComputeVMContext(ctx, containerName, labels)
 }
 
-func (sm *ServiceManager) DeleteComputeInstance(identity ComputeInstanceIdentity) error {
+func (sm *ServiceManager) DeleteComputeInstance(
+	ctx context.Context,
+	identity ComputeInstanceIdentity,
+) error {
 	containerName, err := identity.DockerName()
 	if err != nil {
 		return err
 	}
 	labels, _ := identity.labels()
-	return sm.deleteComputeVM(containerName, labels)
+	return sm.deleteComputeVMContext(ctx, containerName, labels)
 }
 
 // DeleteLegacyComputeVM removes only the pre-scoped container name when it has
@@ -1111,29 +1448,33 @@ func (sm *ServiceManager) DeleteLegacyComputeVM(instanceName string) error {
 }
 
 func (sm *ServiceManager) deleteComputeVM(containerName string, expectedLabels map[string]string) error {
+	return sm.deleteComputeVMContext(context.Background(), containerName, expectedLabels)
+}
+
+func (sm *ServiceManager) deleteComputeVMContext(ctx context.Context, containerName string, expectedLabels map[string]string) error {
 	log.Printf("[Orchestrator] Tearing down Data Plane VM: %s", containerName)
 	if !validDockerResourceName(containerName) {
 		return fmt.Errorf("invalid Compute container name")
 	}
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return err
 	}
 	if status == "not_found" {
 		return nil
 	}
-	if !exactLabels(labels, expectedLabels) {
+	if !containsLabels(labels, expectedLabels) {
 		return fmt.Errorf("refusing to delete unowned Compute container %q", containerName)
 	}
 
 	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", url.PathEscape(containerName))
-	req, _ := http.NewRequest("POST", stopURL, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, stopURL, nil)
 	if response, stopErr := sm.dockerClient.Do(req); stopErr == nil {
 		response.Body.Close()
 	}
 
 	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", url.PathEscape(containerName))
-	req, _ = http.NewRequest("DELETE", rmURL, nil)
+	req, _ = http.NewRequestWithContext(ctx, http.MethodDelete, rmURL, nil)
 	resp, err := sm.dockerClient.Do(req)
 	if err != nil {
 		return err
@@ -1152,7 +1493,7 @@ func isOwnedComputeVM(labels map[string]string, containerName string) bool {
 	expected := ownedDockerLabels()
 	expected["minisky.service"] = "compute-instance"
 	expected["minisky.resource"] = containerName
-	return exactLabels(labels, expected)
+	return containsLabels(labels, expected)
 }
 
 // DeleteServerlessVM deletes only the current profile's exact MiniSky-owned
@@ -1323,14 +1664,34 @@ func (sm *ServiceManager) tryServerlessLifecycle(identity ServerlessIdentity) (f
 
 // GetContainerLogs returns the last 'tail' lines of stdout/stderr from a container.
 func (sm *ServiceManager) GetContainerLogs(containerName string, tail int) (string, error) {
+	if err := sm.requireOwnedContainer(containerName); err != nil {
+		return "", err
+	}
 	url := fmt.Sprintf("http://localhost/containers/%s/logs?stdout=true&stderr=true&tail=%d", containerName, tail)
 	return sm.fetchLogs(url)
 }
 
 // GetContainerLogsSince returns stdout/stderr logs since a specific unix timestamp
 func (sm *ServiceManager) GetContainerLogsSince(containerName string, since int64) (string, error) {
+	if err := sm.requireOwnedContainer(containerName); err != nil {
+		return "", err
+	}
 	url := fmt.Sprintf("http://localhost/containers/%s/logs?stdout=true&stderr=true&timestamps=true&since=%d", containerName, since)
 	return sm.fetchLogs(url)
+}
+
+func (sm *ServiceManager) requireOwnedContainer(name string) error {
+	status, labels, err := sm.inspectContainer(name)
+	if err != nil {
+		return err
+	}
+	if status == "not_found" {
+		return fmt.Errorf("container %q not found", name)
+	}
+	if !isOwnedDockerResource(labels) {
+		return fmt.Errorf("container %q is not owned by the active MiniSky profile", name)
+	}
+	return nil
 }
 
 func (sm *ServiceManager) fetchLogs(url string) (string, error) {
@@ -1770,7 +2131,7 @@ func (sm *ServiceManager) GetComputeInstancePortMappings(identity ComputeInstanc
 	}
 	expected, _ := identity.labels()
 	status, labels, err := sm.inspectContainer(containerName)
-	if err != nil || status != "running" || !exactLabels(labels, expected) {
+	if err != nil || status != "running" || !containsLabels(labels, expected) {
 		return nil
 	}
 	sm.mu.RLock()
@@ -1779,6 +2140,9 @@ func (sm *ServiceManager) GetComputeInstancePortMappings(identity ComputeInstanc
 }
 
 func (sm *ServiceManager) ApplyFirewallPortsToVPC(vpcName string, containerNames []string, osImages []string) error {
+	if len(containerNames) != len(osImages) {
+		return fmt.Errorf("Compute firewall target/image count mismatch")
+	}
 	allowedPorts := []string{}
 	sm.mu.RLock()
 	rules := sm.fwRules[vpcName]
@@ -1795,8 +2159,12 @@ func (sm *ServiceManager) ApplyFirewallPortsToVPC(vpcName string, containerNames
 	log.Printf("[Orchestrator] Applying firewall ports %v to VPC '%s' (recreating %d VMs)", allowedPorts, vpcName, len(containerNames))
 	for i, cName := range containerNames {
 		osImage := osImages[i]
-		sm.DeleteComputeVM(cName)
-		sm.ProvisionComputeVM(context.Background(), cName, osImage, vpcName, allowedPorts, []string{}, []string{"tail", "-f", "/dev/null"})
+		if err := sm.DeleteComputeVM(cName); err != nil {
+			return fmt.Errorf("remove Compute VM %q for firewall update: %w", cName, err)
+		}
+		if err := sm.ProvisionComputeVM(context.Background(), cName, osImage, vpcName, allowedPorts, nil, []string{"tail", "-f", "/dev/null"}); err != nil {
+			return fmt.Errorf("recreate Compute VM %q for firewall update: %w", cName, err)
+		}
 	}
 	return nil
 }
@@ -1820,7 +2188,14 @@ func (sm *ServiceManager) ApplyFirewallPortsToComputeInstances(
 		}
 	}
 	for index, identity := range identities {
-		if err := sm.DeleteComputeInstance(identity); err != nil {
+		timeout := sm.dockerTimeout
+		if timeout <= 0 {
+			timeout = dockerRequestTimeout
+		}
+		deleteCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := sm.DeleteComputeInstance(deleteCtx, identity)
+		cancel()
+		if err != nil {
 			return err
 		}
 		if err := sm.ProvisionComputeInstance(
@@ -2085,7 +2460,7 @@ func (sm *ServiceManager) GetComputeInstanceIP(identity ComputeInstanceIdentity)
 		return ""
 	}
 	expected, _ := identity.labels()
-	if !exactLabels(info.Config.Labels, expected) {
+	if !containsLabels(info.Config.Labels, expected) {
 		return ""
 	}
 	if network, ok := info.NetworkSettings.Networks[networkName]; ok && network.IPAddress != "" {
@@ -2113,15 +2488,19 @@ func (sm *ServiceManager) ListManagedContainers() []ContainerSummary {
 	}
 	defer resp.Body.Close()
 	var raw []struct {
-		Names  []string `json:"Names"`
-		Status string   `json:"Status"`
-		Image  string   `json:"Image"`
+		Names  []string          `json:"Names"`
+		Status string            `json:"Status"`
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil
 	}
 	out := make([]ContainerSummary, 0, len(raw))
 	for _, c := range raw {
+		if !isOwnedDockerResource(c.Labels) {
+			continue
+		}
 		name := ""
 		if len(c.Names) > 0 {
 			name = strings.TrimPrefix(c.Names[0], "/")
@@ -2139,6 +2518,9 @@ type ContainerStats struct {
 
 // GetContainerStats retrieves the resource usage stats of a container.
 func (sm *ServiceManager) GetContainerStats(name string) (*ContainerStats, error) {
+	if err := sm.requireOwnedContainer(name); err != nil {
+		return nil, err
+	}
 	url := fmt.Sprintf("http://localhost/containers/%s/stats?stream=false", name)
 	resp, err := sm.dockerClient.Get(url)
 	if err != nil {

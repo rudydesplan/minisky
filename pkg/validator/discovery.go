@@ -195,13 +195,20 @@ var embeddedRules = []ServiceSchema{
 
 			// tabledata.insertAll — requires `rows`
 			{
-				HTTPMethod:  "POST",
-				PathGlob:    "/bigquery/v2/projects/*/datasets/*/tables/*/insertAll",
-				ContentType: "application/json",
+				HTTPMethod:   "POST",
+				PathGlob:     "/bigquery/v2/projects/*/datasets/*/tables/*/insertAll",
+				ContentType:  "application/json",
+				MaxBodyBytes: 10 << 20,
 				RequiredBody: []BodyField{
 					{Path: "rows", Type: "array",
-						Message: "field 'rows' is required for tabledata.insertAll"},
+						Message:  "field 'rows' is required for tabledata.insertAll",
+						MaxItems: 50_000},
 				},
+			},
+			{
+				HTTPMethod:   "POST",
+				PathGlob:     "/upload/bigquery/v2/projects/*/jobs",
+				MaxBodyBytes: 50 << 20,
 			},
 		},
 	},
@@ -349,6 +356,16 @@ var embeddedRules = []ServiceSchema{
 						Message: "field 'name' is required for buckets.insert"},
 				},
 			},
+			{
+				HTTPMethod:   "POST",
+				PathGlob:     "/upload/storage/v1/b/*/o",
+				MaxBodyBytes: 64 << 20,
+			},
+			{
+				HTTPMethod:   "PUT",
+				PathGlob:     "/upload/storage/v1/b/*/o",
+				MaxBodyBytes: 64 << 20,
+			},
 		},
 	},
 
@@ -375,6 +392,28 @@ var embeddedRules = []ServiceSchema{
 						Message: "field 'topic' is required for subscriptions.create"},
 				},
 			},
+			{
+				HTTPMethod:   "POST",
+				PathGlob:     "/v1/projects/*/topics/*:publish",
+				ContentType:  "application/json",
+				MaxBodyBytes: 10 << 20,
+				RequiredBody: []BodyField{{
+					Path: "messages", Type: "array",
+					Message:  "field 'messages' is required for topics.publish",
+					MaxItems: 1_000,
+				}},
+			},
+			{
+				HTTPMethod:   "POST",
+				PathGlob:     "/projects/*/topics/*:publish",
+				ContentType:  "application/json",
+				MaxBodyBytes: 10 << 20,
+				RequiredBody: []BodyField{{
+					Path: "messages", Type: "array",
+					Message:  "field 'messages' is required for topics.publish",
+					MaxItems: 1_000,
+				}},
+			},
 		},
 	},
 
@@ -398,7 +437,8 @@ var embeddedRules = []ServiceSchema{
 				ContentType: "application/json",
 				RequiredBody: []BodyField{
 					{Path: "payload.data", Type: "string",
-						Message: "field 'payload.data' is required for secretVersions.add"},
+						Message:         "field 'payload.data' is required for secretVersions.add",
+						MaxDecodedBytes: 64 << 10},
 				},
 			},
 		},
@@ -553,7 +593,8 @@ var embeddedRules = []ServiceSchema{
 				ContentType: "application/json",
 				RequiredBody: []BodyField{{
 					Path: "entries", Type: "array",
-					Message: "field 'entries' is required for entries.write",
+					Message:  "field 'entries' is required for entries.write",
+					MaxItems: 1_000,
 				}},
 			},
 			{
@@ -571,18 +612,20 @@ var embeddedRules = []ServiceSchema{
 		Domain: "aiplatform.googleapis.com",
 		Methods: []MethodSchema{
 			{
-				HTTPMethod:  "POST",
-				PathGlob:    "/v1/projects/*/locations/*/publishers/*/models/*:generateContent",
-				ContentType: "application/json",
+				HTTPMethod:   "POST",
+				PathGlob:     "/v1/projects/*/locations/*/publishers/*/models/*:generateContent",
+				ContentType:  "application/json",
+				MaxBodyBytes: 4 << 20,
 				RequiredBody: []BodyField{{
 					Path: "contents", Type: "array",
 					Message: "field 'contents' is required for models.generateContent",
 				}},
 			},
 			{
-				HTTPMethod:  "POST",
-				PathGlob:    "/v1/projects/*/locations/*/endpoints/*:predict",
-				ContentType: "application/json",
+				HTTPMethod:   "POST",
+				PathGlob:     "/v1/projects/*/locations/*/endpoints/*:predict",
+				ContentType:  "application/json",
+				MaxBodyBytes: 4 << 20,
 				RequiredBody: []BodyField{{
 					Path: "instances", Type: "array",
 					Message: "field 'instances' is required for endpoints.predict",

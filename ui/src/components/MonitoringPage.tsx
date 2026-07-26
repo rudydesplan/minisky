@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Box, Typography, Chip, IconButton, Tooltip, CircularProgress,
-  Paper, LinearProgress
+  Alert, Paper, LinearProgress
 } from '@mui/material';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
@@ -12,6 +12,7 @@ import MonitorHeartIcon from '@mui/icons-material/MonitorHeart';
 import CodeIcon from '@mui/icons-material/Code';
 import StorageIcon from '@mui/icons-material/Storage';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
+import { requireOk } from '../apiClient';
 
 type ContainerMetrics = {
   name: string;
@@ -54,7 +55,7 @@ function MiniSparkline({ points, color }: { points: number[]; color: string }) {
   }).join(' ');
 
   return (
-    <svg width={width} height={height} style={{ overflow: 'visible' }}>
+    <svg width={width} height={height} style={{ overflow: 'visible' }} role="img" aria-label="Recent metric trend">
       <polyline
         points={coords}
         fill="none"
@@ -103,28 +104,31 @@ export default function MonitoringPage() {
   const [history, setHistory] = useState<Record<string, HistoryPoint[]>>({});
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchMetrics = async () => {
     setLoading(true);
     try {
       const res = await fetch('/api/manage/monitoring/stats');
-      if (res.ok) {
-        const data: ContainerMetrics[] = await res.json();
-        setMetrics(data ?? []);
-        const now = new Date().toLocaleTimeString();
-        setHistory(prev => {
-          const next = { ...prev };
-          (data ?? []).forEach(m => {
-            const pts = prev[m.name] ?? [];
-            next[m.name] = [
-              ...pts,
-              { time: now, cpu: m.cpu, mem: m.memMB }
-            ].slice(-MAX_HISTORY);
-          });
-          return next;
+      await requireOk(res, 'Unable to load container metrics. Verify that Docker is available.');
+      const data: ContainerMetrics[] = await res.json();
+      setMetrics(data ?? []);
+      setError(null);
+      const now = new Date().toLocaleTimeString();
+      setHistory(prev => {
+        const next = { ...prev };
+        (data ?? []).forEach(m => {
+          const pts = prev[m.name] ?? [];
+          next[m.name] = [
+            ...pts,
+            { time: now, cpu: m.cpu, mem: m.memMB }
+          ].slice(-MAX_HISTORY);
         });
-      }
+        return next;
+      });
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Unable to load container metrics');
     } finally {
       setLoading(false);
     }
@@ -146,8 +150,13 @@ export default function MonitoringPage() {
     if (!window.confirm("Remove all exited containers and unused MiniSky images?")) return;
     setLoading(true);
     try {
-      await fetch('/api/manage/system/prune-containers', { method: 'POST' });
+      await requireOk(
+        await fetch('/api/manage/system/prune-containers', { method: 'POST' }),
+        'Container cleanup failed. Check Docker availability and retry.',
+      );
       fetchMetrics();
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Container cleanup failed');
     } finally {
       setLoading(false);
     }
@@ -178,10 +187,10 @@ export default function MonitoringPage() {
           </Box>
           <Box>
             <Typography variant="h6" sx={{ fontWeight: 700, fontSize: '1rem', color: '#e6edf3', lineHeight: 1 }}>
-              Cloud Monitoring
+              Container Metrics
             </Typography>
             <Typography variant="caption" sx={{ color: '#8b949e' }}>
-              Real-time CPU & Memory metrics for all MiniSky services
+              Docker runtime CPU and memory only — this is not Cloud Monitoring or PromQL
             </Typography>
           </Box>
         </Box>
@@ -200,25 +209,29 @@ export default function MonitoringPage() {
           )}
         </Box>
 
-        <Tooltip title={streaming ? 'Stop auto-refresh' : 'Auto-refresh (5s)'}>
+        <Tooltip title={streaming ? 'Stop auto-refresh' : 'Auto-refresh (1s)'}>
           <IconButton size="small" onClick={streaming ? stopStream : startStream}
+            aria-label={streaming ? 'Stop automatic metrics refresh' : 'Start automatic metrics refresh'}
             sx={{ color: streaming ? '#f28b82' : '#81c995', border: '1px solid', borderColor: 'currentColor' }}>
             {streaming ? <StopIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
           </IconButton>
         </Tooltip>
         <Tooltip title="Prune exited containers & unused images">
           <IconButton size="small" onClick={handlePrune} disabled={loading}
+            aria-label="Prune exited containers and unused images"
             sx={{ color: '#f28b82', border: '1px solid', borderColor: '#f28b8240' }}>
             <DeleteSweepIcon fontSize="small" />
           </IconButton>
         </Tooltip>
         <Tooltip title="Refresh now">
           <IconButton size="small" onClick={fetchMetrics} disabled={loading}
+            aria-label="Refresh container metrics"
             sx={{ color: '#8b949e' }}>
             {loading ? <CircularProgress size={16} sx={{ color: '#8b949e' }} /> : <RefreshIcon fontSize="small" />}
           </IconButton>
         </Tooltip>
       </Box>
+      {error && <Alert severity="error" role="alert" sx={{ m: 2 }}>{error}</Alert>}
 
       {/* Content */}
       {metrics.length === 0 ? (

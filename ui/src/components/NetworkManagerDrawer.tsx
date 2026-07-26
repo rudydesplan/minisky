@@ -11,10 +11,13 @@ import AddIcon from '@mui/icons-material/Add';
 import DnsIcon from '@mui/icons-material/Dns';
 import HubIcon from '@mui/icons-material/Hub';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
+import { customNetworkPayload, subnetworkPayload } from '../networkContracts';
 
 type NetworkManagerDrawerProps = { open: boolean; onClose: () => void };
 
 type VpcNetwork = { name: string; id: string; autoCreateSubnetworks: boolean; creationTimestamp: string };
+type Subnetwork = { name: string; ipCidrRange: string; network: string; region: string };
 type ManagedZone = { name: string; dnsName: string; visibility: string; creationTime: string; nameServers: string[] };
 type RRSet = { name: string; type: string; ttl: number; rrdatas: string[] };
 
@@ -28,7 +31,11 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
   // ── VPC state ──────────────────────────────────────────────────────────────
   const [networks, setNetworks] = useState<VpcNetwork[]>([]);
   const [newNetName, setNewNetName] = useState('');
-  const [autoSubnet, setAutoSubnet] = useState(true);
+  const [subnetworks, setSubnetworks] = useState<Subnetwork[]>([]);
+  const [newSubnetName, setNewSubnetName] = useState('');
+  const [newSubnetCIDR, setNewSubnetCIDR] = useState('10.10.0.0/24');
+  const [newSubnetNetwork, setNewSubnetNetwork] = useState('');
+  const region = 'us-central1';
 
   // ── DNS state ──────────────────────────────────────────────────────────────
   const [zones, setZones] = useState<ManagedZone[]>([]);
@@ -45,11 +52,19 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
   const loadNetworks = useCallback(async () => {
     try {
       const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks`);
-      if (res.ok) {
-        const data = await res.json();
-        setNetworks(data.items || []);
-      }
-    } catch (e) { console.error(e); }
+      await requireOk(res, 'Unable to load VPC networks.');
+      const data = await res.json();
+      setNetworks(data.items || []);
+    } catch (e) { showToast(safeRequestError(e, 'Unable to load VPC networks. Check the local service and retry.'), 'error'); }
+  }, [activeProject]);
+
+  const loadSubnetworks = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/manage/network/projects/${activeProject}/regions/${region}/subnetworks`);
+      await requireOk(res, 'Unable to load subnetworks.');
+      const data = await res.json();
+      setSubnetworks(data.items || []);
+    } catch (e) { showToast(safeRequestError(e, 'Unable to load subnetworks. Check the local service and retry.'), 'error'); }
   }, [activeProject]);
 
   const loadZones = useCallback(async () => {
@@ -73,8 +88,8 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
   }, [activeProject]);
 
   useEffect(() => {
-    if (open) { loadNetworks(); loadZones(); }
-  }, [open, loadNetworks, loadZones]);
+    if (open) { loadNetworks(); loadSubnetworks(); loadZones(); }
+  }, [open, loadNetworks, loadSubnetworks, loadZones]);
 
   useEffect(() => {
     if (selectedZone) loadRRSets(selectedZone.name);
@@ -83,65 +98,92 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
   // ── VPC actions ────────────────────────────────────────────────────────────
   const handleCreateNetwork = async () => {
     if (!newNetName.trim()) return;
-    const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newNetName.trim(), autoCreateSubnetworks: autoSubnet }),
-    });
-    if (res.ok) { showToast(`VPC "${newNetName}" created`); setNewNetName(''); loadNetworks(); }
-    else showToast('Failed to create VPC', 'error');
+    try {
+      const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(customNetworkPayload(newNetName)),
+      });
+      await requireOk(res, 'Failed to create VPC. Custom-mode networks are required.');
+      showToast(`VPC "${newNetName}" created`);
+      setNewNetName('');
+      loadNetworks();
+    } catch (e) { showToast(safeRequestError(e, 'Unable to connect while creating the VPC.'), 'error'); }
   };
 
   const handleDeleteNetwork = async (name: string) => {
-    const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks/${name}`, { method: 'DELETE' });
-    if (res.ok || res.status === 200) { showToast(`VPC "${name}" deleted`); loadNetworks(); }
-    else showToast('Failed to delete VPC', 'error');
+    try {
+      const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks/${name}`, { method: 'DELETE' });
+      await requireOk(res, 'Failed to delete VPC. Remove attached subnetworks and instances first.');
+      showToast(`VPC "${name}" deleted`);
+      loadNetworks();
+    } catch (e) { showToast(safeRequestError(e, 'Unable to connect while deleting the VPC.'), 'error'); }
+  };
+
+  const handleCreateSubnetwork = async () => {
+    if (!newSubnetName.trim() || !newSubnetNetwork || !newSubnetCIDR.trim()) return;
+    try {
+      const res = await fetch(`/api/manage/network/projects/${activeProject}/regions/${region}/subnetworks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subnetworkPayload(activeProject, newSubnetNetwork, newSubnetName, newSubnetCIDR)),
+      });
+      await requireOk(res, 'Failed to create subnetwork. Check the CIDR and selected VPC.');
+      showToast(`Subnetwork "${newSubnetName}" created`);
+      setNewSubnetName('');
+      loadSubnetworks();
+    } catch (e) { showToast(safeRequestError(e, 'Unable to connect while creating the subnetwork.'), 'error'); }
   };
 
   // ── DNS Zone actions ───────────────────────────────────────────────────────
   const handleCreateZone = async () => {
     if (!newZoneName.trim() || !newDnsName.trim()) return;
-    const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newZoneName, dnsName: newDnsName, visibility: 'public' }),
-    });
-    if (res.ok) { showToast(`Zone "${newZoneName}" created`); setNewZoneName(''); setNewDnsName(''); loadZones(); }
-    else showToast('Failed to create zone', 'error');
+    try {
+      const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newZoneName, dnsName: newDnsName, visibility: 'public' }),
+      });
+      await requireOk(res, 'Failed to create zone. Check the zone and DNS names.');
+      showToast(`Zone "${newZoneName}" created`); setNewZoneName(''); setNewDnsName(''); loadZones();
+    } catch (e) { showToast(safeRequestError(e, 'DNS zone creation failed. Check the local service and retry.'), 'error'); }
   };
 
   const handleDeleteZone = async (name: string) => {
-    const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${name}`, { method: 'DELETE' });
-    if (res.status === 204 || res.ok) { showToast(`Zone "${name}" deleted`); setSelectedZone(null); loadZones(); }
-    else { const e = await res.json(); showToast(e?.error?.message || 'Delete failed', 'error'); }
+    try {
+      const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${name}`, { method: 'DELETE' });
+      await requireOk(res, 'Failed to delete zone. Remove custom records and retry.');
+      showToast(`Zone "${name}" deleted`); setSelectedZone(null); loadZones();
+    } catch (e) { showToast(safeRequestError(e, 'DNS zone deletion failed. Check the local service and retry.'), 'error'); }
   };
 
   // ── RRSet actions ──────────────────────────────────────────────────────────
   const handleAddRecord = async () => {
     if (!selectedZone || !newRRName || !newRRData) return;
-    const res = await fetch(
-      `/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets`,
-      {
+    try {
+      const res = await fetch(
+        `/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets`,
+        {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newRRName, type: newRRType, ttl: parseInt(newRRTtl), rrdatas: [newRRData] }),
-      }
-    );
-    if (res.ok) {
+        },
+      );
+      await requireOk(res, 'Failed to add DNS record. Check the record values.');
       showToast(`${newRRType} record added`);
       setNewRRName(''); setNewRRData('');
       loadRRSets(selectedZone.name);
-    } else {
-      const e = await res.json();
-      showToast(e?.error?.message || 'Failed to add record', 'error');
-    }
+    } catch (e) { showToast(safeRequestError(e, 'DNS record creation failed. Check the local service and retry.'), 'error'); }
   };
 
   const handleDeleteRecord = async (name: string, type: string) => {
     if (!selectedZone) return;
-    await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets/${encodeURIComponent(name)}/${type}`, { method: 'DELETE' });
-    showToast(`${type} record deleted`);
-    loadRRSets(selectedZone.name);
+    try {
+      const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets/${encodeURIComponent(name)}/${type}`, { method: 'DELETE' });
+      await requireOk(res, 'Failed to delete DNS record.');
+      showToast(`${type} record deleted`);
+      loadRRSets(selectedZone.name);
+    } catch (e) { showToast(safeRequestError(e, 'DNS record deletion failed. Check the local service and retry.'), 'error'); }
   };
 
   const recordTypeColor = (t: string): 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' | 'default' => {
@@ -161,7 +203,7 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
               <HubIcon sx={{ color: '#1a73e8' }} />
               <Typography variant="h5" sx={{ fontWeight: 500 }}>Network Manager</Typography>
             </Box>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close Network Manager" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
           <Chip label={activeProject} size="small" sx={{ mb: 2, backgroundColor: '#e8f0fe', color: '#1a73e8', fontWeight: 600 }} />
 
@@ -180,17 +222,19 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
                   onChange={e => setNewNetName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
                   sx={{ flex: 1 }}
                 />
-                <FormControl size="small" sx={{ minWidth: 160 }}>
-                  <InputLabel>Subnets</InputLabel>
-                  <Select value={autoSubnet ? 'auto' : 'custom'} label="Subnets" onChange={e => setAutoSubnet(e.target.value === 'auto')}>
-                    <MenuItem value="auto">Auto-create subnets</MenuItem>
-                    <MenuItem value="custom">Custom subnets</MenuItem>
+                <FormControl size="small" sx={{ minWidth: 190 }}>
+                  <InputLabel>Subnet mode</InputLabel>
+                  <Select value="custom" label="Subnet mode" disabled>
+                    <MenuItem value="custom">Custom (supported)</MenuItem>
                   </Select>
                 </FormControl>
                 <Button variant="contained" startIcon={<AddIcon />} onClick={handleCreateNetwork} disabled={!newNetName.trim()}>
                   Create VPC
                 </Button>
               </Box>
+              <Alert severity="info" sx={{ mb: 3 }}>
+                Auto-mode VPC creation is not supported. MiniSky creates custom-mode VPCs; add a bounded regional subnetwork below.
+              </Alert>
 
               <Table size="small">
                 <TableHead>
@@ -211,8 +255,38 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
                       <TableCell><Chip size="small" label={n.autoCreateSubnetworks ? 'Auto' : 'Custom'} variant="outlined" /></TableCell>
                       <TableCell sx={{ color: '#80868b', fontSize: '0.8rem' }}>{new Date(n.creationTimestamp).toLocaleDateString()}</TableCell>
                       <TableCell align="right">
-                        <IconButton size="small" color="error" onClick={() => handleDeleteNetwork(n.name)}><DeleteIcon fontSize="small" /></IconButton>
+                        <IconButton aria-label={`Delete VPC ${n.name}`} size="small" color="error" onClick={() => handleDeleteNetwork(n.name)}><DeleteIcon fontSize="small" /></IconButton>
                       </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+
+              <Typography variant="h6" component="h3" sx={{ mt: 4, mb: 2 }}>Subnetworks ({region})</Typography>
+              <Box sx={{ display: 'flex', gap: 1.5, mb: 2, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                <TextField size="small" label="Subnetwork name" value={newSubnetName}
+                  onChange={e => setNewSubnetName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} />
+                <TextField size="small" label="Primary IPv4 CIDR" value={newSubnetCIDR}
+                  onChange={e => setNewSubnetCIDR(e.target.value)} />
+                <FormControl size="small" sx={{ minWidth: 180 }}>
+                  <InputLabel>VPC network</InputLabel>
+                  <Select value={newSubnetNetwork} label="VPC network" inputProps={{ 'aria-label': 'VPC network' }} onChange={e => setNewSubnetNetwork(e.target.value)}>
+                    {networks.filter(network => !network.autoCreateSubnetworks).map(network => (
+                      <MenuItem key={network.name} value={network.name}>{network.name}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+                <Button variant="outlined" onClick={handleCreateSubnetwork}
+                  disabled={!newSubnetName || !newSubnetCIDR || !newSubnetNetwork}>Create subnetwork</Button>
+              </Box>
+              <Table size="small" aria-label="Subnetworks">
+                <TableHead><TableRow><TableCell>Name</TableCell><TableCell>CIDR</TableCell><TableCell>VPC</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {subnetworks.map(subnetwork => (
+                    <TableRow key={`${subnetwork.region}/${subnetwork.name}`}>
+                      <TableCell>{subnetwork.name}</TableCell>
+                      <TableCell sx={{ fontFamily: 'monospace' }}>{subnetwork.ipCidrRange}</TableCell>
+                      <TableCell>{subnetwork.network.split('/').pop()}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -267,7 +341,7 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
                           </TableCell>
                           <TableCell align="right">
                             {rr.type !== 'SOA' && rr.type !== 'NS' && (
-                              <IconButton size="small" color="error" onClick={() => handleDeleteRecord(rr.name, rr.type)}><DeleteIcon fontSize="small" /></IconButton>
+                              <IconButton aria-label={`Delete ${rr.type} record ${rr.name}`} size="small" color="error" onClick={() => handleDeleteRecord(rr.name, rr.type)}><DeleteIcon fontSize="small" /></IconButton>
                             )}
                           </TableCell>
                         </TableRow>
@@ -307,7 +381,7 @@ export default function NetworkManagerDrawer({ open, onClose }: NetworkManagerDr
                           <TableCell><Chip size="small" label={z.visibility} color={z.visibility === 'public' ? 'success' : 'default'} variant="outlined" /></TableCell>
                           <TableCell sx={{ color: '#80868b', fontSize: '0.75rem' }}>{z.nameServers?.[0]}</TableCell>
                           <TableCell align="right">
-                            <IconButton size="small" color="error" onClick={e => { e.stopPropagation(); handleDeleteZone(z.name); }}><DeleteIcon fontSize="small" /></IconButton>
+                            <IconButton aria-label={`Delete DNS zone ${z.name}`} size="small" color="error" onClick={e => { e.stopPropagation(); handleDeleteZone(z.name); }}><DeleteIcon fontSize="small" /></IconButton>
                           </TableCell>
                         </TableRow>
                       ))}

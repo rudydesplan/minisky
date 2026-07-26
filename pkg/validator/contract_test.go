@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -127,7 +128,23 @@ func TestValidateRequestRejectsBoundedSubnetworkBodyBeforeAllocation(t *testing.
 	}
 }
 
-func TestValidateRequestPreservesUnboundedRuleBehavior(t *testing.T) {
+func TestEveryJSONMutationRuleHasBodyLimit(t *testing.T) {
+	t.Parallel()
+
+	validator := NewValidator()
+	for _, service := range embeddedRules {
+		for _, rule := range service.Methods {
+			if rule.ContentType != "application/json" || !isMutationMethod(rule.HTTPMethod) {
+				continue
+			}
+			if got := validator.RequestBodyLimit(service.Domain, rule.HTTPMethod, rule.PathGlob); got <= 0 {
+				t.Errorf("%s %s %s body limit = %d, want nonzero", service.Domain, rule.HTTPMethod, rule.PathGlob, got)
+			}
+		}
+	}
+}
+
+func TestValidateRequestAppliesInheritedBodyLimit(t *testing.T) {
 	body := `{"name":"network","description":"` + strings.Repeat("x", (1<<20)+1) + `"}`
 	req := httptest.NewRequest(
 		http.MethodPost,
@@ -136,14 +153,102 @@ func TestValidateRequestPreservesUnboundedRuleBehavior(t *testing.T) {
 	)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	if ok := NewValidator().ValidateRequestForDomain(rec, req, "compute.googleapis.com"); !ok {
-		t.Fatalf("unbounded network rule rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	if ok := NewValidator().ValidateRequestForDomain(rec, req, "compute.googleapis.com"); ok {
+		t.Fatal("oversized request passed inherited body limit")
 	}
-	restored, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatal(err)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
 	}
-	if string(restored) != body {
-		t.Fatal("unbounded request body was not preserved")
+}
+
+func TestValidateRequestBoundsDecodedBase64Field(t *testing.T) {
+	t.Parallel()
+
+	payload := base64.StdEncoding.EncodeToString(bytesOfSize((64 << 10) + 1))
+	body := `{"payload":{"data":"` + payload + `"}}`
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"http://secretmanager.googleapis.com/v1/projects/demo/secrets/test:addVersion",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	if ok := NewValidator().ValidateRequestForDomain(rec, req, "secretmanager.googleapis.com"); ok {
+		t.Fatal("oversized decoded payload passed validation")
+	}
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "decoded") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestValidateRequestBoundsCollectionItems(t *testing.T) {
+	t.Parallel()
+
+	entries := strings.Repeat(`{"logName":"projects/demo/logs/app"},`, 1_001)
+	body := `{"entries":[` + strings.TrimSuffix(entries, ",") + `]}`
+	req := httptest.NewRequest(http.MethodPost, "http://logging.googleapis.com/v2/entries:write", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	if ok := NewValidator().ValidateRequestForDomain(rec, req, "logging.googleapis.com"); ok {
+		t.Fatal("oversized collection passed validation")
+	}
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "at most 1000") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRequestBodyLimitRouteOverrides(t *testing.T) {
+	t.Parallel()
+
+	validator := NewValidator()
+	for _, test := range []struct {
+		name, domain, method, path string
+		want                       int64
+	}{
+		{
+			name: "inherited JSON mutation", domain: "compute.googleapis.com", method: http.MethodPost,
+			path: "/compute/v1/projects/demo/global/networks", want: DefaultMaxBodyBytes,
+		},
+		{
+			name: "BigQuery streaming insert", domain: "bigquery.googleapis.com", method: http.MethodPost,
+			path: "/bigquery/v2/projects/demo/datasets/data/tables/events/insertAll", want: 10 << 20,
+		},
+		{
+			name: "BigQuery media upload", domain: "bigquery.googleapis.com", method: http.MethodPost,
+			path: "/upload/bigquery/v2/projects/demo/jobs", want: 50 << 20,
+		},
+		{
+			name: "PubSub publish", domain: "pubsub.googleapis.com", method: http.MethodPost,
+			path: "/v1/projects/demo/topics/events:publish", want: 10 << 20,
+		},
+		{
+			name: "Storage resumable chunk", domain: "storage.googleapis.com", method: http.MethodPut,
+			path: "/upload/storage/v1/b/photos/o", want: 64 << 20,
+		},
+		{
+			name: "unmatched gateway fallback", domain: "custom.googleapis.com", method: http.MethodPost,
+			path: "/v1/upload", want: DefaultMaxBodyBytes,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validator.RequestBodyLimit(test.domain, test.method, test.path); got != test.want {
+				t.Fatalf("limit=%d want=%d", got, test.want)
+			}
+		})
+	}
+}
+
+func bytesOfSize(size int) []byte {
+	return []byte(strings.Repeat("x", size))
+}
+
+func isMutationMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
 	}
 }

@@ -1,6 +1,7 @@
 package cloudkms
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -8,6 +9,11 @@ import (
 )
 
 const cloudKMSStateEntry = "cloudkms/metadata"
+
+type kmsStateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
 
 type cloudKMSMetadata struct {
 	Locations map[string]map[string]persistedKeyRing `json:"locations"`
@@ -38,6 +44,10 @@ type persistedCryptoKeyVersion struct {
 }
 
 func NewAPIWithStore(store *state.Store) (*API, error) {
+	return newAPIWithStore(store)
+}
+
+func newAPIWithStore(store kmsStateStore) (*API, error) {
 	api := newAPI(store)
 	if store == nil {
 		return api, nil
@@ -80,7 +90,13 @@ func (api *API) persistMetadata() error {
 	api.persistMu.Lock()
 	defer api.persistMu.Unlock()
 
+	snapshot := api.snapshotMetadata()
+	return api.saveMetadata(snapshot)
+}
+
+func (api *API) snapshotMetadata() cloudKMSMetadata {
 	api.mu.RLock()
+	defer api.mu.RUnlock()
 	snapshot := cloudKMSMetadata{Locations: make(map[string]map[string]persistedKeyRing, len(api.store))}
 	for location, rings := range api.store {
 		snapshot.Locations[location] = make(map[string]persistedKeyRing, len(rings))
@@ -89,17 +105,7 @@ func (api *API) persistMetadata() error {
 			savedRing := persistedKeyRing{Name: ring.Name, CreateTime: ring.CreateTime, Keys: make(map[string]persistedCryptoKey, len(ring.keys))}
 			for keyID, key := range ring.keys {
 				key.mu.Lock()
-				savedKey := persistedCryptoKey{
-					Name: key.Name, Purpose: key.Purpose, CreateTime: key.CreateTime,
-					VersionTemplate: key.VersionTemplate, Labels: key.Labels,
-				}
-				for _, version := range key.versions {
-					savedKey.Versions = append(savedKey.Versions, persistedCryptoKeyVersion{
-						Name: version.Name, State: version.State, CreateTime: version.CreateTime,
-						DestroyTime: version.DestroyTime, Algorithm: version.Algorithm,
-						AESKey: append([]byte(nil), version.aesKey...),
-					})
-				}
+				savedKey := persistedCryptoKeyFromKeyLocked(key)
 				key.mu.Unlock()
 				savedRing.Keys[keyID] = savedKey
 			}
@@ -107,6 +113,97 @@ func (api *API) persistMetadata() error {
 			snapshot.Locations[location][ringID] = savedRing
 		}
 	}
-	api.mu.RUnlock()
+	return snapshot
+}
+
+func (api *API) saveMetadata(snapshot cloudKMSMetadata) error {
+	if api.stateStore == nil {
+		return nil
+	}
 	return api.stateStore.Save(cloudKMSStateEntry, snapshot)
+}
+
+func (api *API) saveMetadataTransaction(previous, next cloudKMSMetadata) error {
+	if api.stateStore == nil {
+		return nil
+	}
+	saveErr := api.stateStore.Save(cloudKMSStateEntry, next)
+	if saveErr == nil {
+		return nil
+	}
+	var durable cloudKMSMetadata
+	loadErr := api.stateStore.Load(cloudKMSStateEntry, &durable)
+	switch {
+	case loadErr == nil && kmsMetadataEqual(durable, next):
+		return nil
+	case loadErr == nil && kmsMetadataEqual(durable, previous):
+		return saveErr
+	case errors.Is(loadErr, state.ErrNotFound) && len(previous.Locations) == 0:
+		return saveErr
+	default:
+		ambiguous := fmt.Errorf("Cloud KMS save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
+		api.markPersistenceDegraded(ambiguous)
+		return ambiguous
+	}
+}
+
+func cloneKMSMetadata(metadata cloudKMSMetadata) cloudKMSMetadata {
+	payload, _ := json.Marshal(metadata)
+	var clone cloudKMSMetadata
+	_ = json.Unmarshal(payload, &clone)
+	if clone.Locations == nil {
+		clone.Locations = make(map[string]map[string]persistedKeyRing)
+	}
+	return clone
+}
+
+func kmsMetadataEqual(left, right cloudKMSMetadata) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func persistedCryptoKeyFromKeyLocked(key *CryptoKey) persistedCryptoKey {
+	saved := persistedCryptoKey{
+		Name: key.Name, Purpose: key.Purpose, CreateTime: key.CreateTime,
+		VersionTemplate: cloneAnyMap(key.VersionTemplate), Labels: cloneStringMap(key.Labels),
+	}
+	for _, version := range key.versions {
+		saved.Versions = append(saved.Versions, persistedCryptoKeyVersion{
+			Name: version.Name, State: version.State, CreateTime: version.CreateTime,
+			DestroyTime: version.DestroyTime, Algorithm: version.Algorithm,
+			AESKey: append([]byte(nil), version.aesKey...),
+		})
+	}
+	return saved
+}
+
+func persistedVersion(version *CryptoKeyVersion) persistedCryptoKeyVersion {
+	return persistedCryptoKeyVersion{
+		Name: version.Name, State: version.State, CreateTime: version.CreateTime,
+		DestroyTime: version.DestroyTime, Algorithm: version.Algorithm,
+		AESKey: append([]byte(nil), version.aesKey...),
+	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]any, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }

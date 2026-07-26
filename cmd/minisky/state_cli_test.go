@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"minisky/pkg/state"
@@ -84,5 +86,31 @@ func TestStateImportInvalidSnapshotPreservesProfile(t *testing.T) {
 	}
 	if !got["present"] {
 		t.Fatalf("active profile changed: %#v", got)
+	}
+}
+
+func TestStateImportRejectsActiveDaemonProfile(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.New(root, "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownership.Close()
+
+	command := newStateCommand(root)
+	command.SetArgs([]string{"import", "-", "--profile", "active"})
+	command.SetIn(bytes.NewBufferString(`{"format":"minisky-state","version":1,"entries":{}}`))
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	err = command.Execute()
+	if !errors.Is(err, state.ErrProfileInUse) {
+		t.Fatalf("state import error = %v, want ErrProfileInUse", err)
+	}
+	if !strings.Contains(err.Error(), "state profile is in use: active") {
+		t.Fatalf("state import error = %q, want profile context", err)
 	}
 }

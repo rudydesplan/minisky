@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"minisky/pkg/state"
@@ -77,6 +78,43 @@ func TestIAMMissingStateIsEmptyAndCorruptStateIsReported(t *testing.T) {
 	}
 	if persisted != "corrupt" {
 		t.Fatalf("corrupt state was overwritten with %q", persisted)
+	}
+}
+
+func TestIAMProductionConstructorFailsClosedOnCorruptState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "iam-corrupt")
+	store, err := state.New(root, "iam-corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(iamStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/projects/demo/serviceAccounts", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if api.PersistenceError() == nil {
+		t.Fatal("corrupt IAM state was not exposed as degradation")
+	}
+}
+
+func TestIAMDegradedResponseRedactsPersistenceCause(t *testing.T) {
+	const sensitive = "/private/iam/state.json: secret-token-123"
+	api := newAPI(nil)
+	api.persistenceErr = errors.New(sensitive)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/projects/demo/serviceAccounts", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(body, `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(body, `"message":"IAM persistence is unavailable"`) ||
+		strings.Contains(body, sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
 	}
 }
 

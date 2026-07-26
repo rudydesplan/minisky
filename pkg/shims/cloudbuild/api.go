@@ -2,6 +2,9 @@ package cloudbuild
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,23 +14,68 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 )
 
 func init() {
 	registry.Register("cloudbuild.googleapis.com", func(ctx *registry.Context) http.Handler {
-		return &API{
-			svcMgr: ctx.SvcMgr,
-			opMgr:  ctx.OpMgr,
-		}
+		return newAPI(ctx.SvcMgr, ctx.OpMgr)
 	})
 }
 
 type API struct {
-	mu     sync.Mutex
-	svcMgr *orchestrator.ServiceManager
-	opMgr  *orchestrator.OperationManager
+	mu       sync.Mutex
+	svcMgr   *orchestrator.ServiceManager
+	opMgr    *orchestrator.OperationManager
+	buildIDs map[string]struct{}
+	randomID func([]byte) (int, error)
+	runAsync func(string, func() error)
+}
+
+func newAPI(svcMgr *orchestrator.ServiceManager, opMgr *orchestrator.OperationManager) *API {
+	api := &API{
+		svcMgr:   svcMgr,
+		opMgr:    opMgr,
+		buildIDs: make(map[string]struct{}),
+		randomID: rand.Read,
+	}
+	if opMgr != nil {
+		api.runAsync = opMgr.RunAsync
+		for _, operation := range opMgr.List() {
+			if operation.Kind != "cloudbuild#operation" {
+				continue
+			}
+			if index := strings.LastIndex(operation.TargetLink, "/builds/"); index >= 0 {
+				api.buildIDs[operation.TargetLink[index+len("/builds/"):]] = struct{}{}
+			}
+		}
+	}
+	return api
+}
+
+func (api *API) allocateBuildID(prefix string) (string, error) {
+	const attempts = 16
+	for range attempts {
+		random := make([]byte, 16)
+		n, err := api.randomID(random)
+		if err != nil {
+			return "", fmt.Errorf("generate build ID: %w", err)
+		}
+		if n != len(random) {
+			return "", fmt.Errorf("generate build ID: short random read")
+		}
+		candidate := prefix + hex.EncodeToString(random)
+		api.mu.Lock()
+		if _, exists := api.buildIDs[candidate]; !exists {
+			api.buildIDs[candidate] = struct{}{}
+			api.mu.Unlock()
+			return candidate, nil
+		}
+		api.mu.Unlock()
+	}
+	return "", fmt.Errorf("generate unique build ID after %d attempts", attempts)
 }
 
 type Build struct {
@@ -152,7 +200,12 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 		return
 	}
 
-	build.Id = fmt.Sprintf("build-%d", time.Now().UnixNano())
+	buildID, err := api.allocateBuildID("build-")
+	if err != nil {
+		http.Error(w, "failed to allocate build identity", http.StatusInternalServerError)
+		return
+	}
+	build.Id = buildID
 	build.ProjectId = project
 	build.Status = "QUEUED"
 	build.CreateTime = time.Now().UTC().Format(time.RFC3339)
@@ -165,10 +218,7 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 	api.opMgr.UpdateMetadata(op.Name, build)
 	api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Build %s queued with %d steps", build.Id, len(build.Steps)))
 
-	api.opMgr.RunAsync(op.Name, func() error {
-		api.executeBuild(project, build, op.Name)
-		return nil
-	})
+	api.runAsync(op.Name, func() error { return api.executeBuild(project, build, op.Name) })
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(op)
@@ -196,13 +246,27 @@ func (api *API) handleListBuilds(w http.ResponseWriter, r *http.Request, project
 	json.NewEncoder(w).Encode(map[string]interface{}{"builds": builds})
 }
 
-func (api *API) executeBuild(project string, build Build, opName string) {
+func (api *API) executeBuild(project string, build Build, opName string) error {
 	build.Status = "WORKING"
 	build.StartTime = time.Now().UTC().Format(time.RFC3339)
 	api.opMgr.UpdateMetadata(opName, build)
 
 	// Workspace volume for sharing code between steps
-	workspaceVol := fmt.Sprintf("minisky-build-workspace-%s", build.Id)
+	resourceID := fmt.Sprintf("projects/%s/builds/%s", project, build.Id)
+	identity := cloudBuildDockerIdentity(resourceID)
+	workspaceVol := identity + "-workspace"
+	ctx := context.Background()
+	if err := api.svcMgr.EnsureBuildWorkspace(ctx, workspaceVol, resourceID); err != nil {
+		build.Status = "FAILURE"
+		build.FinishTime = time.Now().UTC().Format(time.RFC3339)
+		api.opMgr.UpdateMetadata(opName, build)
+		return fmt.Errorf("prepare build workspace: %w", err)
+	}
+	defer func() {
+		if err := api.svcMgr.RemoveBuildWorkspace(context.Background(), workspaceVol, resourceID); err != nil {
+			log.Printf("[Shim: Cloud Build] cleanup workspace %s: %v", workspaceVol, err)
+		}
+	}()
 
 	failed := false
 
@@ -219,15 +283,19 @@ func (api *API) executeBuild(project string, build Build, opName string) {
 
 		api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Cloning %s (branch: %s)...", repo, branch))
 
-		cloneContainer := fmt.Sprintf("minisky-build-clone-%s", build.Id)
+		cloneContainer := identity + "-clone"
 		// We use a helper container to clone into a volume
-		err := api.svcMgr.ProvisionBuildStep(context.Background(), cloneContainer, "alpine/git:latest", []string{workspaceVol + ":/workspace"}, []string{}, []string{"clone", "-b", branch, repo, "/workspace"})
+		err := api.svcMgr.ProvisionBuildStep(ctx, cloneContainer, resourceID, "alpine/git:latest", []string{workspaceVol + ":/workspace"}, []string{}, []string{"clone", "-b", branch, repo, "/workspace"})
 		if err != nil {
 			api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone failed: %v", err))
 			failed = true
 		} else {
+			defer api.cleanupBuildContainer(cloneContainer, resourceID)
 			time.Sleep(3 * time.Second)
-			api.svcMgr.StopAndRemoveContainer(cloneContainer)
+			if err := api.svcMgr.StopAndRemoveBuildContainer(ctx, cloneContainer, resourceID); err != nil {
+				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone cleanup failed: %v", err))
+				failed = true
+			}
 		}
 	}
 
@@ -247,30 +315,48 @@ func (api *API) executeBuild(project string, build Build, opName string) {
 				}
 			}
 
-			containerName := fmt.Sprintf("minisky-build-step-%s-%d", build.Id, i)
+			containerName := fmt.Sprintf("%s-step-%d", identity, i)
 			// Mount the workspace volume to all steps
-			err := api.svcMgr.ProvisionBuildStep(context.Background(), containerName, img, []string{workspaceVol + ":/workspace"}, step.Env, step.Args)
+			err := api.svcMgr.ProvisionBuildStep(ctx, containerName, resourceID, img, []string{workspaceVol + ":/workspace"}, step.Env, step.Args)
 			if err != nil {
 				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d failed: %v", i, err))
 				failed = true
 				break
 			}
+			defer api.cleanupBuildContainer(containerName, resourceID)
 
 			time.Sleep(3 * time.Second) // Simulate build time
 			api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Step #%d finished successfully", i))
-			api.svcMgr.StopAndRemoveContainer(containerName)
+			if err := api.svcMgr.StopAndRemoveBuildContainer(ctx, containerName, resourceID); err != nil {
+				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d cleanup failed: %v", i, err))
+				failed = true
+				break
+			}
 		}
 	}
 
 	build.FinishTime = time.Now().UTC().Format(time.RFC3339)
 	if failed {
 		build.Status = "FAILURE"
-		api.opMgr.Fail(opName, 500, "Build failed")
+		api.opMgr.UpdateMetadata(opName, build)
+		return fmt.Errorf("build failed")
 	} else {
 		build.Status = "SUCCESS"
 		api.pushLog(project, "INFO", build.Id, "Build SUCCESS")
 	}
 	api.opMgr.UpdateMetadata(opName, build)
+	return nil
+}
+
+func cloudBuildDockerIdentity(resourceID string) string {
+	sum := sha256.Sum256([]byte(config.GetProfile() + "\x00" + resourceID))
+	return fmt.Sprintf("minisky-build-%x", sum[:10])
+}
+
+func (api *API) cleanupBuildContainer(name, resourceID string) {
+	if err := api.svcMgr.StopAndRemoveBuildContainer(context.Background(), name, resourceID); err != nil {
+		log.Printf("[Shim: Cloud Build] cleanup container %s: %v", name, err)
+	}
 }
 
 func (api *API) handleCreateTrigger(w http.ResponseWriter, r *http.Request, project string) {
@@ -285,8 +371,13 @@ func (api *API) handleCreateTrigger(w http.ResponseWriter, r *http.Request, proj
 func (api *API) handleRunTrigger(w http.ResponseWriter, r *http.Request, project, triggerId string) {
 	// In a real implementation, we'd look up the trigger by ID.
 	// For the emulator, we just simulate starting a build from "GitHub"
+	buildID, err := api.allocateBuildID("build-trigger-")
+	if err != nil {
+		http.Error(w, "failed to allocate build identity", http.StatusInternalServerError)
+		return
+	}
 	build := Build{
-		Id:         fmt.Sprintf("build-trigger-%d", time.Now().Unix()),
+		Id:         buildID,
 		ProjectId:  project,
 		Status:     "QUEUED",
 		CreateTime: time.Now().UTC().Format(time.RFC3339),
@@ -307,7 +398,7 @@ func (api *API) handleRunTrigger(w http.ResponseWriter, r *http.Request, project
 		return
 	}
 	api.opMgr.UpdateMetadata(op.Name, build)
-	go api.executeBuild(project, build, op.Name)
+	api.runAsync(op.Name, func() error { return api.executeBuild(project, build, op.Name) })
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(op)

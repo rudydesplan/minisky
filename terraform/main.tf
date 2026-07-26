@@ -117,6 +117,27 @@ resource "google_compute_subnetwork" "phase16" {
   region        = var.region
 }
 
+# This instance intentionally exercises only one NIC on the bounded regional
+# IPv4 subnetwork. It has no access_config, IPv6, additional NIC, or implicit
+# NAT claim.
+resource "google_compute_instance" "phase16" {
+  count = local.use_minisky && var.enable_phase16_network_resources && var.enable_phase16_compute_instance ? 1 : 0
+
+  name         = var.phase16_instance_name
+  machine_type = "e2-micro"
+  zone         = var.phase16_instance_zone
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.phase16[0].id
+  }
+}
+
 # The repository metadata is served by MiniSky while pushed image manifests and
 # blobs live in the profile-owned Registry v2 backend.
 resource "google_artifact_registry_repository" "phase10" {

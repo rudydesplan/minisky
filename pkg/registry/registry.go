@@ -13,7 +13,23 @@ type Context struct {
 	OpMgr  *orchestrator.OperationManager
 	SvcMgr *orchestrator.ServiceManager
 	shims  map[string]http.Handler
+	shared map[string]http.Handler
 	mu     sync.RWMutex
+}
+
+// SharedHandler returns one handler instance for related domains in this boot.
+func (c *Context) SharedHandler(key string, create func() http.Handler) http.Handler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shared == nil {
+		c.shared = make(map[string]http.Handler)
+	}
+	if handler := c.shared[key]; handler != nil {
+		return handler
+	}
+	handler := create()
+	c.shared[key] = handler
+	return handler
 }
 
 // GetShim allows one shim to find another for cross-service events (e.g. Pub/Sub -> Serverless).
@@ -65,6 +81,7 @@ func BootAll(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceM
 		OpMgr:  opMgr,
 		SvcMgr: svcMgr,
 		shims:  make(map[string]http.Handler),
+		shared: make(map[string]http.Handler),
 	}
 
 	// First pass: Instantiate all shims

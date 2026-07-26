@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import {
   Box, Typography, Chip, TextField, Select, MenuItem, FormControl,
   InputLabel, IconButton, Tooltip, CircularProgress,
-  ToggleButtonGroup, ToggleButton
+  ToggleButtonGroup, ToggleButton, Alert
 } from '@mui/material';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
@@ -14,6 +14,7 @@ import MemoryIcon from '@mui/icons-material/Memory';
 import StorageIcon from '@mui/icons-material/Storage';
 import CodeIcon from '@mui/icons-material/Code';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
+import { checkedMutation, safeRequestError } from '../apiClient';
 
 type LogEntry = {
   insertId: string;
@@ -62,6 +63,7 @@ export default function LogExplorer() {
   const [selectedContainer, setSelectedContainer] = useState('');
   const [containerLogs, setContainerLogs] = useState('');
   const [containerLoading, setContainerLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const streamTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -125,8 +127,11 @@ export default function LogExplorer() {
     if (!window.confirm("Permanently clear all centralized log history?")) return;
     setLoading(true);
     try {
-      await fetch('/api/manage/system/reset-logs', { method: 'POST' });
+      await checkedMutation('/api/manage/system/reset-logs', { method: 'POST' },
+        'Log reset failed. Check dashboard permissions and retry.');
       setEntries([]);
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while resetting logs.'));
     } finally {
       setLoading(false);
     }
@@ -153,6 +158,7 @@ export default function LogExplorer() {
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0d1117', color: '#c9d1d9' }}>
+      {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
       {/* Header */}
       <Box sx={{
         px: 3, py: 2,

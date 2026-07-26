@@ -7,6 +7,8 @@ import HubIcon from '@mui/icons-material/Hub';
 import StorageIcon from '@mui/icons-material/Storage';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { gkeClusterRoute } from '../gkeRoutes.js';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type Props = {
   open: boolean;
@@ -15,7 +17,8 @@ type Props = {
 
 type GkeCluster = {
   name: string;
-  status: 'RUNNING' | 'PROVISIONING';
+  status: 'RUNNING' | 'PROVISIONING' | 'ERROR';
+  location?: string;
 };
 
 export default function GKEManagerDrawer({ open, onClose }: Props) {
@@ -24,62 +27,55 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newClusterName, setNewClusterName] = useState('');
+  const [zone, setZone] = useState('us-central1-c');
   const [provisioning, setProvisioning] = useState(false);
 
   const fetchClusters = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters`);
-      if (res.ok) {
-        const data = await res.json();
-        setClusters(data || []);
-      } else {
-        const text = await res.text();
-        setError(text);
-      }
-    } catch {
-      setError('Failed to connect to backend API');
+      const res = await fetch(gkeClusterRoute(activeProject, zone));
+      await requireOk(res, 'Unable to load GKE clusters. Check the GKE backend and retry.');
+      const data = await res.json();
+      setClusters(Array.isArray(data?.clusters) ? data.clusters : []);
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect to the GKE backend.'));
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [activeProject]);
+  }, [activeProject, zone]);
 
   const handleCreate = async () => {
     if (!newClusterName) return;
     setProvisioning(true);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters`, {
+      const res = await fetch(gkeClusterRoute(activeProject, zone), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newClusterName })
       });
-      if (res.ok) {
-        setNewClusterName('');
-        // Immediately fetch to show the provisioning state
-        fetchClusters();
-      } else {
-        const text = await res.text();
-        setError(text);
-      }
-    } catch {
-      setError('Failed to provision cluster');
+      await requireOk(res, 'GKE cluster provisioning failed. Check kind availability and the cluster name.');
+      setNewClusterName('');
+      fetchClusters();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while provisioning the GKE cluster.'));
     } finally {
       setProvisioning(false);
     }
   };
 
   const handleDownloadConfig = async (name: string) => {
-    const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters/${name}/config`);
-    if (res.ok) {
+    try {
+      const res = await fetch(gkeClusterRoute(activeProject, zone, name, true));
+      await requireOk(res, 'Kubeconfig download failed. Verify explicit kubeconfig permission and retry.');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `${name}-kubeconfig.yaml`;
       a.click();
-    } else {
-      alert('Failed to download kubeconfig');
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while downloading kubeconfig.'));
     }
   };
 
@@ -88,15 +84,11 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
     
     setLoading(true);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters/${name}`, { method: 'DELETE' });
-      if (res.ok) {
-        fetchClusters();
-      } else {
-        const text = await res.text();
-        alert(`Delete failed: ${text}`);
-      }
-    } catch {
-      alert('Network error during deletion');
+      const res = await fetch(gkeClusterRoute(activeProject, zone, name), { method: 'DELETE' });
+      await requireOk(res, 'GKE cluster deletion failed. Wait for active provisioning to finish and retry.');
+      fetchClusters();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while deleting the GKE cluster.'));
     } finally {
       setLoading(false);
     }
@@ -140,6 +132,13 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         </Typography>
 
         <Box sx={{ mb: 4, display: 'flex', gap: 2 }}>
+          <TextField
+            size="small"
+            label="Zone"
+            value={zone}
+            onChange={(e) => setZone(e.target.value)}
+            disabled={provisioning}
+          />
           <TextField 
             size="small" 
             label="New Cluster Name" 
@@ -152,7 +151,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
           <Button 
             variant="contained" 
             onClick={handleCreate} 
-            disabled={provisioning || !newClusterName}
+            disabled={provisioning || !newClusterName || !zone}
             sx={{ whiteSpace: 'nowrap', minWidth: '160px' }}
           >
             {provisioning ? <CircularProgress size={20} color="inherit" /> : 'Provision Cluster'}

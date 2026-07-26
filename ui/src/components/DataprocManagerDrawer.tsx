@@ -11,6 +11,7 @@ import AddIcon from '@mui/icons-material/Add';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 type DataprocManagerDrawerProps = { 
   open: boolean; 
@@ -53,16 +54,6 @@ interface DataprocJob {
 interface DataprocVersion {
   version: string;
   label: string;
-}
-
-interface ApiErrorResponse {
-  error?: {
-    message?: string;
-  };
-}
-
-function getErrorMessage(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
 }
 
 export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, onOpenBigQuery }: DataprocManagerDrawerProps) {
@@ -112,6 +103,7 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
     if (open) {
       loadData();
       fetch('/api/config/images')
+        .then(r => requireOk(r, 'Unable to load Dataproc image configuration.'))
         .then(r => r.json())
         .then(d => {
           setAvailableVersions(d.dataproc?.versions || []);
@@ -137,22 +129,23 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (res.ok) {
-        showToast('Provisioning Spark/Hadoop cluster nodes...');
-        setTimeout(loadData, 1000);
-      } else {
-        const e = await res.json() as ApiErrorResponse;
-        showToast(e.error?.message || 'Failed', 'error');
-      }
-    } catch (e: unknown) { showToast(getErrorMessage(e, 'Failed to create cluster'), 'error'); }
+      await requireOk(res, 'Dataproc cluster creation failed. Check the cluster name, image version, and worker count.');
+      showToast('Provisioning Spark/Hadoop cluster nodes...');
+      setTimeout(loadData, 1000);
+    } catch (e: unknown) { showToast(safeRequestError(e, 'Unable to connect while creating the Dataproc cluster.'), 'error'); }
     setNewClusterOpen(false);
     setNewClusterName('');
   };
 
   const handleDeleteCluster = async (name: string) => {
-    await fetch(`${apiRoot}/clusters/${name}`, { method: 'DELETE' });
-    showToast('Tearing down cluster nodes...');
-    setTimeout(loadData, 1000);
+    try {
+      await checkedMutation(`${apiRoot}/clusters/${name}`, { method: 'DELETE' },
+        'Dataproc cluster deletion failed. Wait for active jobs to finish and retry.');
+      showToast('Tearing down cluster nodes...');
+      setTimeout(loadData, 1000);
+    } catch (error) {
+      showToast(safeRequestError(error, 'Unable to connect while deleting the Dataproc cluster.'), 'error');
+    }
   };
 
   const handleSubmitJob = async () => {
@@ -169,14 +162,10 @@ export default function DataprocManagerDrawer({ open, onClose, onOpenStorage, on
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (res.ok) {
-        showToast('PySpark Job submitted successfully.');
-        setTimeout(loadData, 500);
-      } else {
-        const e = await res.json() as ApiErrorResponse;
-        showToast(e.error?.message || 'Failed', 'error');
-      }
-    } catch (e: unknown) { showToast(getErrorMessage(e, 'Failed to submit job'), 'error'); }
+      await requireOk(res, 'Dataproc job submission failed. Check the cluster and script URI.');
+      showToast('PySpark Job submitted successfully.');
+      setTimeout(loadData, 500);
+    } catch (e: unknown) { showToast(safeRequestError(e, 'Unable to connect while submitting the Dataproc job.'), 'error'); }
     setNewJobOpen(false);
   };
 

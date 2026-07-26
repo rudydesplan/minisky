@@ -263,10 +263,16 @@ project="phase16-subnetwork-terraform-$$"
 region="us-central1"
 network_name="phase16-terraform-network"
 subnetwork_name="phase16-terraform-subnetwork"
+instance_name="phase16-terraform-instance"
+zone="${region}-a"
 canonical="projects/${project}/global/networks/${network_name}"
+instance_canonical="projects/${project}/zones/${zone}/instances/${instance_name}"
+peer_name="minisky-phase16-peer-$$"
 pid=""
 current_log=""
 bridge_id=""
+container_id=""
+instance_ip=""
 subnetwork_cidr=""
 started_at="${SECONDS}"
 mkdir -p "${home}" "${state_root}" "${tf_data_dir}"
@@ -283,6 +289,18 @@ name = prefix + readable + "-" + suffix
 if len(name) > 63:
     raise SystemExit("hashed Docker bridge name exceeds 63 characters")
 print(name)
+PY
+)"
+
+container_name="$(python3 - "${profile}" "${instance_canonical}" "${instance_name}" <<'PY'
+import hashlib
+import sys
+
+profile, canonical, instance = sys.argv[1:]
+suffix = hashlib.sha256((profile + "\0" + canonical).encode()).hexdigest()[:16]
+prefix = "minisky-vm-"
+readable = instance[:63 - len(prefix) - 1 - len(suffix)].rstrip("-")
+print(prefix + readable + "-" + suffix)
 PY
 )"
 
@@ -331,6 +349,58 @@ expected_labels = {
 if (value.get("Labels") or {}) != expected_labels:
     raise SystemExit(f"bridge labels={value.get('Labels')!r} want={expected_labels!r}")
 print(value["Id"])
+PY
+}
+
+inspect_exact_instance() {
+  local reference=$1
+  local expected_id=${2:-}
+  local expected_ip=${3:-}
+  local output=$4
+  docker inspect "${reference}" >"${output}"
+  python3 - "${output}" "${container_name}" "${expected_id}" "${expected_ip}" \
+    "${profile}" "${project}" "${zone}" "${instance_name}" "${instance_canonical}" \
+    "${bridge_name}" "${bridge_id}" "${subnetwork_cidr}" <<'PY'
+import ipaddress
+import json
+import sys
+
+(path, expected_name, expected_id, expected_ip, profile, project, zone, instance,
+ canonical, bridge_name, bridge_id, cidr) = sys.argv[1:]
+values = json.load(open(path, encoding="utf-8"))
+if len(values) != 1:
+    raise SystemExit("expected exactly one Docker container inspection")
+value = values[0]
+if value.get("Name", "").lstrip("/") != expected_name:
+    raise SystemExit(f"container name={value.get('Name')!r} want={expected_name!r}")
+if not value.get("Id"):
+    raise SystemExit("Compute container has no immutable Docker ID")
+if expected_id and value["Id"] != expected_id:
+    raise SystemExit(f"Compute container ID churned: got={value['Id']} want={expected_id}")
+expected_labels = {
+    "managed-by": "minisky",
+    "minisky.profile": profile,
+    "minisky.service": "compute-instance",
+    "minisky.project": project,
+    "minisky.zone": zone,
+    "minisky.instance": instance,
+    "minisky.canonical-resource": canonical,
+}
+labels = (value.get("Config") or {}).get("Labels") or {}
+if any(labels.get(key) != expected for key, expected in expected_labels.items()):
+    raise SystemExit(f"Compute ownership labels={labels!r} want at least {expected_labels!r}")
+networks = (value.get("NetworkSettings") or {}).get("Networks") or {}
+if list(networks) != [bridge_name]:
+    raise SystemExit(f"Compute networks={list(networks)!r} want only {bridge_name!r}")
+endpoint = networks[bridge_name]
+if endpoint.get("NetworkID") != bridge_id:
+    raise SystemExit(f"Compute endpoint bridge ID={endpoint.get('NetworkID')!r} want={bridge_id!r}")
+address = endpoint.get("IPAddress", "")
+if ipaddress.ip_address(address) not in ipaddress.ip_network(cidr):
+    raise SystemExit(f"Compute IPv4={address!r} is outside {cidr!r}")
+if expected_ip and address != expected_ip:
+    raise SystemExit(f"Compute IPv4 churned: got={address!r} want={expected_ip!r}")
+print(value["Id"], address)
 PY
 }
 
@@ -422,10 +492,10 @@ if docker network inspect minisky-net >/dev/null 2>&1; then
   echo "Refusing to disturb an existing Docker network named minisky-net." >&2
   exit 1
 fi
-while IFS= read -r container_name; do
-  case "${container_name}" in
+while IFS= read -r existing_container_name; do
+  case "${existing_container_name}" in
     minisky-*)
-      echo "Refusing to disturb existing MiniSky container: ${container_name}" >&2
+      echo "Refusing to disturb existing MiniSky container: ${existing_container_name}" >&2
       exit 1
       ;;
   esac
@@ -555,23 +625,87 @@ assert_bridge_absent() {
   fi
 }
 
+start_owned_test_peer() {
+  docker run --detach \
+    --name "${peer_name}" \
+    --network "${bridge_id}" \
+    --label managed-by=minisky \
+    --label "minisky.profile=${profile}" \
+    --label minisky.service=compute-instance-acceptance-peer \
+    --label "minisky.resource=${instance_canonical}" \
+    nginx:1.27-alpine >/dev/null
+}
+
+assert_peer_traffic() {
+  local response
+  response="$(docker exec "${peer_name}" wget -qO- "http://${instance_ip}/")"
+  if [[ "${response}" != *"Welcome to nginx!"* ]]; then
+    echo "Owned bridge peer did not receive the Compute instance HTTP response." >&2
+    return 1
+  fi
+}
+
+remove_owned_test_peer() {
+  local inspection="${work}/peer-cleanup.json"
+  local id
+  if ! docker inspect "${peer_name}" >"${inspection}" 2>/dev/null; then
+    return 0
+  fi
+  id="$(python3 - "${inspection}" "${profile}" "${instance_canonical}" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))[0]
+expected = {
+    "managed-by": "minisky",
+    "minisky.profile": sys.argv[2],
+    "minisky.service": "compute-instance-acceptance-peer",
+    "minisky.resource": sys.argv[3],
+}
+labels = (value.get("Config") or {}).get("Labels") or {}
+if all(labels.get(key) == expected_value for key, expected_value in expected.items()):
+    print(value.get("Id", ""))
+PY
+)"
+  if [[ -z "${id}" ]]; then
+    echo "Refusing to remove a test peer without exact ownership labels." >&2
+    return 1
+  fi
+  docker rm -f "${id}" >/dev/null
+}
+
+assert_instance_absent() {
+  if [[ -n "${container_id}" ]] && docker inspect "${container_id}" >/dev/null 2>&1; then
+    echo "Expected Compute container ID ${container_id} to be absent." >&2
+    return 1
+  fi
+  if docker inspect "${container_name}" >/dev/null 2>&1; then
+    echo "Expected Compute container ${container_name} to be absent." >&2
+    return 1
+  fi
+}
+
 assert_api_resources() {
   local network_response="${work}/network-response.json"
   local subnetwork_response="${work}/subnetwork-response.json"
+  local instance_response="${work}/instance-response.json"
   local network_url="${gateway}/_minisky/compute/compute/v1/projects/${project}/global/networks/${network_name}"
   local subnetwork_url="${gateway}/_minisky/compute/compute/v1/projects/${project}/regions/${region}/subnetworks/${subnetwork_name}"
+  local instance_url="${gateway}/_minisky/compute/compute/v1/projects/${project}/zones/${zone}/instances/${instance_name}"
   curl --globoff --fail --silent --show-error "${network_url}" >"${network_response}"
   curl --globoff --fail --silent --show-error "${subnetwork_url}" >"${subnetwork_response}"
-  python3 - "${network_response}" "${subnetwork_response}" "${project}" "${region}" \
-    "${network_name}" "${subnetwork_name}" "${subnetwork_cidr}" <<'PY'
+  curl --globoff --fail --silent --show-error "${instance_url}" >"${instance_response}"
+  python3 - "${network_response}" "${subnetwork_response}" "${instance_response}" "${project}" "${region}" \
+    "${zone}" "${network_name}" "${subnetwork_name}" "${instance_name}" "${subnetwork_cidr}" <<'PY'
 import ipaddress
 import json
 import sys
 from datetime import datetime
 
-network_path, subnetwork_path, project, region, network_name, subnetwork_name, cidr = sys.argv[1:]
+network_path, subnetwork_path, instance_path, project, region, zone, network_name, subnetwork_name, instance_name, cidr = sys.argv[1:]
 network = json.load(open(network_path, encoding="utf-8"))
 subnetwork = json.load(open(subnetwork_path, encoding="utf-8"))
+instance = json.load(open(instance_path, encoding="utf-8"))
 network_link = f"https://www.googleapis.com/compute/v1/projects/{project}/global/networks/{network_name}"
 region_link = f"https://www.googleapis.com/compute/v1/projects/{project}/regions/{region}"
 network_expected = {
@@ -608,6 +742,25 @@ for resource_name, resource in (("network", network), ("subnetwork", subnetwork)
         raise SystemExit(f"{resource_name} creationTimestamp is not RFC3339")
 if not subnetwork.get("fingerprint"):
     raise SystemExit("subnetwork fingerprint is empty")
+interfaces = instance.get("networkInterfaces") or []
+if instance.get("name") != instance_name or instance.get("status") != "RUNNING" or len(interfaces) != 1:
+    raise SystemExit(f"unexpected Compute instance={instance!r}")
+interface = interfaces[0]
+expected_interface = {
+    "kind": "compute#networkInterface",
+    "name": "nic0",
+    "network": network_link,
+    "subnetwork": f"{region_link}/subnetworks/{subnetwork_name}",
+}
+for key, expected in expected_interface.items():
+    if interface.get(key) != expected:
+        raise SystemExit(f"instance network interface {key}={interface.get(key)!r} want={expected!r}")
+address = ipaddress.ip_address(interface.get("networkIP", ""))
+if address not in ipaddress.ip_network(cidr):
+    raise SystemExit(f"instance networkIP={address} is outside {cidr}")
+if interface.get("accessConfigs"):
+    raise SystemExit("bounded Compute instance unexpectedly reports a NAT access config")
+print(address)
 PY
 }
 
@@ -615,6 +768,7 @@ assert_api_missing() {
   local url
   local status
   for url in \
+    "${gateway}/_minisky/compute/compute/v1/projects/${project}/zones/${zone}/instances/${instance_name}" \
     "${gateway}/_minisky/compute/compute/v1/projects/${project}/regions/${region}/subnetworks/${subnetwork_name}" \
     "${gateway}/_minisky/compute/compute/v1/projects/${project}/global/networks/${network_name}"; do
     status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"
@@ -633,6 +787,7 @@ assert_targeted_plan_clean() {
     -input=false \
     -target='google_compute_network.phase16[0]' \
     -target='google_compute_subnetwork.phase16[0]' \
+    -target='google_compute_instance.phase16[0]' \
     "${tf_vars[@]}"
   plan_exit=$?
   set -e
@@ -653,7 +808,10 @@ docker network inspect $(docker network ls -q) >"${work}/existing-networks.json"
 subnetwork_cidr="$(select_subnetwork_cidr "${work}/existing-networks.json")"
 
 tf_vars=(
+  -var="enable_phase16_compute_instance=true"
   -var="enable_phase16_network_resources=true"
+  -var="phase16_instance_name=${instance_name}"
+  -var="phase16_instance_zone=${zone}"
   -var="minisky_endpoint=${gateway}"
   -var="phase16_network_name=${network_name}"
   -var="phase16_subnetwork_cidr=${subnetwork_cidr}"
@@ -673,21 +831,40 @@ terraform -chdir="${terraform_dir}" apply \
   -input=false \
   -target='google_compute_network.phase16[0]' \
   -target='google_compute_subnetwork.phase16[0]' \
+  -target='google_compute_instance.phase16[0]' \
   "${tf_vars[@]}"
 
-assert_api_resources
 bridge_id="$(inspect_exact_bridge "${bridge_name}" "" "${work}/apply-bridge.json")"
+instance_ip="$(assert_api_resources)"
+read -r container_id inspected_ip < <(
+  inspect_exact_instance "${container_name}" "" "${instance_ip}" "${work}/apply-instance.json"
+)
+if [[ "${inspected_ip}" != "${instance_ip}" ]]; then
+  echo "API and Docker primary IPv4 addresses diverged." >&2
+  exit 1
+fi
+start_owned_test_peer
+assert_peer_traffic
 assert_single_canonical_bridge
 assert_targeted_plan_clean
 stop_daemon
 
 start_daemon "restarted"
-tf_vars[1]="-var=minisky_endpoint=${gateway}"
+tf_vars[4]="-var=minisky_endpoint=${gateway}"
 assert_targeted_plan_clean
-assert_api_resources
+restarted_ip="$(assert_api_resources)"
+if [[ "${restarted_ip}" != "${instance_ip}" ]]; then
+  echo "Primary IPv4 address churned across MiniSky restart." >&2
+  exit 1
+fi
 inspect_exact_bridge "${bridge_id}" "${bridge_id}" "${work}/restart-bridge.json" >/dev/null
+inspect_exact_instance "${container_id}" "${container_id}" "${instance_ip}" "${work}/restart-instance.json" >/dev/null
+assert_peer_traffic
 assert_single_canonical_bridge
 
+terraform -chdir="${terraform_dir}" state rm \
+  -backup="${work}/state-before-instance-rm.backup" \
+  'google_compute_instance.phase16[0]'
 terraform -chdir="${terraform_dir}" state rm \
   -backup="${work}/state-before-subnetwork-rm.backup" \
   'google_compute_subnetwork.phase16[0]'
@@ -706,16 +883,36 @@ terraform -chdir="${terraform_dir}" import \
   "${tf_vars[@]}" \
   'google_compute_subnetwork.phase16[0]' \
   "projects/${project}/regions/${region}/subnetworks/${subnetwork_name}"
-assert_targeted_plan_clean
+terraform -chdir="${terraform_dir}" import \
+  -backup="${work}/state-before-instance-import.backup" \
+  -input=false \
+  "${tf_vars[@]}" \
+  'google_compute_instance.phase16[0]' \
+  "projects/${project}/zones/${zone}/instances/${instance_name}"
+# The provider can import and refresh this bounded ID, but Compute GET cannot
+# reconstruct the create-only boot_disk.initialize_params.image value. A
+# post-import plan therefore proposes replacement and is not claimed drift-free.
 stop_daemon
 
 start_daemon "import-restarted"
-tf_vars[1]="-var=minisky_endpoint=${gateway}"
-assert_targeted_plan_clean
-assert_api_resources
+tf_vars[4]="-var=minisky_endpoint=${gateway}"
+imported_ip="$(assert_api_resources)"
+if [[ "${imported_ip}" != "${instance_ip}" ]]; then
+  echo "Primary IPv4 address churned across import restart." >&2
+  exit 1
+fi
 inspect_exact_bridge "${bridge_id}" "${bridge_id}" "${work}/import-restart-bridge.json" >/dev/null
+inspect_exact_instance "${container_id}" "${container_id}" "${instance_ip}" "${work}/import-restart-instance.json" >/dev/null
+assert_peer_traffic
 assert_single_canonical_bridge
 
+terraform -chdir="${terraform_dir}" destroy \
+  -auto-approve \
+  -input=false \
+  -target='google_compute_instance.phase16[0]' \
+  "${tf_vars[@]}"
+assert_instance_absent
+remove_owned_test_peer
 terraform -chdir="${terraform_dir}" destroy \
   -auto-approve \
   -input=false \
@@ -731,8 +928,9 @@ assert_bridge_absent
 stop_daemon
 
 start_daemon "cleanup-restarted"
-tf_vars[1]="-var=minisky_endpoint=${gateway}"
+tf_vars[4]="-var=minisky_endpoint=${gateway}"
 assert_api_missing
+assert_instance_absent
 assert_bridge_absent
 stop_daemon
 

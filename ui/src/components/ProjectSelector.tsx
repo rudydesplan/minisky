@@ -47,6 +47,8 @@ export default function ProjectSelector() {
       <Button 
         variant="text" 
         onClick={handleClick}
+        aria-haspopup="menu"
+        aria-expanded={Boolean(anchorEl)}
         sx={{ 
           color: '#5f6368', 
           textTransform: 'none', 
@@ -90,7 +92,7 @@ export default function ProjectSelector() {
             fullWidth
             type="password"
             autoComplete="off"
-            placeholder="Paste local dashboard token"
+            label="Dashboard token"
             value={sessionToken}
             onChange={(event) => setSessionToken(event.target.value)}
             sx={{ mb: 1 }}
@@ -119,7 +121,7 @@ export default function ProjectSelector() {
               autoFocus
               size="small" 
               fullWidth 
-              placeholder="my-project-id"
+              label="New project ID"
               value={newProjectName}
               onChange={(e) => setNewProjectName(e.target.value)}
               sx={{ mb: 1 }}

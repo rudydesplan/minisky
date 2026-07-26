@@ -1,4 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
+
+export type BackendState = {
+  profile: string;
+  backend: string;
+  enabled: boolean;
+  source: string;
+  diagnostic?: string;
+};
 
 export type Service = {
   id: string;
@@ -8,12 +17,15 @@ export type Service = {
   port: number | null;
   description: string;
   missingDeps?: string[];
+  backend?: BackendState;
 };
 
 export type DashboardSettings = {
   bq_duckdb: boolean;
   gke_kind: boolean;
   serverless_pack: boolean;
+  runtime_profile?: { name: string; diagnostic?: string };
+  backends?: Record<string, BackendState>;
 };
 
 export type DashboardSettingKey = keyof DashboardSettings;
@@ -38,24 +50,24 @@ function isDashboardSettings(value: unknown): value is DashboardSettings {
 export function useServices() {
   const [services, setServices] = useState<Service[]>([]);
   const [settings, setSettings] = useState<DashboardSettings>(defaultSettings);
+  const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     try {
       const res = await fetch('/api/services');
-      if (res.ok) {
-        setServices(await res.json() as Service[]);
-      }
+      await requireOk(res, 'Unable to load service status.');
+      setServices(await res.json() as Service[]);
       const setRes = await fetch('/api/settings');
-      if (setRes.ok) {
-        const data: unknown = await setRes.json();
-        if (isDashboardSettings(data)) {
-          setSettings(data);
-        } else {
-          console.error('invalid settings response', data);
-        }
+      await requireOk(setRes, 'Unable to load runtime settings.');
+      const data: unknown = await setRes.json();
+      if (isDashboardSettings(data)) {
+        setSettings(data);
+        setError(null);
+      } else {
+        throw new Error('Runtime settings returned an invalid response.');
       }
-    } catch (e) {
-      console.error("error loading UI data", e);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Unable to load dashboard data');
     }
   }, []);
 
@@ -70,48 +82,46 @@ export function useServices() {
     if (projectID) {
       url += `?project=${encodeURIComponent(projectID)}`;
     }
-    await fetch(url, { method: 'POST' });
-    loadData();
+    try {
+      await checkedMutation(url, { method: 'POST' }, 'Service start failed. Check the required backend and retry.');
+      await loadData();
+    } catch (cause: unknown) {
+      setError(safeRequestError(cause, 'Unable to connect while starting the service.'));
+    }
   };
 
   const handleStopContainer = async (id: string) => {
-    await fetch(`/api/services/${id}/stop`, { method: 'POST' });
-    loadData();
+    try {
+      await checkedMutation(`/api/services/${id}/stop`, { method: 'POST' }, 'Service stop failed. Wait for active operations and retry.');
+      await loadData();
+    } catch (cause: unknown) {
+      setError(safeRequestError(cause, 'Unable to connect while stopping the service.'));
+    }
   };
 
   const toggleSetting = async (key: DashboardSettingKey, currentVal: boolean) => {
     try {
-      const res = await fetch('/api/settings', {
+      await checkedMutation('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [key]: !currentVal })
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        alert(`Failed to update setting: ${errText}`);
-      }
+      }, 'Failed to update backend setting.');
       loadData();
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
-      alert(`Error updating setting: ${message}`);
+      setError(safeRequestError(e, 'Unable to connect while updating the backend setting.'));
     }
   };
 
   const handleInstallDependency = async (id: string) => {
     try {
-      const res = await fetch(`/api/manage/system/install-dependency/${id}`, { method: 'POST' });
-      if (!res.ok) {
-        const errText = await res.text();
-        alert(`Installation failed: ${errText}`);
-      } else {
-        alert(`${id} installed successfully! You can now enable the service.`);
-      }
+      await checkedMutation(`/api/manage/system/install-dependency/${id}`, { method: 'POST' },
+        'Dependency installation failed. Check network access and local permissions.');
+      alert(`${id} installed successfully! You can now enable the service.`);
       loadData();
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
-      alert(`Error installing dependency: ${message}`);
+      setError(safeRequestError(e, 'Unable to connect while installing the dependency.'));
     }
   };
 
-  return { services, settings, handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency };
+  return { services, settings, error, handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency };
 }

@@ -5,6 +5,7 @@ import {
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk } from '../apiClient';
 
 interface Props {
   open: boolean;
@@ -80,7 +81,7 @@ export default function SchedulerManagerDrawer({ open, onClose, onCreated }: Pro
         body: JSON.stringify(job),
       });
 
-      if (!res.ok) throw new Error(await res.text());
+      await requireOk(res, 'Scheduler job creation failed. Check the cron schedule and target fields.');
 
       onCreated();
       onClose();
@@ -97,7 +98,7 @@ export default function SchedulerManagerDrawer({ open, onClose, onCreated }: Pro
       <Box sx={{ width: 450, p: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
           <Typography variant="h5" sx={{ fontWeight: 500 }}>Create Scheduler Job</Typography>
-          <Button onClick={onClose}><CloseIcon /></Button>
+          <Button aria-label="Close Scheduler job form" onClick={onClose}><CloseIcon /></Button>
         </Box>
 
         <Divider sx={{ mb: 4 }} />

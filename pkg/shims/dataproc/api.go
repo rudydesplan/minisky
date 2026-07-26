@@ -1,8 +1,10 @@
 package dataproc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,7 +15,10 @@ import (
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
+
+const dataprocStateEntry = "dataproc/metadata"
 
 func init() {
 	registry.Register("dataproc.googleapis.com", func(ctx *registry.Context) http.Handler {
@@ -118,20 +123,95 @@ type QueryList struct {
 
 // API is the high-fidelity Dataproc v1 shim.
 type API struct {
-	mu       sync.RWMutex
-	opMgr    *orchestrator.OperationManager
-	svcMgr   *orchestrator.ServiceManager
-	clusters map[string]*Cluster // key: project:region:clusterName
-	jobs     map[string]*Job     // key: project:region:jobId
+	mu              sync.RWMutex
+	mutationMu      sync.Mutex
+	opMgr           *orchestrator.OperationManager
+	svcMgr          dataprocServiceManager
+	store           dataprocStateStore
+	initErr         error
+	clusters        map[string]*Cluster // key: project:region:clusterName
+	jobs            map[string]*Job     // key: project:region:jobId
+	operationRunner func(string, func() error)
+	jobRunner       func(func())
+	afterAdmission  func()
+}
+
+type dataprocStateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+type dataprocServiceManager interface {
+	ProvisionComputeVM(context.Context, string, string, string, []string, []string, []string) error
+	DeleteComputeVM(string) error
+	RunCommandInContainer(string, []string) (string, error)
+}
+
+type dataprocContextualDeleter interface {
+	DeleteComputeVMContext(context.Context, string) error
+}
+
+type dataprocMetadata struct {
+	Clusters map[string]*Cluster `json:"clusters"`
+	Jobs     map[string]*Job     `json:"jobs"`
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
-	return &API{
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Dataproc] persistence degraded: %v", err)
+		api := newAPI(opMgr, svcMgr, nil)
+		api.initErr = fmt.Errorf("open Dataproc state: %w", err)
+		return api
+	}
+	api, err := NewAPIWithStore(opMgr, svcMgr, store)
+	if err != nil {
+		log.Printf("[Shim: Dataproc] state rehydration failed: %v", err)
+		api = newAPI(opMgr, svcMgr, store)
+		api.initErr = err
+	}
+	return api
+}
+
+func NewAPIWithStore(opMgr *orchestrator.OperationManager, svcMgr dataprocServiceManager, store dataprocStateStore) (*API, error) {
+	api := newAPI(opMgr, svcMgr, store)
+	if store == nil {
+		return api, nil
+	}
+	var persisted dataprocMetadata
+	if err := store.Load(dataprocStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api, nil
+		}
+		return nil, fmt.Errorf("load Dataproc metadata: %w", err)
+	}
+	previous := cloneDataprocMetadata(persisted)
+	if err := normalizeDataprocMetadata(&persisted, true); err != nil {
+		return nil, fmt.Errorf("load Dataproc metadata: %w", err)
+	}
+	if !dataprocMetadataEqual(previous, persisted) {
+		if err := api.commitMetadata(previous, persisted); err != nil {
+			return nil, fmt.Errorf("persist Dataproc restart normalization: %w", err)
+		}
+	} else {
+		api.replaceMetadata(persisted)
+	}
+	return api, nil
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, svcMgr dataprocServiceManager, store dataprocStateStore) *API {
+	api := &API{
 		opMgr:    opMgr,
 		svcMgr:   svcMgr,
+		store:    store,
 		clusters: make(map[string]*Cluster),
 		jobs:     make(map[string]*Job),
 	}
+	if opMgr != nil {
+		api.operationRunner = opMgr.RunAsync
+	}
+	api.jobRunner = func(work func()) { go work() }
+	return api
 }
 
 // ServeHTTP dispatches Dataproc v1 paths.
@@ -149,6 +229,13 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Dataproc] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.initializationError() != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Dataproc persistence is unavailable")
+		return
+	}
+	if api.afterAdmission != nil {
+		api.afterAdmission()
+	}
 
 	path := r.URL.Path
 
@@ -160,7 +247,6 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(path, "/clusters"):
 		api.routeClusters(w, r, path)
 	default:
-		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Dataproc resource not found: "+path)
 	}
 }
@@ -186,7 +272,7 @@ func (api *API) routeClusters(w http.ResponseWriter, r *http.Request, path strin
 	case http.MethodDelete:
 		api.deleteCluster(w, r, project, region, clusterName)
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -197,12 +283,10 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		Labels      map[string]string `json:"labels"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 		return
 	}
 	if body.ClusterName == "" {
-		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "clusterName is required")
 		return
 	}
@@ -240,24 +324,56 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		},
 	}
 
-	key := clusterKey(project, region, body.ClusterName)
-	api.mu.Lock()
-	api.clusters[key] = cl
-	api.mu.Unlock()
-
 	targetLink := fmt.Sprintf(
 		"https://dataproc.googleapis.com/v1/projects/%s/regions/%s/clusters/%s",
 		project, region, body.ClusterName)
+	key := clusterKey(project, region, body.ClusterName)
+	api.mutationMu.Lock()
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
+	}
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	if _, exists := previous.Clusters[key]; exists {
+		api.mutationMu.Unlock()
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "Cluster "+body.ClusterName+" already exists")
+		return
+	}
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
+	}
 	op, err := api.opMgr.RegisterDurable("dataproc#operation", "CREATE", targetLink, "", region)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		api.mutationMu.Unlock()
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
-	api.opMgr.RunAsync(op.Name, func() error {
+	snapshot := cloneDataprocMetadata(previous)
+	snapshot.Clusters[key] = cloneCluster(cl)
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "Dataproc persistence became unavailable")
+		return
+	}
+	if err := api.commitMetadata(previous, snapshot); err != nil {
+		api.mutationMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "Dataproc cluster metadata was not persisted")
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist Dataproc cluster metadata")
+		return
+	}
+	api.mutationMu.Unlock()
+
+	work := func() error {
 		clusterStr := body.ClusterName
 		reg := config.GetImageRegistry()
+		created := make([]string, 0, 1+cfg.WorkerConfig.NumInstances)
+		if err := api.PersistenceError(); err != nil {
+			return fmt.Errorf("Dataproc persistence unavailable before provisioning: %w", err)
+		}
 
 		// Provision the Master Node
 		masterImage := reg.Dataproc.DefaultImage
@@ -278,7 +394,30 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 
 		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterStr)
-		api.svcMgr.ProvisionComputeVM(context.Background(), masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+		if api.svcMgr == nil {
+			return fmt.Errorf("Dataproc Docker backend is unavailable")
+		}
+		if err := api.PersistenceError(); err != nil {
+			return fmt.Errorf("Dataproc persistence unavailable before master provisioning: %w", err)
+		}
+		if err := api.svcMgr.ProvisionComputeVM(context.Background(), masterName, masterImage, "default", reg.Dataproc.MasterPorts, connectivityEnv, []string{"tail", "-f", "/dev/null"}); err != nil {
+			provisionErr := fmt.Errorf("provision Dataproc master: %w", err)
+			compensationErr := api.compensateProvisionedCluster(append(created, masterName))
+			detail := "Master provisioning failed: " + err.Error()
+			if compensationErr != nil {
+				detail += "; compensation ambiguous: " + compensationErr.Error()
+			}
+			if persistErr := api.setClusterStatus(key, "ERROR", detail); persistErr != nil {
+				api.degrade(persistErr)
+				provisionErr = errors.Join(provisionErr, persistErr)
+			}
+			if compensationErr != nil {
+				api.degrade(fmt.Errorf("Dataproc master compensation ambiguity: %w", compensationErr))
+				return errors.Join(provisionErr, fmt.Errorf("Dataproc compensation: %w", compensationErr))
+			}
+			return provisionErr
+		}
+		created = append(created, masterName)
 
 		// Provision Worker Nodes
 		numWorkers := 2
@@ -287,17 +426,49 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 		}
 		for i := 0; i < numWorkers; i++ {
 			workerName := fmt.Sprintf("minisky-dataproc-%s-w-%d", clusterStr, i)
-			api.svcMgr.ProvisionComputeVM(context.Background(), workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"})
+			if err := api.PersistenceError(); err != nil {
+				compensationErr := api.compensateProvisionedCluster(created)
+				return errors.Join(
+					fmt.Errorf("Dataproc persistence unavailable during provisioning: %w", err),
+					compensationErr,
+				)
+			}
+			if err := api.svcMgr.ProvisionComputeVM(context.Background(), workerName, masterImage, "default", []string{}, connectivityEnv, []string{"tail", "-f", "/dev/null"}); err != nil {
+				provisionErr := fmt.Errorf("provision Dataproc worker %d: %w", i, err)
+				compensationErr := api.compensateProvisionedCluster(append(created, workerName))
+				detail := provisionErr.Error()
+				if compensationErr != nil {
+					detail += "; compensation ambiguous: " + compensationErr.Error()
+				}
+				if persistErr := api.setClusterStatus(key, "ERROR", detail); persistErr != nil {
+					api.degrade(persistErr)
+					provisionErr = errors.Join(provisionErr, persistErr)
+				}
+				if compensationErr != nil {
+					api.degrade(fmt.Errorf("Dataproc worker compensation ambiguity: %w", compensationErr))
+					return errors.Join(provisionErr, fmt.Errorf("Dataproc compensation: %w", compensationErr))
+				}
+				return provisionErr
+			}
+			created = append(created, workerName)
 		}
-
-		api.mu.Lock()
-		if c, ok := api.clusters[key]; ok {
-			c.Status.State = "RUNNING"
-			c.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
+		if err := api.setClusterStatus(key, "RUNNING", ""); err != nil {
+			compensationErr := api.compensateProvisionedCluster(created)
+			compensationState := errors.New("Dataproc backends were compensated after RUNNING persistence failure; durable cluster metadata may require restart normalization")
+			if compensationErr != nil {
+				compensationState = fmt.Errorf("Dataproc RUNNING-save compensation was incomplete: %w", compensationErr)
+			}
+			api.degrade(errors.Join(err, compensationState))
+			if compensationErr != nil {
+				return errors.Join(err, fmt.Errorf("Dataproc RUNNING-save compensation: %w", compensationErr))
+			}
+			return errors.Join(err, compensationState)
 		}
-		api.mu.Unlock()
 		return nil
-	})
+	}
+	if api.operationRunner != nil {
+		api.operationRunner(op.Name, work)
+	}
 
 	// Dataproc uses google.longrunning.Operation format
 	w.WriteHeader(http.StatusOK)
@@ -307,11 +478,10 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 func (api *API) getCluster(w http.ResponseWriter, project, region, name string) {
 	key := clusterKey(project, region, name)
 	api.mu.RLock()
-	cl, ok := api.clusters[key]
+	cl := cloneCluster(api.clusters[key])
 	api.mu.RUnlock()
 
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
+	if cl == nil {
 		writeError(w, 404, "NOT_FOUND", "Cluster "+name+" not found")
 		return
 	}
@@ -325,7 +495,7 @@ func (api *API) listClusters(w http.ResponseWriter, project, region string) {
 	items := []*Cluster{}
 	for k, v := range api.clusters {
 		if strings.HasPrefix(k, prefix) {
-			items = append(items, v)
+			items = append(items, cloneCluster(v))
 		}
 	}
 	api.mu.RUnlock()
@@ -335,17 +505,17 @@ func (api *API) listClusters(w http.ResponseWriter, project, region string) {
 
 func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, region, name string) {
 	key := clusterKey(project, region, name)
-	api.mu.Lock()
-	cl, ok := api.clusters[key]
-	if ok {
-		cl.Status.State = "DELETING"
-		// Delay actual map deletion to allow UI to see DELETING state briefly,
-		// but since we want to align with previous exact behavior, we just copy properties.
+	api.mutationMu.Lock()
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
 	}
-	api.mu.Unlock()
-
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	cl := cloneCluster(previous.Clusters[key])
+	if cl == nil {
+		api.mutationMu.Unlock()
 		writeError(w, 404, "NOT_FOUND", "Cluster "+name+" not found")
 		return
 	}
@@ -358,25 +528,69 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, r
 	targetLink := fmt.Sprintf(
 		"https://dataproc.googleapis.com/v1/projects/%s/regions/%s/clusters/%s",
 		project, region, name)
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
+	}
 	op, err := api.opMgr.RegisterDurable("dataproc#operation", "DELETE", targetLink, "", region)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		api.mutationMu.Unlock()
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
-	api.opMgr.RunAsync(op.Name, func() error {
+	deleting := cloneDataprocMetadata(previous)
+	deletingCluster := deleting.Clusters[key]
+	deletingCluster.Status = ClusterStatus{
+		State: "DELETING", StateStartTime: time.Now().UTC().Format(time.RFC3339),
+	}
+	deletingCluster.StatusHistory = append(deletingCluster.StatusHistory, deletingCluster.Status)
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "Dataproc persistence became unavailable")
+		return
+	}
+	if err := api.commitMetadata(previous, deleting); err != nil {
+		api.mutationMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "Dataproc deletion metadata was not persisted")
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist Dataproc deletion metadata")
+		return
+	}
+	api.mutationMu.Unlock()
+	work := func() error {
 		// Teardown physical containers
-		api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-m", name))
-		for i := 0; i < numWorkers; i++ {
-			api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-w-%d", name, i))
+		if api.svcMgr == nil {
+			return fmt.Errorf("Dataproc Docker backend is unavailable")
 		}
-
-		api.mu.Lock()
-		delete(api.clusters, key)
-		api.mu.Unlock()
-		return nil
-	})
+		if err := api.PersistenceError(); err != nil {
+			return fmt.Errorf("Dataproc persistence unavailable before deletion: %w", err)
+		}
+		if err := api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-m", name)); err != nil {
+			deleteErr := fmt.Errorf("delete Dataproc master: %w", err)
+			if persistErr := api.setClusterStatus(key, "ERROR", "Master deletion failed: "+err.Error()); persistErr != nil {
+				api.degrade(persistErr)
+				return errors.Join(deleteErr, persistErr)
+			}
+			return deleteErr
+		}
+		for i := 0; i < numWorkers; i++ {
+			if err := api.PersistenceError(); err != nil {
+				return fmt.Errorf("Dataproc persistence unavailable during deletion: %w", err)
+			}
+			if err := api.svcMgr.DeleteComputeVM(fmt.Sprintf("minisky-dataproc-%s-w-%d", name, i)); err != nil {
+				deleteErr := fmt.Errorf("delete Dataproc worker %d: %w", i, err)
+				if persistErr := api.setClusterStatus(key, "ERROR", "Worker deletion failed: "+err.Error()); persistErr != nil {
+					api.degrade(persistErr)
+					return errors.Join(deleteErr, persistErr)
+				}
+				return deleteErr
+			}
+		}
+		return api.deleteClusterMetadata(key)
+	}
+	if api.operationRunner != nil {
+		api.operationRunner(op.Name, work)
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(toLRO(op, project, region))
 }
@@ -406,7 +620,7 @@ func (api *API) routeJobs(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 
-	w.WriteHeader(http.StatusMethodNotAllowed)
+	writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 }
 
 func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, region string) {
@@ -414,7 +628,6 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 		Job Job `json:"job"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 		return
 	}
@@ -429,23 +642,43 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 	}
 
 	key := jobKey(project, region, jobId)
-	api.mu.Lock()
-	api.jobs[key] = &job
-	api.mu.Unlock()
+	api.mutationMu.Lock()
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
+	}
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	snapshot := cloneDataprocMetadata(previous)
+	snapshot.Jobs[key] = cloneJob(&job)
+	if api.rejectDegradedMutation(w) {
+		api.mutationMu.Unlock()
+		return
+	}
+	if err := api.commitMetadata(previous, snapshot); err != nil {
+		api.mutationMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist Dataproc job metadata")
+		return
+	}
+	api.mutationMu.Unlock()
 
 	// Drive job state: PENDING → RUNNING → DONE
-	go func() {
+	work := func() {
 		time.Sleep(500 * time.Millisecond)
-		api.mu.Lock()
-		j, ok := api.jobs[key]
-		if !ok {
-			api.mu.Unlock()
+		api.mu.RLock()
+		j := cloneJob(api.jobs[key])
+		api.mu.RUnlock()
+		if j == nil {
 			return
 		}
 		j.Status.State = "RUNNING"
 		j.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
 		clusterName := j.Placement.ClusterName
-		api.mu.Unlock()
+		if err := api.persistJob(key, j); err != nil {
+			api.degrade(err)
+			return
+		}
 
 		masterName := fmt.Sprintf("minisky-dataproc-%s-m", clusterName)
 
@@ -466,27 +699,41 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 		}
 
 		if len(cmd) > 0 {
-			out, err := api.svcMgr.RunCommandInContainer(masterName, cmd)
-			api.mu.Lock()
-			if j, ok := api.jobs[key]; ok {
-				if err != nil {
-					j.Status.State = "ERROR"
-					j.Status.Details = fmt.Sprintf("Spark-submit failed: %v\nOutput: %s", err, out)
-				} else {
-					j.Status.State = "DONE"
-					j.Status.Details = out
-				}
+			if api.svcMgr == nil {
+				j.Status.State = "ERROR"
+				j.Status.Details = "Dataproc Docker backend is unavailable"
 				j.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
+				if err := api.persistJob(key, j); err != nil {
+					api.degrade(err)
+				}
+				return
 			}
-			api.mu.Unlock()
-		} else {
-			api.mu.Lock()
-			if j, ok := api.jobs[key]; ok {
+			if err := api.PersistenceError(); err != nil {
+				return
+			}
+			out, err := api.svcMgr.RunCommandInContainer(masterName, cmd)
+			if err != nil {
+				j.Status.State = "ERROR"
+				j.Status.Details = fmt.Sprintf("Spark-submit failed: %v\nOutput: %s", err, out)
+			} else {
 				j.Status.State = "DONE"
+				j.Status.Details = out
 			}
-			api.mu.Unlock()
+			j.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
+			if err := api.persistJob(key, j); err != nil {
+				api.degrade(err)
+			}
+		} else {
+			j.Status.State = "DONE"
+			j.Status.StateStartTime = time.Now().UTC().Format(time.RFC3339)
+			if err := api.persistJob(key, j); err != nil {
+				api.degrade(err)
+			}
 		}
-	}()
+	}
+	if api.jobRunner != nil {
+		api.jobRunner(work)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(&job)
@@ -495,11 +742,10 @@ func (api *API) submitJob(w http.ResponseWriter, r *http.Request, project, regio
 func (api *API) getJob(w http.ResponseWriter, project, region, jobId string) {
 	key := jobKey(project, region, jobId)
 	api.mu.RLock()
-	job, ok := api.jobs[key]
+	job := cloneJob(api.jobs[key])
 	api.mu.RUnlock()
 
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
+	if job == nil {
 		writeError(w, 404, "NOT_FOUND", "Job "+jobId+" not found")
 		return
 	}
@@ -513,7 +759,7 @@ func (api *API) listJobs(w http.ResponseWriter, project, region string) {
 	items := []*Job{}
 	for k, v := range api.jobs {
 		if strings.HasPrefix(k, prefix) {
-			items = append(items, v)
+			items = append(items, cloneJob(v))
 		}
 	}
 	api.mu.RUnlock()
@@ -532,7 +778,6 @@ func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string
 
 	op := api.opMgr.Get(opName)
 	if op == nil {
-		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
 	}
@@ -573,7 +818,280 @@ func extractSegmentAfter(path, keyword string) string {
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{"code": code, "status": status, "message": message},
 	})
+}
+
+func (api *API) snapshotLocked() dataprocMetadata {
+	payload, _ := json.Marshal(dataprocMetadata{Clusters: api.clusters, Jobs: api.jobs})
+	var snapshot dataprocMetadata
+	_ = json.Unmarshal(payload, &snapshot)
+	_ = normalizeDataprocMetadata(&snapshot, false)
+	return snapshot
+}
+
+func (api *API) commitMetadata(previous, candidate dataprocMetadata) error {
+	_, err := api.commitMetadataOutcome(previous, candidate)
+	return err
+}
+
+func (api *API) commitMetadataOutcome(previous, candidate dataprocMetadata) (bool, error) {
+	if api.store == nil {
+		api.replaceMetadata(candidate)
+		return false, nil
+	}
+	saveErr := api.store.Save(dataprocStateEntry, candidate)
+	if saveErr == nil {
+		api.replaceMetadata(candidate)
+		return false, nil
+	}
+	var observed dataprocMetadata
+	loadErr := api.store.Load(dataprocStateEntry, &observed)
+	if loadErr == nil {
+		if err := normalizeDataprocMetadata(&observed, false); err != nil {
+			loadErr = err
+		} else {
+			switch {
+			case dataprocMetadataEqual(observed, candidate):
+				api.replaceMetadata(candidate)
+				return true, nil
+			case dataprocMetadataEqual(observed, previous):
+				return true, saveErr
+			}
+		}
+	} else if errors.Is(loadErr, state.ErrNotFound) && dataprocMetadataEmpty(previous) {
+		return true, saveErr
+	}
+	readbackErr := loadErr
+	if readbackErr == nil {
+		readbackErr = errors.New("readback differed from previous and candidate snapshots")
+	}
+	ambiguous := errors.Join(saveErr, fmt.Errorf("read back Dataproc metadata: %w", readbackErr))
+	api.degrade(ambiguous)
+	return true, ambiguous
+}
+
+func (api *API) replaceMetadata(metadata dataprocMetadata) {
+	api.mu.Lock()
+	api.clusters = metadata.Clusters
+	api.jobs = metadata.Jobs
+	api.mu.Unlock()
+}
+
+func (api *API) setClusterStatus(key, status, detail string) error {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable: %w", err)
+	}
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	snapshot := cloneDataprocMetadata(previous)
+	cluster := snapshot.Clusters[key]
+	if cluster == nil {
+		return fmt.Errorf("Dataproc cluster disappeared")
+	}
+	cluster.Status = ClusterStatus{
+		State: status, Detail: detail, StateStartTime: time.Now().UTC().Format(time.RFC3339),
+	}
+	cluster.StatusHistory = append(cluster.StatusHistory, cluster.Status)
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable before cluster outcome save: %w", err)
+	}
+	saveFailed, err := api.commitMetadataOutcome(previous, snapshot)
+	if saveFailed {
+		degradation := err
+		if degradation == nil {
+			degradation = errors.New("Dataproc cluster outcome save required readback reconciliation")
+		}
+		api.degrade(degradation)
+	}
+	if err != nil {
+		return fmt.Errorf("persist Dataproc cluster outcome: %w", err)
+	}
+	if saveFailed {
+		return errors.New("persist Dataproc cluster outcome: save returned an error")
+	}
+	return nil
+}
+
+func (api *API) compensateProvisionedCluster(created []string) error {
+	var compensationErr error
+	for index := len(created) - 1; index >= 0; index-- {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var err error
+		if contextual, ok := api.svcMgr.(dataprocContextualDeleter); ok {
+			err = contextual.DeleteComputeVMContext(ctx, created[index])
+		} else {
+			err = api.svcMgr.DeleteComputeVM(created[index])
+		}
+		cancel()
+		if err != nil {
+			compensationErr = errors.Join(compensationErr,
+				fmt.Errorf("delete %s: %w", created[index], err))
+		}
+	}
+	return compensationErr
+}
+
+func (api *API) deleteClusterMetadata(key string) error {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable: %w", err)
+	}
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	snapshot := cloneDataprocMetadata(previous)
+	delete(snapshot.Clusters, key)
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable before deletion outcome save: %w", err)
+	}
+	saveFailed, err := api.commitMetadataOutcome(previous, snapshot)
+	if saveFailed {
+		degradation := err
+		if degradation == nil {
+			degradation = errors.New("Dataproc deletion completion save required readback reconciliation")
+		}
+		api.degrade(degradation)
+	}
+	if err != nil {
+		return fmt.Errorf("persist Dataproc cluster deletion: %w", err)
+	}
+	if saveFailed {
+		return errors.New("persist Dataproc cluster deletion: save returned an error")
+	}
+	return nil
+}
+
+func (api *API) persistJob(key string, job *Job) error {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable: %w", err)
+	}
+	api.mu.RLock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
+	snapshot := cloneDataprocMetadata(previous)
+	snapshot.Jobs[key] = cloneJob(job)
+	if err := api.PersistenceError(); err != nil {
+		return fmt.Errorf("Dataproc persistence unavailable before job outcome save: %w", err)
+	}
+	saveFailed, err := api.commitMetadataOutcome(previous, snapshot)
+	if saveFailed {
+		degradation := err
+		if degradation == nil {
+			degradation = errors.New("Dataproc job outcome save required readback reconciliation")
+		}
+		api.degrade(degradation)
+	}
+	if err != nil {
+		return fmt.Errorf("persist Dataproc job outcome: %w", err)
+	}
+	if saveFailed {
+		return errors.New("persist Dataproc job outcome: save returned an error")
+	}
+	return nil
+}
+
+func normalizeDataprocMetadata(metadata *dataprocMetadata, restarting bool) error {
+	if metadata.Clusters == nil {
+		metadata.Clusters = make(map[string]*Cluster)
+	}
+	if metadata.Jobs == nil {
+		metadata.Jobs = make(map[string]*Job)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for key, cluster := range metadata.Clusters {
+		if cluster == nil {
+			return fmt.Errorf("cluster %q is null", key)
+		}
+		if restarting && cluster.Status.State != "ERROR" {
+			cluster.Status = ClusterStatus{
+				State: "ERROR", Detail: "Docker backend state is not reconciled after restart", StateStartTime: now,
+			}
+			cluster.StatusHistory = append(cluster.StatusHistory, cluster.Status)
+		}
+	}
+	for key, job := range metadata.Jobs {
+		if job == nil {
+			return fmt.Errorf("job %q is null", key)
+		}
+		if restarting && job.Status.State != "DONE" && job.Status.State != "ERROR" {
+			job.Status = JobStatus{
+				State: "ERROR", Details: "Job execution was interrupted by restart", StateStartTime: now,
+			}
+		}
+	}
+	return nil
+}
+
+func cloneDataprocMetadata(metadata dataprocMetadata) dataprocMetadata {
+	payload, _ := json.Marshal(metadata)
+	var clone dataprocMetadata
+	_ = json.Unmarshal(payload, &clone)
+	_ = normalizeDataprocMetadata(&clone, false)
+	return clone
+}
+
+func dataprocMetadataEqual(left, right dataprocMetadata) bool {
+	leftPayload, leftErr := json.Marshal(left)
+	rightPayload, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftPayload, rightPayload)
+}
+
+func dataprocMetadataEmpty(metadata dataprocMetadata) bool {
+	return len(metadata.Clusters) == 0 && len(metadata.Jobs) == 0
+}
+
+func cloneCluster(cluster *Cluster) *Cluster {
+	if cluster == nil {
+		return nil
+	}
+	payload, _ := json.Marshal(cluster)
+	var clone Cluster
+	_ = json.Unmarshal(payload, &clone)
+	return &clone
+}
+
+func cloneJob(job *Job) *Job {
+	if job == nil {
+		return nil
+	}
+	payload, _ := json.Marshal(job)
+	var clone Job
+	_ = json.Unmarshal(payload, &clone)
+	return &clone
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.initErr
+}
+
+func (api *API) initializationError() error { return api.PersistenceError() }
+
+func (api *API) rejectDegradedMutation(w http.ResponseWriter) bool {
+	if api.PersistenceError() == nil {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Dataproc persistence is unavailable")
+	return true
+}
+
+func (api *API) degrade(err error) {
+	api.mu.Lock()
+	if api.initErr == nil {
+		api.initErr = fmt.Errorf("Dataproc persistence is degraded: %w", err)
+	} else {
+		api.initErr = errors.Join(api.initErr, err)
+	}
+	api.mu.Unlock()
 }

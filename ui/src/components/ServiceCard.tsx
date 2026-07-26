@@ -9,6 +9,7 @@ import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import LockIcon from '@mui/icons-material/LockOutlined';
 import PsychologyIcon from '@mui/icons-material/Psychology';
 import type { DashboardSettingKey, DashboardSettings, Service } from '../hooks/useServices';
+import { serviceBackendPresentation } from '../serviceBackendPresentation';
 
 type ServiceCardProps = {
   service: Service;
@@ -57,6 +58,7 @@ export default function ServiceCard({
                <SecurityIcon sx={{ color: '#1e8e3e', fontSize: '1.2rem' }}/>;
     }
   };
+  const backendPresentation = serviceBackendPresentation(s.backend);
 
   return (
     <Card className="material-panel" sx={{ height: '100%' }}>
@@ -89,6 +91,31 @@ export default function ServiceCard({
         <Typography variant="body2" sx={{ color: '#5f6368', lineHeight: 1.5, mb: 3, flexGrow: 1 }}>
           {s.description}
         </Typography>
+        {s.backend && backendPresentation && (
+          <Box sx={{ mb: 2 }}>
+            <Chip
+              size="small"
+              variant="outlined"
+              label={backendPresentation.backendLabel}
+            />
+            <Chip
+              size="small"
+              variant="outlined"
+              sx={{ ml: 0.75 }}
+              label={backendPresentation.fidelityLabel}
+            />
+            {s.backend.diagnostic && (
+              <Typography role="status" variant="caption" color="warning.main" sx={{ display: 'block', mt: 0.75 }}>
+                {s.backend.diagnostic}
+              </Typography>
+            )}
+          </Box>
+        )}
+        {s.missingDeps && s.missingDeps.length > 0 && (
+          <Typography role="status" variant="caption" color="warning.main" sx={{ mb: 2 }}>
+            Missing dependency: {s.missingDeps.join(', ')}
+          </Typography>
+        )}
         
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
           {s.port ? (

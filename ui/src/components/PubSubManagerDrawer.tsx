@@ -12,6 +12,7 @@ import SendIcon from '@mui/icons-material/Send';
 import DownloadIcon from '@mui/icons-material/Download';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 type PubSubManagerDrawerProps = { open: boolean; onClose: () => void };
 
@@ -31,9 +32,6 @@ type PulledMessage = {
   data: string;
   ackId: string;
 };
-
-const errorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
 
 export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDrawerProps) {
   const { activeProject } = useProjectContext();
@@ -102,14 +100,10 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
     if (!newColName) return;
     try {
       const res = await fetch(`${apiRoot}/topics/${newColName}`, { method: 'PUT' });
-      if (res.ok) {
-        showToast('Topic created');
-        loadTopics();
-      } else {
-        const e = await res.json();
-        showToast(e.error?.message || 'Failed', 'error');
-      }
-    } catch (e: unknown) { showToast(errorMessage(e), 'error'); }
+      await requireOk(res, 'Pub/Sub topic creation failed. Check the topic name and retry.');
+      showToast('Topic created');
+      loadTopics();
+    } catch (e: unknown) { showToast(safeRequestError(e, 'Unable to connect while creating the Pub/Sub topic.'), 'error'); }
     setNewTopicOpen(false);
     setNewColName('');
   };
@@ -122,28 +116,29 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic: activeTopic })
       });
-      if (res.ok) {
-        showToast('Subscription created');
-        loadSubscriptions();
-      } else {
-        const e = await res.json();
-        showToast(e.error?.message || 'Failed', 'error');
-      }
-    } catch (e: unknown) { showToast(errorMessage(e), 'error'); }
+      await requireOk(res, 'Pub/Sub subscription creation failed. Check the subscription and topic names.');
+      showToast('Subscription created');
+      loadSubscriptions();
+    } catch (e: unknown) { showToast(safeRequestError(e, 'Unable to connect while creating the Pub/Sub subscription.'), 'error'); }
     setNewSubOpen(false);
     setNewSubName('');
   };
 
   const handleDeleteTopic = async (name: string) => {
-    await fetch(`/api/manage/pubsub/${name}`, { method: 'DELETE' });
-    if (activeTopic === name) setActiveTopic(null);
-    loadTopics();
+    try {
+      await requireOk(await fetch(`/api/manage/pubsub/${name}`, { method: 'DELETE' }),
+        'Pub/Sub topic deletion failed. Detach subscriptions and retry.');
+      if (activeTopic === name) setActiveTopic(null);
+      loadTopics();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while deleting the Pub/Sub topic.'), 'error'); }
   };
 
   const handleDeleteSub = async (name: string) => {
-    await fetch(`/api/manage/pubsub/${name}`, { method: 'DELETE' });
-    if (activeSubscription === name) setActiveSubscription(null);
-    loadSubscriptions();
+    try {
+      await requireOk(await fetch(`/api/manage/pubsub/${name}`, { method: 'DELETE' }), 'Pub/Sub subscription deletion failed. Retry the action.');
+      if (activeSubscription === name) setActiveSubscription(null);
+      loadSubscriptions();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while deleting the Pub/Sub subscription.'), 'error'); }
   };
 
   const handlePublish = async () => {
@@ -158,14 +153,10 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: [{ data: base64Data }] })
       });
-      if (res.ok) {
-        showToast('Message published successfully to topic');
-      } else {
-        const e = await res.json();
-        showToast(e.error?.message || 'Failed to publish', 'error');
-      }
+      await requireOk(res, 'Pub/Sub publish failed. Check the topic and message payload.');
+      showToast('Message published successfully to topic');
     } catch (e: unknown) {
-      showToast('Error publishing: ' + errorMessage(e), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while publishing the Pub/Sub message.'), 'error');
     } finally {
       setLoading(false);
     }
@@ -175,14 +166,13 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
     if (!activeSubscription) return;
     setLoading(true);
     try {
-      const res = await fetch(`/api/manage/pubsub/${activeSubscription}:pull`, {
+      const res = await checkedMutation(`/api/manage/pubsub/${activeSubscription}:pull`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ returnImmediately: true, maxMessages: 10 })
-      });
-      if (res.ok) {
-        const data: { receivedMessages?: ReceivedMessage[] } = await res.json();
-        if (data.receivedMessages && data.receivedMessages.length > 0) {
+      }, 'Pub/Sub pull failed. Check the subscription and retry.');
+      const data: { receivedMessages?: ReceivedMessage[] } = await res.json();
+      if (data.receivedMessages && data.receivedMessages.length > 0) {
           const decoded = data.receivedMessages.map((msg) => {
             let text: string;
             try { text = decodeURIComponent(escape(atob(msg.message.data))); } catch { text = '<binary>'; }
@@ -193,26 +183,20 @@ export default function PubSubManagerDrawer({ open, onClose }: PubSubManagerDraw
               ackId: msg.ackId
             };
           });
-          setPulledMessages(decoded);
-          showToast(`Pulled ${decoded.length} messages`);
-
-          // Auto-ack to avoid pulling same messages immediately again (common emulator workflow)
           const ackIds = data.receivedMessages.map((message) => message.ackId);
-          fetch(`/api/manage/pubsub/${activeSubscription}:acknowledge`, {
+          await requireOk(await fetch(`/api/manage/pubsub/${activeSubscription}:acknowledge`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ackIds })
-          });
-        } else {
-          showToast('No new messages available', 'error');
-          setPulledMessages([]);
-        }
+          }), 'Pub/Sub acknowledgement failed. Retry the pull before processing messages.');
+          setPulledMessages(decoded);
+          showToast(`Pulled and acknowledged ${decoded.length} messages`);
       } else {
-        const e = await res.json();
-        showToast(e.error?.message || 'Failed to pull', 'error');
+        showToast('No new messages available', 'error');
+        setPulledMessages([]);
       }
     } catch (e: unknown) {
-      showToast('Error pulling: ' + errorMessage(e), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while pulling Pub/Sub messages.'), 'error');
     } finally {
       setLoading(false);
     }

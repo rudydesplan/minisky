@@ -31,13 +31,25 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 	for _, service := range services {
 		service := service
 		t.Run(service.Domain, func(t *testing.T) {
-			if service.Fidelity == "" {
-				t.Error("fidelity tier is empty")
-			}
-			switch service.Fidelity {
-			case registry.FidelityHigh, registry.FidelityStandard, registry.FidelityPassthrough:
+			switch service.Support {
+			case registry.SupportImplemented:
+				if service.Fidelity == "" {
+					t.Error("implemented service fidelity tier is empty")
+				}
+				switch service.Fidelity {
+				case registry.FidelityHigh, registry.FidelityStandard, registry.FidelityPassthrough:
+				default:
+					t.Errorf("unknown fidelity tier %q", service.Fidelity)
+				}
+			case registry.SupportDeferred:
+				if service.Fidelity != "" {
+					t.Errorf("deferred service claims fidelity tier %q", service.Fidelity)
+				}
+				if service.DeferredReason == "" {
+					t.Error("deferred service has no reason")
+				}
 			default:
-				t.Errorf("unknown fidelity tier %q", service.Fidelity)
+				t.Errorf("unknown support status %q", service.Support)
 			}
 			if service.Persistence == "" {
 				t.Error("persistence category is empty")
@@ -55,12 +67,21 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 			if count := strings.Count(string(documentation), domainReference); count != 1 {
 				t.Errorf("docs/service-compatibility.md lists %q %d times, want exactly once", service.Domain, count)
 			}
-			expectedRow := fmt.Sprintf(
-				"| `%s` | %s | %s |",
-				service.Domain,
-				service.Fidelity,
-				service.Persistence,
-			)
+			expectedRow := ""
+			if service.Support == registry.SupportDeferred {
+				expectedRow = fmt.Sprintf(
+					"| `%s` | deferred | %s |",
+					service.Domain,
+					service.Persistence,
+				)
+			} else {
+				expectedRow = fmt.Sprintf(
+					"| `%s` | %s | %s |",
+					service.Domain,
+					service.Fidelity,
+					service.Persistence,
+				)
+			}
 			if !strings.Contains(string(documentation), expectedRow) {
 				t.Errorf("docs/service-compatibility.md does not contain manifest row %q", expectedRow)
 			}
@@ -71,6 +92,108 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 				t.Error("Docker-gated service has no backend contract rationale")
 			}
 		})
+	}
+}
+
+func TestManifestTruthForPersistedAndDeferredServices(t *testing.T) {
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byDomain := make(map[string]registry.Service, len(services))
+	for _, service := range services {
+		byDomain[service.Domain] = service
+	}
+
+	expected := map[string]struct {
+		fidelity    registry.FidelityTier
+		persistence registry.PersistenceCategory
+	}{
+		"artifactregistry.googleapis.com": {registry.FidelityStandard, registry.PersistenceFile},
+		"bigtableadmin.googleapis.com":    {registry.FidelityStandard, registry.PersistenceFile},
+	}
+	for domain, want := range expected {
+		service, ok := byDomain[domain]
+		if !ok {
+			t.Fatalf("manifest does not contain %q", domain)
+		}
+		if service.Fidelity != want.fidelity || service.Persistence != want.persistence {
+			t.Errorf(
+				"%s manifest = %s/%s, want %s/%s",
+				domain,
+				service.Fidelity,
+				service.Persistence,
+				want.fidelity,
+				want.persistence,
+			)
+		}
+	}
+}
+
+func TestMemcachedContractIsExplicitlyDeferred(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "contract-test")
+
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var memcached registry.Service
+	for _, service := range services {
+		if service.Domain == "memcache.googleapis.com" {
+			memcached = service
+			break
+		}
+	}
+	if memcached.Domain == "" {
+		t.Fatal("manifest does not contain memcache.googleapis.com")
+	}
+	if memcached.Support != registry.SupportDeferred {
+		t.Errorf("support = %q, want %q", memcached.Support, registry.SupportDeferred)
+	}
+	if memcached.Fidelity != "" {
+		t.Errorf("fidelity = %q, want empty for deferred service", memcached.Fidelity)
+	}
+	if memcached.Persistence != registry.PersistenceStatic {
+		t.Errorf("persistence = %q, want %q", memcached.Persistence, registry.PersistenceStatic)
+	}
+
+	handlers, err := registry.ContractHandlers(orchestrator.NewOperationManager(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, ok := handlers["memcache.googleapis.com"]
+	if !ok {
+		t.Fatal("no contract handler for memcache.googleapis.com")
+	}
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/projects/local-dev-project/locations/us-central1/instances",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusNotImplemented, response.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if envelope.Error.Code != http.StatusNotImplemented ||
+		envelope.Error.Status != "UNIMPLEMENTED" ||
+		!strings.Contains(envelope.Error.Message, "Memcached") {
+		t.Fatalf("unexpected deferred Memcached response: %+v", envelope.Error)
 	}
 }
 
