@@ -1,7 +1,7 @@
 
 import { useEffect, useState } from 'react';
 import { Link, Route, Switch, useLocation } from 'wouter';
-import { Box, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography } from '@mui/material';
+import { Alert, Box, Button, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography } from '@mui/material';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import StorageIcon from '@mui/icons-material/Storage';
 import ComputeIcon from '@mui/icons-material/Computer';
@@ -28,6 +28,8 @@ import MemorystorePage from './components/MemorystorePage';
 import TasksAndSchedulingPage from './components/TasksAndSchedulingPage';
 import SecurityPage from './components/SecurityPage';
 import GatewayRequestsPage from './components/GatewayRequestsPage';
+import { DASHBOARD_AUTH_EVENT, requireOk } from './apiClient';
+import { useProjectContext } from './contexts/ProjectContext';
 
 const DRAWER_WIDTH = 280;
 
@@ -51,6 +53,7 @@ function NavItem({ to, label, icon }: { to: string; label: string; icon: React.R
     <ListItemButton
       component={Link}
       to={to}
+      aria-current={active ? 'page' : undefined}
       sx={{
         borderRadius: '8px', mb: 1,
         backgroundColor: active ? '#e8f0fe' : 'transparent',
@@ -65,23 +68,44 @@ function NavItem({ to, label, icon }: { to: string; label: string; icon: React.R
 
 function NavigationContent() {
   const [pathname] = useLocation();
+  const { projectError } = useProjectContext();
   const isLogging = pathname === '/logging';
   const isMonitoring = pathname === '/monitoring';
   const isGatewayRequests = pathname === '/gateway-requests';
   const [version, setVersion] = useState('...');
+  const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/system/info')
+      .then(res => requireOk(res, 'Unable to load MiniSky version information.'))
       .then(res => res.json())
       .then(data => setVersion(data.version))
       .catch(err => console.error('Failed to fetch version:', err));
   }, []);
 
+  useEffect(() => {
+    const handleAuthError = (event: Event) => {
+      setAuthError((event as CustomEvent<string>).detail);
+    };
+    window.addEventListener(DASHBOARD_AUTH_EVENT, handleAuthError);
+    return () => window.removeEventListener(DASHBOARD_AUTH_EVENT, handleAuthError);
+  }, []);
+
   return (
     <Box sx={{ display: 'flex', minHeight: '100vh' }}>
+      <Button
+        component="a"
+        href="#main-content"
+        className="skip-link"
+        variant="contained"
+      >
+        Skip to main content
+      </Button>
       {/* Sidebar */}
       <Drawer
         variant="permanent"
+        component="nav"
+        aria-label="Primary navigation"
         sx={{
           width: DRAWER_WIDTH, flexShrink: 0,
           '& .MuiDrawer-paper': { width: DRAWER_WIDTH, boxSizing: 'border-box' },
@@ -109,6 +133,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/gateway-requests"
+            aria-current={isGatewayRequests ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 1,
               backgroundColor: isGatewayRequests ? '#e8f0fe' : 'transparent',
@@ -128,6 +153,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/logging"
+            aria-current={isLogging ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 1,
               backgroundColor: isLogging ? '#e8f0fe' : 'transparent',
@@ -147,6 +173,7 @@ function NavigationContent() {
           <ListItemButton
             component={Link}
             to="/monitoring"
+            aria-current={isMonitoring ? 'page' : undefined}
             sx={{
               borderRadius: '8px', mt: 0.5,
               backgroundColor: isMonitoring ? '#e8f0fe' : 'transparent',
@@ -157,7 +184,7 @@ function NavigationContent() {
               <BarChartIcon />
             </ListItemIcon>
             <ListItemText
-              primary="Cloud Monitoring"
+              primary="Container Metrics"
               sx={{ color: isMonitoring ? '#1a73e8' : '#3c4043', '& span': { fontWeight: isMonitoring ? 500 : 400 } }}
             />
           </ListItemButton>
@@ -165,13 +192,23 @@ function NavigationContent() {
       </Drawer>
 
       {/* Main content */}
-      <Box component="main" sx={{
+      <Box component="main" id="main-content" tabIndex={-1} sx={{
         flexGrow: 1,
         // Log Explorer gets full height with no padding
         ...(isLogging || isMonitoring || isGatewayRequests ? { p: 0, height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }
                                           : { p: 6, position: 'relative' })
       }}>
         {!isLogging && !isMonitoring && !isGatewayRequests && <ProjectSelector />}
+        {(authError || projectError) && (
+          <Alert
+            severity="error"
+            role="alert"
+            onClose={authError ? () => setAuthError(null) : undefined}
+            sx={{ mb: 2, mr: isLogging || isMonitoring || isGatewayRequests ? 2 : 0 }}
+          >
+            {authError ?? projectError}
+          </Alert>
+        )}
         <Switch>
           <Route path="/" component={Dashboard} />
           <Route path="/compute" component={ComputePage} />
@@ -186,6 +223,15 @@ function NavigationContent() {
           <Route path="/security" component={SecurityPage} />
           <Route path="/memorystore" component={MemorystorePage} />
           <Route path="/tasks" component={TasksAndSchedulingPage} />
+          <Route>
+            <Box sx={{ maxWidth: 640, py: 8 }}>
+              <Typography variant="h3" component="h1" sx={{ mb: 2 }}>Page not found</Typography>
+              <Typography sx={{ mb: 3, color: 'text.secondary' }}>
+                This dashboard route does not exist.
+              </Typography>
+              <Button component={Link} to="/" variant="contained">Return to diagnostics</Button>
+            </Box>
+          </Route>
         </Switch>
       </Box>
     </Box>

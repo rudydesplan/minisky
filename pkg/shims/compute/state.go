@@ -114,6 +114,10 @@ func newAPIWithMetadataStore(
 			instance.project = parts[0]
 			instance.zone = parts[1]
 		}
+		if instance.Status == "DELETING" {
+			instance.HostPorts = nil
+			continue
+		}
 		instance.Status = metadataOnlyStatus
 		instance.HostPorts = nil
 		instance.Description = rehydratedInstanceDescription
@@ -174,6 +178,91 @@ func (api *API) ReconcileVPCIPAM(ctx context.Context) error {
 		}
 	}
 	api.setInitializationError(nil)
+	return nil
+}
+
+// ReconcileComputeInstances rehydrates only existing exact owned custom-VPC
+// containers. It never creates, connects, or adopts a Docker endpoint.
+func (api *API) ReconcileComputeInstances(ctx context.Context) error {
+	api.mu.RLock()
+	keys := make([]string, 0, len(api.instances))
+	for key := range api.instances {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	instances := make(map[string]*Instance, len(keys))
+	for _, key := range keys {
+		instances[key] = api.instances[key].DeepCopy()
+	}
+	api.mu.RUnlock()
+
+	changed := false
+	for _, key := range keys {
+		instance := instances[key]
+		if instance == nil || (instance.Labels != nil && instance.Labels["managed-by"] == "gke") {
+			continue
+		}
+		attachment, custom, err := api.computeInstanceNetworkAttachment(instance.project, instance.NetworkInterfaces)
+		if err != nil {
+			return fmt.Errorf("reconcile Compute instance %q: %w", instance.Name, err)
+		}
+		if !custom {
+			if instance.Status == "DELETING" {
+				return fmt.Errorf(
+					"reconcile Compute instance %q: deletion marker cannot be confirmed without a custom VPC attachment",
+					instance.Name,
+				)
+			}
+			continue
+		}
+		if api.computeNetwork == nil {
+			return errors.New("Compute custom-network backend is unavailable")
+		}
+		runtime, found, err := api.computeNetwork.ReconcileComputeInstanceOnVPC(
+			ctx,
+			orchestratorComputeIdentity(instance.project, instance.zone, instance.Name),
+			attachment,
+		)
+		if err != nil {
+			return fmt.Errorf("reconcile Compute instance %q: %w", instance.Name, err)
+		}
+		if !found {
+			if instance.Status == "DELETING" {
+				api.mu.Lock()
+				if current := api.instances[key]; current != nil && current.Status == "DELETING" {
+					delete(api.instances, key)
+					changed = true
+				}
+				api.mu.Unlock()
+			}
+			continue
+		}
+		if instance.Status == "DELETING" {
+			return fmt.Errorf(
+				"reconcile Compute instance %q: deletion marker still has an exact owned container",
+				instance.Name,
+			)
+		}
+		if runtime.Status != "running" || runtime.IPAddress == "" {
+			return fmt.Errorf("reconcile Compute instance %q: exact owned container is not running", instance.Name)
+		}
+		api.mu.Lock()
+		current := api.instances[key]
+		if current != nil && len(current.NetworkInterfaces) == 1 {
+			current.Status = "RUNNING"
+			current.NetworkInterfaces[0].NetworkIP = runtime.IPAddress
+			if current.Description == rehydratedInstanceDescription {
+				current.Description = ""
+			}
+			changed = true
+		}
+		api.mu.Unlock()
+	}
+	if changed {
+		if err := api.persistMetadata(); err != nil {
+			return fmt.Errorf("persist reconciled Compute instances: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -280,6 +369,10 @@ func (api *API) initializationError() error {
 	api.initMu.RLock()
 	defer api.initMu.RUnlock()
 	return api.initializationErr
+}
+
+func (api *API) PersistenceError() error {
+	return api.initializationError()
 }
 
 func subnetworkVPCIdentity(subnetwork *Subnetwork) (string, string, error) {

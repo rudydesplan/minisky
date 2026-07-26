@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Box, Typography } from '@mui/material';
+import { Alert, Box, Chip, Typography } from '@mui/material';
 import { useServices } from '../hooks/useServices';
 import ServiceCard from './ServiceCard';
 import StorageManagerDrawer from './StorageManagerDrawer';
@@ -26,9 +26,8 @@ import CloudBuildDrawer from './CloudBuildDrawer';
 
 export default function Dashboard() {
   const { 
-    services, settings, handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency 
+    services, settings, error, handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency
   } = useServices();
-  const runningServices = services.filter(s => s.status === 'RUNNING');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [iamDrawerOpen, setIamDrawerOpen] = useState(false);
   const [computeDrawerOpen, setComputeDrawerOpen] = useState(false);
@@ -65,16 +64,24 @@ export default function Dashboard() {
           </Typography>
         </Box>
       </Box>
+      {error && <Alert severity="error" role="alert" sx={{ mb: 3 }}>{error}</Alert>}
+      <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 3 }}>
+        <Typography variant="body2" sx={{ color: 'text.secondary' }}>Runtime profile</Typography>
+        <Chip size="small" label={settings.runtime_profile?.name ?? 'unknown'} />
+        {settings.runtime_profile?.diagnostic && (
+          <Alert severity="warning" sx={{ py: 0 }}>{settings.runtime_profile.diagnostic}</Alert>
+        )}
+      </Box>
 
-      <Typography variant="h6" sx={{ mb: 3, color: 'var(--text-primary)' }}>Currently Active Endpoints</Typography>
+      <Typography variant="h6" sx={{ mb: 3, color: 'var(--text-primary)' }}>Service Runtime Status</Typography>
       
-      {runningServices.length === 0 ? (
+      {services.length === 0 ? (
         <Box sx={{ p: 4, background: '#f8f9fa', borderRadius: '10px', border: '1px dashed #dadce0', textAlign: 'center' }}>
           <Typography variant="body1" sx={{ color: '#80868b' }}>No active endpoints. Services will spin up automatically when invoked, or you can manually enable them in their specific tabs.</Typography>
         </Box>
       ) : (
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 4 }}>
-          {runningServices.map((s, idx) => (
+          {services.map((s, idx) => (
             <ServiceCard 
               key={s.id} 
               service={s} 

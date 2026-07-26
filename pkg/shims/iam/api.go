@@ -93,6 +93,7 @@ type API struct {
 	issuer                    *localsecurity.Issuer
 	tokenAudience             string
 	hierarchy                 hierarchyResolver
+	persistenceErr            error
 }
 
 type hierarchyResolver interface {
@@ -117,13 +118,17 @@ type iamMetadata struct {
 func NewAPI() *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
-		log.Printf("[Shim: IAM] state disabled: %v", err)
-		return newAPI(nil)
+		degraded := newAPI(nil)
+		degraded.persistenceErr = fmt.Errorf("open IAM state: %w", err)
+		log.Printf("[Shim: IAM] persistence degraded: %v", degraded.persistenceErr)
+		return degraded
 	}
 	api, err := NewAPIWithStore(store)
 	if err != nil {
-		log.Printf("[Shim: IAM] state rehydration failed: %v", err)
-		return newAPI(store)
+		degraded := newAPI(store)
+		degraded.persistenceErr = err
+		log.Printf("[Shim: IAM] persistence degraded: %v", err)
+		return degraded
 	}
 	if issuer, issuerErr := localsecurity.LoadIssuer(config.GetProfileDir()); issuerErr != nil {
 		log.Printf("[Shim: IAM] local credential issuer unavailable: %v", issuerErr)
@@ -199,6 +204,12 @@ func (api *API) persistMetadata() error {
 	metadata.WorkloadIdentityProviders = cloneWorkloadIdentityProviders(api.workloadIdentityProviders)
 	api.mu.RUnlock()
 	return api.store.Save(iamStateEntry, metadata)
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
 }
 
 // EnforcementEnabled reports whether cross-shim mutation checks are active.
@@ -361,6 +372,11 @@ func (api *API) persistOrError(w http.ResponseWriter) bool {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: IAM] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if err := api.PersistenceError(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "IAM persistence is unavailable")
+		return
+	}
 
 	path := r.URL.Path
 

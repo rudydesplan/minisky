@@ -69,13 +69,15 @@ type API struct {
 func NewAPI() *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
-		log.Printf("[Shim: Cloud KMS] state disabled: %v", err)
-		return newAPI(nil)
+		degraded := newAPI(nil)
+		degraded.markPersistenceDegraded(fmt.Errorf("open Cloud KMS state: %w", err))
+		return degraded
 	}
 	api, err := NewAPIWithStore(store)
 	if err != nil {
-		log.Printf("[Shim: Cloud KMS] state rehydration failed: %v", err)
-		return newAPI(nil)
+		degraded := newAPI(store)
+		degraded.markPersistenceDegraded(err)
+		return degraded
 	}
 	return api
 }
@@ -141,7 +143,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	api.mu.RUnlock()
 	if persistenceErr != nil {
 		jsonErrStatus(w, http.StatusServiceUnavailable, "UNAVAILABLE",
-			"Cloud KMS persistence is degraded: "+persistenceErr.Error())
+			"Cloud KMS persistence is unavailable")
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
@@ -822,4 +824,11 @@ func (api *API) markPersistenceDegraded(err error) {
 	api.mu.Lock()
 	api.persistenceErr = err
 	api.mu.Unlock()
+	log.Printf("[Shim: Cloud KMS] persistence degraded: %v", err)
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
 }

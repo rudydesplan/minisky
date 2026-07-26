@@ -40,6 +40,29 @@ variable "enable_phase16_network_resources" {
   default     = false
 }
 
+variable "enable_phase16_compute_instance" {
+  description = "Create the optional local Phase-16 Compute instance on the bounded subnetwork"
+  type        = bool
+  default     = false
+}
+
+variable "phase16_instance_name" {
+  description = "Name of the optional local Phase-16 Compute instance"
+  type        = string
+  default     = "minisky-phase16"
+
+  validation {
+    condition     = can(regex("^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$", var.phase16_instance_name))
+    error_message = "phase16_instance_name must follow GCE RFC1035 naming rules."
+  }
+}
+
+variable "phase16_instance_zone" {
+  description = "Zone of the optional local Phase-16 Compute instance"
+  type        = string
+  default     = "us-central1-a"
+}
+
 variable "phase16_network_name" {
   description = "Name of the optional local Phase-16 custom-mode network"
   type        = string

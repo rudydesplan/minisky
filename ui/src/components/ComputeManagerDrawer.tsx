@@ -13,6 +13,7 @@ import TerminalIcon from '@mui/icons-material/Terminal';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { useProjectContext } from '../contexts/ProjectContext';
 import TerminalDrawer from './TerminalDrawer';
+import { checkedMutation, requireOk, safeRequestError } from '../apiClient';
 
 const ZONE = 'us-central1-a';
 
@@ -66,11 +67,13 @@ export default function ComputeManagerDrawer({ open, onClose }: ComputeManagerDr
       loadInstances();
       
       fetch(`/api/manage/compute/projects/${activeProject}/global/networks`)
+        .then(r => requireOk(r, 'Unable to load VPC networks for Compute.'))
         .then(r => r.json())
         .then(d => setNetworks(d.items || []))
         .catch(console.error);
 
       fetch('/api/config/images')
+        .then(r => requireOk(r, 'Unable to load Compute image configuration.'))
         .then(r => r.json())
         .then(d => {
           if (d.compute?.os_images) {
@@ -102,35 +105,43 @@ export default function ComputeManagerDrawer({ open, onClose }: ComputeManagerDr
           }),
         }
       );
-      if (res.ok) {
-        showToast(`VM "${vmName}" is being provisioned — Docker image: ${osImage}`);
-        setVmName('');
-        setTimeout(loadInstances, 1500);
-      } else {
-        const e = await res.json();
-        showToast(e?.error?.message || 'Failed to create VM', 'error');
-      }
+      await requireOk(res, 'VM creation failed. Check the network, machine type, image, and VM name.');
+      showToast(`VM "${vmName}" is being provisioned — Docker image: ${osImage}`);
+      setVmName('');
+      setTimeout(loadInstances, 1500);
+    } catch (cause) {
+      showToast(safeRequestError(cause, 'Unable to connect while creating the VM.'), 'error');
     } finally {
       setLoading(false);
     }
   };
 
   const handleDelete = async (name: string) => {
-    await fetch(
-      `/api/manage/compute/projects/${activeProject}/zones/${ZONE}/instances/${name}`,
-      { method: 'DELETE' }
-    );
-    showToast(`VM "${name}" deletion requested`);
-    setTimeout(loadInstances, 1000);
+    try {
+      await checkedMutation(
+        `/api/manage/compute/projects/${activeProject}/zones/${ZONE}/instances/${name}`,
+        { method: 'DELETE' },
+        'VM deletion failed. Stop the VM and detach dependent resources before retrying.',
+      );
+      showToast(`VM "${name}" deletion requested`);
+      setTimeout(loadInstances, 1000);
+    } catch (error) {
+      showToast(safeRequestError(error, 'Unable to connect while deleting the VM.'), 'error');
+    }
   };
 
   const handleAction = async (name: string, action: 'start' | 'stop') => {
-    await fetch(
-      `/api/manage/compute/projects/${activeProject}/zones/${ZONE}/instances/${name}/${action}`,
-      { method: 'POST' }
-    );
-    showToast(`VM "${name}" ${action} requested`);
-    setTimeout(loadInstances, 1000);
+    try {
+      await checkedMutation(
+        `/api/manage/compute/projects/${activeProject}/zones/${ZONE}/instances/${name}/${action}`,
+        { method: 'POST' },
+        'VM state change failed. Refresh the instance state and retry.',
+      );
+      showToast(`VM "${name}" ${action} requested`);
+      setTimeout(loadInstances, 1000);
+    } catch (error) {
+      showToast(safeRequestError(error, 'Unable to connect while changing VM state.'), 'error');
+    }
   };
 
   const sshCommand = (name: string) => `docker exec -it minisky-vm-${name} /bin/bash`;

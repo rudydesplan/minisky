@@ -2,6 +2,9 @@ package gke
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -20,9 +23,19 @@ type gkeStore interface {
 }
 
 type gkeMetadata struct {
-	Backend    string                          `json:"backend"`
-	Clusters   map[string]*Cluster             `json:"clusters"`
-	Ownerships map[string]*kubeconfigOwnership `json:"kubeconfigOwnerships,omitempty"`
+	Backend           string                          `json:"backend"`
+	Clusters          map[string]*Cluster             `json:"clusters"`
+	Ownerships        map[string]*kubeconfigOwnership `json:"kubeconfigOwnerships,omitempty"`
+	OwnershipChecksum string                          `json:"kubeconfigOwnershipChecksum,omitempty"`
+}
+
+func kubeconfigOwnershipChecksum(ownerships map[string]*kubeconfigOwnership) (string, error) {
+	data, err := json.Marshal(ownerships)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API, error) {
@@ -41,7 +54,12 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API
 		api.clusters = persisted.Clusters
 	}
 	if persisted.Ownerships != nil {
-		api.ownerships = persisted.Ownerships
+		checksum, checksumErr := kubeconfigOwnershipChecksum(persisted.Ownerships)
+		if checksumErr == nil && checksum == persisted.OwnershipChecksum {
+			api.ownerships = persisted.Ownerships
+		} else {
+			log.Printf("[Shim: GKE] ignoring unchecksummed or corrupt kubeconfig ownership metadata")
+		}
 	}
 	if backend, ok := api.backend.(*KindBackend); ok {
 		for key, ownership := range api.ownerships {
@@ -102,5 +120,10 @@ func (api *API) persistMetadata() error {
 		}
 	}
 	api.mu.RUnlock()
+	checksum, err := kubeconfigOwnershipChecksum(snapshot.Ownerships)
+	if err != nil {
+		return fmt.Errorf("checksum GKE kubeconfig ownership metadata: %w", err)
+	}
+	snapshot.OwnershipChecksum = checksum
 	return api.stateStore.Save(gkeStateEntry, snapshot)
 }

@@ -12,6 +12,7 @@ import AddIcon from '@mui/icons-material/Add';
 import SaveIcon from '@mui/icons-material/Save';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type Document = {
   name: string;
@@ -21,12 +22,6 @@ type Document = {
 };
 
 type FirestoreManagerDrawerProps = { open: boolean; onClose: () => void };
-
-interface ApiErrorResponse {
-  error?: {
-    message?: string;
-  };
-}
 
 interface FirestoreDocumentSnapshot {
   id: string;
@@ -99,12 +94,12 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pageSize: 100 })
       });
-      if (res.ok) {
+      if (res.status === 404) {
+        setCollections([]);
+      } else {
+        await requireOk(res, 'Firestore collection loading failed. Check the database and retry.');
         const data = await res.json();
         setCollections(data.collectionIds || []);
-      } else if (res.status === 404) {
-        // Database might not be initialized yet via actual documents
-        setCollections([]);
       }
     } catch (e) {
       console.error(e);
@@ -191,15 +186,11 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fields: {} })
       });
-      if (res.ok) {
-        showToast('Created new document');
-        loadDocuments(activeCollection);
-      } else {
-        const e = await res.json() as ApiErrorResponse;
-        showToast(e.error?.message || 'Failed', 'error');
-      }
+      await requireOk(res, 'Firestore document creation failed. Check the collection and retry.');
+      showToast('Created new document');
+      loadDocuments(activeCollection);
     } catch (e: unknown) {
-      showToast(getErrorMessage(e, 'Failed to create document'), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while creating the Firestore document.'), 'error');
     }
   };
 
@@ -219,28 +210,33 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
         body: JSON.stringify({ fields })
       });
       
-      if (res.ok) {
-        showToast('Document saved successfully');
-        loadDocuments(activeCollection!);
-      } else {
-        const e = await res.json() as ApiErrorResponse;
-        showToast(e.error?.message || 'Save failed', 'error');
-      }
+      await requireOk(res, 'Firestore document save failed. Check the document fields and retry.');
+      showToast('Document saved successfully');
+      loadDocuments(activeCollection!);
     } catch (e: unknown) {
-      showToast('Invalid JSON format: ' + getErrorMessage(e, 'Unknown parsing error'), 'error');
+      showToast(
+        e instanceof SyntaxError
+          ? 'Invalid JSON format. Correct the document fields and retry.'
+          : safeRequestError(e, 'Unable to connect while saving the Firestore document.'),
+        'error',
+      );
     }
   };
 
   const handleDeleteDocument = async (docName: string) => {
     const docId = docName.split('/').pop();
-    await fetch(`${dbRoot}/${activeCollection}/${docId}`, { method: 'DELETE' });
-    showToast('Document deleted');
-    if (activeDocument?.name === docName) {
-      setActiveDocument(null);
+    try {
+      await requireOk(await fetch(`${dbRoot}/${activeCollection}/${docId}`, { method: 'DELETE' }),
+        'Firestore document deletion failed. Refresh the collection and retry.');
+      showToast('Document deleted');
+      if (activeDocument?.name === docName) {
+        setActiveDocument(null);
+      }
+      loadDocuments(activeCollection!);
+      loadCollections();
+    } catch (error) {
+      showToast(safeRequestError(error, 'Unable to connect while deleting the Firestore document.'), 'error');
     }
-    loadDocuments(activeCollection!);
-    // Refresh collections if creating/deleting the only doc in a collection
-    loadCollections();
   };
 
   const handleCreateCollection = () => {

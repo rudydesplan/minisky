@@ -37,8 +37,16 @@ func secureReadKubeconfigOwnership(string, *kubeconfigOwnership) ([]byte, error)
 	return nil, errSecureKubeconfigUnsupported
 }
 
-func kubeconfigOwnershipFromFileInfo(ClusterIdentity, os.FileInfo) (*kubeconfigOwnership, error) {
+func kubeconfigOwnershipFromTarget(ClusterIdentity, *secureKubeconfigTarget) (*kubeconfigOwnership, error) {
 	return nil, errSecureKubeconfigUnsupported
+}
+
+func finalizeKubeconfigOwnership(*secureKubeconfigTarget, *kubeconfigOwnership) error {
+	return errSecureKubeconfigUnsupported
+}
+
+func reportUnmatchedKubeconfigQuarantine(string, *unmatchedKubeconfigQuarantine) error {
+	return errSecureKubeconfigUnsupported
 }
 
 func secureQuarantineOwnedKubeconfig(string, *kubeconfigOwnership) error {

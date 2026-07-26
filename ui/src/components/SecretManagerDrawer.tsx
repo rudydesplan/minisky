@@ -13,6 +13,7 @@ import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
 
 interface Secret {
   name: string;
@@ -56,7 +57,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/secretmanager/projects/${activeProject}/secrets`);
-      if (!res.ok) throw new Error('Failed to fetch secrets');
+      await requireOk(res, 'Secret loading failed. Check the local service and retry.');
       const data = await res.json() as { secrets?: Secret[] };
       setSecrets(data.secrets || []);
     } catch (err: unknown) {
@@ -72,7 +73,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
     setVersionValue(null);
     try {
       const res = await fetch(`/api/manage/secretmanager/${secretName}/versions`);
-      if (!res.ok) throw new Error('Failed to fetch versions');
+      await requireOk(res, 'Secret version loading failed. Check the secret and retry.');
       const data = await res.json() as { versions?: SecretVersion[] };
       setVersions(data.versions || []);
     } catch (err: unknown) {
@@ -100,26 +101,21 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ replication: { automatic: {} } })
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as {
-          error?: { message?: string };
-        };
-        throw new Error(errData.error?.message || 'Failed to create secret');
-      }
+      await requireOk(res, 'Secret creation failed. Check the secret ID and retry.');
 
       if (initialValue) {
-        await fetch(`/api/manage/secretmanager/projects/${activeProject}/secrets/${newSecretId}:addVersion`, {
+        await requireOk(await fetch(`/api/manage/secretmanager/projects/${activeProject}/secrets/${newSecretId}:addVersion`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ payload: { data: btoa(initialValue) } })
-        });
+        }), 'Initial secret version creation failed. Retry after creating the secret.');
       }
 
       setNewSecretId('');
       setInitialValue('');
       fetchSecrets();
     } catch (err: unknown) {
-      setError(getErrorMessage(err));
+      setError(safeRequestError(err, 'Unable to connect while creating the secret.'));
     } finally {
       setCreating(false);
     }
@@ -134,11 +130,11 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ payload: { data: btoa(newVersionValue) } })
       });
-      if (!res.ok) throw new Error('Failed to add version');
+      await requireOk(res, 'Secret version creation failed. Check the secret state and retry.');
       setNewVersionValue('');
       fetchVersions(secretName);
     } catch (err: unknown) {
-      setError(getErrorMessage(err));
+      setError(safeRequestError(err, 'Unable to connect while adding the secret version.'));
     } finally {
       setAddingVersion(false);
     }
@@ -153,7 +149,7 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
 
     try {
       const res = await fetch(`/api/manage/secretmanager/${versionName}:access`);
-      if (!res.ok) throw new Error('Failed to access secret version');
+      await requireOk(res, 'Secret version access failed. Check permissions and version state.');
       const data = await res.json() as { payload: { data: string } };
       setVersionValue(atob(data.payload.data));
       setRevealedVersion(versionName);
@@ -168,11 +164,11 @@ export default function SecretManagerDrawer({ open, onClose }: Props) {
     
     try {
       const res = await fetch(`/api/manage/secretmanager/${name}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error('Failed to delete secret');
+      await requireOk(res, 'Secret deletion failed. Remove dependent versions and retry.');
       if (expandedSecret === name) setExpandedSecret(null);
       fetchSecrets();
     } catch (err: unknown) {
-      setError(getErrorMessage(err));
+      setError(safeRequestError(err, 'Unable to connect while deleting the secret.'));
     }
   };
 

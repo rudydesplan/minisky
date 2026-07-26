@@ -4,6 +4,8 @@ package gke
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -80,7 +82,7 @@ func securePrepareKubeconfigUnlocked(path string) (*secureKubeconfigTarget, erro
 	}
 	name := filepath.Base(path)
 	fd, err := unix.Openat(dirfd, name,
-		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+		unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, errors.Join(err, dir.Close())
 	}
@@ -191,6 +193,13 @@ func securePublishKubeconfig(target *secureKubeconfigTarget, path string) error 
 	if statErr != nil || finalCloseErr != nil || !os.SameFile(target.fileInfo, finalInfo) {
 		return fail(errors.Join(os.ErrPermission, statErr, finalCloseErr))
 	}
+	if target.ownership != nil {
+		descriptorInfo, statErr := target.file.Stat()
+		if statErr != nil ||
+			!kubeconfigOpenFileMatches(target.file, descriptorInfo, target.ownership) {
+			return fail(errors.Join(os.ErrPermission, statErr))
+		}
+	}
 	if target.testFileClose != nil {
 		err = target.testFileClose()
 	} else {
@@ -284,7 +293,11 @@ func secureDiscardKubeconfigUnlocked(target *secureKubeconfigTarget) error {
 	}
 	var closeErr error
 	if target.file != nil {
-		closeErr = target.file.Close()
+		// The descriptor still identifies the file this operation created even
+		// when the published pathname was replaced. Zeroize only through that
+		// descriptor; never infer ownership from a mutable pathname.
+		closeErr = errors.Join(
+			target.file.Truncate(0), target.file.Chmod(0), target.file.Sync(), target.file.Close())
 		target.file = nil
 	}
 	dirCloseErr := target.dir.Close()
@@ -321,33 +334,210 @@ func secureReadKubeconfigValidated(
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 ||
 		(expected != nil && !os.SameFile(expected, info)) ||
-		(ownership != nil && !kubeconfigOwnershipMatches(info, ownership)) {
+		(ownership != nil && !kubeconfigFileIdentityMatches(info, ownership)) {
 		return nil, errors.Join(os.ErrPermission, err, file.Close(), unix.Close(dirfd))
 	}
 	data, readErr := io.ReadAll(file)
+	if readErr == nil && ownership != nil && !kubeconfigDigestMatches(data, ownership) {
+		return nil, errors.Join(os.ErrPermission, file.Close(), unix.Close(dirfd))
+	}
 	return data, errors.Join(readErr, file.Close(), unix.Close(dirfd))
 }
 
-func kubeconfigOwnershipFromFileInfo(identity ClusterIdentity, info os.FileInfo) (*kubeconfigOwnership, error) {
-	stat, ok := info.Sys().(*syscall.Stat_t)
+func kubeconfigOwnershipFromTarget(
+	identity ClusterIdentity,
+	target *secureKubeconfigTarget,
+) (*kubeconfigOwnership, error) {
+	if target == nil || target.file == nil || target.dir == nil || target.fileInfo == nil {
+		return nil, fmt.Errorf("kubeconfig ownership target unavailable")
+	}
+	stat, ok := target.fileInfo.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil, fmt.Errorf("kubeconfig ownership identity unavailable")
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	var backendNonce [16]byte
+	if _, err := rand.Read(backendNonce[:]); err != nil {
 		return nil, fmt.Errorf("generate backend ownership nonce: %w", err)
 	}
 	return &kubeconfigOwnership{
 		Profile: identity.Profile, Project: identity.Project, Zone: identity.Zone, Cluster: identity.Cluster,
-		BackendName: "minisky-owned-" + hex.EncodeToString(nonce[:]),
+		BackendName: "minisky-owned-" + hex.EncodeToString(backendNonce[:]),
 		Device:      uint64(stat.Dev), Inode: uint64(stat.Ino),
 	}, nil
 }
 
-func kubeconfigOwnershipMatches(info os.FileInfo, ownership *kubeconfigOwnership) bool {
+func finalizeKubeconfigOwnership(
+	target *secureKubeconfigTarget,
+	ownership *kubeconfigOwnership,
+) error {
+	if target == nil || target.file == nil || target.fileInfo == nil || ownership == nil {
+		return fmt.Errorf("kubeconfig ownership target unavailable")
+	}
+	info, err := target.file.Stat()
+	if err != nil || !os.SameFile(target.fileInfo, info) ||
+		!kubeconfigFileIdentityMatches(info, ownership) {
+		return errors.Join(os.ErrPermission, err)
+	}
+	data, err := io.ReadAll(io.NewSectionReader(target.file, 0, info.Size()))
+	if err != nil || int64(len(data)) != info.Size() {
+		return errors.Join(fmt.Errorf("hash kubeconfig ownership content"), err)
+	}
+	after, err := target.file.Stat()
+	if err != nil || !os.SameFile(info, after) || after.Size() != info.Size() ||
+		!kubeconfigFileIdentityMatches(after, ownership) {
+		return errors.Join(os.ErrPermission, err)
+	}
+	sum := sha256.Sum256(data)
+	ownership.SHA256 = hex.EncodeToString(sum[:])
+	target.ownership = ownership
+	return nil
+}
+
+func kubeconfigFileIdentityMatches(info os.FileInfo, ownership *kubeconfigOwnership) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && ownership != nil &&
+	return ok && ownership != nil && info.Mode().IsRegular() && uint64(stat.Nlink) == 1 &&
 		uint64(stat.Dev) == ownership.Device && uint64(stat.Ino) == ownership.Inode
+}
+
+// A digest proves that bytes match previously trusted state; it does not prove
+// file provenance. A byte-identical, single-link replacement that also reuses
+// the recorded device/inode is indistinguishable and therefore accepted.
+func kubeconfigDigestMatches(data []byte, ownership *kubeconfigOwnership) bool {
+	if !ownership.hasContentDigest() {
+		return false
+	}
+	expected, err := hex.DecodeString(ownership.SHA256)
+	if err != nil {
+		return false
+	}
+	sum := sha256.Sum256(data)
+	return subtle.ConstantTimeCompare(sum[:], expected) == 1
+}
+
+func kubeconfigOpenFileMatches(
+	file *os.File,
+	info os.FileInfo,
+	ownership *kubeconfigOwnership,
+) bool {
+	if file == nil || !kubeconfigFileIdentityMatches(info, ownership) {
+		return false
+	}
+	data, err := io.ReadAll(io.NewSectionReader(file, 0, info.Size()))
+	return err == nil && int64(len(data)) == info.Size() &&
+		kubeconfigDigestMatches(data, ownership)
+}
+
+func unmatchedQuarantineEvidence(
+	name string,
+	info os.FileInfo,
+) *unmatchedKubeconfigQuarantine {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	return &unmatchedKubeconfigQuarantine{
+		Entry: name, Device: uint64(stat.Dev), Inode: uint64(stat.Ino),
+		Size: info.Size(), LinkCount: uint64(stat.Nlink),
+	}
+}
+
+func findUnmatchedKubeconfigQuarantine(
+	dirfd int,
+	ownership *kubeconfigOwnership,
+) (*unmatchedKubeconfigQuarantine, error) {
+	duplicate, err := unix.Dup(dirfd)
+	if err != nil {
+		return nil, err
+	}
+	dir := os.NewFile(uintptr(duplicate), "unmatched-kubeconfig-quarantines")
+	names, readErr := dir.Readdirnames(-1)
+	closeErr := dir.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		if !strings.HasPrefix(name, ".quarantine-") {
+			continue
+		}
+		fd, openErr := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			continue
+		}
+		file := os.NewFile(uintptr(fd), name)
+		info, statErr := file.Stat()
+		fileCloseErr := file.Close()
+		if statErr != nil || fileCloseErr != nil {
+			if fileCloseErr != nil {
+				return nil, fileCloseErr
+			}
+			continue
+		}
+		evidence := unmatchedQuarantineEvidence(name, info)
+		if evidence != nil && ownership != nil &&
+			evidence.Device == ownership.Device && evidence.Inode == ownership.Inode {
+			return evidence, nil
+		}
+	}
+	return nil, nil
+}
+
+func reportUnmatchedKubeconfigQuarantine(
+	path string,
+	evidence *unmatchedKubeconfigQuarantine,
+) error {
+	if evidence == nil || !validQuarantineEntryName(evidence.Entry) {
+		return &unmatchedKubeconfigQuarantineError{
+			Evidence: evidence, Reason: "invalid or missing quarantine evidence",
+		}
+	}
+	dirfd, err := openKubeconfigDir(filepath.Dir(path), false)
+	if err != nil {
+		return &unmatchedKubeconfigQuarantineError{
+			Evidence: evidence, Reason: "cannot inspect retained entry: " + err.Error(),
+		}
+	}
+	defer unix.Close(dirfd)
+	fd, err := unix.Openat(
+		dirfd, evidence.Entry, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &unmatchedKubeconfigQuarantineError{
+			Evidence: evidence, Reason: "retained entry unavailable: " + err.Error(),
+		}
+	}
+	file := os.NewFile(uintptr(fd), evidence.Entry)
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if err := errors.Join(statErr, closeErr); err != nil {
+		return &unmatchedKubeconfigQuarantineError{
+			Evidence: evidence, Reason: "cannot inspect retained entry: " + err.Error(),
+		}
+	}
+	observed := unmatchedQuarantineEvidence(evidence.Entry, info)
+	if observed == nil || *observed != *evidence {
+		return &unmatchedKubeconfigQuarantineError{
+			Evidence: evidence,
+			Reason: "retained entry identity changed; leave it untouched and inspect " +
+				filepath.Join(filepath.Dir(path), evidence.Entry),
+		}
+	}
+	return &unmatchedKubeconfigQuarantineError{
+		Evidence: evidence,
+		Reason: "content has no trusted digest; leave it untouched and inspect " +
+			filepath.Join(filepath.Dir(path), evidence.Entry),
+	}
+}
+
+func validQuarantineEntryName(name string) bool {
+	if len(name) != len(".quarantine-")+32 ||
+		!strings.HasPrefix(name, ".quarantine-") {
+		return false
+	}
+	for _, r := range name[len(".quarantine-"):] {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // secureQuarantineOwnedKubeconfig applies the same no-unlink invariant to
@@ -377,6 +567,21 @@ func secureQuarantineOwnedKubeconfigUnlocked(path string, ownership *kubeconfigO
 	} else if openErr == unix.ENOENT {
 		finalExists = false
 	}
+	if !ownership.hasContentDigest() {
+		evidence, findErr := findUnmatchedKubeconfigQuarantine(dirfd, ownership)
+		if findErr != nil {
+			return errors.Join(findErr, unix.Close(dirfd))
+		}
+		if evidence != nil {
+			return errors.Join(reportUnmatchedKubeconfigQuarantine(path, evidence), unix.Close(dirfd))
+		}
+		if !finalExists {
+			return errors.Join(&unmatchedKubeconfigQuarantineError{
+				Reason: "final path is absent and no trusted content digest exists; " +
+					"operator confirmation is required",
+			}, unix.Close(dirfd))
+		}
+	}
 	if found, err := zeroizeExistingOwnedTombstone(dirfd, ownership); err != nil {
 		return errors.Join(err, unix.Close(dirfd))
 	} else if found {
@@ -405,9 +610,22 @@ func secureQuarantineOwnedKubeconfigUnlocked(path string, ownership *kubeconfigO
 				info, statErr := file.Stat()
 				if statErr != nil {
 					cleanupErr = errors.Join(statErr, file.Close())
-				} else if !kubeconfigOwnershipMatches(info, ownership) {
+				} else if !ownership.hasContentDigest() ||
+					!kubeconfigFileIdentityMatches(info, ownership) {
+					evidence := unmatchedQuarantineEvidence(name, info)
 					cleanupErr = errors.Join(
-						fmt.Errorf("deleted kubeconfig ownership mismatch: %w", os.ErrPermission),
+						&unmatchedKubeconfigQuarantineError{
+							Evidence: evidence,
+							Reason:   "entry identity has no trusted content equivalence",
+						},
+						file.Close())
+				} else if !kubeconfigOpenFileMatches(file, info, ownership) {
+					evidence := unmatchedQuarantineEvidence(name, info)
+					cleanupErr = errors.Join(
+						&unmatchedKubeconfigQuarantineError{
+							Evidence: evidence,
+							Reason:   "content differs from trusted ownership digest",
+						},
 						file.Close())
 				} else {
 					cleanupErr = errors.Join(file.Truncate(0), file.Chmod(0), file.Sync(), file.Close())
@@ -443,7 +661,11 @@ func zeroizeExistingOwnedTombstone(
 		}
 		file := os.NewFile(uintptr(fd), name)
 		info, statErr := file.Stat()
-		if statErr == nil && kubeconfigOwnershipMatches(info, ownership) {
+		if statErr == nil && kubeconfigFileIdentityMatches(info, ownership) &&
+			info.Size() == 0 && info.Mode().Perm() == 0 {
+			return true, file.Close()
+		}
+		if statErr == nil && kubeconfigOpenFileMatches(file, info, ownership) {
 			return true, errors.Join(
 				file.Truncate(0), file.Chmod(0), file.Sync(), unix.Fsync(dirfd), file.Close())
 		}
@@ -472,7 +694,10 @@ func checkKubeconfigEntryCapacity(dirfd int) error {
 	for _, name := range names {
 		if strings.HasSuffix(name, ".kubeconfig") ||
 			strings.HasPrefix(name, ".quarantine-") ||
-			strings.HasPrefix(name, ".deleted-") {
+			strings.HasPrefix(name, ".deleted-") ||
+			// Legacy uncommitted witness entries are never trusted or unlinked;
+			// count them so they cannot bypass the bounded-directory guard.
+			strings.HasPrefix(name, ".ownership-") {
 			count++
 		}
 	}

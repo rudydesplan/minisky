@@ -21,6 +21,21 @@ import (
 	"google.golang.org/api/option"
 )
 
+func TestBigQueryDegradedResponseRedactsPersistenceCause(t *testing.T) {
+	const sensitive = "/private/bigquery/state.json: query-secret-123"
+	api := newAPI(nil, nil)
+	api.persistenceErr = errors.New(sensitive)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/demo/datasets", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(body, `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(body, `"message":"BigQuery persistence is unavailable"`) ||
+		strings.Contains(body, sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
+	}
+}
+
 type failingBigQueryStore struct {
 	mu       sync.Mutex
 	metadata bigQueryMetadata

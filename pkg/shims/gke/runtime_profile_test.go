@@ -57,21 +57,24 @@ func TestDeleteClusterRemovesTrackedKubeconfig(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "kubeconfig-restart")
 	identity := ClusterIdentity{Profile: "kubeconfig-restart", Project: "demo", Zone: "zone", Cluster: "cluster"}
 	path := kindKubeconfigPath(identity)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	target, err := securePrepareKubeconfig(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("credentials"), 0o600); err != nil {
+	if _, err := target.file.Write([]byte("credentials")); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
+	if err := securePublishKubeconfig(target, path); err != nil {
 		t.Fatal(err)
 	}
 	restarted := &KindBackend{enabled: true}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, info)
-	if err != nil {
-		t.Fatal(err)
-	}
 	deleted := filepath.Join(binDir, "deleted")
 	script := "#!/bin/sh\nif [ \"$1\" = get ]; then if [ ! -f " + deleted +
 		" ]; then echo " + ownership.BackendName + "; fi; else printf deleted > " + deleted + "; fi\nexit 0\n"

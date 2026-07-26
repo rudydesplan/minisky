@@ -16,6 +16,7 @@ type secureKubeconfigTarget struct {
 	dir                  *os.File
 	fileInfo             os.FileInfo
 	dirInfo              os.FileInfo
+	ownership            *kubeconfigOwnership
 	testFileSync         func() error
 	testDirSync          func() error
 	testFileClose        func() error
@@ -31,6 +32,7 @@ type kubeconfigOwnership struct {
 	Zone        string `json:"zone"`
 	Cluster     string `json:"cluster"`
 	BackendName string `json:"backendName,omitempty"`
+	SHA256      string `json:"sha256,omitempty"`
 	Device      uint64 `json:"device"`
 	Inode       uint64 `json:"inode"`
 }
@@ -54,4 +56,20 @@ func (ownership *kubeconfigOwnership) matchesIdentity(identity ClusterIdentity) 
 		ownership.Project == identity.Project &&
 		ownership.Zone == identity.Zone &&
 		ownership.Cluster == identity.Cluster
+}
+
+func (ownership *kubeconfigOwnership) hasContentDigest() bool {
+	if ownership == nil || len(ownership.SHA256) != 64 {
+		return false
+	}
+	for _, r := range ownership.SHA256 {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (ownership *kubeconfigOwnership) isDurable() bool {
+	return ownership.hasBackendNonce() && ownership.hasContentDigest()
 }

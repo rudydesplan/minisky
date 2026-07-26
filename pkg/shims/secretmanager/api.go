@@ -61,13 +61,15 @@ type API struct {
 func NewAPI(sm *orchestrator.ServiceManager, logAPI *logging.API) *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
-		log.Printf("[Shim: Secret Manager] state disabled: %v", err)
-		return newAPI(sm, logAPI, nil)
+		degraded := newAPI(sm, logAPI, nil)
+		degraded.markPersistenceDegraded(fmt.Errorf("open Secret Manager state: %w", err))
+		return degraded
 	}
 	api, err := NewAPIWithStore(sm, logAPI, store)
 	if err != nil {
-		log.Printf("[Shim: Secret Manager] state rehydration failed: %v", err)
-		return newAPI(sm, logAPI, nil)
+		degraded := newAPI(sm, logAPI, store)
+		degraded.markPersistenceDegraded(err)
+		return degraded
 	}
 	return api
 }
@@ -129,7 +131,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	api.mu.RUnlock()
 	if persistenceErr != nil {
 		jsonErrorStatus(w, http.StatusServiceUnavailable, "UNAVAILABLE",
-			"Secret Manager persistence is degraded: "+persistenceErr.Error())
+			"Secret Manager persistence is unavailable")
 		return
 	}
 
@@ -392,6 +394,13 @@ func (api *API) markPersistenceDegraded(err error) {
 	api.mu.Lock()
 	api.persistenceErr = err
 	api.mu.Unlock()
+	log.Printf("[Shim: Secret Manager] persistence degraded: %v", err)
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
 }
 
 func (api *API) listVersions(w http.ResponseWriter, r *http.Request, project, secretId string) {

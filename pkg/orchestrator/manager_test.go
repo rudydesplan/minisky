@@ -80,6 +80,142 @@ func TestTerminalExecTargetRequiresActiveProfileOwnership(t *testing.T) {
 	}
 }
 
+func TestListManagedContainersFiltersActiveProfileOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return dockerResponse(http.StatusOK, `[
+			{"Names":["/minisky-owned"],"Status":"Up","Image":"owned","Labels":{"managed-by":"minisky","minisky.profile":"active"}},
+			{"Names":["/minisky-other"],"Status":"Up","Image":"other","Labels":{"managed-by":"minisky","minisky.profile":"other"}},
+			{"Names":["/minisky-unowned"],"Status":"Up","Image":"user","Labels":{}}
+		]`), nil
+	})}}
+	containers := manager.ListManagedContainers()
+	if len(containers) != 1 || containers[0].Name != "minisky-owned" {
+		t.Fatalf("managed containers = %#v", containers)
+	}
+}
+
+func TestContainerLogsAndStatsRequireActiveProfileOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	mutated := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(request.URL.Path, "/json") {
+			return dockerResponse(http.StatusOK, `{"State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other"}}}`), nil
+		}
+		mutated = true
+		return dockerResponse(http.StatusOK, `{}`), nil
+	})}}
+	if _, err := manager.GetContainerLogs("minisky-other", 10); err == nil {
+		t.Fatal("logs allowed cross-profile container")
+	}
+	if _, err := manager.GetContainerStats("minisky-other"); err == nil {
+		t.Fatal("stats allowed cross-profile container")
+	}
+	if mutated {
+		t.Fatal("cross-profile request reached logs or stats endpoint")
+	}
+}
+
+func TestCloudBuildResourcesUseExactOwnershipLabels(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-profile")
+	const resource = "projects/demo/builds/build-1"
+	var volumeLabels, containerLabels map[string]string
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/volumes/"):
+			return dockerResponse(http.StatusNotFound, `{}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/volumes/create":
+			var payload struct {
+				Labels map[string]string `json:"Labels"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			volumeLabels = payload.Labels
+			return dockerResponse(http.StatusCreated, `{}`), nil
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/containers/"):
+			return dockerResponse(http.StatusNotFound, `{}`), nil
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/images/"):
+			return dockerResponse(http.StatusOK, `{}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/containers/create":
+			var payload struct {
+				Labels map[string]string `json:"Labels"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			containerLabels = payload.Labels
+			return dockerResponse(http.StatusCreated, `{}`), nil
+		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/start"):
+			return dockerResponse(http.StatusNoContent, `{}`), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}}
+	if err := manager.EnsureBuildWorkspace(context.Background(), "workspace", resource); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ProvisionBuildStep(context.Background(), "build-step", resource, "alpine:latest", []string{"workspace:/workspace"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	expected := buildResourceLabels(resource)
+	if !exactLabels(volumeLabels, expected) || !exactLabels(containerLabels, expected) {
+		t.Fatalf("volume labels=%v container labels=%v expected=%v", volumeLabels, containerLabels, expected)
+	}
+}
+
+func TestCloudBuildCleanupRefusesCrossProfileResources(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	deleted := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			return dockerResponse(http.StatusOK, `{"State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/build-1"}}}`), nil
+		}
+		deleted = true
+		return dockerResponse(http.StatusNoContent, `{}`), nil
+	})}}
+	if err := manager.StopAndRemoveBuildContainer(context.Background(), "build-step", "projects/demo/builds/build-1"); err == nil {
+		t.Fatal("cross-profile build container cleanup succeeded")
+	}
+	if deleted {
+		t.Fatal("cross-profile build container was mutated")
+	}
+}
+
+func TestCloudBuildCrashCleanupRemovesOnlyActiveProfileResources(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	var deleted []string
+	requestCount := 0
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/json":
+			return dockerResponse(http.StatusOK, `[
+				{"Id":"owned-container","Labels":{"managed-by":"minisky","minisky.profile":"active","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/1"}},
+				{"Id":"other-container","Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/1"}}
+			]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/volumes":
+			return dockerResponse(http.StatusOK, `{"Volumes":[
+				{"Name":"owned-volume","Labels":{"managed-by":"minisky","minisky.profile":"active","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/1"}},
+				{"Name":"user-volume","Labels":{"managed-by":"someone-else","minisky.profile":"active","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/1"}}
+			]}`), nil
+		case request.Method == http.MethodDelete:
+			deleted = append(deleted, request.URL.Path)
+			return dockerResponse(http.StatusNoContent, `{}`), nil
+		default:
+			t.Fatalf("unexpected Docker request #%d %s %s", requestCount, request.Method, request.URL)
+			return nil, nil
+		}
+	})}}
+	if err := manager.ReconcileBuildResources(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 2 || deleted[0] != "/containers/owned-container" || deleted[1] != "/volumes/owned-volume" {
+		t.Fatalf("deleted resources = %v", deleted)
+	}
+}
+
 func TestVPCNetworkUsesOwnedLabelsAndValidatedIPAM(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "network-test")
 	var createPayload map[string]any

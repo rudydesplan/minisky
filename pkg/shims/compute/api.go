@@ -117,12 +117,14 @@ type MetadataItem struct {
 }
 
 type NetworkInterface struct {
-	Kind          string         `json:"kind"`
-	Name          string         `json:"name"`
-	Network       string         `json:"network"`
-	NetworkIP     string         `json:"networkIP"`
-	Subnetwork    string         `json:"subnetwork,omitempty"`
-	AccessConfigs []AccessConfig `json:"accessConfigs,omitempty"`
+	Kind              string         `json:"kind"`
+	Name              string         `json:"name"`
+	Network           string         `json:"network"`
+	NetworkIP         string         `json:"networkIP"`
+	Subnetwork        string         `json:"subnetwork,omitempty"`
+	AccessConfigs     []AccessConfig `json:"accessConfigs,omitempty"`
+	StackType         string         `json:"stackType,omitempty"`
+	IPv6AccessConfigs []AccessConfig `json:"ipv6AccessConfigs,omitempty"`
 }
 
 type AccessConfig struct {
@@ -298,28 +300,50 @@ type firewallBackend interface {
 	) error
 }
 
+type computeNetworkBackend interface {
+	ProvisionComputeInstanceOnVPC(
+		context.Context,
+		orchestrator.ComputeInstanceIdentity,
+		string,
+		orchestrator.ComputeInstanceNetwork,
+		[]string,
+		[]string,
+		[]string,
+	) (orchestrator.ComputeInstanceRuntime, error)
+	ReconcileComputeInstanceOnVPC(
+		context.Context,
+		orchestrator.ComputeInstanceIdentity,
+		orchestrator.ComputeInstanceNetwork,
+	) (orchestrator.ComputeInstanceRuntime, bool, error)
+	DeleteComputeInstance(context.Context, orchestrator.ComputeInstanceIdentity) error
+}
+
+const defaultComputeDeleteTimeout = 30 * time.Second
+
 type API struct {
-	mu                sync.RWMutex
-	persistMu         sync.Mutex
-	initMu            sync.RWMutex
-	opMgr             *orchestrator.OperationManager
-	svcMgr            *orchestrator.ServiceManager
-	vpcIPAM           vpcIPAMBackend
-	legacyVM          legacyVMBackend
-	legacyVPC         legacyVPCBackend
-	firewall          firewallBackend
-	initializationErr error
-	stateStore        computeMetadataStore
-	instances         map[string]*Instance   // key: project+":"+zone+":"+name
-	networks          map[string]*Network    // key: project+":"+name
-	subnetworks       map[string]*Subnetwork // key: project+":"+region+":"+name
-	nextSubnetworkID  uint64
-	securityPolicies  map[string]*SecurityPolicy // key: project+":"+name
-	firewalls         map[string]*FirewallRule   // key: project+":"+name
-	instanceGroups    map[string]*InstanceGroup  // key: project+":"+zone+":"+name
-	loadBalancers     map[string]map[string]interface{}
-	roundRobin        map[string]uint64
-	httpClient        *http.Client
+	mu                   sync.RWMutex
+	persistMu            sync.Mutex
+	initMu               sync.RWMutex
+	opMgr                *orchestrator.OperationManager
+	svcMgr               *orchestrator.ServiceManager
+	vpcIPAM              vpcIPAMBackend
+	legacyVM             legacyVMBackend
+	legacyVPC            legacyVPCBackend
+	firewall             firewallBackend
+	computeNetwork       computeNetworkBackend
+	initializationErr    error
+	stateStore           computeMetadataStore
+	instances            map[string]*Instance   // key: project+":"+zone+":"+name
+	networks             map[string]*Network    // key: project+":"+name
+	subnetworks          map[string]*Subnetwork // key: project+":"+region+":"+name
+	nextSubnetworkID     uint64
+	securityPolicies     map[string]*SecurityPolicy // key: project+":"+name
+	firewalls            map[string]*FirewallRule   // key: project+":"+name
+	instanceGroups       map[string]*InstanceGroup  // key: project+":"+zone+":"+name
+	loadBalancers        map[string]map[string]interface{}
+	roundRobin           map[string]uint64
+	httpClient           *http.Client
+	computeDeleteTimeout time.Duration
 }
 
 // NewAPI builds the Compute shim with the shared LRO manager and service manager.
@@ -341,31 +365,38 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 	if err := api.ReconcileVPCIPAM(context.Background()); err != nil {
 		log.Printf("[Shim: Compute Engine] VPC IPAM reconciliation failed: %v", err)
 		api.setInitializationError(err)
+		return api
+	}
+	if err := api.ReconcileComputeInstances(context.Background()); err != nil {
+		log.Printf("[Shim: Compute Engine] Compute instance reconciliation failed: %v", err)
+		api.setInitializationError(err)
 	}
 	return api
 }
 
 func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager, store computeMetadataStore) *API {
 	api := &API{
-		opMgr:            opMgr,
-		svcMgr:           svcMgr,
-		stateStore:       store,
-		instances:        make(map[string]*Instance),
-		networks:         make(map[string]*Network),
-		subnetworks:      make(map[string]*Subnetwork),
-		nextSubnetworkID: 1,
-		securityPolicies: make(map[string]*SecurityPolicy),
-		firewalls:        make(map[string]*FirewallRule),
-		instanceGroups:   make(map[string]*InstanceGroup),
-		loadBalancers:    make(map[string]map[string]interface{}),
-		roundRobin:       make(map[string]uint64),
-		httpClient:       &http.Client{Timeout: 2 * time.Second},
+		opMgr:                opMgr,
+		svcMgr:               svcMgr,
+		stateStore:           store,
+		instances:            make(map[string]*Instance),
+		networks:             make(map[string]*Network),
+		subnetworks:          make(map[string]*Subnetwork),
+		nextSubnetworkID:     1,
+		securityPolicies:     make(map[string]*SecurityPolicy),
+		firewalls:            make(map[string]*FirewallRule),
+		instanceGroups:       make(map[string]*InstanceGroup),
+		loadBalancers:        make(map[string]map[string]interface{}),
+		roundRobin:           make(map[string]uint64),
+		httpClient:           &http.Client{Timeout: 2 * time.Second},
+		computeDeleteTimeout: defaultComputeDeleteTimeout,
 	}
 	if svcMgr != nil {
 		api.vpcIPAM = svcMgr
 		api.legacyVM = svcMgr
 		api.legacyVPC = svcMgr
 		api.firewall = svcMgr
+		api.computeNetwork = svcMgr
 	}
 	return api
 }
@@ -574,7 +605,9 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	defer api.persistMu.Unlock()
 	netIfaces, err := api.resolveInstanceNetworkInterfaces(project, zone, body.NetworkInterfaces)
 	if err != nil {
-		if errors.Is(err, errUnsupportedAutoNetwork) || errors.Is(err, errUnsupportedMultipleNICs) {
+		if errors.Is(err, errUnsupportedAutoNetwork) ||
+			errors.Is(err, errUnsupportedMultipleNICs) ||
+			errors.Is(err, errUnsupportedNetworkNIC) {
 			writeErrorStatus(w, http.StatusNotImplemented, "UNIMPLEMENTED", err.Error())
 		} else {
 			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -686,41 +719,35 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 	}
 	op.Kind = "compute#operation"
 
-	// Drive state machine asynchronously: PROVISIONING → PROVISIONING_DOCKER → RUNNING
+	// Drive state machine asynchronously: PROVISIONING → RUNNING.
 	opName := op.Name
+	operationContext := context.WithoutCancel(r.Context())
 	api.opMgr.RunAsync(opName, func() error {
-		// 1. Initial Staging phase (simulates resource allocation)
 		api.mu.Lock()
 		if i, ok := api.instances[key]; ok {
 			i.Status = "STAGING"
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Compute Engine] persist staging instance: %v", err)
+			return fmt.Errorf("persist staging instance: %w", err)
 		}
-		time.Sleep(2 * time.Second)
 
 		if isGKE {
-			// Kind already manages the docker daemon side. Mark running directly.
 			api.mu.Lock()
 			if i, ok := api.instances[key]; ok {
 				i.Status = "RUNNING"
 			}
 			api.mu.Unlock()
-			if err := api.persistMetadata(); err != nil {
-				log.Printf("[Shim: Compute Engine] persist running instance: %v", err)
-			}
-			return nil
+			return api.persistMetadata()
 		}
 
-		// 2. Provisioning phase (simulates Docker container startup)
 		api.mu.Lock()
 		if i, ok := api.instances[key]; ok {
 			i.Status = "PROVISIONING"
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Compute Engine] persist provisioning instance: %v", err)
+			return fmt.Errorf("persist provisioning instance: %w", err)
 		}
 
 		var interfaces []NetworkInterface
@@ -729,44 +756,78 @@ func (api *API) insertInstance(w http.ResponseWriter, r *http.Request, project, 
 			interfaces = append(interfaces, i.NetworkInterfaces...)
 		}
 		api.mu.RUnlock()
-		logicalVPC, dockerVPC, nameErr := resolvedInstanceVPCDockerNetwork(project, interfaces)
-		if nameErr != nil {
-			return nameErr
+		identity := orchestratorComputeIdentity(project, zone, name)
+		attachment, customNetwork, attachmentErr := api.computeInstanceNetworkAttachment(project, interfaces)
+		if attachmentErr != nil {
+			return api.rollbackFailedInstanceProvision(key, inst, attachmentErr)
 		}
-		allowedPorts := api.getAllowedPortsForVPC(logicalVPC)
-
-		// Tell the Orchestrator to physically spin up the Docker container!
-		err := api.svcMgr.ProvisionComputeInstance(
-			context.Background(),
-			orchestratorComputeIdentity(project, zone, name),
-			osImage,
-			dockerVPC,
-			allowedPorts,
-			[]string{},
-			dockerCommand,
-		)
-
-		// Keep the simulated delay outside the metadata lock.
-		if err == nil {
-			time.Sleep(1500 * time.Millisecond)
-		}
-		api.mu.Lock()
-		if i, ok := api.instances[key]; ok {
-			if err != nil {
-				i.Status = "TERMINATED"
-				i.Description = fmt.Sprintf("Failed to provision docker data plane: %v", err)
-				api.mu.Unlock()
-				if persistErr := api.persistMetadata(); persistErr != nil {
-					log.Printf("[Shim: Compute Engine] persist failed instance: %v", persistErr)
+		var provisionErr error
+		networkIP := ""
+		if customNetwork {
+			if api.computeNetwork == nil {
+				provisionErr = errors.New("Compute custom-network backend is unavailable")
+			} else {
+				allowedPorts := api.getAllowedPortsForVPC(networkSelfLink(project, attachment.VPC.Network))
+				provisionCtx, cancel := context.WithTimeout(operationContext, 3*time.Minute)
+				runtime, err := api.computeNetwork.ProvisionComputeInstanceOnVPC(
+					provisionCtx,
+					identity,
+					osImage,
+					attachment,
+					allowedPorts,
+					nil,
+					dockerCommand,
+				)
+				cancel()
+				provisionErr = err
+				networkIP = runtime.IPAddress
+				if provisionErr == nil && networkIP == "" {
+					provisionErr = errors.New("Compute backend did not return a truthful primary IPv4 address")
 				}
-				return err
 			}
+		} else if api.svcMgr == nil {
+			provisionErr = errors.New("Compute backend is unavailable")
+		} else {
+			logicalVPC, dockerVPC, nameErr := resolvedInstanceVPCDockerNetwork(project, interfaces)
+			if nameErr != nil {
+				provisionErr = nameErr
+			} else {
+				provisionErr = api.svcMgr.ProvisionComputeInstance(
+					operationContext,
+					identity,
+					osImage,
+					dockerVPC,
+					api.getAllowedPortsForVPC(logicalVPC),
+					nil,
+					dockerCommand,
+				)
+			}
+		}
+		if provisionErr != nil {
+			return api.rollbackFailedInstanceProvision(key, inst, provisionErr)
+		}
 
+		api.mu.Lock()
+		var runningSnapshot *Instance
+		if i, ok := api.instances[key]; ok {
+			if customNetwork && len(i.NetworkInterfaces) == 1 {
+				i.NetworkInterfaces[0].NetworkIP = networkIP
+			}
 			i.Status = "RUNNING"
+			runningSnapshot = i.DeepCopy()
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Compute Engine] persist running instance: %v", err)
+			return api.reconcileRunningInstanceSaveFailure(
+				operationContext,
+				key,
+				inst,
+				runningSnapshot,
+				identity,
+				customNetwork,
+				attachment,
+				err,
+			)
 		}
 		return nil
 	})
@@ -875,14 +936,30 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		return
 	}
 
+	deleteBaseContext := context.WithoutCancel(r.Context())
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Simulate winding down time
-		time.Sleep(3 * time.Second)
-
+		deleteContext, cancelDelete := context.WithTimeout(deleteBaseContext, api.computeDeleteTimeout)
+		defer cancelDelete()
 		if isGKE {
-			api.svcMgr.DeleteComputeVM(containerName)
+			if api.svcMgr != nil {
+				if err := api.svcMgr.DeleteComputeVMContext(deleteContext, containerName); err != nil {
+					return api.restoreInstanceAfterDeleteFailure(key, inst, err)
+				}
+			}
 		} else {
-			_ = api.svcMgr.DeleteComputeInstance(orchestratorComputeIdentity(project, zone, name))
+			if api.computeNetwork == nil {
+				return api.restoreInstanceAfterDeleteFailure(
+					key,
+					inst,
+					errors.New("Compute deletion backend is unavailable"),
+				)
+			}
+			if err := api.computeNetwork.DeleteComputeInstance(
+				deleteContext,
+				orchestratorComputeIdentity(project, zone, name),
+			); err != nil {
+				return api.restoreInstanceAfterDeleteFailure(key, inst, err)
+			}
 		}
 
 		legacyCleanup := api.removeInstanceAndLegacyCleanupEligibility(key, name)
@@ -890,13 +967,58 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 			api.cleanupLegacyComputeVM(name, legacyCleanup)
 		}
 		if err := api.persistMetadata(); err != nil {
-			log.Printf("[Shim: Compute Engine] persist deleted instance: %v", err)
+			return api.reconcileDeletedInstanceSaveFailure(key, err)
 		}
 		return nil
 	})
 
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
+}
+
+func (api *API) restoreInstanceAfterDeleteFailure(key string, instance *Instance, cause error) error {
+	api.mu.Lock()
+	if current := api.instances[key]; current == instance {
+		current.Status = "RUNNING"
+	}
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		combined := fmt.Errorf("delete Compute instance: %w; restore metadata: %v", cause, err)
+		api.setInitializationError(combined)
+		return combined
+	}
+	return cause
+}
+
+func (api *API) reconcileDeletedInstanceSaveFailure(key string, saveErr error) error {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+
+	if absent, _ := api.persistedInstanceMatches(key, nil); absent {
+		return nil
+	}
+
+	api.mu.RLock()
+	payload, snapshotErr := api.marshalMetadataLocked()
+	api.mu.RUnlock()
+	retryErr := snapshotErr
+	if retryErr == nil {
+		retryErr = api.saveMetadataPayload(payload)
+	}
+	if retryErr == nil {
+		return nil
+	}
+	if absent, _ := api.persistedInstanceMatches(key, nil); absent {
+		return nil
+	}
+
+	combined := fmt.Errorf(
+		"persist deleted instance: %w; retry absent metadata: %v",
+		saveErr,
+		retryErr,
+	)
+	api.setInitializationError(combined)
+	return combined
 }
 
 func (api *API) removeInstanceAndLegacyCleanupEligibility(key, name string) bool {
@@ -909,6 +1031,182 @@ func (api *API) removeInstanceAndLegacyCleanupEligibility(key, name string) bool
 		}
 	}
 	return true
+}
+
+func (api *API) rollbackFailedInstanceProvision(key string, instance *Instance, cause error) error {
+	log.Printf("[Shim: Compute Engine] instance provisioning failed for %s: %v", key, cause)
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.Lock()
+	current := api.instances[key]
+	if current == instance {
+		delete(api.instances, key)
+	}
+	payload, snapshotErr := api.marshalMetadataLocked()
+	api.mu.Unlock()
+	if snapshotErr == nil {
+		snapshotErr = api.saveMetadataPayload(payload)
+	}
+	if snapshotErr != nil {
+		api.mu.Lock()
+		if api.instances[key] == nil {
+			api.instances[key] = instance
+		}
+		api.mu.Unlock()
+		combined := fmt.Errorf("provision Compute instance: %w; rollback metadata: %v", cause, snapshotErr)
+		api.setInitializationError(combined)
+		return combined
+	}
+	return cause
+}
+
+func (api *API) reconcileRunningInstanceSaveFailure(
+	baseContext context.Context,
+	key string,
+	instance *Instance,
+	expected *Instance,
+	identity orchestrator.ComputeInstanceIdentity,
+	customNetwork bool,
+	attachment orchestrator.ComputeInstanceNetwork,
+	saveErr error,
+) error {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+
+	if committed, _ := api.persistedInstanceMatches(key, expected); committed {
+		return nil
+	}
+
+	cleanupContext, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(baseContext),
+		api.computeDeleteTimeout,
+	)
+	defer cancelCleanup()
+	var cleanupErr error
+	if customNetwork {
+		if api.computeNetwork == nil {
+			cleanupErr = errors.New("Compute custom-network cleanup backend is unavailable")
+		} else {
+			cleanupErr = api.computeNetwork.DeleteComputeInstance(cleanupContext, identity)
+		}
+	} else if api.svcMgr == nil {
+		cleanupErr = errors.New("Compute cleanup backend is unavailable")
+	} else {
+		containerName, nameErr := identity.DockerName()
+		if nameErr != nil {
+			cleanupErr = nameErr
+		} else {
+			cleanupErr = api.svcMgr.DeleteComputeVMContext(cleanupContext, containerName)
+		}
+	}
+
+	if cleanupErr != nil {
+		runtimeConfirmed := false
+		var reconcileErr error
+		if customNetwork && api.computeNetwork != nil {
+			reconcileContext, cancelReconcile := context.WithTimeout(
+				context.WithoutCancel(baseContext),
+				api.computeDeleteTimeout,
+			)
+			runtime, found, err := api.computeNetwork.ReconcileComputeInstanceOnVPC(
+				reconcileContext,
+				identity,
+				attachment,
+			)
+			cancelReconcile()
+			reconcileErr = err
+			expectedIP := ""
+			if expected != nil && len(expected.NetworkInterfaces) == 1 {
+				expectedIP = expected.NetworkInterfaces[0].NetworkIP
+			}
+			runtimeConfirmed = err == nil && found && runtime.Status == "running" &&
+				runtime.IPAddress != "" && runtime.IPAddress == expectedIP
+			if err == nil && !runtimeConfirmed {
+				reconcileErr = errors.New("exact owned running container and primary IPv4 were not confirmed")
+			}
+		}
+		if !runtimeConfirmed {
+			combined := fmt.Errorf(
+				"persist running instance: %w; cleanup exact owned container: %v; "+
+					"runtime ownership reconciliation failed: %v",
+				saveErr,
+				cleanupErr,
+				reconcileErr,
+			)
+			api.setInitializationError(combined)
+			return combined
+		}
+		api.mu.RLock()
+		payload, snapshotErr := api.marshalMetadataLocked()
+		api.mu.RUnlock()
+		retryErr := snapshotErr
+		if retryErr == nil {
+			retryErr = api.saveMetadataPayload(payload)
+		}
+		if retryErr == nil {
+			return nil
+		}
+		if committed, _ := api.persistedInstanceMatches(key, expected); committed {
+			return nil
+		}
+		combined := fmt.Errorf(
+			"persist running instance: %w; cleanup exact owned container: %v; retry metadata: %v",
+			saveErr,
+			cleanupErr,
+			retryErr,
+		)
+		api.setInitializationError(combined)
+		return combined
+	}
+
+	api.mu.Lock()
+	if api.instances[key] == instance {
+		delete(api.instances, key)
+	}
+	payload, snapshotErr := api.marshalMetadataLocked()
+	api.mu.Unlock()
+	rollbackErr := snapshotErr
+	if rollbackErr == nil {
+		rollbackErr = api.saveMetadataPayload(payload)
+	}
+	if rollbackErr != nil {
+		if absent, _ := api.persistedInstanceMatches(key, nil); !absent {
+			combined := fmt.Errorf(
+				"persist running instance: %w; compensate metadata: %v",
+				saveErr,
+				rollbackErr,
+			)
+			api.setInitializationError(combined)
+			return combined
+		}
+	}
+	return fmt.Errorf("persist running instance: %w; exact owned container was removed", saveErr)
+}
+
+func (api *API) persistedInstanceMatches(key string, expected *Instance) (bool, error) {
+	if api.stateStore == nil {
+		return expected == nil, nil
+	}
+	var persisted computeMetadata
+	if err := api.stateStore.Load(computeStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return expected == nil, nil
+		}
+		return false, err
+	}
+	actual := persisted.Instances[key]
+	if actual == nil || expected == nil {
+		return actual == nil && expected == nil, nil
+	}
+	actualJSON, err := json.Marshal(actual)
+	if err != nil {
+		return false, err
+	}
+	expectedJSON, err := json.Marshal(expected)
+	if err != nil {
+		return false, err
+	}
+	return string(actualJSON) == string(expectedJSON), nil
 }
 
 func (api *API) cleanupLegacyComputeVM(name string, eligible bool) {

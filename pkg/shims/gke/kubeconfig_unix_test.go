@@ -4,6 +4,7 @@ package gke
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -139,6 +141,41 @@ func TestSecurePublishRejectsPreReturnSwap(t *testing.T) {
 	}
 }
 
+func TestSecurePublishRejectsPostDigestContentMutation(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(root, "cluster.kubeconfig")
+	target, err := securePrepareKubeconfig(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.file.Write([]byte("credential")); err != nil {
+		t.Fatal(err)
+	}
+	identity := ClusterIdentity{
+		Profile: "publish", Project: "demo", Zone: "zone", Cluster: "cluster",
+	}
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
+	target.testBeforeFinalCheck = func() error {
+		return os.WriteFile(final, []byte("attacker"), 0o600)
+	}
+	if err := securePublishKubeconfig(target, final); err == nil {
+		t.Fatal("published content changed after digest sealing")
+	}
+	if _, err := os.Stat(final); !os.IsNotExist(err) {
+		t.Fatalf("mutated final remains: %v", err)
+	}
+	assertZeroizedQuarantine(t, root, ".quarantine-*")
+}
+
 func TestSecureCleanupQuarantinesReplacementAndPreservesNewFinal(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -150,6 +187,15 @@ func TestSecureCleanupQuarantinesReplacementAndPreservesNewFinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := target.file.Write([]byte("credential")); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := kubeconfigOwnershipFromTarget(ClusterIdentity{
+		Profile: "cleanup", Project: "demo", Zone: "zone", Cluster: "cluster",
+	}, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
 		t.Fatal(err)
 	}
 	target.testFileSync = func() error { return errors.New("force cleanup") }
@@ -177,6 +223,10 @@ func TestSecureCleanupQuarantinesReplacementAndPreservesNewFinal(t *testing.T) {
 	data, err = os.ReadFile(matches[0])
 	if err != nil || string(data) != "attacker" {
 		t.Fatalf("quarantined replacement=%q err=%v", data, err)
+	}
+	witnesses, err := filepath.Glob(filepath.Join(root, ".ownership-*"))
+	if err != nil || len(witnesses) != 0 {
+		t.Fatalf("unexpected ownership links=%v err=%v", witnesses, err)
 	}
 }
 
@@ -222,15 +272,18 @@ func TestPostSuccessRegularMutationIsRejectedOnTrackedRead(t *testing.T) {
 	if _, err := target.file.Write([]byte("credential")); err != nil {
 		t.Fatal(err)
 	}
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
 	if err := securePublishKubeconfig(target, final); err != nil {
 		t.Fatal(err)
 	}
 	backend := &KindBackend{}
 	name, err := kindBackendName(identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,6 +296,229 @@ func TestPostSuccessRegularMutationIsRejectedOnTrackedRead(t *testing.T) {
 	}
 	if _, err := backend.ReadKubeconfig(identity); err == nil {
 		t.Fatal("accepted post-success regular-file inode replacement")
+	}
+}
+
+func TestContentDigestRejectsReplacementWithReusedFileIdentity(t *testing.T) {
+	// Threat boundary: the digest proves trusted-state content equivalence, not
+	// provenance. A byte-identical, single-link replacement with reused
+	// device/inode identity is indistinguishable; this case changes the bytes.
+	identity, backend, final, root := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing original ownership")
+	}
+	if err := os.Remove(final); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(final, []byte("attacker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("replacement file identity unavailable")
+	}
+	forged := *ownership
+	forged.Device = uint64(stat.Dev)
+	forged.Inode = uint64(stat.Ino)
+	if data, err := secureReadKubeconfigOwnership(final, &forged); err == nil || data != nil {
+		t.Fatalf("replacement read data=%q err=%v", data, err)
+	}
+	err = secureQuarantineOwnedKubeconfig(final, &forged)
+	if err == nil || !strings.Contains(err.Error(), "manual recovery required") {
+		t.Fatalf("quarantine error=%v", err)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(root, ".quarantine-*"))
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("quarantines=%v err=%v", matches, globErr)
+	}
+	data, readErr := os.ReadFile(matches[0])
+	if readErr != nil || string(data) != "attacker" {
+		t.Fatalf("attacker quarantine=%q err=%v", data, readErr)
+	}
+	witnesses, globErr := filepath.Glob(filepath.Join(root, ".ownership-*"))
+	if globErr != nil || len(witnesses) != 0 {
+		t.Fatalf("unexpected ownership links=%v err=%v", witnesses, globErr)
+	}
+}
+
+func TestContentDigestRejectsSameInodeContentTamper(t *testing.T) {
+	identity, backend, final, root := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing original ownership")
+	}
+	if err := os.WriteFile(final, []byte("attacker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := secureReadKubeconfigOwnership(final, ownership); err == nil || data != nil {
+		t.Fatalf("tampered read data=%q err=%v", data, err)
+	}
+	err = secureQuarantineOwnedKubeconfig(final, ownership)
+	if err == nil || !strings.Contains(err.Error(), "manual recovery required") {
+		t.Fatalf("quarantine error=%v", err)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(root, ".quarantine-*"))
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("quarantines=%v err=%v", matches, globErr)
+	}
+	data, readErr := os.ReadFile(matches[0])
+	if readErr != nil || string(data) != "attacker" {
+		t.Fatalf("tampered quarantine=%q err=%v", data, readErr)
+	}
+}
+
+func TestDualLinkReplacementIsNeverReadOrZeroized(t *testing.T) {
+	identity, backend, final, root := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing original ownership")
+	}
+	if err := os.Remove(final); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "attacker")
+	attacker := []byte("dual-link-attacker")
+	if err := os.WriteFile(outside, attacker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, final); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("replacement file identity unavailable")
+	}
+	forged := *ownership
+	forged.Device = uint64(stat.Dev)
+	forged.Inode = uint64(stat.Ino)
+	sum := sha256.Sum256(attacker)
+	forged.SHA256 = fmt.Sprintf("%x", sum[:])
+	if data, err := secureReadKubeconfigOwnership(final, &forged); err == nil || data != nil {
+		t.Fatalf("dual-link read data=%q err=%v", data, err)
+	}
+	err = secureQuarantineOwnedKubeconfig(final, &forged)
+	if err == nil || !strings.Contains(err.Error(), "manual recovery required") {
+		t.Fatalf("quarantine error=%v", err)
+	}
+	for _, path := range []string{outside} {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil || string(data) != string(attacker) {
+			t.Fatalf("attacker link %q=%q err=%v", path, data, readErr)
+		}
+	}
+	matches, globErr := filepath.Glob(filepath.Join(root, ".quarantine-*"))
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("quarantines=%v err=%v", matches, globErr)
+	}
+	data, readErr := os.ReadFile(matches[0])
+	if readErr != nil || string(data) != string(attacker) {
+		t.Fatalf("attacker quarantine=%q err=%v", data, readErr)
+	}
+}
+
+func TestOwnershipDigestContainsNoCredentialMaterial(t *testing.T) {
+	identity, backend, _, _ := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing ownership")
+	}
+	sum := sha256.Sum256([]byte("credential"))
+	if ownership.SHA256 != fmt.Sprintf("%x", sum[:]) {
+		t.Fatalf("digest=%q", ownership.SHA256)
+	}
+	encoded, err := json.Marshal(ownership)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "credential") {
+		t.Fatalf("ownership metadata contains credential material: %s", encoded)
+	}
+}
+
+func TestLegacyOwnershipWithoutDigestFailsClosed(t *testing.T) {
+	identity, backend, final, _ := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	legacy := *ownership
+	legacy.SHA256 = ""
+	restarted := &KindBackend{enabled: true}
+	restarted.RestoreKubeconfigOwnership(identity, &legacy)
+	if _, err := restarted.ReadKubeconfig(identity); err == nil {
+		t.Fatal("legacy ownership authorized kubeconfig read")
+	}
+	if err := restarted.DeleteClusterContext(t.Context(), identity); err == nil {
+		t.Fatal("legacy ownership authorized cluster deletion")
+	}
+	data, err := os.ReadFile(final)
+	if err != nil || string(data) != "credential" {
+		t.Fatalf("legacy refusal changed credential=%q err=%v", data, err)
+	}
+}
+
+func TestCorruptMainOwnershipChecksumFailsClosedAfterRestart(t *testing.T) {
+	identity, backend, final, _ := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := backend.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	clone := *ownership
+	key := clusterKey(identity.Project, identity.Zone, identity.Cluster)
+	metadata := checkedGKEMetadata(t,
+		map[string]*Cluster{key: {Name: identity.Cluster, Location: identity.Zone}},
+		map[string]*kubeconfigOwnership{key: &clone})
+	metadata.Ownerships[key].SHA256 = strings.Repeat("0", 64)
+	store, err := state.New(t.TempDir(), identity.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(gkeStateEntry, metadata); err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.GetBackend().ReadKubeconfig(identity); err == nil {
+		t.Fatal("corrupt main ownership checksum authorized read")
+	}
+	data, err := os.ReadFile(final)
+	if err != nil || string(data) != "credential" {
+		t.Fatalf("checksum refusal changed credential=%q err=%v", data, err)
 	}
 }
 
@@ -453,11 +729,14 @@ func TestKubeconfigReadWaitsForAtomicPublish(t *testing.T) {
 	if _, err := temporary.file.Write([]byte("complete")); err != nil {
 		t.Fatal(err)
 	}
-	if err := securePublishKubeconfig(temporary, final); err != nil {
+	ownership, err := kubeconfigOwnershipFromTarget(identity, temporary)
+	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, temporary.fileInfo)
-	if err != nil {
+	if err := finalizeKubeconfigOwnership(temporary, ownership); err != nil {
+		t.Fatal(err)
+	}
+	if err := securePublishKubeconfig(temporary, final); err != nil {
 		t.Fatal(err)
 	}
 	backend.RestoreKubeconfigOwnership(identity, ownership)
@@ -488,6 +767,13 @@ func TestAPIReadsKubeconfigOnlyForPersistedLogicalIdentity(t *testing.T) {
 	if _, err := target.file.Write([]byte("complete")); err != nil {
 		t.Fatal(err)
 	}
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
 	if err := securePublishKubeconfig(target, final); err != nil {
 		t.Fatal(err)
 	}
@@ -496,10 +782,6 @@ func TestAPIReadsKubeconfigOnlyForPersistedLogicalIdentity(t *testing.T) {
 	}
 	api.clusters[clusterKey(identity.Project, identity.Zone, identity.Cluster)] = &Cluster{
 		Name: identity.Cluster, Location: identity.Zone,
-	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
-	if err != nil {
-		t.Fatal(err)
 	}
 	api.ownerships[clusterKey(identity.Project, identity.Zone, identity.Cluster)] = ownership
 	backend.RestoreKubeconfigOwnership(identity, ownership)
@@ -524,6 +806,13 @@ func TestKubeconfigDeleteWaitsForLifecycleLock(t *testing.T) {
 	if _, err := target.file.Write([]byte("complete")); err != nil {
 		t.Fatal(err)
 	}
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
 	if err := securePublishKubeconfig(target, final); err != nil {
 		t.Fatal(err)
 	}
@@ -536,10 +825,6 @@ func TestKubeconfigDeleteWaitsForLifecycleLock(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir)
 	backend := &KindBackend{enabled: true}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
-	if err != nil {
-		t.Fatal(err)
-	}
 	backend.kubeconfigOwners.Store(name, ownership)
 	unlock := backend.lockName(name)
 	done := make(chan error, 1)
@@ -581,7 +866,7 @@ func TestKubeconfigDeletionQuarantinesReplacementWithoutDeletingIt(t *testing.T)
 		t.Fatal(err)
 	}
 	err := backend.DeleteClusterContext(t.Context(), identity)
-	if err == nil || !strings.Contains(err.Error(), "ownership mismatch") {
+	if err == nil || !strings.Contains(err.Error(), "manual recovery required") {
 		t.Fatalf("delete error=%v", err)
 	}
 	matches, globErr := filepath.Glob(filepath.Join(root, ".quarantine-*"))
@@ -595,24 +880,25 @@ func TestKubeconfigDeletionQuarantinesReplacementWithoutDeletingIt(t *testing.T)
 }
 
 func TestRestartReloadsOwnershipForExpectedDeletion(t *testing.T) {
-	identity, _, final, root := prepareOwnedDeletionTest(t)
-	info, err := os.Stat(final)
+	identity, original, _, root := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, info)
-	if err != nil {
-		t.Fatal(err)
+	raw, ok := original.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing original ownership")
 	}
 	store, err := state.New(t.TempDir(), "restart-owned")
 	if err != nil {
 		t.Fatal(err)
 	}
 	key := clusterKey(identity.Project, identity.Zone, identity.Cluster)
-	if err := store.Save(gkeStateEntry, gkeMetadata{
-		Clusters:   map[string]*Cluster{key: {Name: identity.Cluster, Location: identity.Zone}},
-		Ownerships: map[string]*kubeconfigOwnership{key: ownership},
-	}); err != nil {
+	metadata := checkedGKEMetadata(t,
+		map[string]*Cluster{key: {Name: identity.Cluster, Location: identity.Zone}},
+		map[string]*kubeconfigOwnership{key: ownership})
+	if err := store.Save(gkeStateEntry, metadata); err != nil {
 		t.Fatal(err)
 	}
 	api, err := NewAPIWithStore(nil, store)
@@ -629,14 +915,15 @@ func TestRestartReloadsOwnershipForExpectedDeletion(t *testing.T) {
 }
 
 func TestRestartReplacementIsQuarantinedAgainstPersistedOwnership(t *testing.T) {
-	identity, _, final, root := prepareOwnedDeletionTest(t)
-	info, err := os.Stat(final)
+	identity, original, final, root := prepareOwnedDeletionTest(t)
+	logicalName, err := kindBackendName(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, info)
-	if err != nil {
-		t.Fatal(err)
+	raw, ok := original.kubeconfigOwners.Load(logicalName)
+	ownership, _ := raw.(*kubeconfigOwnership)
+	if !ok || ownership == nil {
+		t.Fatal("missing original ownership")
 	}
 	backend := &KindBackend{enabled: true}
 	backend.RestoreKubeconfigOwnership(identity, ownership)
@@ -648,7 +935,7 @@ func TestRestartReplacementIsQuarantinedAgainstPersistedOwnership(t *testing.T) 
 		t.Fatal(err)
 	}
 	err = backend.DeleteClusterContext(t.Context(), identity)
-	if err == nil || !strings.Contains(err.Error(), "ownership mismatch") {
+	if err == nil || !strings.Contains(err.Error(), "manual recovery required") {
 		t.Fatalf("delete error=%v", err)
 	}
 	matches, globErr := filepath.Glob(filepath.Join(root, ".quarantine-*"))
@@ -764,10 +1051,10 @@ func TestPostKindCleanupFailureRetriesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := clusterKey(identity.Project, identity.Zone, identity.Cluster)
-	if err := store.Save(gkeStateEntry, gkeMetadata{
-		Clusters:   map[string]*Cluster{key: {Name: identity.Cluster, Location: identity.Zone}},
-		Ownerships: map[string]*kubeconfigOwnership{key: ownership},
-	}); err != nil {
+	metadata := checkedGKEMetadata(t,
+		map[string]*Cluster{key: {Name: identity.Cluster, Location: identity.Zone}},
+		map[string]*kubeconfigOwnership{key: ownership})
+	if err := store.Save(gkeStateEntry, metadata); err != nil {
 		t.Fatal(err)
 	}
 	api, err := NewAPIWithStore(nil, store)
@@ -796,11 +1083,14 @@ func prepareOwnedDeletionTest(t *testing.T) (ClusterIdentity, *KindBackend, stri
 	if _, err := target.file.Write([]byte("credential")); err != nil {
 		t.Fatal(err)
 	}
-	if err := securePublishKubeconfig(target, final); err != nil {
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
+	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
-	if err != nil {
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
+	if err := securePublishKubeconfig(target, final); err != nil {
 		t.Fatal(err)
 	}
 	backend := &KindBackend{enabled: true}
@@ -850,6 +1140,25 @@ func assertZeroizedQuarantine(t *testing.T, root, pattern string) {
 	}
 }
 
+func countTrackedKubeconfigEntries(t *testing.T, root string) int {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".kubeconfig") ||
+			strings.HasPrefix(name, ".quarantine-") ||
+			strings.HasPrefix(name, ".deleted-") ||
+			strings.HasPrefix(name, ".ownership-") {
+			count++
+		}
+	}
+	return count
+}
+
 func TestKubeconfigTombstoneCapIsStableAcrossRetries(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -870,6 +1179,34 @@ func TestKubeconfigTombstoneCapIsStableAcrossRetries(t *testing.T) {
 	}
 	if _, err := os.Stat(final); !os.IsNotExist(err) {
 		t.Fatalf("rejected creation left final entry: %v", err)
+	}
+}
+
+func TestOwnedKubeconfigAddsNoWitnessEntryAtCapacity(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	identity := ClusterIdentity{
+		Profile: "capacity", Project: "demo", Zone: "zone", Cluster: "cluster",
+	}
+	root := filepath.Dir(kindKubeconfigPath(identity))
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxKubeconfigEntries-1; i++ {
+		name := filepath.Join(root, fmt.Sprintf("active-%032x.kubeconfig", i))
+		if err := os.WriteFile(name, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target, _, err := prepareKubeconfigWithIntent(identity)
+	if err != nil {
+		t.Fatalf("prepare error=%v", err)
+	}
+	witnesses, err := filepath.Glob(filepath.Join(root, ".ownership-*"))
+	if err != nil || len(witnesses) != 0 {
+		t.Fatalf("unexpected ownership links=%v err=%v", witnesses, err)
+	}
+	if err := secureDiscardKubeconfig(target); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -924,8 +1261,8 @@ func TestOwnershipIntentCrashBoundariesReconcile(t *testing.T) {
 		credential bool
 		expected   kubeconfigIntentPhase
 	}{
-		{name: "after-intent-before-kind", phase: intentPrepared, expected: intentTerminal},
-		{name: "during-kind-before-create-started", phase: intentPrepared, credential: true, expected: intentTerminal},
+		{name: "after-intent-before-kind", phase: intentPrepared, expected: intentPrepared},
+		{name: "during-kind-before-create-started", phase: intentPrepared, credential: true, expected: intentPrepared},
 		{name: "after-create-started", phase: intentCreateStarted, credential: true, expected: intentCleanupPending},
 		{name: "after-backend-created-phase", phase: intentBackendCreated, credential: true, expected: intentCleanupPending},
 	}
@@ -941,7 +1278,7 @@ func TestOwnershipIntentCrashBoundariesReconcile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
+			ownership, err := kubeconfigOwnershipFromTarget(identity, target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -950,6 +1287,11 @@ func TestOwnershipIntentCrashBoundariesReconcile(t *testing.T) {
 			}
 			if tc.credential {
 				if _, err := target.file.Write([]byte("credential")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.phase == intentBackendCreated {
+				if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -963,22 +1305,123 @@ func TestOwnershipIntentCrashBoundariesReconcile(t *testing.T) {
 			}
 			backend := &KindBackend{}
 			reconcileErr := backend.ReconcileKubeconfigIntents(t.Context(), "intent-crash", nil)
-			if tc.expected == intentTerminal && reconcileErr != nil {
-				t.Fatal(reconcileErr)
-			}
-			if tc.expected == intentTerminal {
-				if _, err := os.Stat(final); !os.IsNotExist(err) {
-					t.Fatalf("credential remained after reconciliation: %v", err)
-				}
-				assertZeroizedQuarantine(t, filepath.Dir(final), ".quarantine-*")
-			} else if reconcileErr == nil {
+			if reconcileErr == nil {
 				t.Fatal("disabled backend cleanup unexpectedly terminalized")
 			}
 			intent, err := loadKubeconfigIntent(identity)
-			if err != nil || intent.Phase != tc.expected {
+			if err != nil || intent.Phase != tc.expected || intent.Error == "" {
 				t.Fatalf("intent=%#v err=%v", intent, err)
 			}
 		})
+	}
+}
+
+func TestCrashBeforeDigestRetainsUnmatchedQuarantineAcrossRestarts(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "unmatched-recovery")
+	identity := ClusterIdentity{
+		Profile: "unmatched-recovery", Project: "demo", Zone: "zone", Cluster: "cluster",
+	}
+	final := kindKubeconfigPath(identity)
+	target, ownership, err := prepareKubeconfigWithIntent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeKubeconfigIntent(identity, ownership, intentCreateStarted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.file.Write([]byte("credential")); err != nil {
+		t.Fatal(err)
+	}
+	if err := securePublishKubeconfig(target, final); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	deleted := filepath.Join(binDir, "deleted")
+	script := "#!/bin/sh\nif [ \"$1\" = get ]; then if [ ! -f " + deleted +
+		" ]; then echo " + ownership.BackendName +
+		"; fi; else printf x >> " + deleted + "; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "kind"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	injected := errors.New("simulated crash before unmatched quarantine intent save")
+	testWriteKubeconfigIntent = func(phase kubeconfigIntentPhase) error {
+		if phase == intentCleanupPending {
+			return injected
+		}
+		return nil
+	}
+	t.Cleanup(func() { testWriteKubeconfigIntent = nil })
+	first := &KindBackend{enabled: true}
+	if err := first.ReconcileKubeconfigIntents(
+		t.Context(), identity.Profile, nil,
+	); !errors.Is(err, injected) {
+		t.Fatalf("first restart error=%v", err)
+	}
+	testWriteKubeconfigIntent = nil
+	intent, err := loadKubeconfigIntent(identity)
+	if err != nil || intent.Phase != intentCreateStarted ||
+		intent.UnmatchedQuarantine != nil {
+		t.Fatalf("post-crash intent=%#v err=%v", intent, err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(final), ".quarantine-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("post-crash quarantines=%v err=%v", matches, err)
+	}
+	quarantinePath := matches[0]
+	if data, err := os.ReadFile(quarantinePath); err != nil || string(data) != "credential" {
+		t.Fatalf("post-crash quarantine=%q err=%v", data, err)
+	}
+	if err := os.WriteFile(final, []byte("unrelated-replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entryCount := countTrackedKubeconfigEntries(t, filepath.Dir(final))
+
+	var evidence *unmatchedKubeconfigQuarantine
+	for restart := 0; restart < 3; restart++ {
+		backend := &KindBackend{enabled: true}
+		err := backend.ReconcileKubeconfigIntents(t.Context(), identity.Profile, nil)
+		if err == nil || !strings.Contains(err.Error(), "manual recovery") {
+			t.Fatalf("restart %d error=%v", restart, err)
+		}
+		intent, loadErr := loadKubeconfigIntent(identity)
+		if loadErr != nil || intent.Phase != intentCleanupPending ||
+			intent.UnmatchedQuarantine == nil || intent.Error == "" {
+			t.Fatalf("restart %d intent=%#v err=%v", restart, intent, loadErr)
+		}
+		if !strings.Contains(intent.Error, intent.UnmatchedQuarantine.Entry) ||
+			!strings.Contains(intent.Error, "device=") ||
+			!strings.Contains(intent.Error, "manual recovery") {
+			t.Fatalf("restart %d error is not actionable: %q", restart, intent.Error)
+		}
+		if restart == 0 {
+			evidence = intent.UnmatchedQuarantine
+			if got := filepath.Join(filepath.Dir(final), evidence.Entry); got != quarantinePath {
+				t.Fatalf("evidence path=%q want %q", got, quarantinePath)
+			}
+		} else if *intent.UnmatchedQuarantine != *evidence {
+			t.Fatalf("restart %d evidence changed: %#v want %#v",
+				restart, intent.UnmatchedQuarantine, evidence)
+		}
+		if got := countTrackedKubeconfigEntries(t, filepath.Dir(final)); got != entryCount {
+			t.Fatalf("restart %d tracked entries=%d want %d", restart, got, entryCount)
+		}
+		if data, readErr := os.ReadFile(quarantinePath); readErr != nil ||
+			string(data) != "credential" {
+			t.Fatalf("restart %d quarantine=%q err=%v", restart, data, readErr)
+		}
+		if data, readErr := os.ReadFile(final); readErr != nil ||
+			string(data) != "unrelated-replacement" {
+			t.Fatalf("restart %d replacement=%q err=%v", restart, data, readErr)
+		}
+		if data, readErr := os.ReadFile(deleted); readErr != nil || string(data) != "x" {
+			t.Fatalf("restart %d backend deletes=%q err=%v", restart, data, readErr)
+		}
+		if data, readErr := backend.ReadKubeconfig(identity); readErr == nil || data != nil {
+			t.Fatalf("restart %d exposed data=%q err=%v", restart, data, readErr)
+		}
 	}
 }
 
@@ -1001,14 +1444,14 @@ func TestPreparedIntentNeverDeletesAnyKindBackend(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir)
 	backend := &KindBackend{enabled: true}
-	if err := backend.ReconcileKubeconfigIntents(t.Context(), identity.Profile, nil); err != nil {
-		t.Fatal(err)
+	if err := backend.ReconcileKubeconfigIntents(t.Context(), identity.Profile, nil); err == nil {
+		t.Fatal("digest-less PREPARED intent unexpectedly reconciled")
 	}
 	if _, err := os.Stat(called); !os.IsNotExist(err) {
 		t.Fatalf("PREPARED reconciliation invoked Kind: %v", err)
 	}
 	intent, err := loadKubeconfigIntent(identity)
-	if err != nil || intent.Phase != intentTerminal ||
+	if err != nil || intent.Phase != intentPrepared || intent.Error == "" ||
 		intent.Ownership.BackendName != ownership.BackendName {
 		t.Fatalf("intent=%#v err=%v", intent, err)
 	}
@@ -1023,7 +1466,7 @@ func TestLegacyDeterministicIntentFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1133,8 +1576,12 @@ exit 0
 	identity := ClusterIdentity{Profile: "phase-save", Project: "demo", Zone: "zone", Cluster: "cluster"}
 	backend := &KindBackend{enabled: true}
 	result, err := backend.CreateClusterContext(t.Context(), identity)
-	if !errors.Is(err, injected) || result.Ownership == nil || !result.Ownership.hasBackendNonce() {
+	if !errors.Is(err, injected) || result.Ownership == nil || !result.Ownership.isDurable() {
 		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	sum := sha256.Sum256([]byte("credential"))
+	if result.Ownership.SHA256 != fmt.Sprintf("%x", sum[:]) {
+		t.Fatalf("ownership digest=%q", result.Ownership.SHA256)
 	}
 	if data, err := os.ReadFile(stateFile); err != nil || len(data) != 0 {
 		t.Fatalf("owned backend remains: %q err=%v", data, err)
@@ -1177,7 +1624,7 @@ func TestOwnershipIntentCommitsAfterDurableMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,6 +1632,9 @@ func TestOwnershipIntentCommitsAfterDurableMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := target.file.Write([]byte("credential")); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
 		t.Fatal(err)
 	}
 	if err := securePublishKubeconfig(target, final); err != nil {
@@ -1201,7 +1651,8 @@ func TestOwnershipIntentCommitsAfterDurableMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	intent, err := loadKubeconfigIntent(identity)
-	if err != nil || intent.Phase != intentCommitted {
+	if err != nil || intent.Phase != intentCommitted ||
+		intent.Ownership.SHA256 != ownership.SHA256 {
 		t.Fatalf("intent=%#v err=%v", intent, err)
 	}
 	data, err := os.ReadFile(final)
@@ -1488,6 +1939,9 @@ func preparePersistedOwnedClusterAPI(
 	if _, err := target.file.Write([]byte("credential")); err != nil {
 		t.Fatal(err)
 	}
+	if err := finalizeKubeconfigOwnership(target, ownership); err != nil {
+		t.Fatal(err)
+	}
 	if err := securePublishKubeconfig(target, final); err != nil {
 		t.Fatal(err)
 	}
@@ -1499,13 +1953,11 @@ func preparePersistedOwnedClusterAPI(
 		t.Fatal(err)
 	}
 	key := clusterKey(identity.Project, identity.Zone, identity.Cluster)
-	if err := store.Save(gkeStateEntry, gkeMetadata{
-		Clusters: map[string]*Cluster{key: {
-			Name: identity.Cluster, Location: identity.Zone, Status: "RUNNING",
-			SelfLink: "https://container.googleapis.com/v1/projects/demo/zones/zone/clusters/cluster",
-		}},
-		Ownerships: map[string]*kubeconfigOwnership{key: ownership},
-	}); err != nil {
+	metadata := checkedGKEMetadata(t, map[string]*Cluster{key: {
+		Name: identity.Cluster, Location: identity.Zone, Status: "RUNNING",
+		SelfLink: "https://container.googleapis.com/v1/projects/demo/zones/zone/clusters/cluster",
+	}}, map[string]*kubeconfigOwnership{key: ownership})
+	if err := store.Save(gkeStateEntry, metadata); err != nil {
 		t.Fatal(err)
 	}
 	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), store)
@@ -1513,4 +1965,19 @@ func preparePersistedOwnedClusterAPI(
 		t.Fatal(err)
 	}
 	return api, store, identity, ownership, final
+}
+
+func checkedGKEMetadata(
+	t *testing.T,
+	clusters map[string]*Cluster,
+	ownerships map[string]*kubeconfigOwnership,
+) gkeMetadata {
+	t.Helper()
+	checksum, err := kubeconfigOwnershipChecksum(ownerships)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gkeMetadata{
+		Clusters: clusters, Ownerships: ownerships, OwnershipChecksum: checksum,
+	}
 }

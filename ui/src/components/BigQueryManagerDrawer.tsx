@@ -15,6 +15,7 @@ import CloudUploadIcon from '@mui/icons-material/CloudUpload';
 import LinkIcon from '@mui/icons-material/Link';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { checkedMutation } from '../apiClient';
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -120,7 +121,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
     setQueryLoading(true);
     setQueryResults(null);
     try {
-      const res = await fetch(`${apiRoot}/jobs`, {
+      const res = await checkedMutation(`${apiRoot}/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -128,7 +129,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
             query: { query: sqlQuery, useLegacySql: false }
           }
         })
-      });
+      }, 'BigQuery query submission failed. Check the SQL and backend status.');
       if (res.ok) {
         const job = await res.json();
         pollJobResults(job.jobReference.jobId);
@@ -207,10 +208,10 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
     formData.append('file', file);
 
     try {
-      const res = await fetch(`${apiRoot}/upload`, {
+      const res = await checkedMutation(`${apiRoot}/upload`, {
         method: 'POST',
         body: formData,
-      });
+      }, 'BigQuery upload failed. Check the file and retry.');
       if (res.ok) {
         const data = await res.json();
         setSourceUri(data.path);
@@ -229,7 +230,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
     if (!targetDataset || !targetTableId || !sourceUri) return;
     setIngesting(true);
     try {
-      const res = await fetch(`${apiRoot}/jobs`, {
+      const res = await checkedMutation(`${apiRoot}/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -247,7 +248,7 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
             }
           }
         })
-      });
+      }, 'BigQuery ingestion failed. Check the source and destination table.');
       if (res.ok) {
         showToast(`Ingestion job started for ${targetTableId}`);
         setTimeout(loadResources, 2000);
@@ -262,11 +263,11 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
   const createDataset = async () => {
     if (!newDsId) return;
     try {
-      const res = await fetch(`${apiRoot}/datasets`, {
+      const res = await checkedMutation(`${apiRoot}/datasets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ datasetReference: { datasetId: newDsId } })
-      });
+      }, 'BigQuery dataset creation failed. Check the dataset ID.');
       if (res.ok) {
         showToast(`Dataset ${newDsId} created`);
         loadResources();
@@ -300,14 +301,14 @@ export default function BigQueryManagerDrawer({ open, onClose }: Props) {
         schema = JSON.parse(newTbSchemaJson);
       }
 
-      const res = await fetch(`${apiRoot}/datasets/${targetDsForTb}/tables`, {
+      const res = await checkedMutation(`${apiRoot}/datasets/${targetDsForTb}/tables`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           tableReference: { tableId: newTbId },
           schema: schema
         })
-      });
+      }, 'BigQuery table creation failed. Check the table ID and schema.');
       if (res.ok) {
         showToast(`Table ${newTbId} created`);
         loadResources();

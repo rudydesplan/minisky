@@ -5,11 +5,12 @@ incremental: shims without an adapter still hold maps in process memory, while
 Docker-backed services keep whatever survives in their containers or configured
 mounts.
 
-BigQuery, IAM, Cloud DNS, Scheduler, Secret Manager, Cloud KMS, GKE, Compute
-Engine, Cloud SQL, and Serverless (Cloud Functions and Cloud Run) persist
-resource metadata through this store. Docker-backed resources restore as
-metadata without implicitly creating missing containers. Docker adoption and
-cleanup require both MiniSky ownership and active-profile labels.
+Artifact Registry, BigQuery, Bigtable Admin, IAM, Cloud DNS, Scheduler, Secret
+Manager, Cloud KMS, GKE, Compute Engine, Cloud SQL, and Serverless (Cloud
+Functions and Cloud Run) persist resource metadata through this store.
+Docker-backed resources restore as metadata without implicitly creating missing
+containers. Docker adoption and cleanup require both MiniSky ownership and
+active-profile labels.
 
 > **Sensitive data warning:** profile state files and exported snapshots can
 > contain local Secret Manager payloads, Cloud KMS AES key material, Serverless
@@ -44,9 +45,9 @@ does not replay that side effect.
 | Service/domain | Current state | Planned adapter behavior |
 | :--- | :--- | :--- |
 | App Engine (`appengine.googleapis.com`) | Apps, services, versions, and LROs in memory; deployment containers may survive | Persist the resource graph and deployment identity; reconcile each version with its container/image and mark missing workloads failed rather than silently recreating them. |
-| Artifact Registry (`artifactregistry.googleapis.com`) | Repository map in memory; LRO polling metadata uses the shared operation store; package/version results are repository-scoped views of the profile-owned Registry v2 backend | Persist repository metadata before including it in snapshots; Registry v2 blobs and manifests remain outside metadata export/import. |
+| Artifact Registry (`artifactregistry.googleapis.com`) | Repository metadata and compact terminal operation outcomes in profile state; LRO polling metadata uses the shared operation store; package/version results are repository-scoped views of the profile-owned Registry v2 backend | Repository metadata survives restart and metadata export/import. Registry v2 blobs and manifests remain outside metadata export/import. |
 | BigQuery (`bigquery.googleapis.com`) | Dataset/table/job metadata in profile state; optional DuckDB data in `~/.minisky/data/bigquery.duckdb`; uploads in `~/.minisky/uploads` | Metadata survives restart and metadata-only export/import. DuckDB rows and uploaded files are deliberately excluded. |
-| Bigtable Admin (`bigtableadmin.googleapis.com`) | Instance, cluster, and table metadata in memory | Persist Admin resources and reconcile them with the emulator; do not claim table data durability unless the emulator data directory is also mounted and exported. |
+| Bigtable Admin (`bigtableadmin.googleapis.com`) | Instance and table metadata in profile state; restored instances report `STATE_NOT_KNOWN` until emulator availability is reconciled; cluster administration returns `501 UNIMPLEMENTED` | Persisted Admin metadata survives restart and metadata export/import. Do not claim table data durability unless the emulator data directory is also mounted and exported. |
 | Bigtable Data (`bigtable.googleapis.com`) | Data belongs to an unmounted emulator container | Add a profile-scoped emulator data mount and lifecycle hooks for clean export/import; share identity with the Bigtable Admin adapter. |
 | Cloud Build (`cloudbuild.googleapis.com`) | Build and trigger state is held through the in-memory LRO manager; temporary Docker workspace volumes | Persist build metadata, trigger definitions, and final logs/status; treat active builds as interrupted after restart and garbage-collect orphan workspaces. |
 | Cloud KMS (`cloudkms.googleapis.com`) | Key hierarchy and AES key bytes in profile state | Key material and version metadata survive restart. Snapshots contain local AES key bytes and must be handled as sensitive files. |

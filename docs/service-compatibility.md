@@ -1,7 +1,7 @@
 # Service compatibility
 
-This matrix is the human-readable view of the executable manifest in
-`pkg/registry`. The contract gate derives its service list from runtime
+This matrix is the human-readable view of the registration and support manifest
+in `pkg/registry`. The contract gate derives its service list from runtime
 registrations, so adding or removing a registered domain requires updating the
 manifest and this document.
 
@@ -19,10 +19,10 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | --- | --- | --- |
 | `aiplatform.googleapis.com` | standard | file |
 | `appengine.googleapis.com` | standard | hybrid |
-| `artifactregistry.googleapis.com` | standard | memory |
+| `artifactregistry.googleapis.com` | standard | file |
 | `bigquery.googleapis.com` | standard | file |
 | `bigtable.googleapis.com` | standard | hybrid |
-| `bigtableadmin.googleapis.com` | standard | hybrid |
+| `bigtableadmin.googleapis.com` | standard | file |
 | `cloudbuild.googleapis.com` | standard | hybrid |
 | `cloudresourcemanager.googleapis.com` | standard | file |
 | `cloudfunctions.googleapis.com` | standard | hybrid |
@@ -41,7 +41,6 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `iamcredentials.googleapis.com` | standard | static |
 | `identitytoolkit.googleapis.com` | passthrough | docker |
 | `logging.googleapis.com` | standard | file |
-| `memcache.googleapis.com` | standard | hybrid |
 | `metadata.google.internal` | high | static |
 | `monitoring.googleapis.com` | standard | file |
 | `pubsub.googleapis.com` | passthrough | docker |
@@ -52,6 +51,16 @@ Persistence categories describe where service state lives: **memory**, **file**,
 | `sqladmin.googleapis.com` | standard | hybrid |
 | `storage.googleapis.com` | passthrough | docker |
 | `sts.googleapis.com` | standard | static |
+
+## Deferred registered domains
+
+Deferred domains are registered only to provide a deterministic unsupported
+response. They have no fidelity tier and do not count as implemented or
+passthrough services.
+
+| Domain | Support | Persistence |
+| --- | --- | --- |
+| `memcache.googleapis.com` | deferred | static |
 
 ## Security and project boundaries
 
@@ -148,8 +157,10 @@ SDK coverage.
 - Memorystore for Redis validates create requests, exposes GCP-shaped
   create/delete operations, persists profile metadata, reconciles only
   profile-owned Docker containers, and publishes Redis on a Docker-assigned
-  loopback port. Redis uses an owned named volume with AOF enabled. Memcached,
-  failover, import/export, and upgrade APIs remain `501 UNIMPLEMENTED`.
+  loopback port. Redis uses an owned named volume with AOF enabled. The separate
+  Memcached domain is a static deferred boundary: every request returns
+  `501 UNIMPLEMENTED`. Redis failover, import/export, and upgrade APIs also
+  remain `501 UNIMPLEMENTED`.
 - Firestore and Datastore remain official Google emulator passthroughs.
   Their data directories are profile-scoped under the non-portable runtime
   tree. The guarded phase 15 SDK smoke covers Firestore document CRUD/query and

@@ -15,6 +15,8 @@ import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import SecurityIcon from '@mui/icons-material/Security';
 import { useProjectContext } from '../contexts/ProjectContext';
 import { useState, useEffect, useCallback } from 'react';
+import { checkedMutation, safeRequestError } from '../apiClient';
+import type { MutationMethod } from '../apiClient';
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -53,14 +55,6 @@ const isSpannerDatabase = (value: unknown): value is SpannerDatabase =>
 
 const getErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
-
-const getApiErrorMessage = (value: unknown): string | undefined => {
-  if (!isRecord(value)) return undefined;
-  if (typeof value.message === 'string') return value.message;
-  return isRecord(value.error) && typeof value.error.message === 'string'
-    ? value.error.message
-    : undefined;
-};
 
 const parseQueryResults = (value: unknown): QueryResults => {
   if (!isRecord(value)) return {};
@@ -144,12 +138,11 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
   }, [apiRoot]);
 
   const createSession = async (instId: string, dbId: string) => {
-    const res = await fetch(`${apiRoot}/instances/${instId}/databases/${dbId}/sessions`, {
+    const res = await checkedMutation(`${apiRoot}/instances/${instId}/databases/${dbId}/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({})
-    });
-    if (!res.ok) throw new Error('Failed to create session');
+    }, 'Spanner session creation failed. Check the database and retry.');
     const data: unknown = await res.json();
     if (!isRecord(data) || typeof data.name !== 'string') {
       throw new Error('Session response did not include a name');
@@ -165,13 +158,13 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       const sessionPath = sessionName.split('/').pop();
 
       // 2. Execute SQL
-      const res = await fetch(`${apiRoot}/instances/${instId}/databases/${dbId}/sessions/${sessionPath}:executeSql`, {
+      const res = await checkedMutation(`${apiRoot}/instances/${instId}/databases/${dbId}/sessions/${sessionPath}:executeSql`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           sql: "SELECT table_name FROM information_schema.tables WHERE table_schema = ''" 
         })
-      });
+      }, 'Spanner table loading failed. Check the database session and retry.');
       if (res.ok) {
         const data: unknown = await res.json();
         const rows = isRecord(data) && Array.isArray(data.rows) ? data.rows : [];
@@ -194,7 +187,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
       
       let url = '';
       let body: Record<string, unknown> = {};
-      let method = 'POST';
+      let method: MutationMethod = 'POST';
 
       if (isDDL) {
         url = `${apiRoot}/instances/${instId}/databases/${dbId}/ddl`;
@@ -209,23 +202,17 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
         method = 'POST';
       }
 
-      const res = await fetch(url, {
-        method: method,
+      const res = await checkedMutation(url, {
+        method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
-      });
-      
+      }, 'Spanner operation failed. Check the SQL statement and selected database.');
       const data: unknown = await res.json();
-      if (res.ok) {
-        setQueryResults(isDDL ? { message: 'Schema updated successfully' } : parseQueryResults(data));
-        showToast(isDDL ? 'Schema updated' : 'Query executed successfully');
-        if (isDDL) loadTables(instId, dbId);
-      } else {
-        const errMsg = getApiErrorMessage(data) || 'Operation failed';
-        showToast(errMsg, 'error');
-      }
+      setQueryResults(isDDL ? { message: 'Schema updated successfully' } : parseQueryResults(data));
+      showToast(isDDL ? 'Schema updated' : 'Query executed successfully');
+      if (isDDL) loadTables(instId, dbId);
     } catch (e: unknown) {
-      showToast(getErrorMessage(e), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while running the Spanner operation.'), 'error');
     } finally {
       setQueryLoading(false);
     }
@@ -239,7 +226,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
     if (!newInstanceId) return;
     setLoading(true);
     try {
-      const res = await fetch(`${apiRoot}/instances`, {
+      const res = await checkedMutation(`${apiRoot}/instances`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -250,7 +237,7 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
             nodeCount: 1
           }
         })
-      });
+      }, 'Spanner instance creation failed. Check the instance ID and configuration.');
       if (res.ok) {
         showToast(`Instance ${newInstanceId} created`);
         loadInstances();
@@ -265,11 +252,11 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
     if (!newDbId || !targetInstance) return;
     setLoading(true);
     try {
-      const res = await fetch(`${apiRoot}/instances/${targetInstance}/databases`, {
+      const res = await checkedMutation(`${apiRoot}/instances/${targetInstance}/databases`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ createStatement: `CREATE DATABASE \`${newDbId}\`` })
-      });
+      }, 'Spanner database creation failed. Check the database ID and instance.');
       if (res.ok) {
         showToast(`Database ${newDbId} created`);
         loadInstances();

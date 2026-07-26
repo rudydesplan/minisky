@@ -13,6 +13,21 @@ import (
 	"minisky/pkg/state"
 )
 
+func TestSchedulerDegradedResponseRedactsPersistenceCause(t *testing.T) {
+	const sensitive = "/private/scheduler/state.json: webhook-secret-123"
+	api := newAPI(nil, Config{}, nil)
+	api.persistenceErr = errors.New(sensitive)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/projects/demo/locations/us-central1/jobs", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(body, `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(body, `"message":"Scheduler persistence is unavailable"`) ||
+		strings.Contains(body, sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
+	}
+}
+
 func TestSchedulerMetadataSurvivesRestart(t *testing.T) {
 	store, err := state.New(t.TempDir(), "scheduler-profile")
 	if err != nil {
@@ -185,7 +200,9 @@ func TestSchedulerAmbiguousPostCommitReadbackFailureFailsClosed(t *testing.T) {
 	blocked := schedulerRequest(api, http.MethodGet,
 		"/v1/projects/test/locations/us-central1/jobs", "")
 	if blocked.Code != http.StatusServiceUnavailable ||
-		!strings.Contains(blocked.Body.String(), "readback unavailable") {
+		!strings.Contains(blocked.Body.String(), `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(blocked.Body.String(), `"message":"Scheduler persistence is unavailable"`) ||
+		strings.Contains(blocked.Body.String(), "readback unavailable") {
 		t.Fatalf("degraded API did not fail closed: %d: %s", blocked.Code, blocked.Body.String())
 	}
 }

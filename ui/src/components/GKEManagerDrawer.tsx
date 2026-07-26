@@ -8,6 +8,7 @@ import StorageIcon from '@mui/icons-material/Storage';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useProjectContext } from '../contexts/ProjectContext';
 import { gkeClusterRoute } from '../gkeRoutes.js';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type Props = {
   open: boolean;
@@ -34,15 +35,11 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
     setError(null);
     try {
       const res = await fetch(gkeClusterRoute(activeProject, zone));
-      if (res.ok) {
-        const data = await res.json();
-        setClusters(Array.isArray(data?.clusters) ? data.clusters : []);
-      } else {
-        const text = await res.text();
-        setError(text);
-      }
-    } catch {
-      setError('Failed to connect to backend API');
+      await requireOk(res, 'Unable to load GKE clusters. Check the GKE backend and retry.');
+      const data = await res.json();
+      setClusters(Array.isArray(data?.clusters) ? data.clusters : []);
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect to the GKE backend.'));
     } finally {
       if (!silent) setLoading(false);
     }
@@ -57,32 +54,28 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newClusterName })
       });
-      if (res.ok) {
-        setNewClusterName('');
-        // Immediately fetch to show the provisioning state
-        fetchClusters();
-      } else {
-        const text = await res.text();
-        setError(text);
-      }
-    } catch {
-      setError('Failed to provision cluster');
+      await requireOk(res, 'GKE cluster provisioning failed. Check kind availability and the cluster name.');
+      setNewClusterName('');
+      fetchClusters();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while provisioning the GKE cluster.'));
     } finally {
       setProvisioning(false);
     }
   };
 
   const handleDownloadConfig = async (name: string) => {
-    const res = await fetch(gkeClusterRoute(activeProject, zone, name, true));
-    if (res.ok) {
+    try {
+      const res = await fetch(gkeClusterRoute(activeProject, zone, name, true));
+      await requireOk(res, 'Kubeconfig download failed. Verify explicit kubeconfig permission and retry.');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `${name}-kubeconfig.yaml`;
       a.click();
-    } else {
-      alert('Failed to download kubeconfig');
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while downloading kubeconfig.'));
     }
   };
 
@@ -92,14 +85,10 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
     setLoading(true);
     try {
       const res = await fetch(gkeClusterRoute(activeProject, zone, name), { method: 'DELETE' });
-      if (res.ok) {
-        fetchClusters();
-      } else {
-        const text = await res.text();
-        alert(`Delete failed: ${text}`);
-      }
-    } catch {
-      alert('Network error during deletion');
+      await requireOk(res, 'GKE cluster deletion failed. Wait for active provisioning to finish and retry.');
+      fetchClusters();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while deleting the GKE cluster.'));
     } finally {
       setLoading(false);
     }

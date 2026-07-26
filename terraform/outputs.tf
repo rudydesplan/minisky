@@ -53,6 +53,16 @@ output "phase16_subnetwork_id" {
   value       = local.use_minisky && var.enable_phase16_network_resources ? google_compute_subnetwork.phase16[0].id : null
 }
 
+output "phase16_instance_id" {
+  description = "Canonical ID of the optional local Phase-16 Compute instance, or null when disabled"
+  value       = local.use_minisky && var.enable_phase16_network_resources && var.enable_phase16_compute_instance ? google_compute_instance.phase16[0].id : null
+}
+
+output "phase16_instance_network_ip" {
+  description = "Docker-observed primary IPv4 address of the optional local Phase-16 instance"
+  value       = local.use_minisky && var.enable_phase16_network_resources && var.enable_phase16_compute_instance ? google_compute_instance.phase16[0].network_interface[0].network_ip : null
+}
+
 output "phase10_artifact_repository_name" {
   description = "Name of the optional local Phase-10 Artifact Registry repository, or null when disabled"
   value       = var.enable_phase10_artifact_resources ? google_artifact_registry_repository.phase10[0].name : null

@@ -10,6 +10,7 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
 
 interface BuildStep {
   name: string;
@@ -37,12 +38,6 @@ interface BuildConfig {
   [key: string]: unknown;
 }
 
-interface ErrorResponse {
-  error?: {
-    message?: string;
-  };
-}
-
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -68,7 +63,7 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/cloudbuild/v1/projects/${activeProject}/builds`);
-      if (!res.ok) throw new Error('Failed to fetch builds');
+      await requireOk(res, 'Cloud Build loading failed. Check the local service and retry.');
       const data: { builds?: Build[] } = await res.json();
       setBuilds(data.builds || []);
     } catch (err: unknown) {
@@ -92,7 +87,7 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
       try {
         body = JSON.parse(buildConfig) as BuildConfig;
       } catch (e) {
-        throw new Error('Invalid JSON configuration', { cause: e });
+        throw new SyntaxError('Invalid JSON configuration', { cause: e });
       }
 
       const payload = {
@@ -111,14 +106,13 @@ export default function CloudBuildDrawer({ open, onClose }: Props) {
         body: JSON.stringify(payload)
       });
       
-      if (!res.ok) {
-        const errData: ErrorResponse = await res.json().catch(() => ({}));
-        throw new Error(errData.error?.message || 'Failed to submit build');
-      }
+      await requireOk(res, 'Cloud Build submission failed. Check the build steps and source configuration.');
 
       fetchBuilds();
     } catch (err: unknown) {
-      setError(getErrorMessage(err));
+      setError(err instanceof SyntaxError
+        ? 'Invalid build JSON. Correct the configuration and retry.'
+        : safeRequestError(err, 'Unable to connect while submitting the Cloud Build.'));
     } finally {
       setSubmitting(false);
     }

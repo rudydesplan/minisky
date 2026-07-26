@@ -78,7 +78,8 @@ not production GCP IAM.
 `minisky doctor` checks writable state, free disk space, Docker, optional tools,
 and configured required images. `minisky doctor --fix` may install MiniSky's
 optional tools and pull only images declared by MiniSky; it never prunes global
-Docker resources.
+Docker resources. Those downloads require network access; after the required
+tools and images are present, the corresponding checks can run offline.
 
 Use `make dev`, `make test`, `make test-phase17`, `make benchmark`, or the explicitly guarded
 `MINISKY_INTEGRATION=1 make test-integration`.

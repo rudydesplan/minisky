@@ -14,6 +14,7 @@ import PersonAddIcon from '@mui/icons-material/PersonAdd';
 import StorageIcon from '@mui/icons-material/Storage';
 import VpnKeyIcon from '@mui/icons-material/VpnKey';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type User = {
   localId: string;
@@ -24,16 +25,6 @@ type User = {
 };
 
 type FirebaseManagerDrawerProps = { open: boolean; onClose: () => void };
-
-interface ApiErrorResponse {
-  error?: {
-    message?: string;
-  };
-}
-
-function getErrorMessage(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
-}
 
 export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManagerDrawerProps) {
   const { activeProject } = useProjectContext();
@@ -82,18 +73,14 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
           emailVerified: true
         })
       });
-      if (res.ok) {
-        showToast('User created successfully');
-        loadUsers();
-        setShowAddUser(false);
-        setNewUserEmail('');
-        setNewUserPass('');
-      } else {
-        const err = await res.json() as ApiErrorResponse;
-        showToast(err.error?.message || 'Failed to create user', 'error');
-      }
+      await requireOk(res, 'Firebase user creation failed. Check the email and password requirements.');
+      showToast('User created successfully');
+      loadUsers();
+      setShowAddUser(false);
+      setNewUserEmail('');
+      setNewUserPass('');
     } catch (e: unknown) {
-      showToast(getErrorMessage(e, 'Failed to create user'), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while creating the Firebase user.'), 'error');
     }
   };
 
@@ -104,12 +91,11 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ localId: uid })
       });
-      if (res.ok) {
-        showToast('User deleted');
-        loadUsers();
-      }
+      await requireOk(res, 'Firebase user deletion failed. Refresh the user list and retry.');
+      showToast('User deleted');
+      loadUsers();
     } catch (e: unknown) {
-      showToast(getErrorMessage(e, 'Failed to delete user'), 'error');
+      showToast(safeRequestError(e, 'Unable to connect while deleting the Firebase user.'), 'error');
     }
   };
 
@@ -139,12 +125,13 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(parsed)
       });
-      if (res.ok) {
-        showToast('Database updated');
-        loadRtdb(dbPath);
-      }
+      await requireOk(res, 'Realtime Database update failed. Check the JSON and database path.');
+      showToast('Database updated');
+      loadRtdb(dbPath);
     } catch (e: unknown) {
-      showToast('Invalid JSON: ' + getErrorMessage(e, 'Unknown parsing error'), 'error');
+      showToast(e instanceof SyntaxError
+        ? 'Invalid JSON. Correct the database value and retry.'
+        : safeRequestError(e, 'Unable to connect while updating Realtime Database.'), 'error');
     }
   };
 

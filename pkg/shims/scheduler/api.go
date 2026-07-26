@@ -286,8 +286,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	persistenceErr := api.persistenceErr
 	api.mu.RUnlock()
 	if persistenceErr != nil {
-		schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
-			"Scheduler persistence is degraded: "+persistenceErr.Error())
+		schedulerError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"Scheduler persistence is unavailable")
 		return
 	}
 
@@ -370,8 +370,8 @@ func (api *API) createJob(w http.ResponseWriter, r *http.Request, path string) {
 		if rollbackErr := api.saveJobs(previous); rollbackErr != nil {
 			api.markPersistenceDegraded(fmt.Errorf(
 				"schedule job %q: %w; rollback metadata: %v", job.Name, err, rollbackErr))
-			schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
-				"Scheduler persistence rollback failed: "+api.persistenceFailure().Error())
+			schedulerError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"Scheduler persistence is unavailable")
 			return
 		}
 		schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
@@ -514,8 +514,8 @@ func (api *API) resumeJob(w http.ResponseWriter, r *http.Request, name string) {
 			if rollbackErr := api.saveJobs(previous); rollbackErr != nil {
 				api.markPersistenceDegraded(fmt.Errorf(
 					"resume job %q: %w; rollback metadata: %v", name, err, rollbackErr))
-				schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
-					"Scheduler persistence rollback failed: "+api.persistenceFailure().Error())
+				schedulerError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+					"Scheduler persistence is unavailable")
 				return
 			}
 			schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
@@ -732,12 +732,17 @@ func (api *API) markPersistenceDegraded(err error) {
 	api.mu.Lock()
 	api.persistenceErr = err
 	api.mu.Unlock()
+	log.Printf("[Shim: Cloud Scheduler] persistence degraded: %v", err)
 }
 
 func (api *API) persistenceFailure() error {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return api.persistenceErr
+}
+
+func (api *API) PersistenceError() error {
+	return api.persistenceFailure()
 }
 
 func schedulerError(w http.ResponseWriter, code int, status, message string) {

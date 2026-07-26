@@ -16,6 +16,7 @@ import TerminalIcon from '@mui/icons-material/Terminal';
 import BuildIcon from '@mui/icons-material/Build';
 import MonitorHeartIcon from '@mui/icons-material/MonitorHeart';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { requireOk, safeRequestError } from '../apiClient';
 
 type Props = {
   open: boolean;
@@ -123,14 +124,10 @@ export default function ServerlessManagerDrawer({
     setLoading(true);
     try {
       const res = await fetch(`/api/manage/serverless/projects/${activeProject}/${type}/${resourceName}`, { method: 'DELETE' });
-      if (res.ok) {
-        fetchResources();
-      } else {
-        const text = await res.text();
-        alert(`Deletion failed: ${text}`);
-      }
-    } catch {
-      alert('Network error during deletion');
+      await requireOk(res, 'Serverless resource deletion failed. Remove dependent triggers and retry.');
+      fetchResources();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while deleting the serverless resource.'));
     } finally {
       setLoading(false);
     }
@@ -175,14 +172,10 @@ export default function ServerlessManagerDrawer({
           } : undefined,
         })
       });
-      if (res.ok) {
-        fetchResources();
-      } else {
-        const text = await res.text();
-        setError(`Deployment failed: ${text}`);
-      }
-    } catch {
-      setError('Network error during deployment');
+      await requireOk(res, 'Serverless deployment failed. Check the runtime, entry point, source, and Buildpacks backend.');
+      fetchResources();
+    } catch (cause) {
+      setError(safeRequestError(cause, 'Unable to connect while deploying the serverless resource.'));
     } finally {
       setLoading(false);
     }

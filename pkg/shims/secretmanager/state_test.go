@@ -48,6 +48,38 @@ func TestSecretsRehydrateAfterRestart(t *testing.T) {
 	}
 }
 
+func TestSecretManagerProductionConstructorFailsClosedOnCorruptState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "secret-corrupt")
+	store, err := state.New(root, "secret-corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(secretManagerStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(nil, nil)
+	response := secretRequest(api, http.MethodGet, "/v1/projects/demo/secrets", "")
+	if response.Code != http.StatusServiceUnavailable || api.PersistenceError() == nil {
+		t.Fatalf("status=%d degraded=%v body=%s", response.Code, api.PersistenceError(), response.Body.String())
+	}
+}
+
+func TestSecretManagerDegradedResponseRedactsPersistenceCause(t *testing.T) {
+	const sensitive = "/private/secrets/state.json: payload-key-123"
+	api := newAPI(nil, nil, nil)
+	api.markPersistenceDegraded(errors.New(sensitive))
+	response := secretRequest(api, http.MethodGet, "/v1/projects/demo/secrets", "")
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(body, `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(body, `"message":"Secret Manager persistence is unavailable"`) ||
+		strings.Contains(body, sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
+	}
+}
+
 func TestSecretMutationsLeaveStateUnchangedWhenSaveFails(t *testing.T) {
 	store := &failingSecretStore{}
 	api := newAPI(nil, nil, store)
@@ -135,7 +167,8 @@ func TestSecretAmbiguousPostCommitReadbackFailureFailsClosed(t *testing.T) {
 	if blocked.Code != http.StatusServiceUnavailable ||
 		envelope.Error.Code != http.StatusServiceUnavailable ||
 		envelope.Error.Status != "UNAVAILABLE" ||
-		!strings.Contains(envelope.Error.Message, "secret readback unavailable") {
+		envelope.Error.Message != "Secret Manager persistence is unavailable" ||
+		strings.Contains(blocked.Body.String(), "secret readback unavailable") {
 		t.Fatalf("degraded API did not fail closed: %d: %s", blocked.Code, blocked.Body.String())
 	}
 }

@@ -12,8 +12,11 @@ import SecurityIcon from '@mui/icons-material/Security';
 import DnsIcon from '@mui/icons-material/Dns';
 import { useProjectContext } from '../contexts/ProjectContext';
 import type { ChipProps } from '@mui/material/Chip';
+import { requireOk, safeRequestError } from '../apiClient';
+import { customNetworkPayload, subnetworkPayload } from '../networkContracts';
 
 type VpcNetwork  = { name: string; autoCreateSubnetworks: boolean; creationTimestamp: string };
+type Subnetwork  = { name: string; ipCidrRange: string; network: string; region: string };
 type Firewall    = { name: string; direction: string; priority: number; sourceRanges: string[]; destinationRanges: string[]; allowed: { IPProtocol: string; ports: string[] }[]; denied: { IPProtocol: string; ports: string[] }[]; disabled: boolean; description: string; creationTimestamp: string };
 type ManagedZone = { name: string; dnsName: string; visibility: string; nameServers: string[] };
 type RRSet       = { name: string; type: string; ttl: number; rrdatas: string[] };
@@ -35,7 +38,11 @@ export default function NetworkPage() {
   // ── VPC ──────────────────────────────────────────────────────────────────────
   const [networks, setNetworks]   = useState<VpcNetwork[]>([]);
   const [vpcName, setVpcName]     = useState('');
-  const [autoSubnet, setAutoSubnet] = useState(true);
+  const [subnetworks, setSubnetworks] = useState<Subnetwork[]>([]);
+  const [subnetName, setSubnetName] = useState('');
+  const [subnetCIDR, setSubnetCIDR] = useState('10.10.0.0/24');
+  const [subnetNetwork, setSubnetNetwork] = useState('');
+  const region = 'us-central1';
 
   // ── Firewall ─────────────────────────────────────────────────────────────────
   const [firewalls, setFirewalls]   = useState<Firewall[]>([]);
@@ -63,6 +70,11 @@ export default function NetworkPage() {
     if (res.ok) setNetworks((await res.json()).items || []);
   }, [activeProject]);
 
+  const loadSubnetworks = useCallback(async () => {
+    const res = await fetch(`/api/manage/network/projects/${activeProject}/regions/${region}/subnetworks`);
+    if (res.ok) setSubnetworks((await res.json()).items || []);
+  }, [activeProject]);
+
   const loadFirewalls = useCallback(async () => {
     const res = await fetch(`/api/manage/network/projects/${activeProject}/global/firewalls`);
     if (res.ok) setFirewalls((await res.json()).items || []);
@@ -78,23 +90,38 @@ export default function NetworkPage() {
     if (res.ok) setRrsets((await res.json()).rrsets || []);
   }, [activeProject]);
 
-  useEffect(() => { loadNetworks(); loadFirewalls(); loadZones(); }, [loadNetworks, loadFirewalls, loadZones]);
+  useEffect(() => { loadNetworks(); loadSubnetworks(); loadFirewalls(); loadZones(); }, [loadNetworks, loadSubnetworks, loadFirewalls, loadZones]);
   useEffect(() => { if (selectedZone) loadRRSets(selectedZone.name); }, [selectedZone, loadRRSets]);
 
   // ── VPC actions ──────────────────────────────────────────────────────────────
   const createVPC = async () => {
     if (!vpcName.trim()) return;
-    const res = await fetch(`/api/manage/network/projects/${activeProject}/global/networks`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: vpcName.trim(), autoCreateSubnetworks: autoSubnet }),
-    });
-    if (res.ok) { showToast(`VPC "${vpcName}" created`); setVpcName(''); loadNetworks(); }
-    else showToast('Create failed', 'error');
+    try {
+      await requireOk(await fetch(`/api/manage/network/projects/${activeProject}/global/networks`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(customNetworkPayload(vpcName)),
+      }), 'VPC creation failed. MiniSky supports custom-mode networks only.');
+      showToast(`VPC "${vpcName}" created`); setVpcName(''); loadNetworks();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while creating the VPC.'), 'error'); }
   };
 
   const deleteVPC = async (name: string) => {
-    await fetch(`/api/manage/network/projects/${activeProject}/global/networks/${name}`, { method: 'DELETE' });
-    showToast(`VPC "${name}" deleted`); loadNetworks();
+    try {
+      await requireOk(await fetch(`/api/manage/network/projects/${activeProject}/global/networks/${name}`, { method: 'DELETE' }),
+        'VPC deletion failed. Remove attached subnetworks and instances first.');
+      showToast(`VPC "${name}" deleted`); loadNetworks();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while deleting the VPC.'), 'error'); }
+  };
+
+  const createSubnetwork = async () => {
+    if (!subnetName || !subnetNetwork || !subnetCIDR) return;
+    try {
+      await requireOk(await fetch(`/api/manage/network/projects/${activeProject}/regions/${region}/subnetworks`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subnetworkPayload(activeProject, subnetNetwork, subnetName, subnetCIDR)),
+      }), 'Subnetwork creation failed. Check the CIDR and selected VPC.');
+      showToast(`Subnetwork "${subnetName}" created`); setSubnetName(''); loadSubnetworks();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while creating the subnetwork.'), 'error'); }
   };
 
   // ── Firewall actions ─────────────────────────────────────────────────────────
@@ -111,50 +138,59 @@ export default function NetworkPage() {
     if (fwDirection === 'INGRESS') body.sourceRanges = [fwSource];
     else body.destinationRanges = [fwSource];
 
-    const res = await fetch(`/api/manage/network/projects/${activeProject}/global/firewalls`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (res.ok) { showToast(`Firewall "${fwName}" created`); setFwName(''); loadFirewalls(); }
-    else showToast('Create failed', 'error');
+    try {
+      await requireOk(await fetch(`/api/manage/network/projects/${activeProject}/global/firewalls`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }), 'Firewall creation failed. Check the protocol, ports, and ranges.');
+      showToast(`Firewall "${fwName}" created`); setFwName(''); loadFirewalls();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while creating the firewall rule.'), 'error'); }
   };
 
   const deleteFirewall = async (name: string) => {
-    await fetch(`/api/manage/network/projects/${activeProject}/global/firewalls/${name}`, { method: 'DELETE' });
-    showToast(`Firewall "${name}" deleted`); loadFirewalls();
+    try {
+      await requireOk(await fetch(`/api/manage/network/projects/${activeProject}/global/firewalls/${name}`, { method: 'DELETE' }), 'Firewall deletion failed.');
+      showToast(`Firewall "${name}" deleted`); loadFirewalls();
+    } catch (error) { showToast(safeRequestError(error, 'Unable to connect while deleting the firewall rule.'), 'error'); }
   };
 
   // ── DNS zone actions ──────────────────────────────────────────────────────────
   const createZone = async () => {
     if (!newZoneName.trim() || !newDnsName.trim()) return;
-    const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newZoneName, dnsName: newDnsName, visibility: 'public' }),
-    });
-    if (res.ok) { showToast(`Zone "${newZoneName}" created`); setNewZoneName(''); setNewDnsName(''); loadZones(); }
-    else showToast('Create failed', 'error');
+    try {
+      await requireOk(await fetch(`/api/manage/dns/projects/${activeProject}/managedZones`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newZoneName, dnsName: newDnsName, visibility: 'public' }),
+      }), 'DNS zone creation failed. Check the zone and DNS names.');
+      showToast(`Zone "${newZoneName}" created`); setNewZoneName(''); setNewDnsName(''); loadZones();
+    } catch (error) { showToast(safeRequestError(error, 'DNS zone creation failed. Check the local service and retry.'), 'error'); }
   };
 
   const deleteZone = async (name: string) => {
-    const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${name}`, { method: 'DELETE' });
-    if (res.status === 204 || res.ok) { showToast(`Zone "${name}" deleted`); setSelectedZone(null); loadZones(); }
-    else { const e = await res.json(); showToast(e?.error?.message || 'Delete failed', 'error'); }
+    try {
+      await requireOk(await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${name}`, { method: 'DELETE' }),
+        'DNS zone deletion failed. Remove custom records and retry.');
+      showToast(`Zone "${name}" deleted`); setSelectedZone(null); loadZones();
+    } catch (error) { showToast(safeRequestError(error, 'DNS zone deletion failed. Check the local service and retry.'), 'error'); }
   };
 
   const addRecord = async () => {
     if (!selectedZone || !newRRName || !newRRData) return;
-    const res = await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newRRName, type: newRRType, ttl: parseInt(newRRTtl), rrdatas: [newRRData] }),
-    });
-    if (res.ok) { showToast('Record added'); setNewRRName(''); setNewRRData(''); loadRRSets(selectedZone.name); }
-    else { const e = await res.json(); showToast(e?.error?.message || 'Failed', 'error'); }
+    try {
+      await requireOk(await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newRRName, type: newRRType, ttl: parseInt(newRRTtl), rrdatas: [newRRData] }),
+      }), 'DNS record creation failed. Check the record values.');
+      showToast('Record added'); setNewRRName(''); setNewRRData(''); loadRRSets(selectedZone.name);
+    } catch (error) { showToast(safeRequestError(error, 'DNS record creation failed. Check the local service and retry.'), 'error'); }
   };
 
   const deleteRecord = async (name: string, type: string) => {
     if (!selectedZone) return;
-    await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets/${encodeURIComponent(name)}/${type}`, { method: 'DELETE' });
-    showToast('Record deleted'); loadRRSets(selectedZone.name);
+    try {
+      await requireOk(await fetch(`/api/manage/dns/projects/${activeProject}/managedZones/${selectedZone.name}/rrsets/${encodeURIComponent(name)}/${type}`, { method: 'DELETE' }), 'DNS record deletion failed.');
+      showToast('Record deleted'); loadRRSets(selectedZone.name);
+    } catch (error) { showToast(safeRequestError(error, 'DNS record deletion failed. Check the local service and retry.'), 'error'); }
   };
 
   const rrColor = (t: string): ChipProps['color'] => {
@@ -197,13 +233,15 @@ export default function NetworkPage() {
             <TextField size="small" label="Network Name" placeholder="my-vpc" value={vpcName} onChange={e => setVpcName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} sx={{ flex: 1 }} />
             <FormControl size="small" sx={{ minWidth: 180 }}>
               <InputLabel>Subnet Mode</InputLabel>
-              <Select value={autoSubnet ? 'auto' : 'custom'} label="Subnet Mode" onChange={e => setAutoSubnet(e.target.value === 'auto')}>
-                <MenuItem value="auto">Auto-create subnets</MenuItem>
-                <MenuItem value="custom">Custom subnets</MenuItem>
+              <Select value="custom" label="Subnet Mode" disabled>
+                <MenuItem value="custom">Custom (supported)</MenuItem>
               </Select>
             </FormControl>
             <Button variant="contained" startIcon={<AddIcon />} onClick={createVPC} disabled={!vpcName.trim()}>Create VPC</Button>
           </Box>
+          <Alert severity="info" sx={{ mb: 3 }}>
+            Auto-mode VPC creation is unsupported. Create a custom-mode VPC, then add a regional subnetwork.
+          </Alert>
           <Table size="small">
             <TableHead><TableRow><TableCell>Name</TableCell><TableCell>Subnets</TableCell><TableCell>Created</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead>
             <TableBody>
@@ -213,7 +251,35 @@ export default function NetworkPage() {
                   <TableCell sx={{ fontWeight: 600 }}>{n.name}</TableCell>
                   <TableCell><Chip size="small" label={n.autoCreateSubnetworks ? 'Auto' : 'Custom'} variant="outlined" /></TableCell>
                   <TableCell sx={{ color: '#80868b', fontSize: '0.8rem' }}>{new Date(n.creationTimestamp).toLocaleDateString()}</TableCell>
-                  <TableCell align="right"><IconButton size="small" color="error" onClick={() => deleteVPC(n.name)}><DeleteIcon fontSize="small" /></IconButton></TableCell>
+                  <TableCell align="right"><IconButton aria-label={`Delete VPC ${n.name}`} size="small" color="error" onClick={() => deleteVPC(n.name)}><DeleteIcon fontSize="small" /></IconButton></TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          <Typography variant="h6" component="h3" sx={{ mt: 4, mb: 2 }}>Subnetworks ({region})</Typography>
+          <Box sx={{ display: 'flex', gap: 1.5, mb: 2, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <TextField size="small" label="Subnetwork name" value={subnetName}
+              onChange={e => setSubnetName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} />
+            <TextField size="small" label="Primary IPv4 CIDR" value={subnetCIDR} onChange={e => setSubnetCIDR(e.target.value)} />
+            <FormControl size="small" sx={{ minWidth: 180 }}>
+              <InputLabel>VPC network</InputLabel>
+              <Select value={subnetNetwork} label="VPC network" inputProps={{ 'aria-label': 'VPC network' }} onChange={e => setSubnetNetwork(e.target.value)}>
+                {networks.filter(network => !network.autoCreateSubnetworks).map(network => (
+                  <MenuItem key={network.name} value={network.name}>{network.name}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <Button variant="outlined" onClick={createSubnetwork}
+              disabled={!subnetName || !subnetCIDR || !subnetNetwork}>Create subnetwork</Button>
+          </Box>
+          <Table size="small" aria-label="Subnetworks">
+            <TableHead><TableRow><TableCell>Name</TableCell><TableCell>CIDR</TableCell><TableCell>VPC</TableCell></TableRow></TableHead>
+            <TableBody>
+              {subnetworks.map(subnetwork => (
+                <TableRow key={`${subnetwork.region}/${subnetwork.name}`}>
+                  <TableCell>{subnetwork.name}</TableCell>
+                  <TableCell sx={{ fontFamily: 'monospace' }}>{subnetwork.ipCidrRange}</TableCell>
+                  <TableCell>{subnetwork.network.split('/').pop()}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -270,7 +336,7 @@ export default function NetworkPage() {
                       {[...(fw.sourceRanges || []), ...(fw.destinationRanges || [])].join(', ')}
                     </TableCell>
                     <TableCell>{fw.priority}</TableCell>
-                    <TableCell align="right"><IconButton size="small" color="error" onClick={() => deleteFirewall(fw.name)}><DeleteIcon fontSize="small" /></IconButton></TableCell>
+                    <TableCell align="right"><IconButton aria-label={`Delete firewall ${fw.name}`} size="small" color="error" onClick={() => deleteFirewall(fw.name)}><DeleteIcon fontSize="small" /></IconButton></TableCell>
                   </TableRow>
                 );
               })}
@@ -312,7 +378,7 @@ export default function NetworkPage() {
                       <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{rr.rrdatas?.join(', ')}</TableCell>
                       <TableCell align="right">
                         {rr.type !== 'SOA' && rr.type !== 'NS' && (
-                          <IconButton size="small" color="error" onClick={() => deleteRecord(rr.name, rr.type)}><DeleteIcon fontSize="small" /></IconButton>
+                          <IconButton aria-label={`Delete ${rr.type} record ${rr.name}`} size="small" color="error" onClick={() => deleteRecord(rr.name, rr.type)}><DeleteIcon fontSize="small" /></IconButton>
                         )}
                       </TableCell>
                     </TableRow>
@@ -340,7 +406,7 @@ export default function NetworkPage() {
                       <TableCell><Chip size="small" label={z.visibility} color={z.visibility === 'public' ? 'success' : 'default'} variant="outlined" /></TableCell>
                       <TableCell sx={{ color: '#80868b', fontSize: '0.75rem' }}>{z.nameServers?.[0]}</TableCell>
                       <TableCell align="right">
-                        <IconButton size="small" color="error" onClick={e => { e.stopPropagation(); deleteZone(z.name); }}><DeleteIcon fontSize="small" /></IconButton>
+                        <IconButton aria-label={`Delete DNS zone ${z.name}`} size="small" color="error" onClick={e => { e.stopPropagation(); deleteZone(z.name); }}><DeleteIcon fontSize="small" /></IconButton>
                       </TableCell>
                     </TableRow>
                   ))}

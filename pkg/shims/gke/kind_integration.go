@@ -280,6 +280,10 @@ func (k *KindBackend) CreateClusterContext(ctx context.Context, identity Cluster
 		return gkeBackendCreateResult{Ownership: ownership},
 			abort(fmt.Errorf("kind create cluster failed: %w", err))
 	}
+	if err := finalizeKubeconfigOwnership(temporaryKubeconfig, ownership); err != nil {
+		return gkeBackendCreateResult{Ownership: ownership},
+			abort(fmt.Errorf("seal kubeconfig ownership digest: %w", err))
+	}
 	if err := writeKubeconfigIntent(identity, ownership, intentBackendCreated); err != nil {
 		return gkeBackendCreateResult{Ownership: ownership},
 			abort(fmt.Errorf("persist BACKEND_CREATED intent: %w", err))
@@ -317,8 +321,8 @@ func (k *KindBackend) CreateClusterContext(ctx context.Context, identity Cluster
 }
 
 func (k *KindBackend) CommitKubeconfigIntent(identity ClusterIdentity, ownership *kubeconfigOwnership) error {
-	if !ownership.hasBackendNonce() {
-		return fmt.Errorf("refusing legacy backend ownership without nonce evidence")
+	if !ownership.isDurable() {
+		return fmt.Errorf("refusing ownership without nonce and content digest evidence")
 	}
 	return writeKubeconfigIntent(identity, ownership, intentCommitted)
 }
@@ -335,6 +339,9 @@ func (k *KindBackend) cleanupOwnedCreateAttempt(
 	if !k.Enabled() {
 		return fmt.Errorf("owned backend cleanup pending: kind backend disabled")
 	}
+	// Prove the nonce-named backend absent before moving any kubeconfig path.
+	// Unmatched quarantine evidence therefore never substitutes for backend
+	// cleanup and cannot cause an unrelated replacement to be deleted.
 	exists, err := kindClusterExists(ctx, ownership.BackendName)
 	if err != nil {
 		return fmt.Errorf("prove owned backend absence: %w", err)
@@ -418,8 +425,8 @@ func (k *KindBackend) DeleteClusterContext(ctx context.Context, identity Cluster
 	}
 	rawOwnership, ok := k.kubeconfigOwners.Load(logicalName)
 	ownership, _ := rawOwnership.(*kubeconfigOwnership)
-	if !ok || !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
-		return fmt.Errorf("refusing cluster deletion without trusted nonce backend ownership")
+	if !ok || !ownership.matchesIdentity(identity) || !ownership.isDurable() {
+		return fmt.Errorf("refusing cluster deletion without trusted content-bound ownership")
 	}
 	if !k.Enabled() {
 		unavailable := retryableUnavailableError{
@@ -463,8 +470,8 @@ func (k *KindBackend) CheckDeleteAvailability(
 	}
 	raw, ok := k.kubeconfigOwners.Load(logicalName)
 	ownership, _ := raw.(*kubeconfigOwnership)
-	if !ok || !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
-		return fmt.Errorf("refusing availability check without trusted nonce ownership")
+	if !ok || !ownership.matchesIdentity(identity) || !ownership.isDurable() {
+		return fmt.Errorf("refusing availability check without trusted content-bound ownership")
 	}
 	if !k.Enabled() {
 		return &backendUnavailableCause{
@@ -499,8 +506,8 @@ func (k *KindBackend) MarkDeleteUnavailable(identity ClusterIdentity) error {
 	}
 	raw, ok := k.kubeconfigOwners.Load(logicalName)
 	ownership, _ := raw.(*kubeconfigOwnership)
-	if !ok || !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
-		return fmt.Errorf("refusing unavailable delete without trusted nonce ownership")
+	if !ok || !ownership.matchesIdentity(identity) || !ownership.isDurable() {
+		return fmt.Errorf("refusing unavailable delete without trusted content-bound ownership")
 	}
 	return k.persistDeleteUnavailable(
 		identity, ownership,
@@ -519,7 +526,7 @@ func (k *KindBackend) FinalizeDeleteIntent(
 	identity ClusterIdentity,
 	ownership *kubeconfigOwnership,
 ) error {
-	if !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
+	if !ownership.matchesIdentity(identity) || !ownership.isDurable() {
 		return fmt.Errorf("refusing to terminalize legacy deletion intent")
 	}
 	if err := writeKubeconfigIntent(identity, ownership, intentTerminal); err != nil {
@@ -536,7 +543,7 @@ func (k *KindBackend) CleanupClusterContext(ctx context.Context, identity Cluste
 }
 
 func (k *KindBackend) RestoreKubeconfigOwnership(identity ClusterIdentity, ownership *kubeconfigOwnership) {
-	if ownership == nil || !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
+	if ownership == nil || !ownership.matchesIdentity(identity) || !ownership.isDurable() {
 		return
 	}
 	if name, err := kindBackendName(identity); err == nil {
@@ -569,9 +576,16 @@ func (k *KindBackend) ReconcileKubeconfigIntents(
 				fmt.Errorf("legacy GKE intent %s lacks backend nonce; explicit adoption or manual cleanup required", key))
 			continue
 		}
+		if intent.UnmatchedQuarantine != nil {
+			reconcileErr = errors.Join(reconcileErr,
+				reportUnmatchedKubeconfigQuarantine(
+					kindKubeconfigPath(identity), intent.UnmatchedQuarantine))
+			continue
+		}
 		if persisted := durable[key]; persisted != nil &&
 			persisted.matchesIdentity(identity) &&
 			persisted.Device == ownership.Device && persisted.Inode == ownership.Inode &&
+			persisted.SHA256 == ownership.SHA256 &&
 			persisted.BackendName == ownership.BackendName {
 			k.RestoreKubeconfigOwnership(identity, persisted)
 			if intent.Phase == intentDeletePending || intent.Phase == intentDeleteCleaned {
@@ -594,8 +608,14 @@ func (k *KindBackend) ReconcileKubeconfigIntents(
 		if intent.Phase == intentPrepared {
 			err := secureQuarantineOwnedKubeconfig(kindKubeconfigPath(identity), ownership)
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				var unmatched *unmatchedKubeconfigQuarantineError
+				var evidence *unmatchedKubeconfigQuarantine
+				if errors.As(err, &unmatched) {
+					evidence = unmatched.Evidence
+				}
 				reconcileErr = errors.Join(reconcileErr, err,
-					writeKubeconfigIntentError(identity, ownership, intentPrepared, err.Error()))
+					writeKubeconfigIntentErrorEvidence(
+						identity, ownership, intentPrepared, err.Error(), evidence))
 				continue
 			}
 			reconcileErr = errors.Join(reconcileErr,
@@ -604,9 +624,14 @@ func (k *KindBackend) ReconcileKubeconfigIntents(
 		}
 		cleanupErr := k.cleanupOwnedCreateAttempt(ctx, identity, ownership, nil)
 		if cleanupErr != nil {
+			var unmatched *unmatchedKubeconfigQuarantineError
+			var evidence *unmatchedKubeconfigQuarantine
+			if errors.As(cleanupErr, &unmatched) {
+				evidence = unmatched.Evidence
+			}
 			reconcileErr = errors.Join(reconcileErr, cleanupErr,
-				writeKubeconfigIntentError(
-					identity, ownership, intentCleanupPending, cleanupErr.Error()))
+				writeKubeconfigIntentErrorEvidence(
+					identity, ownership, intentCleanupPending, cleanupErr.Error(), evidence))
 			continue
 		}
 		reconcileErr = errors.Join(reconcileErr, writeKubeconfigIntent(identity, ownership, intentTerminal))
@@ -674,14 +699,12 @@ func (k *KindBackend) ReadKubeconfig(identity ClusterIdentity) ([]byte, error) {
 	unlock := k.lockName(kindName)
 	defer unlock()
 	path := kindKubeconfigPath(identity)
-	// For clusters created by this backend process, retain the published inode
-	// identity so a same-UID pathname replacement is rejected on the next read.
-	// After process restart there is no trusted inode continuity; O_NOFOLLOW,
-	// regular-file, and permission validation remain the enforceable boundary.
+	// Durable identity and a content digest reject both pathname replacement and
+	// same-inode content mutation across restarts.
 	expected, _ := k.kubeconfigOwners.Load(kindName)
 	ownership, _ := expected.(*kubeconfigOwnership)
-	if !ownership.matchesIdentity(identity) || !ownership.hasBackendNonce() {
-		return nil, fmt.Errorf("refusing kubeconfig read without trusted nonce ownership")
+	if !ownership.matchesIdentity(identity) || !ownership.isDurable() {
+		return nil, fmt.Errorf("refusing kubeconfig read without trusted content-bound ownership")
 	}
 	return secureReadKubeconfigOwnership(path, ownership)
 }

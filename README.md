@@ -4,7 +4,7 @@
 
 **Official Website:** [minisky.bmics.com.ng](https://minisky.bmics.com.ng)
 
-MiniSky provides a seamless, professional-grade development environment that emulates GCP services locally. It allows developers to test Infrastructure-as-Code (Terraform), Serverless functions, and complex data workflows without incurring cloud costs or requiring an internet connection.
+MiniSky provides a seamless, professional-grade development environment that emulates GCP services locally. It allows developers to test Infrastructure-as-Code (Terraform), Serverless functions, and complex data workflows without incurring cloud costs. Once dependencies and required images are available locally, many workflows can run offline; first use may pull lazily loaded emulator images.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -171,9 +171,9 @@ Required failures return a nonzero exit status; missing Kind or Pack is reported
 as optional because each gates only its corresponding service.
 
 `minisky doctor bigquery` remains available for an isolated DuckDB check without
-starting Docker-backed services. `doctor --fix` is intentionally unavailable:
-the current Kind/Pack installer is coupled to the running Docker service manager
-and is not safe to invoke from standalone diagnostics.
+starting Docker-backed services. `minisky doctor --fix` may install missing
+optional Kind and Pack tools and pull only configured MiniSky images. Downloads
+require network access; the command does not prune global Docker resources.
 
 ### Roadmap principles
 
@@ -192,7 +192,7 @@ and is not safe to invoke from standalone diagnostics.
 
 | Phase | Feature set | Verification | Status |
 | :--- | :--- | :--- | :---: |
-| 6 | Service fidelity baseline and compatibility matrices | Every registered domain has manifest/docs coherence and an executable in-process or backend-gated contract | ✅ Baseline |
+| 6 | Service support/fidelity baseline and compatibility matrices | Manifest and docs agree on implemented/deferred status; implemented domains have an executable in-process or backend-gated contract, while deferred domains return deterministic unsupported responses | ✅ Baseline |
 | 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; bounded Phase-15 data and Phase-16 network resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
 | 9 | Executable serverless and event delivery | A guarded local Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes; Scheduler remains manual `:run` E2E | ✅ Verified bounded local slice |
@@ -208,8 +208,10 @@ and is not safe to invoke from standalone diagnostics.
 ### Phase 6 — Fidelity baseline
 
 - Maintain `docs/service-compatibility.md` with the manifest vocabulary:
-  **high**, **standard**, or **passthrough** fidelity and **memory**, **file**,
-  **docker**, **hybrid**, or **static** persistence.
+  **implemented** or **deferred** support status. Implemented domains additionally
+  declare **high**, **standard**, or **passthrough** fidelity; every domain
+  declares **memory**, **file**, **docker**, **hybrid**, or **static**
+  persistence.
 - Add `docs/state-model.md` describing file, Docker volume, and in-memory state
   per service.
 - Standardize GCP error envelopes and request validation for Storage, Pub/Sub,

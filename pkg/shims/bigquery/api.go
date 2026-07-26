@@ -402,6 +402,10 @@ func (api *API) persistenceFailure() error {
 	return api.persistenceErr
 }
 
+func (api *API) PersistenceError() error {
+	return api.persistenceFailure()
+}
+
 // GetBackend exposes the backend for dynamic dashboard configuration.
 func (api *API) GetBackend() *DuckDBBackend {
 	return api.backend
@@ -413,7 +417,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := api.persistenceFailure(); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", err.Error())
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "BigQuery persistence is unavailable")
 		return
 	}
 

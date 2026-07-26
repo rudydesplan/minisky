@@ -179,6 +179,12 @@ type artifactOperationOutcome struct {
 	Sequence      uint64      `json:"sequence"`
 }
 
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.initErr
+}
+
 func configuredRegistryIndex(sm *orchestrator.ServiceManager) RegistryIndex {
 	registryURL := os.Getenv("MINISKY_ARTIFACT_REGISTRY_URL")
 	if registryURL != "" {

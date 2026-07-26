@@ -31,6 +31,7 @@ func TestResolveInstanceNetworkInterfaces(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "subnetwork only", project: "project-a", zone: "us-central1-a", input: NetworkInterface{Subnetwork: "subnet-a"}},
+		{name: "provider relative subnetwork ID", project: "project-a", zone: "us-central1-a", input: NetworkInterface{Subnetwork: "projects/project-a/regions/us-central1/subnetworks/subnet-a"}},
 		{name: "network only inference", project: "project-a", zone: "us-central1-a", input: NetworkInterface{Network: "custom"}},
 		{name: "custom without subnet", project: "project-a", zone: "us-central1-a", input: NetworkInterface{Network: "empty"}, wantErr: true},
 		{name: "both agree", project: "project-a", zone: "us-central1-a", input: NetworkInterface{Network: networkSelfLink("project-a", "custom"), Subnetwork: subnet.SelfLink}},

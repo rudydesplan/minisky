@@ -11,6 +11,7 @@ import (
 var (
 	errUnsupportedAutoNetwork  = errors.New("auto-mode VPC attachment is not implemented")
 	errUnsupportedMultipleNICs = errors.New("multiple network interfaces are not implemented")
+	errUnsupportedNetworkNIC   = errors.New("requested network-interface semantics are not implemented")
 )
 
 func computeInstanceContainerName(project, zone string, instance *Instance) (string, error) {
@@ -35,7 +36,14 @@ func (api *API) computeInstancePortMappings(project, zone string, instance *Inst
 }
 
 func (api *API) computeInstanceIP(project, zone string, instance *Instance) string {
-	if api.svcMgr == nil || instance == nil {
+	if instance == nil {
+		return ""
+	}
+	if len(instance.NetworkInterfaces) == 1 &&
+		instance.NetworkInterfaces[0].Network != networkSelfLink(project, "default") {
+		return instance.NetworkInterfaces[0].NetworkIP
+	}
+	if api.svcMgr == nil {
 		return ""
 	}
 	if instance.Labels != nil && instance.Labels["managed-by"] == "gke" {
@@ -68,6 +76,25 @@ func (api *API) resolveInstanceNetworkInterfaces(
 		return nil, err
 	}
 	first := &resolved[0]
+	if first.Name == "" {
+		first.Name = "nic0"
+	}
+	if first.Kind == "" {
+		first.Kind = "compute#networkInterface"
+	}
+	if len(first.AccessConfigs) > 0 {
+		return nil, fmt.Errorf("%w: external IPv4/NAT access configs", errUnsupportedNetworkNIC)
+	}
+	if first.NetworkIP != "" {
+		return nil, fmt.Errorf("%w: caller-selected static networkIP", errUnsupportedNetworkNIC)
+	}
+	if first.StackType != "" && first.StackType != "IPV4_ONLY" {
+		return nil, fmt.Errorf("%w: IPv6 stack types", errUnsupportedNetworkNIC)
+	}
+	if len(first.IPv6AccessConfigs) > 0 {
+		return nil, fmt.Errorf("%w: IPv6 access configs", errUnsupportedNetworkNIC)
+	}
+	first.StackType = "IPV4_ONLY"
 
 	if first.Subnetwork != "" {
 		subnetName, err := resolveInstanceSubnetworkReference(project, region, first.Subnetwork)
@@ -143,18 +170,52 @@ func (api *API) resolveInstanceNetworkInterfaces(
 	return resolved, nil
 }
 
+func (api *API) computeInstanceNetworkAttachment(
+	project string,
+	interfaces []NetworkInterface,
+) (orchestrator.ComputeInstanceNetwork, bool, error) {
+	if len(interfaces) != 1 || interfaces[0].Network == networkSelfLink(project, "default") {
+		return orchestrator.ComputeInstanceNetwork{}, false, nil
+	}
+	subnetworkReference := interfaces[0].Subnetwork
+	if subnetworkReference == "" {
+		return orchestrator.ComputeInstanceNetwork{}, false, errors.New("custom VPC instance is missing its primary subnetwork")
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	for _, subnetwork := range api.subnetworks {
+		if subnetwork == nil || subnetwork.SelfLink != subnetworkReference {
+			continue
+		}
+		parentProject, network, err := subnetworkVPCIdentity(subnetwork)
+		if err != nil || parentProject != project {
+			return orchestrator.ComputeInstanceNetwork{}, false, errors.New("instance subnetwork has an invalid parent VPC")
+		}
+		return orchestrator.ComputeInstanceNetwork{
+			VPC:  orchestrator.VPCNetworkIdentity{Project: project, Network: network},
+			CIDR: subnetwork.IPCidrRange,
+		}, true, nil
+	}
+	return orchestrator.ComputeInstanceNetwork{}, false, errors.New("instance subnetwork metadata was not found")
+}
+
 func resolveInstanceSubnetworkReference(project, region, value string) (string, error) {
 	if gceResourceName.MatchString(value) {
 		return value, nil
 	}
 	const marker = "https://www.googleapis.com/compute/v1/projects/"
-	if !strings.HasPrefix(value, marker) {
-		return "", errors.New("subnetwork must be a name or canonical same-project regional URL")
+	remaining := value
+	if strings.HasPrefix(remaining, marker) {
+		remaining = strings.TrimPrefix(remaining, marker)
+	} else if strings.HasPrefix(remaining, "projects/") {
+		remaining = strings.TrimPrefix(remaining, "projects/")
+	} else {
+		return "", errors.New("subnetwork must be a name or canonical same-project regional reference")
 	}
-	parts := strings.Split(strings.TrimPrefix(value, marker), "/")
+	parts := strings.Split(remaining, "/")
 	if len(parts) != 5 || parts[0] != project || parts[1] != "regions" ||
 		parts[2] != region || parts[3] != "subnetworks" || !gceResourceName.MatchString(parts[4]) {
-		return "", errors.New("subnetwork URL must match the instance project and zone region")
+		return "", errors.New("subnetwork reference must match the instance project and zone region")
 	}
 	return parts[4], nil
 }

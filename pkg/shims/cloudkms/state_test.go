@@ -54,6 +54,42 @@ func TestKeyMaterialRehydratesAfterRestart(t *testing.T) {
 	}
 }
 
+func TestCloudKMSProductionConstructorFailsClosedOnCorruptState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "kms-corrupt")
+	store, err := state.New(root, "kms-corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(cloudKMSStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI()
+	request := httptest.NewRequest(http.MethodGet, "/v1/projects/demo/locations/global/keyRings", nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || api.PersistenceError() == nil {
+		t.Fatalf("status=%d degraded=%v body=%s", response.Code, api.PersistenceError(), response.Body.String())
+	}
+}
+
+func TestCloudKMSDegradedResponseRedactsPersistenceCause(t *testing.T) {
+	const sensitive = "/private/kms/state.json: key-material-123"
+	api := newAPI(nil)
+	api.markPersistenceDegraded(errors.New(sensitive))
+	request := httptest.NewRequest(http.MethodGet, "/v1/projects/demo/locations/global/keyRings", nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(body, `"status":"UNAVAILABLE"`) ||
+		!strings.Contains(body, `"message":"Cloud KMS persistence is unavailable"`) ||
+		strings.Contains(body, sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
+	}
+}
+
 func TestKMSMutationsLeaveStateUnchangedWhenSaveFails(t *testing.T) {
 	store := &failingKMSStore{fail: true}
 	api := newAPI(store)
@@ -167,7 +203,8 @@ func TestKMSAmbiguousPostCommitReadbackFailureFailsClosed(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable ||
 		envelope.Error.Code != http.StatusServiceUnavailable ||
 		envelope.Error.Status != "UNAVAILABLE" ||
-		!strings.Contains(envelope.Error.Message, "KMS readback unavailable") {
+		envelope.Error.Message != "Cloud KMS persistence is unavailable" ||
+		strings.Contains(response.Body.String(), "KMS readback unavailable") {
 		t.Fatalf("degraded API did not fail closed: %d: %s", response.Code, response.Body.String())
 	}
 }

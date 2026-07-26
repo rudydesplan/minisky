@@ -100,6 +100,32 @@ func TestGatewayMuxExposesReadinessWithoutDispatching(t *testing.T) {
 	}
 }
 
+type degradedHealth struct{ err error }
+
+func (health degradedHealth) PersistenceError() error { return health.err }
+
+func TestGatewayDefaultsToLoopbackAndRequiresExplicitRemoteBind(t *testing.T) {
+	if got := gatewayListenAddress("", "8080"); got != "127.0.0.1:8080" {
+		t.Fatalf("default address = %q", got)
+	}
+	if got := gatewayListenAddress("0.0.0.0", "8080"); got != "0.0.0.0:8080" {
+		t.Fatalf("remote address = %q", got)
+	}
+}
+
+func TestGatewayHealthReportsPersistenceDegradation(t *testing.T) {
+	const sensitive = "/Users/private/.minisky/profiles/prod/state.json: permission denied"
+	handler := gatewayMux(http.NotFoundHandler(), degradedHealth{err: errors.New(sensitive)})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil))
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"status":"degraded"`) ||
+		!strings.Contains(response.Body.String(), `"message":"persistence is degraded"`) ||
+		strings.Contains(response.Body.String(), sensitive) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestDashboardAuditProjectUsesCanonicalHeader(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "http://localhost/api/settings", nil)
 	request.Header.Set("X-MiniSky-Project", "local-dev-project")

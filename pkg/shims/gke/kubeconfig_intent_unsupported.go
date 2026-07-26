@@ -8,6 +8,15 @@ func writeKubeconfigIntent(ClusterIdentity, *kubeconfigOwnership, kubeconfigInte
 func writeKubeconfigIntentError(ClusterIdentity, *kubeconfigOwnership, kubeconfigIntentPhase, string) error {
 	return errSecureKubeconfigUnsupported
 }
+func writeKubeconfigIntentErrorEvidence(
+	ClusterIdentity,
+	*kubeconfigOwnership,
+	kubeconfigIntentPhase,
+	string,
+	*unmatchedKubeconfigQuarantine,
+) error {
+	return errSecureKubeconfigUnsupported
+}
 func prepareKubeconfigWithIntent(ClusterIdentity) (*secureKubeconfigTarget, *kubeconfigOwnership, error) {
 	return nil, nil, errSecureKubeconfigUnsupported
 }

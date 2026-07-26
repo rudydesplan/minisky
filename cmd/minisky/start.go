@@ -47,6 +47,7 @@ import (
 
 var (
 	apiPort         string
+	apiBind         string
 	uiPort          string
 	otelEnabled     bool
 	otelEndpoint    string
@@ -133,6 +134,9 @@ var startCmd = &cobra.Command{
 			}
 			if err := svcMgr.EnsureNetwork(ctx); err != nil {
 				log.Fatalf("[FATAL] Cannot create isolated minisky-net network: %v", err)
+			}
+			if err := svcMgr.ReconcileBuildResources(ctx); err != nil {
+				log.Fatalf("[FATAL] Cannot reconcile Cloud Build resources: %v", err)
 			}
 		}
 
@@ -233,7 +237,13 @@ var startCmd = &cobra.Command{
 				}
 			})
 		}
-		gatewayHandler := gatewayMux(publicGateway)
+		healthChecks := []persistenceHealth{opMgr}
+		for _, handler := range shims {
+			if health, ok := handler.(persistenceHealth); ok {
+				healthChecks = append(healthChecks, health)
+			}
+		}
+		gatewayHandler := gatewayMux(publicGateway, healthChecks...)
 		gatewayObservability.SetReplayTarget(gatewayHandler)
 
 		// ── Graceful Shutdown ────────────────────────────────────────────────
@@ -330,8 +340,8 @@ var startCmd = &cobra.Command{
 		}()
 
 		// ── API Proxy Gateway ────────────────────────────────────────────────
-		addr := ":" + apiPort
-		log.Printf("🚀 MiniSky API Gateway listening on %s://localhost:%s (mTLS=%t)", gatewayScheme, apiPort, tlsDiagnostics.ClientCAEnabled)
+		addr := gatewayListenAddress(apiBind, apiPort)
+		log.Printf("🚀 MiniSky API Gateway listening on %s://%s (mTLS=%t)", gatewayScheme, addr, tlsDiagnostics.ClientCAEnabled)
 		server := &http.Server{Addr: addr, Handler: gatewayHandler, TLSConfig: gatewayTLS}
 		var serveErr error
 		if gatewayTLS != nil {
@@ -420,6 +430,7 @@ func nativeIntegrationDisablesDocker() bool {
 
 func init() {
 	startCmd.Flags().StringVar(&apiPort, "port", "8080", "Port for the MiniSky API Gateway (env: MINISKY_PORT)")
+	startCmd.Flags().StringVar(&apiBind, "bind", "127.0.0.1", "Gateway bind address; remote binds expose Docker-backed APIs and require trusted network controls (env: MINISKY_BIND)")
 	startCmd.Flags().StringVar(&uiPort, "ui-port", "8081", "Port for the MiniSky Dashboard UI (env: MINISKY_UI_PORT)")
 	startCmd.Flags().BoolVar(&otelEnabled, "otel", false, "Enable OTLP HTTP trace export (env: MINISKY_OTEL_ENABLED)")
 	startCmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint (env: MINISKY_OTEL_ENDPOINT)")
@@ -441,6 +452,9 @@ func init() {
 	// Allow environment variable overrides
 	if p := os.Getenv("MINISKY_PORT"); p != "" {
 		apiPort = p
+	}
+	if value := os.Getenv("MINISKY_BIND"); value != "" {
+		apiBind = value
 	}
 	if p := os.Getenv("MINISKY_UI_PORT"); p != "" {
 		uiPort = p
@@ -550,7 +564,19 @@ func selectServiceDomains(
 	return selectedShims, selectedLazy, nil
 }
 
-func gatewayMux(gateway http.Handler) http.Handler {
+type persistenceHealth interface {
+	PersistenceError() error
+}
+
+func gatewayListenAddress(bind, port string) string {
+	bind = strings.TrimSpace(bind)
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	return net.JoinHostPort(bind, port)
+}
+
+func gatewayMux(gateway http.Handler, healthChecks ...persistenceHealth) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -558,6 +584,20 @@ func gatewayMux(gateway http.Handler) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		degraded := false
+		for _, health := range healthChecks {
+			if health != nil && health.PersistenceError() != nil {
+				degraded = true
+			}
+		}
+		if degraded {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":  "degraded",
+				"message": "persistence is degraded",
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
 	mux.Handle("/", gateway)

@@ -1058,8 +1058,11 @@ func (api *API) handleManageArtifactRegistry() http.Handler {
 		origDir := proxy.Director
 		proxy.Director = func(req *http.Request) {
 			origDir(req)
-			path := strings.TrimPrefix(req.URL.Path, "/api/manage/artifactregistry")
+			const prefix = "/api/manage/artifactregistry"
+			path := strings.TrimPrefix(req.URL.Path, prefix)
+			escapedPath := strings.TrimPrefix(req.URL.EscapedPath(), prefix)
 			req.URL.Path = "/v1" + path
+			req.URL.RawPath = "/v1" + escapedPath
 			req.Host = "artifactregistry.googleapis.com"
 			log.Printf("[UI/API Proxy] Artifact Registry → %s", req.URL.Path)
 		}

@@ -3,7 +3,6 @@
 package gke
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -118,9 +117,19 @@ func writeKubeconfigIntentError(
 	phase kubeconfigIntentPhase,
 	phaseError string,
 ) error {
+	return writeKubeconfigIntentErrorEvidence(identity, ownership, phase, phaseError, nil)
+}
+
+func writeKubeconfigIntentErrorEvidence(
+	identity ClusterIdentity,
+	ownership *kubeconfigOwnership,
+	phase kubeconfigIntentPhase,
+	phaseError string,
+	unmatched *unmatchedKubeconfigQuarantine,
+) error {
 	kubeconfigLifecycleMu.Lock()
 	defer kubeconfigLifecycleMu.Unlock()
-	return writeKubeconfigIntentUnlocked(identity, ownership, phase, phaseError)
+	return writeKubeconfigIntentUnlocked(identity, ownership, phase, phaseError, unmatched)
 }
 
 func writeKubeconfigIntentUnlocked(
@@ -128,6 +137,7 @@ func writeKubeconfigIntentUnlocked(
 	ownership *kubeconfigOwnership,
 	phase kubeconfigIntentPhase,
 	phaseError string,
+	unmatched *unmatchedKubeconfigQuarantine,
 ) error {
 	if testWriteKubeconfigIntent != nil {
 		if err := testWriteKubeconfigIntent(phase); err != nil {
@@ -144,7 +154,8 @@ func writeKubeconfigIntentUnlocked(
 		return err
 	}
 	intent := kubeconfigIntent{
-		Generation: generation, Phase: phase, Ownership: ownership, Error: phaseError,
+		Generation: generation, Phase: phase, Ownership: ownership,
+		UnmatchedQuarantine: unmatched, Error: phaseError,
 	}
 	data, err := encodeKubeconfigIntent(intent)
 	if err != nil {
@@ -203,16 +214,11 @@ func prepareKubeconfigWithIntent(
 	if err != nil {
 		return nil, nil, err
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, nil, errors.Join(err, secureDiscardKubeconfigUnlocked(target))
-	}
-	ownership, err := kubeconfigOwnershipFromFileInfo(identity, target.fileInfo)
+	ownership, err := kubeconfigOwnershipFromTarget(identity, target)
 	if err != nil {
 		return nil, nil, errors.Join(err, secureDiscardKubeconfigUnlocked(target))
 	}
-	ownership.BackendName = "minisky-owned-" + hex.EncodeToString(nonce[:])
-	if err := writeKubeconfigIntentUnlocked(identity, ownership, intentPrepared, ""); err != nil {
+	if err := writeKubeconfigIntentUnlocked(identity, ownership, intentPrepared, "", nil); err != nil {
 		return nil, nil, errors.Join(err, secureDiscardKubeconfigUnlocked(target))
 	}
 	return target, ownership, nil
