@@ -84,6 +84,7 @@ type Status struct {
 
 type API struct {
 	mu             sync.RWMutex
+	persistMu      sync.Mutex
 	store          stateStore
 	jobs           map[string]*Job // key: projects/{p}/locations/{l}/jobs/{j}
 	cron           *cron.Cron
@@ -92,6 +93,7 @@ type API struct {
 	client         *http.Client
 	gatewayBaseURL string
 	now            func() time.Time
+	persistenceErr error
 }
 
 type stateStore interface {
@@ -148,7 +150,9 @@ func NewAPIWithConfigAndStore(logAPI *logging.API, config Config, store stateSto
 		}
 	}
 	for _, job := range api.jobs {
-		api.scheduleJobLocked(job)
+		if err := api.scheduleJobLocked(job); err != nil {
+			return nil, fmt.Errorf("restore Scheduler job %q: %w", job.Name, err)
+		}
 	}
 	return startScheduler(api), nil
 }
@@ -201,13 +205,62 @@ func (api *API) persistMetadata() error {
 	if api.store == nil {
 		return nil
 	}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	next := api.snapshotJobs()
+	saveErr := api.saveJobs(next)
+	if saveErr == nil {
+		return nil
+	}
+	var durable schedulerMetadata
+	loadErr := api.store.Load(schedulerStateEntry, &durable)
+	if loadErr == nil && jobsEqual(durable.Jobs, next) {
+		return nil
+	}
+	ambiguous := fmt.Errorf("Scheduler save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
+	api.markPersistenceDegraded(ambiguous)
+	return ambiguous
+}
+
+func (api *API) snapshotJobs() map[string]*Job {
 	api.mu.RLock()
+	defer api.mu.RUnlock()
 	jobs := make(map[string]*Job, len(api.jobs))
 	for name, job := range api.jobs {
 		jobs[name] = cloneJob(job)
 	}
-	api.mu.RUnlock()
+	return jobs
+}
+
+func (api *API) saveJobs(jobs map[string]*Job) error {
+	if api.store == nil {
+		return nil
+	}
 	return api.store.Save(schedulerStateEntry, schedulerMetadata{Jobs: jobs})
+}
+
+func (api *API) saveJobsTransaction(previous, next map[string]*Job) error {
+	if api.store == nil {
+		return nil
+	}
+	saveErr := api.saveJobs(next)
+	if saveErr == nil {
+		return nil
+	}
+	var durable schedulerMetadata
+	loadErr := api.store.Load(schedulerStateEntry, &durable)
+	switch {
+	case loadErr == nil && jobsEqual(durable.Jobs, next):
+		return nil
+	case loadErr == nil && jobsEqual(durable.Jobs, previous):
+		return saveErr
+	case errors.Is(loadErr, state.ErrNotFound) && len(previous) == 0:
+		return saveErr
+	default:
+		ambiguous := fmt.Errorf("Scheduler save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
+		api.markPersistenceDegraded(ambiguous)
+		return ambiguous
+	}
 }
 
 func (api *API) persistOrError(w http.ResponseWriter) bool {
@@ -229,6 +282,14 @@ func (api *API) pushLog(projectId, severity, jobId, text string) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud Scheduler] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	api.mu.RLock()
+	persistenceErr := api.persistenceErr
+	api.mu.RUnlock()
+	if persistenceErr != nil {
+		schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+			"Scheduler persistence is degraded: "+persistenceErr.Error())
+		return
+	}
 
 	path := canonicalSchedulerPath(r.URL.Path)
 
@@ -287,16 +348,38 @@ func (api *API) createJob(w http.ResponseWriter, r *http.Request, path string) {
 
 	job.State = "ENABLED"
 	job.Status = &Status{Code: 0, Message: "Job created"}
-
-	api.mu.Lock()
-	api.jobs[job.Name] = &job
-	api.scheduleJobLocked(&job)
-	result := job
-	api.mu.Unlock()
-
-	if !api.persistOrError(w) {
+	if _, err := cron.ParseStandard(job.Schedule); err != nil {
+		schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
 		return
 	}
+
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotJobs()
+	next := cloneJobs(previous)
+	next[job.Name] = cloneJob(&job)
+	if err := api.saveJobsTransaction(previous, next); err != nil {
+		schedulerError(w, http.StatusInternalServerError, "INTERNAL",
+			"Failed to persist Scheduler metadata: "+err.Error())
+		return
+	}
+
+	api.mu.Lock()
+	if err := api.scheduleJobLocked(&job); err != nil {
+		api.mu.Unlock()
+		if rollbackErr := api.saveJobs(previous); rollbackErr != nil {
+			api.markPersistenceDegraded(fmt.Errorf(
+				"schedule job %q: %w; rollback metadata: %v", job.Name, err, rollbackErr))
+			schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+				"Scheduler persistence rollback failed: "+api.persistenceFailure().Error())
+			return
+		}
+		schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
+		return
+	}
+	api.jobs[job.Name] = &job
+	result := job
+	api.mu.Unlock()
 	project := extractProject(job.Name)
 	api.pushLog(project, "INFO", job.Name, "Job created: "+job.Schedule)
 	w.WriteHeader(http.StatusOK)
@@ -336,6 +419,16 @@ func (api *API) listJobs(w http.ResponseWriter, r *http.Request, path string) {
 }
 
 func (api *API) deleteJob(w http.ResponseWriter, name string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotJobs()
+	next := cloneJobs(previous)
+	delete(next, name)
+	if err := api.saveJobsTransaction(previous, next); err != nil {
+		schedulerError(w, http.StatusInternalServerError, "INTERNAL",
+			"Failed to persist Scheduler metadata: "+err.Error())
+		return
+	}
 	api.mu.Lock()
 	if id, ok := api.cronIDs[name]; ok {
 		api.cron.Remove(id)
@@ -344,9 +437,6 @@ func (api *API) deleteJob(w http.ResponseWriter, name string) {
 	delete(api.jobs, name)
 	api.mu.Unlock()
 
-	if !api.persistOrError(w) {
-		return
-	}
 	project := extractProject(name)
 	api.pushLog(project, "INFO", name, "Job deleted")
 	w.WriteHeader(http.StatusOK)
@@ -374,6 +464,18 @@ func (api *API) runJob(w http.ResponseWriter, r *http.Request, name string) {
 }
 
 func (api *API) pauseJob(w http.ResponseWriter, r *http.Request, name string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotJobs()
+	next := cloneJobs(previous)
+	if job := next[name]; job != nil {
+		job.State = "PAUSED"
+	}
+	if err := api.saveJobsTransaction(previous, next); err != nil {
+		schedulerError(w, http.StatusInternalServerError, "INTERNAL",
+			"Failed to persist Scheduler metadata: "+err.Error())
+		return
+	}
 	api.mu.Lock()
 	if job, ok := api.jobs[name]; ok {
 		job.State = "PAUSED"
@@ -383,22 +485,45 @@ func (api *API) pauseJob(w http.ResponseWriter, r *http.Request, name string) {
 		}
 	}
 	api.mu.Unlock()
-	if !api.persistOrError(w) {
-		return
-	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (api *API) resumeJob(w http.ResponseWriter, r *http.Request, name string) {
-	api.mu.Lock()
-	if job, ok := api.jobs[name]; ok {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotJobs()
+	next := cloneJobs(previous)
+	if job := next[name]; job != nil {
 		job.State = "ENABLED"
-		api.scheduleJobLocked(job)
+		if _, err := cron.ParseStandard(job.Schedule); err != nil {
+			schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
+			return
+		}
 	}
-	api.mu.Unlock()
-	if !api.persistOrError(w) {
+	if err := api.saveJobsTransaction(previous, next); err != nil {
+		schedulerError(w, http.StatusInternalServerError, "INTERNAL",
+			"Failed to persist Scheduler metadata: "+err.Error())
 		return
 	}
+	api.mu.Lock()
+	if job, ok := api.jobs[name]; ok {
+		candidate := cloneJob(job)
+		candidate.State = "ENABLED"
+		if err := api.scheduleJobLocked(candidate); err != nil {
+			api.mu.Unlock()
+			if rollbackErr := api.saveJobs(previous); rollbackErr != nil {
+				api.markPersistenceDegraded(fmt.Errorf(
+					"resume job %q: %w; rollback metadata: %v", name, err, rollbackErr))
+				schedulerError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
+					"Scheduler persistence rollback failed: "+api.persistenceFailure().Error())
+				return
+			}
+			schedulerError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid schedule: "+err.Error())
+			return
+		}
+		api.jobs[name] = candidate
+	}
+	api.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -406,14 +531,9 @@ func (api *API) resumeJob(w http.ResponseWriter, r *http.Request, name string) {
 // Engine
 // ─────────────────────────────────────────────────────────────────────────────
 
-func (api *API) scheduleJobLocked(job *Job) {
+func (api *API) scheduleJobLocked(job *Job) error {
 	if job.State != "ENABLED" {
-		return
-	}
-
-	// Remove old if exists
-	if id, ok := api.cronIDs[job.Name]; ok {
-		api.cron.Remove(id)
+		return nil
 	}
 
 	id, err := api.cron.AddFunc(job.Schedule, func() {
@@ -421,10 +541,13 @@ func (api *API) scheduleJobLocked(job *Job) {
 	})
 
 	if err != nil {
-		log.Printf("[Scheduler] Error scheduling job %s: %v", job.Name, err)
-		return
+		return err
+	}
+	if oldID, ok := api.cronIDs[job.Name]; ok {
+		api.cron.Remove(oldID)
 	}
 	api.cronIDs[job.Name] = id
+	return nil
 }
 
 func (api *API) executeJob(job *Job) {
@@ -589,6 +712,40 @@ func cloneJob(job *Job) *Job {
 		clone.AppEngineTarget = &target
 	}
 	return &clone
+}
+
+func cloneJobs(jobs map[string]*Job) map[string]*Job {
+	result := make(map[string]*Job, len(jobs))
+	for name, job := range jobs {
+		result[name] = cloneJob(job)
+	}
+	return result
+}
+
+func jobsEqual(left, right map[string]*Job) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func (api *API) markPersistenceDegraded(err error) {
+	api.mu.Lock()
+	api.persistenceErr = err
+	api.mu.Unlock()
+}
+
+func (api *API) persistenceFailure() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
+}
+
+func schedulerError(w http.ResponseWriter, code int, status, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"code": code, "message": message, "status": status},
+	})
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

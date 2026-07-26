@@ -3,23 +3,51 @@ package router
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/registry"
 	localsecurity "minisky/pkg/security"
 	_ "minisky/pkg/shims"
+	"minisky/pkg/shims/bigquery"
+	"minisky/pkg/state"
 )
 
 type testAuthorizer struct {
 	issuer *localsecurity.Issuer
 	allow  bool
+}
+
+type countingAuthorizer struct {
+	issuer     *localsecurity.Issuer
+	verifies   int
+	authorizes int
+}
+
+func (a *countingAuthorizer) EnforcementEnabled() bool { return true }
+func (a *countingAuthorizer) Authorize(string, string, string) bool {
+	a.authorizes++
+	return true
+}
+func (a *countingAuthorizer) VerifyLocalToken(
+	token string,
+	audience string,
+	scope string,
+) (localsecurity.Claims, error) {
+	a.verifies++
+	return a.issuer.Verify(token, localsecurity.VerifyOptions{
+		Audience: audience, RequiredScope: scope,
+	})
 }
 
 type authorizationCheck struct {
@@ -61,6 +89,28 @@ func (a testAuthorizer) VerifyLocalToken(token, audience, scope string) (localse
 type testProjects map[string]bool
 
 func (p testProjects) Exists(id string) bool { return p[id] }
+
+type countingReplayShim struct {
+	api       *bigquery.API
+	probes    int
+	principal string
+}
+
+func (s *countingReplayShim) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.principal = r.Header.Get("X-MiniSky-Principal")
+	s.api.ServeHTTP(w, r)
+}
+
+func (s *countingReplayShim) IsCompletedUploadReplayCandidate(r *http.Request) bool {
+	return s.api.IsCompletedUploadReplayCandidate(r)
+}
+
+func (s *countingReplayShim) ProbeCompletedUploadReplay(
+	r *http.Request,
+) (func(http.ResponseWriter), bool) {
+	s.probes++
+	return s.api.ProbeCompletedUploadReplay(r)
+}
 
 func TestStrictAuthorizationReturnsRedacted401And403(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
@@ -464,6 +514,25 @@ func TestProjectInspectionPreservesExactLimitBody(t *testing.T) {
 	}
 }
 
+func TestProjectClassificationDoesNotTruncateLargerBoundedJSON(t *testing.T) {
+	const size = 2 << 20
+	base := `{"projectId":"known-project"}`
+	body := base + strings.Repeat(" ", size-len(base))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/v1/resources", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+
+	if got := ProjectFromRequest(request); got != "" {
+		t.Fatalf("project=%q, want body inspection skipped above bounded classifier window", got)
+	}
+	restored, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != body {
+		t.Fatalf("restored body length=%d, want=%d", len(restored), len(body))
+	}
+}
+
 func TestProjectInspectionRejectsOversizedBodyWithoutDispatch(t *testing.T) {
 	const limit = 1 << 20
 	router := NewProxyRouterWithManager(nil)
@@ -484,23 +553,41 @@ func TestProjectInspectionRejectsOversizedBodyWithoutDispatch(t *testing.T) {
 	}
 }
 
-func TestOversizedBodyIsPreservedWhenProjectInspectionIsDisabled(t *testing.T) {
+func TestGatewayFallbackRejectsOversizedUnmatchedJSONBeforeDispatch(t *testing.T) {
 	const size = (1 << 20) + 1
-	body := strings.Repeat("x", size)
 	router := NewProxyRouterWithManager(nil)
-	router.RegisterShim("logging.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if string(got) != body {
-			t.Fatalf("body length=%d, want %d", len(got), len(body))
+	router.RegisterShim("custom.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized request reached shim")
+	}))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/custom/unvalidated",
+		strings.NewReader(strings.Repeat("x", size)))
+	request.ContentLength = -1
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(response.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestExplicitUploadLimitOverridesGatewayFallback(t *testing.T) {
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("bigquery.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Fatalf("read upload body: %v", err)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/logging/unvalidated",
-		strings.NewReader(body))
-	request.Header.Set("Content-Type", "application/json")
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/bigquery/upload/bigquery/v2/projects/demo/jobs?uploadType=multipart",
+		strings.NewReader("small streamed body"),
+	)
+	request.Header.Set("Content-Type", "multipart/related; boundary=test")
+	request.ContentLength = 2 << 20
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, request)
@@ -509,6 +596,447 @@ func TestOversizedBodyIsPreservedWhenProjectInspectionIsDisabled(t *testing.T) {
 		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
 	}
 }
+
+func TestGatewayDoesNotPrebufferNonJSONBody(t *testing.T) {
+	source := &countingReadCloser{Reader: strings.NewReader("streamed body")}
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("custom.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if source.reads != 0 {
+			t.Fatalf("gateway read streamed body before dispatch: reads=%d", source.reads)
+		}
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Fatalf("read streamed body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/custom/upload", nil)
+	request.Body = source
+	request.ContentLength = int64(len("streamed body"))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestGatewaySpoolsUnknownLengthBeforeDispatchAndRejectsOversize(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "unknown-spool")
+	ownership := acquireRouterTestOwnership(t)
+	defer ownership.Close()
+
+	const size = (1 << 20) + 1
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("custom.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized unknown-length request reached shim")
+	}))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/custom/upload", nil)
+	request.Body = io.NopCloser(strings.NewReader(strings.Repeat("x", size)))
+	request.ContentLength = -1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(response.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCompletedBigQueryRetryBypassesGatewayDeclaredLimit(t *testing.T) {
+	proxy, api, ownership := completedBigQueryProxy(t, "gateway-declared-replay")
+	defer ownership.Close()
+	location, expected := completeBigQueryUploadThroughProxy(t, proxy, api, "gateway-declared-job")
+
+	request := httptest.NewRequest(http.MethodPost, location, nil)
+	request.Body = panicReadCloser{}
+	request.ContentLength = (50 << 20) + 1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Body.String() != expected {
+		t.Fatalf("replay status/body=(%d,%q), want (200,%q)",
+			response.Code, response.Body.String(), expected)
+	}
+}
+
+func TestCompletedBigQueryRetryBypassesGatewaySpoolQuota(t *testing.T) {
+	proxy, api, ownership := completedBigQueryProxy(t, "gateway-quota-replay")
+	defer ownership.Close()
+	location, expected := completeBigQueryUploadThroughProxy(t, proxy, api, "gateway-quota-job")
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "user:alice@example.com",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	quota := profileBodySpoolQuota(config.GetProfileDir())
+	quota.mu.Lock()
+	remaining := quota.max - quota.used
+	quota.mu.Unlock()
+	if !quota.reserve(remaining) {
+		t.Fatal("failed to exhaust gateway request-spool quota")
+	}
+	defer quota.release(remaining)
+
+	source := &countingReadCloser{Reader: strings.NewReader("abc")}
+	request := httptest.NewRequest(http.MethodPost, location, nil)
+	request.Body = source
+	request.ContentLength = -1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Body.String() != expected {
+		t.Fatalf("replay status/body=(%d,%q), want (200,%q)",
+			response.Code, response.Body.String(), expected)
+	}
+	if source.reads != 0 {
+		t.Fatalf("completed replay read unknown-length body %d times", source.reads)
+	}
+}
+
+func TestCompletedBigQueryRetryRequiresAuthenticationBeforeReplay(t *testing.T) {
+	proxy, api, ownership := completedBigQueryProxy(t, "gateway-auth-replay")
+	defer ownership.Close()
+	location, _ := completeBigQueryUploadThroughProxy(t, proxy, api, "gateway-auth-job")
+
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	request := httptest.NewRequest(http.MethodPost, location, nil)
+	request.Body = panicReadCloser{}
+	request.ContentLength = (50 << 20) + 1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestUnauthenticatedUploadCandidatesNeverProbeReplayState(t *testing.T) {
+	proxy, api, ownership := completedBigQueryProxy(t, "gateway-auth-oracle")
+	defer ownership.Close()
+	completedLocation, _ := completeBigQueryUploadThroughProxy(t, proxy, api, "oracle-completed")
+	incompleteLocation := startBigQueryUploadThroughProxy(t, proxy, "oracle-incomplete")
+	probe := &countingReplayShim{api: api}
+	proxy.RegisterShim("bigquery.googleapis.com", probe)
+
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	unknownLocation := strings.Replace(
+		completedLocation,
+		"upload_id="+url.QueryEscape(uploadIDFromUploadLocation(t, completedLocation)),
+		"upload_id=unknown",
+		1,
+	)
+	malformedLocation := strings.Replace(
+		completedLocation,
+		"upload_id="+url.QueryEscape(uploadIDFromUploadLocation(t, completedLocation)),
+		"upload_id=",
+		1,
+	)
+	var expectedBody string
+	for _, location := range []string{
+		completedLocation,
+		unknownLocation,
+		incompleteLocation,
+		malformedLocation,
+	} {
+		request := httptest.NewRequest(http.MethodPost, location, nil)
+		request.Body = panicReadCloser{}
+		request.ContentLength = (50 << 20) + 1
+		request.Header.Set("Content-Type", "application/octet-stream")
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("location=%s status=%d body=%s", location, response.Code, response.Body.String())
+		}
+		if expectedBody == "" {
+			expectedBody = response.Body.String()
+		} else if response.Body.String() != expectedBody {
+			t.Fatalf("authentication oracle: body=%q want=%q", response.Body.String(), expectedBody)
+		}
+	}
+	if probe.probes != 0 {
+		t.Fatalf("unauthenticated candidates triggered %d replay probes, want 0", probe.probes)
+	}
+}
+
+func TestAuthenticatedUploadCandidatesAuthorizeAndProbeExactlyOnce(t *testing.T) {
+	proxy, api, ownership := completedBigQueryProxy(t, "gateway-auth-preflight")
+	defer ownership.Close()
+	completedLocation, expected := completeBigQueryUploadThroughProxy(t, proxy, api, "preflight-completed")
+	incompleteLocation := startBigQueryUploadThroughProxy(t, proxy, "preflight-incomplete")
+	probe := &countingReplayShim{api: api}
+	proxy.RegisterShim("bigquery.googleapis.com", probe)
+
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	authorizer := &countingAuthorizer{issuer: issuer}
+	proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "user:alice@example.com",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownLocation := strings.Replace(
+		completedLocation,
+		"upload_id="+url.QueryEscape(uploadIDFromUploadLocation(t, completedLocation)),
+		"upload_id=unknown",
+		1,
+	)
+	for index, test := range []struct {
+		location string
+		status   int
+		body     string
+	}{
+		{location: completedLocation, status: http.StatusOK, body: expected},
+		{location: unknownLocation, status: http.StatusRequestEntityTooLarge},
+		{location: incompleteLocation, status: http.StatusRequestEntityTooLarge},
+	} {
+		request := httptest.NewRequest(http.MethodPost, test.location, nil)
+		request.Body = panicReadCloser{}
+		request.ContentLength = (50 << 20) + 1
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("location=%s status=%d want=%d body=%s",
+				test.location, response.Code, test.status, response.Body.String())
+		}
+		if test.body != "" && response.Body.String() != test.body {
+			t.Fatalf("completed replay body=%q want=%q", response.Body.String(), test.body)
+		}
+		wantCalls := index + 1
+		if authorizer.verifies != wantCalls || authorizer.authorizes != wantCalls {
+			t.Fatalf("after request %d verify/authorize=(%d,%d), want (%d,%d)",
+				index, authorizer.verifies, authorizer.authorizes, wantCalls, wantCalls)
+		}
+		if probe.probes != wantCalls {
+			t.Fatalf("after request %d probes=%d want=%d", index, probe.probes, wantCalls)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodPost, unknownLocation, strings.NewReader("abc"))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Content-Range", "bytes 0-2/3")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("dispatched unknown status=%d body=%s", response.Code, response.Body.String())
+	}
+	if authorizer.verifies != 4 || authorizer.authorizes != 4 || probe.probes != 4 {
+		t.Fatalf("dispatch verify/authorize/probe=(%d,%d,%d), want (4,4,4)",
+			authorizer.verifies, authorizer.authorizes, probe.probes)
+	}
+	if probe.principal != "user:alice@example.com" {
+		t.Fatalf("dispatched principal=%q", probe.principal)
+	}
+}
+
+func TestUnknownBigQueryUploadIDStillUsesGatewayBodyLimit(t *testing.T) {
+	proxy, _, ownership := completedBigQueryProxy(t, "gateway-unknown-replay")
+	defer ownership.Close()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/upload/bigquery/v2/projects/demo/jobs?uploadType=resumable&upload_id=unknown",
+		nil,
+	)
+	request.Body = panicReadCloser{}
+	request.ContentLength = (50 << 20) + 1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestIncompleteBigQueryUploadIDStillUsesGatewayBodyLimit(t *testing.T) {
+	proxy, _, ownership := completedBigQueryProxy(t, "gateway-incomplete-replay")
+	defer ownership.Close()
+	metadata := `{"jobReference":{"jobId":"incomplete-job","location":"US"},"configuration":{"load":{"destinationTable":{"projectId":"demo","datasetId":"dataset","tableId":"events"},"sourceFormat":"NEWLINE_DELIMITED_JSON"}}}`
+	start := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/upload/bigquery/v2/projects/demo/jobs?uploadType=resumable",
+		strings.NewReader(metadata),
+	)
+	start.Header.Set("Content-Type", "application/json")
+	startResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(startResponse, start)
+	if startResponse.Code != http.StatusOK {
+		t.Fatalf("start status=%d body=%s", startResponse.Code, startResponse.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodPost, startResponse.Header().Get("Location"), nil)
+	request.Body = panicReadCloser{}
+	request.ContentLength = (50 << 20) + 1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func completedBigQueryProxy(
+	t *testing.T,
+	profile string,
+) (*ProxyRouter, *bigquery.API, *state.Ownership) {
+	t.Helper()
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", profile)
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := bigquery.NewAPI(nil)
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("bigquery.googleapis.com", api)
+	return proxy, api, ownership
+}
+
+func completeBigQueryUploadThroughProxy(
+	t *testing.T,
+	proxy *ProxyRouter,
+	api *bigquery.API,
+	jobID string,
+) (string, string) {
+	t.Helper()
+	_ = api
+	location := startBigQueryUploadThroughProxy(t, proxy, jobID)
+	finish := httptest.NewRequest(http.MethodPost, location, strings.NewReader("abc"))
+	finish.Header.Set("Content-Type", "application/octet-stream")
+	finish.Header.Set("Content-Range", "bytes 0-2/3")
+	finishResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(finishResponse, finish)
+	if finishResponse.Code != http.StatusOK {
+		t.Fatalf("finish status=%d body=%s", finishResponse.Code, finishResponse.Body.String())
+	}
+	return location, finishResponse.Body.String()
+}
+
+func startBigQueryUploadThroughProxy(
+	t *testing.T,
+	proxy *ProxyRouter,
+	jobID string,
+) string {
+	t.Helper()
+	metadata := fmt.Sprintf(
+		`{"jobReference":{"jobId":%q,"location":"US"},"configuration":{"load":{"destinationTable":{"projectId":"demo","datasetId":"dataset","tableId":"events"},"sourceFormat":"NEWLINE_DELIMITED_JSON"}}}`,
+		jobID,
+	)
+	start := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/upload/bigquery/v2/projects/demo/jobs?uploadType=resumable",
+		strings.NewReader(metadata),
+	)
+	start.Header.Set("Content-Type", "application/json")
+	startResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(startResponse, start)
+	if startResponse.Code != http.StatusOK {
+		t.Fatalf("start status=%d body=%s", startResponse.Code, startResponse.Body.String())
+	}
+	return startResponse.Header().Get("Location")
+}
+
+func uploadIDFromUploadLocation(t *testing.T, location string) string {
+	t.Helper()
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed.Query().Get("upload_id")
+}
+
+func TestGatewayRejectsSymlinkedRequestSpoolDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", stateDir)
+	t.Setenv("MINISKY_PROFILE", "symlink-spool")
+	ownership := acquireRouterTestOwnership(t)
+	defer ownership.Close()
+
+	external := t.TempDir()
+	profileDir := filepath.Join(stateDir, "profiles", "symlink-spool")
+	if err := os.Symlink(external, filepath.Join(profileDir, "request-spool")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	externalFile := filepath.Join(external, "keep")
+	if err := os.WriteFile(externalFile, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("custom.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("request with unsafe spool path reached shim")
+	}))
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/_minisky/custom/upload", nil)
+	request.Body = io.NopCloser(strings.NewReader("streamed"))
+	request.ContentLength = -1
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(externalFile); err != nil {
+		t.Fatalf("external file was touched: %v", err)
+	}
+}
+
+func acquireRouterTestOwnership(t *testing.T) *state.Ownership {
+	t.Helper()
+	store, err := state.New(os.Getenv("MINISKY_STATE_DIR"), os.Getenv("MINISKY_PROFILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ownership
+}
+
+type countingReadCloser struct {
+	io.Reader
+	reads int
+}
+
+func (r *countingReadCloser) Read(payload []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(payload)
+}
+
+func (*countingReadCloser) Close() error { return nil }
+
+type panicReadCloser struct{}
+
+func (panicReadCloser) Read([]byte) (int, error) {
+	panic("completed retry body was read")
+}
+
+func (panicReadCloser) Close() error { return nil }
 
 func TestGatewayAloneEnforcesCrossProjectPubSubAttachment(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
@@ -933,6 +1461,7 @@ func TestServeHTTPPreservesLegacyLocalPathAliases(t *testing.T) {
 	}{
 		{name: "storage", domain: "storage.googleapis.com", path: "/storage/v1/b/demo/o"},
 		{name: "storage upload", domain: "storage.googleapis.com", path: "/upload/storage/v1/b/demo/o"},
+		{name: "bigquery upload", domain: "bigquery.googleapis.com", path: "/upload/bigquery/v2/projects/demo/jobs"},
 		{name: "bigquery", domain: "bigquery.googleapis.com", path: "/bigquery/v2/projects/demo/datasets"},
 		{name: "pubsub topics", domain: "pubsub.googleapis.com", path: "/v1/projects/demo/topics"},
 		{name: "pubsub subscriptions", domain: "pubsub.googleapis.com", path: "/projects/demo/subscriptions"},

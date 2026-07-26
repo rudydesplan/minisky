@@ -2,9 +2,12 @@ package cloudkms
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"minisky/pkg/state"
@@ -49,4 +52,171 @@ func TestKeyMaterialRehydratesAfterRestart(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "cmVzdGFydA==") {
 		t.Fatalf("decrypt restored key: %d: %s", response.Code, response.Body.String())
 	}
+}
+
+func TestKMSMutationsLeaveStateUnchangedWhenSaveFails(t *testing.T) {
+	store := &failingKMSStore{fail: true}
+	api := newAPI(store)
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, request)
+		return response
+	}
+	ringPath := "/v1/projects/demo/locations/global/keyRings"
+	if response := call(http.MethodPost, ringPath+"?keyRingId=failed", `{}`); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed ring create status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(api.store) != 0 || len(store.snapshot()) != 0 {
+		t.Fatalf("failed ring create changed state: live=%#v persisted=%s", api.store, store.snapshot())
+	}
+
+	store.setFail(false)
+	if response := call(http.MethodPost, ringPath+"?keyRingId=ring", `{}`); response.Code != http.StatusOK {
+		t.Fatalf("seed ring: %d: %s", response.Code, response.Body.String())
+	}
+	ringBaseline := store.snapshot()
+	store.setFail(true)
+	keyPath := ringPath + "/ring/cryptoKeys"
+	if response := call(http.MethodPost, keyPath+"?cryptoKeyId=failed", `{}`); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed key create status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(api.store["demo/global"]["ring"].keys) != 0 || string(store.snapshot()) != string(ringBaseline) {
+		t.Fatal("failed key create changed live or persisted state")
+	}
+
+	store.setFail(false)
+	if response := call(http.MethodPost, keyPath+"?cryptoKeyId=key", `{}`); response.Code != http.StatusOK {
+		t.Fatalf("seed key: %d: %s", response.Code, response.Body.String())
+	}
+	baseline := store.snapshot()
+	store.setFail(true)
+
+	if response := call(http.MethodPatch, keyPath+"/key", `{"labels":{"changed":"true"}}`); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed key update status = %d, body = %s", response.Code, response.Body.String())
+	}
+	key := api.store["demo/global"]["ring"].keys["key"]
+	if key.Labels != nil || string(store.snapshot()) != string(baseline) {
+		t.Fatal("failed key update changed live or persisted state")
+	}
+
+	if response := call(http.MethodPost, keyPath+"/key/cryptoKeyVersions", `{}`); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed version create status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(key.versions) != 1 || string(store.snapshot()) != string(baseline) {
+		t.Fatal("failed version create changed live or persisted state")
+	}
+
+	if response := call(http.MethodPost, keyPath+"/key/cryptoKeyVersions/1:destroy", `{}`); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed version destroy status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if key.versions[0].State != "ENABLED" || len(key.versions[0].aesKey) == 0 ||
+		string(store.snapshot()) != string(baseline) {
+		t.Fatal("failed version destroy changed live or persisted state")
+	}
+}
+
+func TestKMSCreateReconcilesPostCommitSaveError(t *testing.T) {
+	store := &failingKMSStore{commitThenFail: true}
+	api := newAPI(store)
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/demo/locations/global/keyRings?keyRingId=committed", strings.NewReader(`{}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if api.store["demo/global"]["committed"] == nil {
+		t.Fatal("post-commit save was not reconciled into live state")
+	}
+	restarted, err := newAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.store["demo/global"]["committed"] == nil {
+		t.Fatal("post-commit save did not survive restart")
+	}
+}
+
+func TestKMSAmbiguousPostCommitReadbackFailureFailsClosed(t *testing.T) {
+	store := &failingKMSStore{commitThenFail: true}
+	api := newAPI(store)
+	store.loadErr = errors.New("KMS readback unavailable")
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/demo/locations/global/keyRings?keyRingId=ambiguous", strings.NewReader(`{}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || api.persistenceErr == nil {
+		t.Fatalf("create status=%d degraded=%v body=%s",
+			response.Code, api.persistenceErr, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet,
+		"/v1/projects/demo/locations/global/keyRings", nil)
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	var envelope struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Status  string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusServiceUnavailable ||
+		envelope.Error.Code != http.StatusServiceUnavailable ||
+		envelope.Error.Status != "UNAVAILABLE" ||
+		!strings.Contains(envelope.Error.Message, "KMS readback unavailable") {
+		t.Fatalf("degraded API did not fail closed: %d: %s", response.Code, response.Body.String())
+	}
+}
+
+type failingKMSStore struct {
+	mu             sync.Mutex
+	data           []byte
+	fail           bool
+	commitThenFail bool
+	loadErr        error
+}
+
+func (s *failingKMSStore) Load(_ string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	if len(s.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(s.data, target)
+}
+
+func (s *failingKMSStore) Save(_ string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errors.New("injected KMS save failure")
+	}
+	data, err := json.Marshal(value)
+	if err == nil {
+		s.data = data
+	}
+	if err == nil && s.commitThenFail {
+		s.commitThenFail = false
+		return errors.New("injected post-commit KMS save failure")
+	}
+	return err
+}
+
+func (s *failingKMSStore) setFail(fail bool) {
+	s.mu.Lock()
+	s.fail = fail
+	s.mu.Unlock()
+}
+
+func (s *failingKMSStore) snapshot() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.data...)
 }

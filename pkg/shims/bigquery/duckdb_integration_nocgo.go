@@ -53,6 +53,10 @@ func (d *DuckDBBackend) ExecuteQuery(query string) ([]map[string]interface{}, er
 	return nil, fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
 }
 
+func (d *DuckDBBackend) ExecuteQueryWithSchema(query string) ([]QueryValues, *TableSchema, error) {
+	return nil, nil, fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
+}
+
 func (d *DuckDBBackend) LoadData(project, dataset, table, sourceURI, format string) error {
 	return fmt.Errorf("duckdb backend requires CGO_ENABLED=1")
 }

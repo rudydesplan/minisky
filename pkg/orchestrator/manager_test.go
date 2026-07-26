@@ -574,6 +574,84 @@ func TestServerlessLifecycleGateRejectsSameIdentityAndAllowsUnrelatedIdentity(t 
 	}
 }
 
+func TestDeleteCloudSQLVolumeRequiresExactOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "sql-volume")
+	expected := ownedDockerLabels()
+	expected["minisky.service"] = "cloudsql"
+	expected["minisky.resource"] = "db"
+	for _, test := range []struct {
+		name       string
+		labels     map[string]string
+		wantDelete bool
+	}{
+		{name: "owned", labels: expected, wantDelete: true},
+		{name: "other profile", labels: map[string]string{
+			"managed-by": "minisky", "minisky.profile": "other",
+			"minisky.service": "cloudsql", "minisky.resource": "db",
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deleted := false
+			manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				switch request.Method {
+				case http.MethodGet:
+					body, _ := json.Marshal(map[string]any{"Labels": test.labels})
+					return dockerResponse(http.StatusOK, string(body)), nil
+				case http.MethodDelete:
+					deleted = true
+					return dockerResponse(http.StatusNoContent, ""), nil
+				default:
+					t.Fatalf("unexpected request %s %s", request.Method, request.URL)
+					return nil, nil
+				}
+			})}}
+			err := manager.deleteCloudSQLVolume(context.Background(), "minisky-db-db", expected)
+			if deleted != test.wantDelete {
+				t.Fatalf("deleted = %t, want %t, error %v", deleted, test.wantDelete, err)
+			}
+			if !test.wantDelete && err == nil {
+				t.Fatal("unowned volume deletion succeeded")
+			}
+		})
+	}
+}
+
+func TestEnsureCloudSQLVolumeLabelsNewVolume(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "sql-volume")
+	expected := ownedDockerLabels()
+	expected["minisky.service"] = "cloudsql"
+	expected["minisky.resource"] = "db"
+	var created struct {
+		Name   string            `json:"Name"`
+		Labels map[string]string `json:"Labels"`
+	}
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			return dockerResponse(http.StatusNotFound, ""), nil
+		}
+		if err := json.NewDecoder(request.Body).Decode(&created); err != nil {
+			t.Fatal(err)
+		}
+		return dockerResponse(http.StatusCreated, ""), nil
+	})}}
+	wasCreated, err := manager.ensureCloudSQLVolume(context.Background(), "minisky-db-db", expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wasCreated || created.Name != "minisky-db-db" || !exactLabels(created.Labels, expected) {
+		t.Fatalf("created volume = %#v, wasCreated=%t", created, wasCreated)
+	}
+}
+
+func TestCloudSQLDockerIdentitySeparatesProjects(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "shared-profile")
+	containerA, volumeA, resourceA := cloudSQLDockerNames("project-a", "db")
+	containerB, volumeB, resourceB := cloudSQLDockerNames("project-b", "db")
+	if containerA == containerB || volumeA == volumeB || resourceA == resourceB {
+		t.Fatalf("cross-project identities collided: %q %q %q", containerA, volumeA, resourceA)
+	}
+}
+
 func dockerResponse(code int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: code,

@@ -51,10 +51,11 @@ type API struct {
 	mu        sync.RWMutex
 	persistMu sync.Mutex
 	// map[project] -> map[secretId] -> *secret
-	store      map[string]map[string]*secret
-	svcMgr     *orchestrator.ServiceManager
-	logAPI     *logging.API
-	stateStore *state.Store
+	store          map[string]map[string]*secret
+	svcMgr         *orchestrator.ServiceManager
+	logAPI         *logging.API
+	stateStore     secretStateStore
+	persistenceErr error
 }
 
 func NewAPI(sm *orchestrator.ServiceManager, logAPI *logging.API) *API {
@@ -71,7 +72,7 @@ func NewAPI(sm *orchestrator.ServiceManager, logAPI *logging.API) *API {
 	return api
 }
 
-func newAPI(sm *orchestrator.ServiceManager, logAPI *logging.API, store *state.Store) *API {
+func newAPI(sm *orchestrator.ServiceManager, logAPI *logging.API, store secretStateStore) *API {
 	return &API{
 		store:      make(map[string]map[string]*secret),
 		svcMgr:     sm,
@@ -108,6 +109,14 @@ func jsonError(w http.ResponseWriter, code int, msg string) {
 	})
 }
 
+func jsonErrorStatus(w http.ResponseWriter, code int, status, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"code": code, "message": msg, "status": status},
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -115,6 +124,14 @@ func jsonError(w http.ResponseWriter, code int, msg string) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Secret Manager] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	api.mu.RLock()
+	persistenceErr := api.persistenceErr
+	api.mu.RUnlock()
+	if persistenceErr != nil {
+		jsonErrorStatus(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"Secret Manager persistence is degraded: "+persistenceErr.Error())
+		return
+	}
 
 	// Strip /v1 prefix if present
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
@@ -220,10 +237,11 @@ func (api *API) createSecret(w http.ResponseWriter, r *http.Request, project str
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	ps := api.projectStore(project)
-	api.mu.Lock()
-	if _, exists := ps[secretId]; exists {
-		api.mu.Unlock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotMetadata()
+	snapshot := cloneSecretMetadata(previous)
+	if _, exists := snapshot.Projects[project][secretId]; exists {
 		jsonError(w, http.StatusConflict, fmt.Sprintf("Secret %s already exists", secretId))
 		return
 	}
@@ -234,12 +252,23 @@ func (api *API) createSecret(w http.ResponseWriter, r *http.Request, project str
 		Labels:      body.Labels,
 		Replication: body.Replication,
 	}
-	ps[secretId] = s
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	if snapshot.Projects[project] == nil {
+		snapshot.Projects[project] = make(map[string]persistedSecret)
+	}
+	snapshot.Projects[project][secretId] = persistedSecret{
+		Name: s.Name, CreateTime: s.CreateTime, Labels: cloneStringMap(s.Labels),
+		Replication: cloneAnyMap(s.Replication), Versions: []*secretVersion{},
+	}
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonError(w, http.StatusInternalServerError, "persist secret: "+err.Error())
 		return
 	}
+	api.mu.Lock()
+	if api.store[project] == nil {
+		api.store[project] = make(map[string]*secret)
+	}
+	api.store[project][secretId] = s
+	api.mu.Unlock()
 
 	api.pushLog(project, "INFO", secretId, "Secret created: "+name)
 	w.WriteHeader(http.StatusOK)
@@ -285,21 +314,23 @@ func (api *API) listSecrets(w http.ResponseWriter, r *http.Request, project stri
 }
 
 func (api *API) deleteSecret(w http.ResponseWriter, r *http.Request, project, secretId string) {
-	ps := api.projectStore(project)
-	api.mu.Lock()
-	_, ok := ps[secretId]
-	if ok {
-		delete(ps, secretId)
-	}
-	api.mu.Unlock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotMetadata()
+	snapshot := cloneSecretMetadata(previous)
+	_, ok := snapshot.Projects[project][secretId]
 	if !ok {
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("Secret %s not found", secretId))
 		return
 	}
-	if err := api.persistMetadata(); err != nil {
+	delete(snapshot.Projects[project], secretId)
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonError(w, http.StatusInternalServerError, "persist secret deletion: "+err.Error())
 		return
 	}
+	api.mu.Lock()
+	delete(api.store[project], secretId)
+	api.mu.Unlock()
 	api.pushLog(project, "INFO", secretId, "Secret deleted")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{})
@@ -310,10 +341,11 @@ func (api *API) deleteSecret(w http.ResponseWriter, r *http.Request, project, se
 // ---------------------------------------------------------------------------
 
 func (api *API) addVersion(w http.ResponseWriter, r *http.Request, project, secretId string) {
-	ps := api.projectStore(project)
-	api.mu.Lock()
-	s, ok := ps[secretId]
-	api.mu.Unlock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.RLock()
+	s, ok := api.store[project][secretId]
+	api.mu.RUnlock()
 	if !ok {
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("Secret %s not found", secretId))
 		return
@@ -326,8 +358,10 @@ func (api *API) addVersion(w http.ResponseWriter, r *http.Request, project, secr
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	s.mu.Lock()
-	versionNum := len(s.versions) + 1
+	previous := api.snapshotMetadata()
+	snapshot := cloneSecretMetadata(previous)
+	saved := snapshot.Projects[project][secretId]
+	versionNum := len(saved.Versions) + 1
 	vName := fmt.Sprintf("projects/%s/secrets/%s/versions/%d", project, secretId, versionNum)
 	v := &secretVersion{
 		Name:       vName,
@@ -335,12 +369,16 @@ func (api *API) addVersion(w http.ResponseWriter, r *http.Request, project, secr
 		State:      "ENABLED",
 		Payload:    body.Payload.Data,
 	}
-	s.versions = append(s.versions, v)
-	s.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	versionCopy := *v
+	saved.Versions = append(saved.Versions, &versionCopy)
+	snapshot.Projects[project][secretId] = saved
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonError(w, http.StatusInternalServerError, "persist secret version: "+err.Error())
 		return
 	}
+	s.mu.Lock()
+	s.versions = append(s.versions, v)
+	s.mu.Unlock()
 
 	api.pushLog(project, "INFO", secretId, fmt.Sprintf("Version %d added", versionNum))
 	jsonOK(w, map[string]any{
@@ -348,6 +386,12 @@ func (api *API) addVersion(w http.ResponseWriter, r *http.Request, project, secr
 		"createTime": v.CreateTime,
 		"state":      v.State,
 	})
+}
+
+func (api *API) markPersistenceDegraded(err error) {
+	api.mu.Lock()
+	api.persistenceErr = err
+	api.mu.Unlock()
 }
 
 func (api *API) listVersions(w http.ResponseWriter, r *http.Request, project, secretId string) {

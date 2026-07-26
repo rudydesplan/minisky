@@ -15,13 +15,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
 func init() {
 	f := func(ctx *registry.Context) http.Handler {
-		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
+		return ctx.SharedHandler("bigtable", func() http.Handler {
+			return NewAPI(ctx.OpMgr, ctx.SvcMgr)
+		})
 	}
 	registry.Register("bigtableadmin.googleapis.com", f)
 	registry.Register("bigtable.googleapis.com", f)
@@ -29,11 +33,12 @@ func init() {
 
 // Instance mirrors the Bigtable Instance resource.
 type Instance struct {
-	Name        string            `json:"name"`
-	DisplayName string            `json:"displayName"`
-	State       string            `json:"state"` // READY, CREATING
-	Type        string            `json:"type"`  // PRODUCTION, DEVELOPMENT
-	Labels      map[string]string `json:"labels"`
+	Name          string            `json:"name"`
+	DisplayName   string            `json:"displayName"`
+	State         string            `json:"state"` // READY, CREATING
+	Type          string            `json:"type"`  // PRODUCTION, DEVELOPMENT
+	Labels        map[string]string `json:"labels"`
+	BackendStatus string            `json:"backendStatus,omitempty"`
 }
 
 // Table mirrors the Bigtable Table resource.
@@ -54,19 +59,63 @@ type GcRule struct {
 
 // API is the high-fidelity Bigtable Admin & Data shim.
 type API struct {
-	mu        sync.RWMutex
-	opMgr     *orchestrator.OperationManager
-	svcMgr    *orchestrator.ServiceManager
-	instances map[string]*Instance // key: projects/{p}/instances/{i}
-	tables    map[string]*Table    // key: projects/{p}/instances/{i}/tables/{t}
+	mu         sync.RWMutex
+	mutationMu sync.Mutex
+	persistMu  sync.Mutex
+	opMgr      *orchestrator.OperationManager
+	svcMgr     *orchestrator.ServiceManager
+	backend    bigtableBackend
+	stateStore bigtableStore
+	instances  map[string]*Instance // key: projects/{p}/instances/{i}
+	tables     map[string]*Table    // key: projects/{p}/instances/{i}/tables/{t}
+}
+
+type bigtableBackend interface {
+	Ensure(context.Context) (string, error)
+}
+
+type serviceManagerBackend struct {
+	manager *orchestrator.ServiceManager
+}
+
+func (b serviceManagerBackend) Ensure(ctx context.Context) (string, error) {
+	if b.manager == nil {
+		return "", fmt.Errorf("Bigtable emulator backend is unavailable")
+	}
+	return b.manager.EnsureServiceRunning(ctx, "bigtable.googleapis.com")
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Bigtable] state disabled: %v", err)
+		return newAPI(opMgr, svcMgr, serviceManagerBackend{manager: svcMgr}, nil)
+	}
+	api, err := newAPIWithDependencies(opMgr, svcMgr, serviceManagerBackend{manager: svcMgr}, store)
+	if err != nil {
+		log.Printf("[Shim: Bigtable] state rehydration failed: %v", err)
+		return newAPI(opMgr, svcMgr, serviceManagerBackend{manager: svcMgr}, store)
+	}
+	return api
+}
+
+func NewAPIWithStore(
+	opMgr *orchestrator.OperationManager,
+	backend bigtableBackend,
+	store bigtableStore,
+) (*API, error) {
+	return newAPIWithDependencies(opMgr, nil, backend, store)
+}
+
+func newAPI(
+	opMgr *orchestrator.OperationManager,
+	svcMgr *orchestrator.ServiceManager,
+	backend bigtableBackend,
+	store bigtableStore,
+) *API {
 	return &API{
-		opMgr:     opMgr,
-		svcMgr:    svcMgr,
-		instances: make(map[string]*Instance),
-		tables:    make(map[string]*Table),
+		opMgr: opMgr, svcMgr: svcMgr, backend: backend, stateStore: store,
+		instances: make(map[string]*Instance), tables: make(map[string]*Table),
 	}
 }
 
@@ -83,17 +132,14 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case strings.Contains(path, "/clusters"):
+		api.routeClusters(w, r, path)
 	case strings.Contains(path, "/instances") && !strings.Contains(path, "/tables"):
 		api.routeInstances(w, r, path)
 	case strings.Contains(path, "/tables"):
 		api.routeTables(w, r, path)
-	case strings.Contains(path, "/clusters"):
-		api.routeClusters(w, r, path)
 	default:
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": map[string]interface{}{"code": 404, "message": "Bigtable resource not found: " + path},
-		})
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable resource not found: "+path)
 	}
 }
 
@@ -114,7 +160,18 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			InstanceId string   `json:"instanceId"`
 			Instance   Instance `json:"instance"`
 		}
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+			return
+		}
+		if project == "" || body.InstanceId == "" {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "project and instanceId are required")
+			return
+		}
+		if _, err := api.ensureBackend(r.Context()); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Bigtable emulator unavailable: "+err.Error())
+			return
+		}
 
 		name := fmt.Sprintf("projects/%s/instances/%s", project, body.InstanceId)
 		inst := &Instance{
@@ -125,13 +182,23 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			Labels:      body.Instance.Labels,
 		}
 
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
 		api.mu.Lock()
+		if _, exists := api.instances[name]; exists {
+			api.mu.Unlock()
+			writeError(w, http.StatusConflict, "ALREADY_EXISTS", "Bigtable instance already exists: "+name)
+			return
+		}
 		api.instances[name] = inst
 		api.mu.Unlock()
-
-		go func() {
-			api.svcMgr.EnsureServiceRunning(context.Background(), "bigtable.googleapis.com")
-		}()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			delete(api.instances, name)
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable instance: "+err.Error())
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(inst)
@@ -141,9 +208,10 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			name := fmt.Sprintf("projects/%s/instances/%s", project, instanceId)
 			api.mu.RLock()
 			inst, ok := api.instances[name]
+			inst = cloneInstance(inst)
 			api.mu.RUnlock()
 			if !ok {
-				w.WriteHeader(http.StatusNotFound)
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable instance not found: "+name)
 				return
 			}
 			json.NewEncoder(w).Encode(inst)
@@ -151,8 +219,8 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 			api.mu.RLock()
 			items := []*Instance{}
 			for _, v := range api.instances {
-				if strings.Contains(v.Name, "projects/"+project) {
-					items = append(items, v)
+				if strings.HasPrefix(v.Name, "projects/"+project+"/instances/") {
+					items = append(items, cloneInstance(v))
 				}
 			}
 			api.mu.RUnlock()
@@ -161,21 +229,46 @@ func (api *API) routeInstances(w http.ResponseWriter, r *http.Request, path stri
 
 	case http.MethodDelete:
 		name := fmt.Sprintf("projects/%s/instances/%s", project, instanceId)
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
 		api.mu.Lock()
+		instance, exists := api.instances[name]
+		if !exists {
+			api.mu.Unlock()
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable instance not found: "+name)
+			return
+		}
+		removedTables := make(map[string]*Table)
 		delete(api.instances, name)
+		for tableName := range api.tables {
+			if strings.HasPrefix(tableName, name+"/tables/") {
+				removedTables[tableName] = api.tables[tableName]
+				delete(api.tables, tableName)
+			}
+		}
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			api.instances[name] = instance
+			for tableName, table := range removedTables {
+				api.tables[tableName] = table
+			}
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable instance deletion: "+err.Error())
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{})
 
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
 func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) < 5 {
-		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid Bigtable table path")
 		return
 	}
 	project := parts[2]
@@ -193,7 +286,34 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 			TableId string `json:"tableId"`
 			Table   Table  `json:"table"`
 		}
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+			return
+		}
+		if body.TableId == "" {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "tableId is required")
+			return
+		}
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
+		api.mu.RLock()
+		_, parentExists := api.instances[parent]
+		api.mu.RUnlock()
+		if !parentExists {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable instance not found: "+parent)
+			return
+		}
+		if _, err := api.ensureBackend(r.Context()); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Bigtable emulator unavailable: "+err.Error())
+			return
+		}
+		api.mu.RLock()
+		_, parentExists = api.instances[parent]
+		api.mu.RUnlock()
+		if !parentExists {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable instance not found: "+parent)
+			return
+		}
 
 		name := fmt.Sprintf("%s/tables/%s", parent, body.TableId)
 		t := &Table{
@@ -206,8 +326,20 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 		}
 
 		api.mu.Lock()
+		if _, exists := api.tables[name]; exists {
+			api.mu.Unlock()
+			writeError(w, http.StatusConflict, "ALREADY_EXISTS", "Bigtable table already exists: "+name)
+			return
+		}
 		api.tables[name] = t
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			delete(api.tables, name)
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable table: "+err.Error())
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(t)
@@ -217,9 +349,10 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 			name := fmt.Sprintf("%s/tables/%s", parent, tableId)
 			api.mu.RLock()
 			t, ok := api.tables[name]
+			t = cloneTable(t)
 			api.mu.RUnlock()
 			if !ok {
-				w.WriteHeader(http.StatusNotFound)
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable table not found: "+name)
 				return
 			}
 			json.NewEncoder(w).Encode(t)
@@ -227,8 +360,8 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 			api.mu.RLock()
 			items := []*Table{}
 			for _, v := range api.tables {
-				if strings.HasPrefix(v.Name, parent+"/tables") {
-					items = append(items, v)
+				if strings.HasPrefix(v.Name, parent+"/tables/") {
+					items = append(items, cloneTable(v))
 				}
 			}
 			api.mu.RUnlock()
@@ -237,36 +370,60 @@ func (api *API) routeTables(w http.ResponseWriter, r *http.Request, path string)
 
 	case http.MethodDelete:
 		name := fmt.Sprintf("%s/tables/%s", parent, tableId)
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
 		api.mu.Lock()
+		table, exists := api.tables[name]
+		if !exists {
+			api.mu.Unlock()
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable table not found: "+name)
+			return
+		}
 		delete(api.tables, name)
 		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			api.tables[name] = table
+			api.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "persist Bigtable table deletion: "+err.Error())
+			return
+		}
 		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{})
 
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
 func (api *API) routeClusters(w http.ResponseWriter, r *http.Request, path string) {
-	json.NewEncoder(w).Encode(map[string]interface{}{"clusters": []interface{}{}})
+	writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Bigtable cluster administration is not implemented")
 }
 
 // handleReadRows implements the REST-to-gRPC bridge for Bigtable Data exploration.
 func (api *API) handleReadRows(w http.ResponseWriter, r *http.Request, resourcePath string) {
 	// resourcePath: /v2/projects/{p}/instances/{i}/tables/{t}
 	parts := strings.Split(strings.Trim(resourcePath, "/"), "/")
-	if len(parts) < 6 {
-		http.Error(w, "Invalid table path", 400)
+	if len(parts) < 7 {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid Bigtable table path")
 		return
 	}
 	projectID := parts[2]
 	instanceID := parts[4]
 	tableID := parts[6]
+	tableName := fmt.Sprintf("projects/%s/instances/%s/tables/%s", projectID, instanceID, tableID)
+	api.mu.RLock()
+	_, exists := api.tables[tableName]
+	api.mu.RUnlock()
+	if !exists {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Bigtable table not found: "+tableName)
+		return
+	}
 
 	// 1. Get emulator address
-	addr, err := api.svcMgr.EnsureServiceRunning(r.Context(), "bigtable.googleapis.com")
+	addr, err := api.ensureBackend(r.Context())
 	if err != nil {
-		http.Error(w, "Bigtable emulator not running", 503)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Bigtable emulator unavailable: "+err.Error())
 		return
 	}
 	// Strip http:// prefix if present
@@ -282,7 +439,7 @@ func (api *API) handleReadRows(w http.ResponseWriter, r *http.Request, resourceP
 		option.WithoutAuthentication(),
 	)
 	if err != nil {
-		http.Error(w, "Failed to connect to Bigtable: "+err.Error(), 500)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "connect to Bigtable emulator: "+err.Error())
 		return
 	}
 	defer client.Close()
@@ -310,9 +467,59 @@ func (api *API) handleReadRows(w http.ResponseWriter, r *http.Request, resourceP
 	})
 
 	if err != nil {
-		http.Error(w, "ReadRows failed: "+err.Error(), 500)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Bigtable emulator read failed: "+err.Error())
 		return
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"rows": rows})
+}
+
+func (api *API) ensureBackend(ctx context.Context) (string, error) {
+	if api.backend == nil {
+		return "", fmt.Errorf("Bigtable emulator backend is unavailable")
+	}
+	return api.backend.Ensure(ctx)
+}
+
+func cloneInstance(instance *Instance) *Instance {
+	if instance == nil {
+		return nil
+	}
+	clone := *instance
+	if instance.Labels != nil {
+		clone.Labels = make(map[string]string, len(instance.Labels))
+		for key, value := range instance.Labels {
+			clone.Labels[key] = value
+		}
+	}
+	return &clone
+}
+
+func cloneTable(table *Table) *Table {
+	if table == nil {
+		return nil
+	}
+	clone := *table
+	if table.ColumnFamilies != nil {
+		clone.ColumnFamilies = make(map[string]ColumnFamily, len(table.ColumnFamilies))
+		for key, family := range table.ColumnFamilies {
+			familyClone := family
+			if family.GcRule != nil {
+				rule := *family.GcRule
+				familyClone.GcRule = &rule
+			}
+			clone.ColumnFamilies[key] = familyClone
+		}
+	}
+	return &clone
+}
+
+func writeError(w http.ResponseWriter, code int, status, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"code": code, "message": message, "status": status, "details": []interface{}{},
+		},
+	})
 }

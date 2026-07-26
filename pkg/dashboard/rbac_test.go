@@ -20,9 +20,10 @@ type dashboardTestAuthorizer struct {
 	resource   string
 	allow      bool
 	allowed    map[string]bool
+	disabled   bool
 }
 
-func (a *dashboardTestAuthorizer) EnforcementEnabled() bool { return true }
+func (a *dashboardTestAuthorizer) EnforcementEnabled() bool { return !a.disabled }
 func (a *dashboardTestAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
 	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
 }
@@ -145,6 +146,124 @@ func TestDashboardTerminalRequiresDedicatedPermission(t *testing.T) {
 
 	if response.Code != http.StatusForbidden || authorizer.permission != "minisky.dashboard.terminal" {
 		t.Fatalf("status=%d permission=%q body=%s", response.Code, authorizer.permission, response.Body.String())
+	}
+}
+
+func TestDashboardKubeconfigDownloadRequiresDedicatedPermission(t *testing.T) {
+	for _, allowed := range []bool{false, true} {
+		issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+		authorizer := &dashboardTestAuthorizer{issuer: issuer, allowed: map[string]bool{
+			"minisky.gke.kubeconfig.download": allowed,
+		}}
+		handler := withDashboardRBAC(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}), authorizer, "dashboard")
+		token, _, err := issuer.Issue(localsecurity.TokenRequest{
+			Subject: "user:gke@example.com", Audience: "dashboard",
+			Scopes: []string{dashboardOAuthScope}, Lifetime: time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet,
+			"http://localhost/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		want := http.StatusForbidden
+		if allowed {
+			want = http.StatusNoContent
+		}
+		if response.Code != want || authorizer.permission != "minisky.gke.kubeconfig.download" {
+			t.Fatalf("allowed=%t status=%d permission=%q", allowed, response.Code, authorizer.permission)
+		}
+	}
+}
+
+func TestDashboardKubeconfigDownloadFailsClosedInEveryRBACMode(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:gke@example.com", Audience: "dashboard",
+		Scopes: []string{dashboardOAuthScope}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		authorizer dashboardAuthorizer
+		want       int
+		dispatched bool
+	}{
+		{name: "absent", want: http.StatusForbidden},
+		{name: "disabled", authorizer: &dashboardTestAuthorizer{issuer: issuer, disabled: true}, want: http.StatusForbidden},
+		{name: "enabled denied", authorizer: &dashboardTestAuthorizer{issuer: issuer}, want: http.StatusForbidden},
+		{name: "enabled explicitly allowed", authorizer: &dashboardTestAuthorizer{
+			issuer: issuer, allowed: map[string]bool{"minisky.gke.kubeconfig.download": true},
+		}, want: http.StatusNoContent, dispatched: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			handler := withDashboardRBAC(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			}), test.authorizer, "dashboard")
+			request := httptest.NewRequest(http.MethodGet,
+				"http://localhost/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config", nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.want || called != test.dispatched {
+				t.Fatalf("status=%d called=%t", response.Code, called)
+			}
+		})
+	}
+}
+
+func TestDashboardGKERouteAuthorizationVariants(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:gke@example.com", Audience: "dashboard",
+		Scopes: []string{dashboardOAuthScope}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus int
+		wantCall   bool
+	}{
+		{name: "canonical", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config", wantStatus: http.StatusNoContent, wantCall: true},
+		{name: "single trailing slash", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config/", wantStatus: http.StatusNoContent, wantCall: true},
+		{name: "repeated slash", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo//config", wantStatus: http.StatusBadRequest},
+		{name: "escaped slash", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo%2Fconfig", wantStatus: http.StatusBadRequest},
+		{name: "extra segment", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config/extra", wantStatus: http.StatusBadRequest},
+		{name: "double trailing slash", path: "/api/manage/gke/projects/team-project/zones/us-central1-c/clusters/demo/config//", wantStatus: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer := &dashboardTestAuthorizer{issuer: issuer, allowed: map[string]bool{
+				"minisky.gke.kubeconfig.download": true,
+			}}
+			called := false
+			handler := withDashboardRBAC(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			}), authorizer, "dashboard")
+			request := httptest.NewRequest(http.MethodGet, "http://localhost"+test.path, nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus || called != test.wantCall {
+				t.Fatalf("status=%d called=%t body=%s", response.Code, called, response.Body.String())
+			}
+			if test.wantCall && authorizer.permission != "minisky.gke.kubeconfig.download" {
+				t.Fatalf("permission=%q", authorizer.permission)
+			}
+		})
 	}
 }
 

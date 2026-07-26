@@ -408,7 +408,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Compute Engine] %s %s", r.Method, r.URL.Path)
 
 	path := r.URL.Path
-	if api.initializationError() != nil {
+	if api.initializationError() != nil && !strings.Contains(path, "/operations/") {
 		w.Header().Set("Content-Type", "application/json")
 		writeErrorStatus(
 			w,
@@ -2334,31 +2334,54 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 	body.SelfLink = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/firewalls/%s", project, body.Name)
 	body.CreationTimestamp = time.Now().UTC().Format(time.RFC3339)
 
-	key := project + ":" + body.Name
-	api.mu.Lock()
-	api.firewalls[key] = &body
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist firewall metadata: "+err.Error())
-		return
-	}
-
 	if api.firewall == nil {
 		writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
 			"firewall backend is unavailable")
 		return
 	}
-	api.firewall.RegisterFirewallRule(firewallKey, firewallEntryFromRule(&body))
 
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	key := project + ":" + body.Name
 	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", body.SelfLink, "", "")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
-		return api.reapplyFirewallToVPC(body.Network)
+	previous, err := api.firewallMetadataSnapshot()
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	snapshot, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("clone firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if snapshot.Firewalls == nil {
+		snapshot.Firewalls = make(map[string]*FirewallRule)
+	}
+	snapshot.Firewalls[key] = cloneFirewallRule(&body)
+	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	api.firewalls[key] = cloneFirewallRule(&body)
+	api.mu.Unlock()
+	api.firewall.RegisterFirewallRule(firewallKey, firewallEntryFromRule(&body))
+	api.runFirewallOperation(op.Name, func() error {
+		if err := api.reapplyFirewallToVPC(body.Network); err != nil {
+			return api.rollbackFirewallMutation(key, previous.Firewalls[key], err, func() error {
+				api.firewall.RemoveFirewallRule(body.Network, body.Name)
+				return api.reapplyFirewallToVPC(body.Network)
+			})
+		}
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -2397,16 +2420,22 @@ func (api *API) listFirewalls(w http.ResponseWriter, project string) {
 
 func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, name string) {
 	key := project + ":" + name
-	api.mu.Lock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.RLock()
 	fw, ok := api.firewalls[key]
+	fw = cloneFirewallRule(fw)
+	api.mu.RUnlock()
 	if !ok {
-		api.mu.Unlock()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Firewall "+name+" not found")
 		return
 	}
 	var patch FirewallRule
-	json.NewDecoder(r.Body).Decode(&patch)
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
 	if len(patch.Allowed) > 0 {
 		fw.Allowed = patch.Allowed
 		fw.Denied = nil
@@ -2426,29 +2455,50 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 	if patch.Priority != 0 {
 		fw.Priority = patch.Priority
 	}
-	result := fw
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist firewall update: "+err.Error())
-		return
-	}
 	if api.firewall == nil {
 		writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
 			"firewall backend is unavailable")
 		return
 	}
-	api.firewall.RemoveFirewallRule(result.Network, result.Name)
-	api.firewall.RegisterFirewallRule(result.Network, firewallEntryFromRule(result))
-
-	op, err := api.opMgr.RegisterDurable("compute#operation", "patch", result.SelfLink, "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "patch", fw.SelfLink, "", "")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
-		return api.reapplyFirewallToVPC(result.Network)
+	previous, err := api.firewallMetadataSnapshot()
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	snapshot, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("clone firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	snapshot.Firewalls[key] = cloneFirewallRule(fw)
+	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall update: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	api.firewalls[key] = cloneFirewallRule(fw)
+	api.mu.Unlock()
+	api.firewall.RemoveFirewallRule(fw.Network, fw.Name)
+	api.firewall.RegisterFirewallRule(fw.Network, firewallEntryFromRule(fw))
+	api.runFirewallOperation(op.Name, func() error {
+		if err := api.reapplyFirewallToVPC(fw.Network); err != nil {
+			previousRule := cloneFirewallRule(previous.Firewalls[key])
+			return api.rollbackFirewallMutation(key, previousRule, err, func() error {
+				api.firewall.RemoveFirewallRule(fw.Network, fw.Name)
+				api.firewall.RegisterFirewallRule(previousRule.Network, firewallEntryFromRule(previousRule))
+				return api.reapplyFirewallToVPC(previousRule.Network)
+			})
+		}
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -2456,22 +2506,15 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 
 func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 	key := project + ":" + name
-	api.mu.Lock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.RLock()
 	fw, ok := api.firewalls[key]
-	networkURL := ""
-	if ok {
-		networkURL = fw.Network
-		delete(api.firewalls, key)
-	}
-	api.mu.Unlock()
+	fw = cloneFirewallRule(fw)
+	api.mu.RUnlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Firewall "+name+" not found")
-		return
-	}
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist firewall deletion: "+err.Error())
 		return
 	}
 	if api.firewall == nil {
@@ -2479,18 +2522,214 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 			"firewall backend is unavailable")
 		return
 	}
-	api.firewall.RemoveFirewallRule(networkURL, name)
-	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", "", "", "")
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", fw.SelfLink, "", "")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
-		return api.reapplyFirewallToVPC(networkURL)
+	previous, err := api.firewallMetadataSnapshot()
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	snapshot, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("clone firewall metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	delete(snapshot.Firewalls, key)
+	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall deletion: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	delete(api.firewalls, key)
+	api.mu.Unlock()
+	api.firewall.RemoveFirewallRule(fw.Network, name)
+	api.runFirewallOperation(op.Name, func() error {
+		if err := api.reapplyFirewallToVPC(fw.Network); err != nil {
+			return api.rollbackFirewallMutation(key, previous.Firewalls[key], err, func() error {
+				api.firewall.RegisterFirewallRule(fw.Network, firewallEntryFromRule(fw))
+				return api.reapplyFirewallToVPC(fw.Network)
+			})
+		}
+		return nil
 	})
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
+}
+
+func (api *API) firewallMetadataSnapshot() (computeMetadata, error) {
+	api.mu.RLock()
+	payload, err := api.marshalMetadataLocked()
+	api.mu.RUnlock()
+	if err != nil {
+		return computeMetadata{}, err
+	}
+	var snapshot computeMetadata
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		return computeMetadata{}, err
+	}
+	return snapshot, nil
+}
+
+func (api *API) saveFirewallMetadata(snapshot computeMetadata) error {
+	if api.stateStore == nil {
+		return nil
+	}
+	return api.stateStore.Save(computeStateEntry, snapshot)
+}
+
+func (api *API) saveFirewallMetadataTransaction(previous, next computeMetadata) error {
+	if api.stateStore == nil {
+		return nil
+	}
+	saveErr := api.saveFirewallMetadata(next)
+	if saveErr == nil {
+		return nil
+	}
+	var durable computeMetadata
+	loadErr := api.stateStore.Load(computeStateEntry, &durable)
+	switch {
+	case loadErr == nil && computeMetadataEqual(durable, next):
+		return nil
+	case loadErr == nil && computeMetadataEqual(durable, previous):
+		return saveErr
+	case errors.Is(loadErr, state.ErrNotFound) && computeMetadataEmpty(previous):
+		return saveErr
+	default:
+		ambiguous := fmt.Errorf("Compute firewall save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
+		api.setInitializationError(ambiguous)
+		return ambiguous
+	}
+}
+
+func (api *API) runFirewallOperation(operationName string, work func() error) {
+	go func() {
+		workErr := work()
+		code, message := 0, ""
+		if workErr != nil {
+			code = http.StatusInternalServerError
+			message = workErr.Error()
+		}
+		if err := api.opMgr.FinalizeDurable(operationName, code, message); err != nil {
+			if workErr != nil {
+				api.setInitializationError(fmt.Errorf("firewall operation failed: %w; %v", workErr, err))
+			} else {
+				api.setInitializationError(err)
+			}
+		}
+	}()
+}
+
+func (api *API) rollbackFirewallMutation(
+	key string,
+	previousRule *FirewallRule,
+	mutationErr error,
+	restoreBackend func() error,
+) error {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	current, err := api.firewallMetadataSnapshot()
+	if err != nil {
+		combined := fmt.Errorf("firewall mutation failed: %w; snapshot rollback failed: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined
+	}
+	snapshot, err := cloneComputeMetadata(current)
+	if err != nil {
+		combined := fmt.Errorf("firewall mutation failed: %w; clone rollback failed: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined
+	}
+	if previousRule == nil {
+		delete(snapshot.Firewalls, key)
+	} else {
+		snapshot.Firewalls[key] = cloneFirewallRule(previousRule)
+	}
+	if err := api.saveFirewallMetadataTransaction(current, snapshot); err != nil {
+		combined := fmt.Errorf("firewall mutation failed: %w; persist rollback failed: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined
+	}
+	api.mu.Lock()
+	if previousRule == nil {
+		delete(api.firewalls, key)
+	} else {
+		api.firewalls[key] = cloneFirewallRule(previousRule)
+	}
+	api.mu.Unlock()
+	if err := restoreBackend(); err != nil {
+		combined := fmt.Errorf("firewall mutation failed: %w; backend compensation failed: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined
+	}
+	return mutationErr
+}
+
+func (api *API) failFirewallOperation(operationName string, mutationErr error) string {
+	if err := api.opMgr.FinalizeDurable(operationName, http.StatusInternalServerError, mutationErr.Error()); err != nil {
+		combined := fmt.Errorf("%w; persist failed operation: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined.Error()
+	}
+	return mutationErr.Error()
+}
+
+func cloneFirewallRule(rule *FirewallRule) *FirewallRule {
+	if rule == nil {
+		return nil
+	}
+	clone := *rule
+	clone.SourceRanges = append([]string(nil), rule.SourceRanges...)
+	clone.DestinationRanges = append([]string(nil), rule.DestinationRanges...)
+	clone.TargetTags = append([]string(nil), rule.TargetTags...)
+	clone.Allowed = cloneFirewallAllows(rule.Allowed)
+	clone.Denied = cloneFirewallAllows(rule.Denied)
+	return &clone
+}
+
+func cloneComputeMetadata(metadata computeMetadata) (computeMetadata, error) {
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		return computeMetadata{}, err
+	}
+	var clone computeMetadata
+	if err := json.Unmarshal(payload, &clone); err != nil {
+		return computeMetadata{}, err
+	}
+	return clone, nil
+}
+
+func computeMetadataEqual(left, right computeMetadata) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func computeMetadataEmpty(metadata computeMetadata) bool {
+	return len(metadata.Instances) == 0 &&
+		len(metadata.Networks) == 0 &&
+		len(metadata.Subnetworks) == 0 &&
+		len(metadata.Firewalls) == 0 &&
+		len(metadata.InstanceGroups) == 0 &&
+		len(metadata.LoadBalancers) == 0
+}
+
+func cloneFirewallAllows(rules []FirewallAllow) []FirewallAllow {
+	if rules == nil {
+		return nil
+	}
+	result := make([]FirewallAllow, len(rules))
+	for index := range rules {
+		result[index] = rules[index]
+		result[index].Ports = append([]string(nil), rules[index].Ports...)
+	}
+	return result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

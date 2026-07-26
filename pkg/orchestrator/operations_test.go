@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -218,6 +220,248 @@ func TestRestartAfterTerminalPersistenceFailureReportsInterruptionWithoutReplay(
 	if polled == nil || !polled.Done || polled.Error == nil ||
 		!strings.Contains(polled.Error.Message, "interrupted by MiniSky restart") {
 		t.Fatalf("restart polling result = %+v", polled)
+	}
+}
+
+func TestRemoveDurableDeletesOperationAcrossRestart(t *testing.T) {
+	store := &injectedOperationStore{}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := manager.RegisterDurable("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemoveDurable(op.Name); err == nil {
+		t.Fatal("RemoveDurable removed a pending operation")
+	}
+	if manager.Get(op.Name) == nil {
+		t.Fatal("pending operation disappeared after rejected removal")
+	}
+	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemoveDurable(op.Name); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Get(op.Name) != nil {
+		t.Fatalf("removed operation remained in memory: %+v", manager.Get(op.Name))
+	}
+	restarted, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Get(op.Name) != nil {
+		t.Fatalf("removed operation returned after restart: %+v", restarted.Get(op.Name))
+	}
+}
+
+func TestRemoveDurableRestoresOperationWhenSaveFails(t *testing.T) {
+	store := &injectedOperationStore{failOnSave: map[int]error{2: errors.New("remove failed")}}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := manager.RegisterDurable("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemoveDurable(op.Name); err == nil {
+		t.Fatal("RemoveDurable returned nil for injected save failure")
+	}
+	if manager.Get(op.Name) == nil {
+		t.Fatal("failed durable removal did not restore operation")
+	}
+}
+
+func TestTerminalObserverPanicDoesNotStopLaterListeners(t *testing.T) {
+	manager := NewOperationManager()
+	unsubscribePanic := manager.OnTerminal(func(*Operation) { panic("observer panic") })
+	defer unsubscribePanic()
+	observed := make(chan string, 1)
+	unsubscribeObserved := manager.OnTerminal(func(operation *Operation) { observed <- operation.Name })
+	defer unsubscribeObserved()
+	op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+
+	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case name := <-observed:
+		if name != op.Name {
+			t.Fatalf("observed operation = %q, want %q", name, op.Name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener after panic was not invoked")
+	}
+}
+
+func TestBlockingTerminalObserverDoesNotBlockOperationCompletion(t *testing.T) {
+	manager := NewOperationManager()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	blocked := manager.ObserveTerminal(func(*Operation) {
+		close(entered)
+		<-release
+	})
+	observed := make(chan struct{})
+	other := manager.ObserveTerminal(func(*Operation) { close(observed) })
+	op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	completed := make(chan error, 1)
+	go func() {
+		completed <- manager.AdvanceDurable(op.Name, 100, StatusDone)
+	}()
+
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("operation completion blocked on terminal observer")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking observer was not dispatched")
+	}
+	select {
+	case <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("blocking observer starved another listener")
+	}
+	close(release)
+	if err := blocked.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTerminalObserverPreservesPerListenerOrder(t *testing.T) {
+	manager := NewOperationManager()
+	observed := make(chan string)
+	subscription := manager.ObserveTerminal(func(operation *Operation) { observed <- operation.Name })
+	defer subscription.Shutdown(context.Background())
+	for range 3 {
+		op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+		if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case name := <-observed:
+			if name != op.Name {
+				t.Fatalf("observed operation = %q, want %q", name, op.Name)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("terminal observer did not preserve delivery order")
+		}
+	}
+}
+
+func TestTerminalObserverCoalescesWakeupsWhenBlocked(t *testing.T) {
+	manager := NewOperationManager()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	observed := make(chan string, 3)
+	subscription := manager.ObserveTerminal(func(operation *Operation) {
+		observed <- operation.Name
+		select {
+		case <-entered:
+		default:
+			close(entered)
+			<-release
+		}
+	})
+	defer subscription.Shutdown(context.Background())
+	first := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	if err := manager.AdvanceDurable(first.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking observer was not dispatched")
+	}
+
+	const notifications = 100
+	var latest string
+	for index := 0; index < notifications; index++ {
+		op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+		latest = op.Name
+		if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	var firstObserved, latestObserved string
+	select {
+	case firstObserved = <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced listener did not receive first wakeup")
+	}
+	select {
+	case latestObserved = <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced listener did not receive latest wakeup")
+	}
+	if firstObserved != first.Name || latestObserved != latest {
+		t.Fatalf("coalesced notifications = [%s %s], want [%s %s]",
+			firstObserved, latestObserved, first.Name, latest)
+	}
+	select {
+	case extra := <-observed:
+		t.Fatalf("coalesced observer received extra notification %q", extra)
+	default:
+	}
+}
+
+func TestTerminalObserverUnsubscribeIsIdempotent(t *testing.T) {
+	manager := NewOperationManager()
+	called := make(chan struct{}, 1)
+	unsubscribe := manager.OnTerminal(func(*Operation) { called <- struct{}{} })
+	unsubscribe()
+	unsubscribe()
+	op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+		t.Fatal("unsubscribed terminal observer was invoked")
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.observerMu.Lock()
+	defer manager.observerMu.Unlock()
+	if len(manager.terminalObservers) != 0 || len(manager.observerOrder) != 0 {
+		t.Fatalf("observer cleanup left registrations: observers=%d order=%d",
+			len(manager.terminalObservers), len(manager.observerOrder))
+	}
+}
+
+func TestTerminalObserverShutdownIsContextBounded(t *testing.T) {
+	manager := NewOperationManager()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	subscription := manager.ObserveTerminal(func(*Operation) {
+		close(entered)
+		<-release
+	})
+	op := manager.Register("artifactregistry#operation", "CREATE", "repositories/apps", "", "")
+	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := subscription.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want context deadline exceeded", err)
+	}
+	close(release)
+	if err := subscription.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

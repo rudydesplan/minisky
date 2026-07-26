@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -57,6 +58,11 @@ type routeAuthorizer interface {
 
 type projectRegistry interface {
 	Exists(projectID string) bool
+}
+
+type completedUploadReplayProbe interface {
+	IsCompletedUploadReplayCandidate(*http.Request) bool
+	ProbeCompletedUploadReplay(*http.Request) (func(http.ResponseWriter), bool)
 }
 
 // NewProxyRouterWithManager creates the router with a pre-initialized ServiceManager injected.
@@ -169,14 +175,48 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Router] %s %s%s", r.Method, targetDomain, r.URL.Path)
 
+	authorized := false
+	// Exact BigQuery completion candidates run the same authentication and
+	// authorization decision as ordinary dispatch before durable replay state
+	// is touched. Unknown and incomplete sessions continue through normal body
+	// enforcement without executing authorization twice.
+	p.mu.RLock()
+	replayHandler := p.routes[targetDomain]
+	p.mu.RUnlock()
+	if probe, ok := replayHandler.(completedUploadReplayProbe); ok &&
+		probe.IsCompletedUploadReplayCandidate(r) {
+		if !p.authorizeRequest(w, r, targetDomain) {
+			return
+		}
+		authorized = true
+		if !p.validator.ValidateRequestPreBodyForDomain(w, r, targetDomain) {
+			return
+		}
+		if replay, completed := probe.ProbeCompletedUploadReplay(r); completed {
+			if !p.validateProject(w, r, targetDomain) {
+				return
+			}
+			if !p.checkQuota(w, r, targetDomain) {
+				return
+			}
+			replay(w)
+			return
+		}
+	}
+
 	// 2. Schema Validation
+	cleanupBody, validBody := p.enforceRequestBodyLimit(w, r, targetDomain)
+	if !validBody {
+		return
+	}
+	defer cleanupBody()
 	if !p.inspectProjectBody(w, r) {
 		return
 	}
 	if !p.validator.ValidateRequestForDomain(w, r, targetDomain) {
 		return
 	}
-	if !p.authorizeRequest(w, r, targetDomain) {
+	if !authorized && !p.authorizeRequest(w, r, targetDomain) {
 		return
 	}
 	if !p.validateProject(w, r, targetDomain) {
@@ -231,6 +271,62 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handler.ServeHTTP(w, r)
 }
 
+func (p *ProxyRouter) enforceRequestBodyLimit(
+	w http.ResponseWriter,
+	r *http.Request,
+	domain string,
+) (func(), bool) {
+	noCleanup := func() {}
+	if r.Body == nil || r.Body == http.NoBody {
+		return noCleanup, true
+	}
+	limit := p.validator.RequestBodyLimit(domain, r.Method, r.URL.Path)
+	if r.ContentLength > limit {
+		p.writeBodyLimitError(w, r, limit)
+		return noCleanup, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	isJSON := strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
+	if !isMutationMethod(r.Method) {
+		return noCleanup, true
+	}
+	if !isJSON && r.ContentLength < 0 {
+		spool, err := spoolUnknownRequestBody(r.Body, limit)
+		_ = r.Body.Close()
+		if err != nil {
+			switch {
+			case errors.Is(err, errRequestBodyTooLarge):
+				p.writeBodyLimitError(w, r, limit)
+			case errors.Is(err, errRequestSpoolQuota):
+				p.writeAuthError(w, http.StatusRequestEntityTooLarge, "RESOURCE_EXHAUSTED",
+					"Profile aggregate request spool quota exceeded")
+			default:
+				p.writeAuthError(w, http.StatusInternalServerError, "INTERNAL", "Unable to spool request body")
+			}
+			return noCleanup, false
+		}
+		r.Body = spool.file
+		r.ContentLength = spool.size
+		return spool.Close, true
+	}
+	if !isJSON {
+		return noCleanup, true
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			p.writeBodyLimitError(w, r, limit)
+			return noCleanup, false
+		}
+		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Unable to read JSON request body")
+		return noCleanup, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return noCleanup, true
+}
+
 func (p *ProxyRouter) inspectProjectBody(w http.ResponseWriter, r *http.Request) bool {
 	if r.Body == nil || !strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
 		return true
@@ -243,18 +339,18 @@ func (p *ProxyRouter) inspectProjectBody(w http.ResponseWriter, r *http.Request)
 	if !projectValidation && !quotaEnabled && (authorizer == nil || !authorizer.EnforcementEnabled()) {
 		return true
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			p.writeBodyLimitError(w, r, maxBytesErr.Limit)
+			return false
+		}
 		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Unable to inspect request body")
 		return false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	if len(body) <= 1<<20 {
-		return true
-	}
-	p.writeAuthError(w, http.StatusRequestEntityTooLarge, "RESOURCE_EXHAUSTED",
-		"JSON request exceeds the 1 MiB project inspection limit")
-	return false
+	return true
 }
 
 func (p *ProxyRouter) checkQuota(w http.ResponseWriter, r *http.Request, domain string) bool {
@@ -546,9 +642,13 @@ func projectsFromRequest(r *http.Request) []string {
 		}
 	}
 	if r.Body != nil && strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
-		body, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+		originalBody := r.Body
+		body, err := io.ReadAll(io.LimitReader(originalBody, (1<<20)+1))
+		r.Body = &joinedReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), originalBody),
+			Closer: originalBody,
+		}
 		if err == nil {
-			r.Body = io.NopCloser(bytes.NewReader(body))
 			if len(body) <= 1<<20 {
 				var value any
 				if json.Unmarshal(body, &value) == nil {
@@ -558,6 +658,11 @@ func projectsFromRequest(r *http.Request) []string {
 		}
 	}
 	return projects
+}
+
+type joinedReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func collectBodyProjects(value any, add func(string)) {
@@ -599,6 +704,31 @@ func (p *ProxyRouter) writeAuthError(w http.ResponseWriter, code int, status, me
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
 		"code": code, "status": status, "message": message,
+	}})
+}
+
+func (p *ProxyRouter) writeBodyLimitError(w http.ResponseWriter, r *http.Request, limit int64) {
+	status := "INVALID_ARGUMENT"
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		p.mu.RLock()
+		authorizer := p.authorizer
+		inspectionEnabled := p.enforceProjects && p.projects != nil || p.quota != nil
+		p.mu.RUnlock()
+		if inspectionEnabled || authorizer != nil && authorizer.EnforcementEnabled() {
+			status = "RESOURCE_EXHAUSTED"
+		}
+	}
+	message := "Request body exceeds " + strconv.FormatInt(limit, 10) + " bytes."
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"code":    http.StatusRequestEntityTooLarge,
+		"status":  status,
+		"message": message,
+		"details": []map[string]any{{
+			"@type":   "type.googleapis.com/google.rpc.BadRequest",
+			"message": message,
+		}},
 	}})
 }
 
@@ -701,7 +831,7 @@ func legacyLocalDomain(path, fallbackDomain string) string {
 	if strings.HasPrefix(path, "/storage/") || strings.HasPrefix(path, "/upload/storage/") {
 		return "storage.googleapis.com"
 	}
-	if strings.HasPrefix(path, "/bigquery/") {
+	if strings.HasPrefix(path, "/bigquery/") || strings.HasPrefix(path, "/upload/bigquery/") {
 		return "bigquery.googleapis.com"
 	}
 	if (strings.HasPrefix(path, "/v1/projects/") || strings.HasPrefix(path, "/projects/")) &&

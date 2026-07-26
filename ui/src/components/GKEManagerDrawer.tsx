@@ -7,6 +7,7 @@ import HubIcon from '@mui/icons-material/Hub';
 import StorageIcon from '@mui/icons-material/Storage';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useProjectContext } from '../contexts/ProjectContext';
+import { gkeClusterRoute } from '../gkeRoutes.js';
 
 type Props = {
   open: boolean;
@@ -15,7 +16,8 @@ type Props = {
 
 type GkeCluster = {
   name: string;
-  status: 'RUNNING' | 'PROVISIONING';
+  status: 'RUNNING' | 'PROVISIONING' | 'ERROR';
+  location?: string;
 };
 
 export default function GKEManagerDrawer({ open, onClose }: Props) {
@@ -24,16 +26,17 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newClusterName, setNewClusterName] = useState('');
+  const [zone, setZone] = useState('us-central1-c');
   const [provisioning, setProvisioning] = useState(false);
 
   const fetchClusters = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters`);
+      const res = await fetch(gkeClusterRoute(activeProject, zone));
       if (res.ok) {
         const data = await res.json();
-        setClusters(data || []);
+        setClusters(Array.isArray(data?.clusters) ? data.clusters : []);
       } else {
         const text = await res.text();
         setError(text);
@@ -43,13 +46,13 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [activeProject]);
+  }, [activeProject, zone]);
 
   const handleCreate = async () => {
     if (!newClusterName) return;
     setProvisioning(true);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters`, {
+      const res = await fetch(gkeClusterRoute(activeProject, zone), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newClusterName })
@@ -70,7 +73,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
   };
 
   const handleDownloadConfig = async (name: string) => {
-    const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters/${name}/config`);
+    const res = await fetch(gkeClusterRoute(activeProject, zone, name, true));
     if (res.ok) {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -88,7 +91,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
     
     setLoading(true);
     try {
-      const res = await fetch(`/api/manage/gke/projects/${activeProject}/clusters/${name}`, { method: 'DELETE' });
+      const res = await fetch(gkeClusterRoute(activeProject, zone, name), { method: 'DELETE' });
       if (res.ok) {
         fetchClusters();
       } else {
@@ -140,6 +143,13 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
         </Typography>
 
         <Box sx={{ mb: 4, display: 'flex', gap: 2 }}>
+          <TextField
+            size="small"
+            label="Zone"
+            value={zone}
+            onChange={(e) => setZone(e.target.value)}
+            disabled={provisioning}
+          />
           <TextField 
             size="small" 
             label="New Cluster Name" 
@@ -152,7 +162,7 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
           <Button 
             variant="contained" 
             onClick={handleCreate} 
-            disabled={provisioning || !newClusterName}
+            disabled={provisioning || !newClusterName || !zone}
             sx={{ whiteSpace: 'nowrap', minWidth: '160px' }}
           >
             {provisioning ? <CircularProgress size={20} color="inherit" /> : 'Provision Cluster'}

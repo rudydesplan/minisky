@@ -7,7 +7,6 @@ import (
 )
 
 func TestClusterMetadataRehydratesWithoutBackendRecreation(t *testing.T) {
-	t.Parallel()
 	store, err := state.New(t.TempDir(), "restart")
 	if err != nil {
 		t.Fatal(err)
@@ -25,10 +24,11 @@ func TestClusterMetadataRehydratesWithoutBackendRecreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := restarted.clusters["demo:us-central1-c:test"]; got == nil || got.Name != "test" {
+	if got := restarted.clusters["demo:us-central1-c:test"]; got == nil || got.Name != "test" ||
+		got.Status != "ERROR" || got.StatusMessage == "" || got.Endpoint != "" {
 		t.Fatalf("restored cluster = %#v", got)
 	}
-	if _, ok := restarted.backend.pendingClusters.Load("test"); ok {
+	if _, ok := restarted.GetBackend().pendingClusters.Load("test"); ok {
 		t.Fatal("rehydration must not start backend reconciliation workers")
 	}
 }

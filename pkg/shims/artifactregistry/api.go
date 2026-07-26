@@ -1,10 +1,13 @@
 package artifactregistry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -14,11 +17,20 @@ import (
 	"sync"
 	"time"
 
+	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
 
-const defaultRegistryURL = "http://127.0.0.1:5000"
+const (
+	defaultRegistryURL         = "http://127.0.0.1:5000"
+	artifactRegistryStateEntry = "artifactregistry/metadata"
+	// Keep a bounded terminal outcome history for provider polling. Outcomes
+	// for operations that are still pending are always retained, even if an
+	// unusually large pending set temporarily exceeds this limit.
+	maxPersistedOperationOutcomes = 128
+)
 
 func init() {
 	registry.Register("artifactregistry.googleapis.com", func(ctx *registry.Context) http.Handler {
@@ -130,36 +142,236 @@ func (index *dockerRegistryIndex) get(ctx context.Context, path string, target a
 }
 
 type API struct {
-	mu     sync.RWMutex
-	svcMgr *orchestrator.ServiceManager
-	opMgr  *orchestrator.OperationManager
-	repos  map[string]*Repository
-	index  RegistryIndex
+	mu                   sync.RWMutex
+	mutationMu           sync.Mutex
+	lifecycleGate        chan struct{}
+	svcMgr               *orchestrator.ServiceManager
+	opMgr                *orchestrator.OperationManager
+	store                stateStore
+	repos                map[string]*Repository
+	outcomes             map[string]artifactOperationOutcome
+	nextOutcomeSequence  uint64
+	index                RegistryIndex
+	initErr              error
+	observerSubscription *orchestrator.TerminalObserverSubscription
+	closed               bool
+
+	afterOperationRegistration func(*orchestrator.Operation) error
+	operationRunner            func(string)
+	compactionHook             func()
+}
+
+type stateStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
+type artifactRegistryMetadata struct {
+	Repositories        map[string]*Repository              `json:"repositories"`
+	Outcomes            map[string]artifactOperationOutcome `json:"operationOutcomes,omitempty"`
+	NextOutcomeSequence uint64                              `json:"nextOutcomeSequence,omitempty"`
+}
+
+type artifactOperationOutcome struct {
+	OperationType string      `json:"operationType"`
+	Target        string      `json:"target"`
+	Repository    *Repository `json:"repository,omitempty"`
+	Sequence      uint64      `json:"sequence"`
+}
+
+func configuredRegistryIndex(sm *orchestrator.ServiceManager) RegistryIndex {
+	registryURL := os.Getenv("MINISKY_ARTIFACT_REGISTRY_URL")
+	if registryURL != "" {
+		client := &http.Client{Timeout: 5 * time.Second}
+		return NewDockerRegistryIndex(client, registryURL)
+	} else if sm == nil {
+		return NewDockerRegistryIndex(&http.Client{Timeout: 5 * time.Second}, defaultRegistryURL)
+	}
+	return nil
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager) *API {
-	registryURL := os.Getenv("MINISKY_ARTIFACT_REGISTRY_URL")
-	var index RegistryIndex
-	if registryURL != "" {
-		client := &http.Client{Timeout: 5 * time.Second}
-		index = NewDockerRegistryIndex(client, registryURL)
-	} else if sm == nil {
-		index = NewDockerRegistryIndex(&http.Client{Timeout: 5 * time.Second}, defaultRegistryURL)
+	index := configuredRegistryIndex(sm)
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	if err != nil {
+		log.Printf("[Shim: Artifact Registry] state disabled: %v", err)
+		api := newAPI(opMgr, sm, index, nil)
+		if observeErr := api.observeTerminalOperations(context.Background()); observeErr != nil {
+			api.initErr = observeErr
+		}
+		return api
 	}
-	return NewAPIWithRegistryIndex(opMgr, sm, index)
+	api, err := NewAPIWithRegistryIndexAndStore(opMgr, sm, index, store)
+	if err != nil {
+		log.Printf("[Shim: Artifact Registry] state rehydration failed: %v", err)
+		api = newAPI(opMgr, sm, index, store)
+		api.initErr = err
+	}
+	return api
 }
 
 // NewAPIWithRegistryIndex allows callers to inject a registry index.
 func NewAPIWithRegistryIndex(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, index RegistryIndex) *API {
-	return &API{
-		opMgr:  opMgr,
-		svcMgr: sm,
-		repos:  make(map[string]*Repository),
-		index:  index,
+	api := newAPI(opMgr, sm, index, nil)
+	if err := api.observeTerminalOperations(context.Background()); err != nil {
+		api.initErr = err
+	}
+	return api
+}
+
+// NewAPIWithRegistryIndexAndStore constructs an Artifact Registry shim backed
+// by the supplied profile metadata store. Registry v2 package and version data
+// remains exclusively in the injected index and is never rehydrated from state;
+// manifest and blob content is not part of this metadata snapshot.
+func NewAPIWithRegistryIndexAndStore(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, index RegistryIndex, store stateStore) (*API, error) {
+	api := newAPI(opMgr, sm, index, store)
+	if store == nil {
+		if err := api.observeTerminalOperations(context.Background()); err != nil {
+			return nil, err
+		}
+		return api, nil
+	}
+	var persisted artifactRegistryMetadata
+	if err := store.Load(artifactRegistryStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			if observeErr := api.observeTerminalOperations(context.Background()); observeErr != nil {
+				return nil, observeErr
+			}
+			return api, nil
+		}
+		return nil, fmt.Errorf("load Artifact Registry metadata: %w", err)
+	}
+	normalizeArtifactRegistryMetadata(&persisted)
+	for name, repository := range persisted.Repositories {
+		if repository == nil {
+			return nil, fmt.Errorf("load Artifact Registry metadata: repository %q is null", name)
+		}
+		api.repos[name] = cloneRepository(repository)
+	}
+	for name, outcome := range persisted.Outcomes {
+		outcome.Repository = cloneRepository(outcome.Repository)
+		api.outcomes[name] = outcome
+	}
+	api.nextOutcomeSequence = persisted.NextOutcomeSequence
+	if err := api.compactOperationOutcomes(); err != nil {
+		return nil, fmt.Errorf("compact Artifact Registry operation outcomes: %w", err)
+	}
+	if err := api.observeTerminalOperations(context.Background()); err != nil {
+		return nil, err
+	}
+	return api, nil
+}
+
+func newAPI(opMgr *orchestrator.OperationManager, sm *orchestrator.ServiceManager, index RegistryIndex, store stateStore) *API {
+	api := &API{
+		opMgr:         opMgr,
+		svcMgr:        sm,
+		store:         store,
+		repos:         make(map[string]*Repository),
+		outcomes:      make(map[string]artifactOperationOutcome),
+		index:         index,
+		lifecycleGate: make(chan struct{}, 1),
+	}
+	api.lifecycleGate <- struct{}{}
+	if opMgr != nil {
+		api.operationRunner = func(name string) {
+			opMgr.RunAsync(name, func() error { return nil })
+		}
+	}
+	return api
+}
+
+func (api *API) observeTerminalOperations(ctx context.Context) error {
+	if err := api.acquireLifecycle(ctx); err != nil {
+		return err
+	}
+	defer api.releaseLifecycle()
+	if api.opMgr == nil {
+		return nil
+	}
+	api.mu.Lock()
+	previous := api.observerSubscription
+	closed := api.closed
+	api.mu.Unlock()
+	if previous != nil {
+		if err := previous.Shutdown(ctx); err != nil {
+			return err
+		}
+		api.mu.Lock()
+		if api.observerSubscription == previous {
+			api.observerSubscription = nil
+		}
+		closed = api.closed
+		api.mu.Unlock()
+	}
+	if closed {
+		return nil
+	}
+	subscription := api.opMgr.ObserveTerminal(func(*orchestrator.Operation) {
+		if err := api.compactOperationOutcomes(); err != nil {
+			log.Printf("[Shim: Artifact Registry] outcome compaction failed: %v", err)
+		}
+	})
+	api.mu.Lock()
+	if api.closed {
+		api.mu.Unlock()
+		return subscription.Shutdown(ctx)
+	}
+	api.observerSubscription = subscription
+	api.mu.Unlock()
+	return nil
+}
+
+// Shutdown releases the terminal observer registered with the shared operation
+// manager. The bootstrap plugin shutdown path calls this method.
+func (api *API) Shutdown(ctx context.Context) error {
+	if err := api.acquireLifecycle(ctx); err != nil {
+		return err
+	}
+	defer api.releaseLifecycle()
+	api.mu.Lock()
+	api.closed = true
+	subscription := api.observerSubscription
+	api.mu.Unlock()
+	if subscription == nil {
+		return nil
+	}
+	if err := subscription.Shutdown(ctx); err != nil {
+		return err
+	}
+	api.mu.Lock()
+	if api.observerSubscription == subscription {
+		api.observerSubscription = nil
+	}
+	api.mu.Unlock()
+	return nil
+}
+
+func (api *API) acquireLifecycle(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-api.lifecycleGate:
+		if err := ctx.Err(); err != nil {
+			api.releaseLifecycle()
+			return err
+		}
+		return nil
 	}
 }
 
+func (api *API) releaseLifecycle() {
+	api.lifecycleGate <- struct{}{}
+}
+
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if api.initializationError() != nil {
+		writeError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION", "Artifact Registry state is unavailable")
+		return
+	}
 	path := r.URL.Path
 	if strings.Contains(path, "/operations/") {
 		if r.Method == http.MethodGet {
@@ -237,6 +449,10 @@ func (api *API) handleGetOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) writeOperation(w http.ResponseWriter, serviceName string, operation *orchestrator.Operation) {
+	api.mu.RLock()
+	outcome, hasOutcome := api.outcomes[operation.Name]
+	outcome.Repository = cloneRepository(outcome.Repository)
+	api.mu.RUnlock()
 	response := map[string]any{
 		"name": serviceName,
 		"done": operation.Done,
@@ -245,18 +461,15 @@ func (api *API) writeOperation(w http.ResponseWriter, serviceName string, operat
 			"verb":   operation.OperationType,
 		},
 	}
-	if operation.Error != nil {
+	if operation.Error != nil && !(operation.Done && hasOutcome) {
 		response["error"] = operation.Error
 	} else if operation.Done {
-		if operation.OperationType == "DELETE" {
+		if hasOutcome && outcome.OperationType == "DELETE" {
 			response["response"] = map[string]any{}
-		} else {
-			api.mu.RLock()
-			repository := cloneRepository(api.repos[operation.TargetLink])
-			api.mu.RUnlock()
-			if repository != nil {
-				response["response"] = repository
-			}
+		} else if hasOutcome && outcome.Repository != nil {
+			response["response"] = outcome.Repository
+		} else if operation.OperationType == "DELETE" {
+			response["response"] = map[string]any{}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -345,31 +558,57 @@ func (api *API) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
 		repo.Mode = "STANDARD_REPOSITORY"
 	}
 
-	api.mu.Lock()
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
+	api.mu.RLock()
 	if _, exists := api.repos[repo.Name]; exists {
-		api.mu.Unlock()
+		api.mu.RUnlock()
 		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "repository already exists: "+repo.Name)
 		return
 	}
-	api.repos[repo.Name] = &repo
-	api.mu.Unlock()
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	if api.opMgr == nil {
+		committed := cloneMetadata(previous)
+		committed.Repositories[repo.Name] = cloneRepository(&repo)
+		if err := api.persistSnapshot(committed); err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository metadata")
+			return
+		}
+		api.replaceMetadata(committed)
 		_ = json.NewEncoder(w).Encode(repo)
 		return
 	}
 	op, err := api.opMgr.RegisterDurable("artifactregistry#operation", "CREATE", repo.Name, "", location)
 	if err != nil {
-		api.mu.Lock()
-		delete(api.repos, repo.Name)
-		api.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation")
+		return
+	}
+	if api.afterOperationRegistration != nil {
+		if err := api.afterOperationRegistration(op); err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "repository operation interrupted before metadata commit")
+			return
+		}
+	}
+	committed := cloneMetadata(previous)
+	committed.Repositories[repo.Name] = cloneRepository(&repo)
+	api.addOperationOutcome(&committed, op.Name, artifactOperationOutcome{
+		OperationType: "CREATE",
+		Target:        repo.Name,
+		Repository:    cloneRepository(&repo),
+	})
+	if err := api.persistRegisteredMutation(committed, previous, op.Name); err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation outcome")
 		return
 	}
 	serviceName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 	api.writeOperation(w, serviceName, op)
-	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	if api.operationRunner != nil {
+		api.operationRunner(op.Name)
+	}
 }
 
 func (api *API) handleListPackages(w http.ResponseWriter, r *http.Request) {
@@ -491,35 +730,287 @@ func (api *API) handleDeleteRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.mu.Lock()
-	repo, exists := api.repos[name]
-	if exists {
-		delete(api.repos, name)
-	}
-	api.mu.Unlock()
-	if !exists {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
+	api.mu.RLock()
+	repo := cloneRepository(api.repos[name])
+	if repo == nil {
+		api.mu.RUnlock()
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "repository not found: "+name)
 		return
 	}
+	previous := api.snapshotLocked()
+	api.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	if api.opMgr == nil {
+		committed := cloneMetadata(previous)
+		delete(committed.Repositories, name)
+		if err := api.persistSnapshot(committed); err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository deletion")
+			return
+		}
+		api.replaceMetadata(committed)
 		_ = json.NewEncoder(w).Encode(map[string]any{})
 		return
 	}
 	location := locationFromResource(repo.Name)
 	op, err := api.opMgr.RegisterDurable("artifactregistry#operation", "DELETE", repo.Name, "", location)
 	if err != nil {
-		api.mu.Lock()
-		api.repos[name] = repo
-		api.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation")
+		return
+	}
+	if api.afterOperationRegistration != nil {
+		if err := api.afterOperationRegistration(op); err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "repository operation interrupted before metadata commit")
+			return
+		}
+	}
+	committed := cloneMetadata(previous)
+	delete(committed.Repositories, name)
+	api.addOperationOutcome(&committed, op.Name, artifactOperationOutcome{
+		OperationType: "DELETE",
+		Target:        repo.Name,
+	})
+	if err := api.persistRegisteredMutation(committed, previous, op.Name); err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist repository operation outcome")
 		return
 	}
 	project := projectFromResource(repo.Name)
 	serviceName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 	api.writeOperation(w, serviceName, op)
-	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	if api.operationRunner != nil {
+		api.operationRunner(op.Name)
+	}
+}
+
+func (api *API) snapshotLocked() artifactRegistryMetadata {
+	snapshot := artifactRegistryMetadata{
+		Repositories:        make(map[string]*Repository, len(api.repos)),
+		Outcomes:            make(map[string]artifactOperationOutcome, len(api.outcomes)),
+		NextOutcomeSequence: api.nextOutcomeSequence,
+	}
+	for name, repository := range api.repos {
+		snapshot.Repositories[name] = cloneRepository(repository)
+	}
+	for name, outcome := range api.outcomes {
+		outcome.Repository = cloneRepository(outcome.Repository)
+		snapshot.Outcomes[name] = outcome
+	}
+	return snapshot
+}
+
+func cloneMetadata(metadata artifactRegistryMetadata) artifactRegistryMetadata {
+	clone := artifactRegistryMetadata{
+		Repositories:        make(map[string]*Repository, len(metadata.Repositories)),
+		Outcomes:            make(map[string]artifactOperationOutcome, len(metadata.Outcomes)),
+		NextOutcomeSequence: metadata.NextOutcomeSequence,
+	}
+	for name, repository := range metadata.Repositories {
+		clone.Repositories[name] = cloneRepository(repository)
+	}
+	for name, outcome := range metadata.Outcomes {
+		outcome.Repository = cloneRepository(outcome.Repository)
+		clone.Outcomes[name] = outcome
+	}
+	return clone
+}
+
+func (api *API) persistSnapshot(snapshot artifactRegistryMetadata) error {
+	if api.store == nil {
+		return nil
+	}
+	if err := api.store.Save(artifactRegistryStateEntry, snapshot); err != nil {
+		return fmt.Errorf("save Artifact Registry metadata: %w", err)
+	}
+	return nil
+}
+
+func (api *API) replaceMetadata(snapshot artifactRegistryMetadata) {
+	api.mu.Lock()
+	clone := cloneMetadata(snapshot)
+	api.repos = clone.Repositories
+	api.outcomes = clone.Outcomes
+	api.nextOutcomeSequence = clone.NextOutcomeSequence
+	api.mu.Unlock()
+}
+
+func (api *API) addOperationOutcome(metadata *artifactRegistryMetadata, operationName string, outcome artifactOperationOutcome) {
+	metadata.NextOutcomeSequence++
+	outcome.Sequence = metadata.NextOutcomeSequence
+	metadata.Outcomes[operationName] = outcome
+}
+
+func (api *API) operationOutcomeEvictions(metadata artifactRegistryMetadata) []string {
+	if api.opMgr == nil {
+		return nil
+	}
+	operations := make(map[string]*orchestrator.Operation)
+	for _, operation := range api.opMgr.List() {
+		if operation != nil && operation.Kind == "artifactregistry#operation" {
+			operations[operation.Name] = operation
+		}
+	}
+	evictions := make([]string, 0)
+	pending := make(map[string]bool)
+	type candidate struct {
+		name     string
+		sequence uint64
+	}
+	terminal := make([]candidate, 0, len(metadata.Outcomes))
+	for name, outcome := range metadata.Outcomes {
+		operation := operations[name]
+		if operation == nil {
+			evictions = append(evictions, name)
+			continue
+		}
+		if !operation.Done {
+			pending[name] = true
+			continue
+		}
+		terminal = append(terminal, candidate{name: name, sequence: outcome.Sequence})
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		if terminal[i].sequence == terminal[j].sequence {
+			return terminal[i].name > terminal[j].name
+		}
+		return terminal[i].sequence > terminal[j].sequence
+	})
+	keepTerminal := maxPersistedOperationOutcomes - len(pending)
+	if keepTerminal < 0 {
+		keepTerminal = 0
+	}
+	for index := keepTerminal; index < len(terminal); index++ {
+		evictions = append(evictions, terminal[index].name)
+	}
+	return evictions
+}
+
+func (api *API) compactOperationOutcomes() error {
+	if api.compactionHook != nil {
+		api.compactionHook()
+	}
+	if api.opMgr == nil {
+		return nil
+	}
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
+	api.mu.RLock()
+	snapshot := api.snapshotLocked()
+	api.mu.RUnlock()
+	evictions := api.operationOutcomeEvictions(snapshot)
+	if len(evictions) == 0 {
+		return nil
+	}
+	for _, name := range evictions {
+		if err := api.opMgr.RemoveDurable(name); err != nil {
+			return fmt.Errorf("expire operation %q: %w", name, err)
+		}
+		delete(snapshot.Outcomes, name)
+	}
+	if api.store == nil {
+		api.replaceMetadata(snapshot)
+		return nil
+	}
+	if err := api.persistSnapshot(snapshot); err != nil {
+		var observed artifactRegistryMetadata
+		if loadErr := api.store.Load(artifactRegistryStateEntry, &observed); loadErr == nil {
+			normalizeArtifactRegistryMetadata(&observed)
+			if artifactRegistryMetadataEqual(observed, snapshot) {
+				api.replaceMetadata(snapshot)
+				return nil
+			}
+		}
+		api.degrade(err)
+		return err
+	}
+	api.replaceMetadata(snapshot)
+	return nil
+}
+
+func (api *API) persistRegisteredMutation(committed, previous artifactRegistryMetadata, operationName string) error {
+	saveErr := api.persistSnapshot(committed)
+	if saveErr == nil {
+		api.replaceMetadata(committed)
+		return nil
+	}
+
+	var observed artifactRegistryMetadata
+	loadErr := api.store.Load(artifactRegistryStateEntry, &observed)
+	if loadErr == nil {
+		normalizeArtifactRegistryMetadata(&observed)
+		switch {
+		case artifactRegistryMetadataEqual(observed, committed):
+			api.replaceMetadata(committed)
+			return nil
+		case artifactRegistryMetadataEqual(observed, previous):
+			return api.failRegisteredOperation(operationName, saveErr)
+		default:
+			api.replaceMetadata(observed)
+			ambiguous := fmt.Errorf("Artifact Registry metadata save returned an error and readback differed from both snapshots: %w", saveErr)
+			api.degrade(ambiguous)
+			return ambiguous
+		}
+	}
+	if errors.Is(loadErr, state.ErrNotFound) && artifactRegistryMetadataEmpty(previous) {
+		return api.failRegisteredOperation(operationName, saveErr)
+	}
+	ambiguous := errors.Join(saveErr, fmt.Errorf("read back Artifact Registry metadata: %w", loadErr))
+	api.degrade(ambiguous)
+	return ambiguous
+}
+
+func (api *API) failRegisteredOperation(operationName string, saveErr error) error {
+	if api.opMgr == nil {
+		return saveErr
+	}
+	if failErr := api.opMgr.FailDurable(operationName, http.StatusInternalServerError,
+		"repository metadata and operation outcome were not persisted"); failErr != nil {
+		combined := errors.Join(saveErr, failErr)
+		api.degrade(combined)
+		return combined
+	}
+	return saveErr
+}
+
+func normalizeArtifactRegistryMetadata(metadata *artifactRegistryMetadata) {
+	if metadata.Repositories == nil {
+		metadata.Repositories = make(map[string]*Repository)
+	}
+	if metadata.Outcomes == nil {
+		metadata.Outcomes = make(map[string]artifactOperationOutcome)
+	}
+	for _, outcome := range metadata.Outcomes {
+		if outcome.Sequence > metadata.NextOutcomeSequence {
+			metadata.NextOutcomeSequence = outcome.Sequence
+		}
+	}
+}
+
+func artifactRegistryMetadataEqual(left, right artifactRegistryMetadata) bool {
+	leftPayload, leftErr := json.Marshal(left)
+	rightPayload, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftPayload, rightPayload)
+}
+
+func artifactRegistryMetadataEmpty(metadata artifactRegistryMetadata) bool {
+	return len(metadata.Repositories) == 0 &&
+		len(metadata.Outcomes) == 0 &&
+		metadata.NextOutcomeSequence == 0
+}
+
+func (api *API) initializationError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.initErr
+}
+
+func (api *API) degrade(err error) {
+	api.mu.Lock()
+	api.initErr = fmt.Errorf("Artifact Registry persistence is degraded: %w", err)
+	api.mu.Unlock()
 }
 
 func repositoryIDFromParent(parent string) string {

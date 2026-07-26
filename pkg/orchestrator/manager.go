@@ -930,7 +930,7 @@ func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName 
 	return sm.startContainer(containerName)
 }
 
-func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName string, version string, rootPassword string) (string, error) {
+func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, project, instanceName string, version string, rootPassword string) (string, bool, error) {
 	var image string
 	var env []string
 	var expPort string
@@ -977,10 +977,13 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 		env = append(sm.standardEnv(), "MYSQL_ROOT_PASSWORD="+rootPassword)
 		expPort = "3306/tcp"
 	} else {
-		return "", fmt.Errorf("unsupported database version: %s", version)
+		return "", false, fmt.Errorf("unsupported database version: %s", version)
 	}
 
-	containerName := "minisky-sql-" + instanceName
+	containerName, volName, resourceID := cloudSQLDockerNames(project, instanceName)
+	resourceLabels := ownedDockerLabels()
+	resourceLabels["minisky.service"] = "cloudsql"
+	resourceLabels["minisky.resource"] = resourceID
 	log.Printf("[Orchestrator] Provisioning Cloud SQL VM: %s (image: %s)", containerName, image)
 
 	exists, err := sm.ImageExistsPublic(image)
@@ -989,19 +992,28 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 	}
 	if !exists {
 		if err := sm.pullImageInternal(ctx, image); err != nil {
-			return "", fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
+			return "", false, fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
 		}
 	} else {
 		log.Printf("[Orchestrator] Image '%s' already exists locally, skipping pull.", image)
 	}
 
-	// Clean up any stale container
-	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://localhost/containers/%s?force=true", containerName), nil)
-	sm.dockerClient.Do(req)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect Cloud SQL container: %w", err)
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, resourceLabels) {
+			return "", false, fmt.Errorf("Cloud SQL container %q exists but is not owned by this profile and resource", containerName)
+		}
+		return "", false, fmt.Errorf("owned Cloud SQL container %q already exists", containerName)
+	}
 
 	// Volumes - mount a docker volume for persistence
-	volName := "minisky-db-" + instanceName
-	sm.dockerClient.Post("http://localhost/volumes/create", "application/json", strings.NewReader(`{"Name": "`+volName+`"}`))
+	volumeCreated, err := sm.ensureCloudSQLVolume(ctx, volName, resourceLabels)
+	if err != nil {
+		return "", false, err
+	}
 
 	var mountTarget string
 	if strings.HasPrefix(version, "MYSQL") {
@@ -1027,10 +1039,7 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 				fmt.Sprintf("%s:%s", volName, mountTarget),
 			},
 		},
-		"Labels": map[string]string{
-			"managed-by": "minisky-sql",
-			"instance":   instanceName,
-		},
+		"Labels": resourceLabels,
 	}
 
 	b, _ := json.Marshal(payload)
@@ -1038,45 +1047,164 @@ func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, instanceName 
 	cReq.Header.Set("Content-Type", "application/json")
 	resp, err := sm.dockerClient.Do(cReq)
 	if err != nil {
-		return "", fmt.Errorf("create SQL container: %v", err)
+		if volumeCreated {
+			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
+		}
+		return "", false, fmt.Errorf("create SQL container: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		if volumeCreated {
+			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
+		}
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create SQL container %d: %s", resp.StatusCode, string(respBody))
+		return "", false, fmt.Errorf("failed to create SQL container %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	if err := sm.startContainer(containerName); err != nil {
-		return "", fmt.Errorf("start SQL container: %v", err)
+		return "", true, fmt.Errorf("start SQL container: %v", err)
 	}
 
 	config := ContainerConfig{Name: containerName, ContainerPort: expPort}
 	internalURL, err := sm.discoverInternalURL(config)
 	if err != nil {
-		return "", fmt.Errorf("port discovery: %v", err)
+		return "", true, fmt.Errorf("port discovery: %v", err)
 	}
 
 	log.Printf("[Orchestrator] ✅ SQL Instance '%s' ONLINE at %s", instanceName, internalURL)
-	return internalURL, nil
+	return internalURL, true, nil
 }
 
 // DeleteCloudSQLVM stops and forcefully removes a Cloud SQL node.
-func (sm *ServiceManager) DeleteCloudSQLVM(instanceName string) error {
-	containerName := "minisky-sql-" + instanceName
+func (sm *ServiceManager) DeleteCloudSQLVM(project, instanceName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return sm.DeleteCloudSQLVMContext(ctx, project, instanceName)
+}
+
+func (sm *ServiceManager) DeleteCloudSQLVMContext(ctx context.Context, project, instanceName string) error {
+	containerName, volumeName, resourceID := cloudSQLDockerNames(project, instanceName)
+	expected := ownedDockerLabels()
+	expected["minisky.service"] = "cloudsql"
+	expected["minisky.resource"] = resourceID
 	log.Printf("[Orchestrator] Tearing down Cloud SQL VM: %s", containerName)
+	status, labels, err := sm.inspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, expected) {
+			return fmt.Errorf("refusing to delete unowned Cloud SQL container %q", containerName)
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+		resp, err := sm.dockerClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("delete Cloud SQL container returned %d", resp.StatusCode)
+		}
+	}
+	return sm.deleteCloudSQLVolume(ctx, volumeName, expected)
+}
 
-	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=2", containerName)
-	req, _ := http.NewRequest("POST", stopURL, nil)
-	sm.dockerClient.Do(req)
+func (sm *ServiceManager) ensureCloudSQLVolume(ctx context.Context, name string, labels map[string]string) (bool, error) {
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	if err != nil {
+		return false, fmt.Errorf("inspect Cloud SQL volume: %w", err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		var volume struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		err := json.NewDecoder(resp.Body).Decode(&volume)
+		resp.Body.Close()
+		if err != nil {
+			return false, fmt.Errorf("decode Cloud SQL volume ownership: %w", err)
+		}
+		if !exactLabels(volume.Labels, labels) {
+			return false, fmt.Errorf("Cloud SQL volume %q exists but is not owned by this profile and resource", name)
+		}
+		return false, nil
+	}
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound {
+		return false, fmt.Errorf("inspect Cloud SQL volume returned %d", status)
+	}
+	payload, _ := json.Marshal(map[string]any{"Name": name, "Labels": labels})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/volumes/create", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = sm.dockerClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("create Cloud SQL volume: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("create Cloud SQL volume returned %d", resp.StatusCode)
+	}
+	return true, nil
+}
 
-	rmURL := fmt.Sprintf("http://localhost/containers/%s?force=true", containerName)
-	req, _ = http.NewRequest("DELETE", rmURL, nil)
-	resp, err := sm.dockerClient.Do(req)
+func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string, labels map[string]string) error {
+	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		status := resp.StatusCode
+		resp.Body.Close()
+		return fmt.Errorf("inspect Cloud SQL volume returned %d", status)
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&volume)
+	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("decode Cloud SQL volume ownership: %w", err)
+	}
+	if !exactLabels(volume.Labels, labels) {
+		return fmt.Errorf("refusing to delete unowned Cloud SQL volume %q", name)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, "http://localhost/volumes/"+url.PathEscape(name), nil)
+	resp, err = sm.dockerClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete Cloud SQL volume returned %d", resp.StatusCode)
+	}
 	return nil
+}
+
+func cloudSQLDockerNames(project, instance string) (string, string, string) {
+	resourceID := config.GetProfile() + "/" + project + "/" + instance
+	sum := sha256.Sum256([]byte(resourceID))
+	safe := strings.ToLower(instance)
+	safe = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			return r
+		}
+		return '-'
+	}, safe)
+	safe = strings.Trim(safe, "-")
+	if len(safe) > 24 {
+		safe = safe[:24]
+	}
+	if safe == "" {
+		safe = "instance"
+	}
+	suffix := fmt.Sprintf("%x", sum[:6])
+	return "minisky-sql-" + safe + "-" + suffix,
+		"minisky-db-" + safe + "-" + suffix, resourceID
 }
 
 // DeleteComputeVM permanently destroys a physical Data Plane compute instance.

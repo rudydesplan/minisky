@@ -24,7 +24,21 @@ type dashboardAuthorizer interface {
 
 func withDashboardRBAC(next http.Handler, authorizer dashboardAuthorizer, audience string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kubeconfigDownload := false
+		if isDashboardGKERoute(r) {
+			route, err := parseDashboardGKERoute(r)
+			if err != nil {
+				writeDashboardAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+				return
+			}
+			kubeconfigDownload = r.Method == http.MethodGet && route.kubeconfig
+		}
 		if authorizer == nil || !authorizer.EnforcementEnabled() {
+			if kubeconfigDownload {
+				writeDashboardAuthError(w, http.StatusForbidden, "PERMISSION_DENIED",
+					"Caller lacks permission minisky.gke.kubeconfig.download")
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -63,6 +77,8 @@ func withDashboardRBAC(next http.Handler, authorizer dashboardAuthorizer, audien
 		}
 		if r.URL.Path == "/api/manage/compute/terminal" {
 			permission = "minisky.dashboard.terminal"
+		} else if kubeconfigDownload {
+			permission = "minisky.gke.kubeconfig.download"
 		} else if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			permission = "minisky.dashboard.view"
 		}

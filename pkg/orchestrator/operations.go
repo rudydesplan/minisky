@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,12 +64,27 @@ type OperationManager struct {
 	ops            map[string]*Operation
 	store          operationStore
 	persistenceErr error
+
+	observerMu        sync.Mutex
+	terminalObservers map[uint64]*terminalObserver
+	observerOrder     []uint64
+	nextObserverID    uint64
+}
+
+type terminalObserver struct {
+	id       uint64
+	callback func(*Operation)
+	pending  *Operation
+	active   bool
+	wakeup   chan struct{}
+	done     chan struct{}
 }
 
 // NewOperationManager returns a ready-to-use OperationManager.
 func NewOperationManager() *OperationManager {
 	return &OperationManager{
-		ops: make(map[string]*Operation),
+		ops:               make(map[string]*Operation),
+		terminalObservers: make(map[uint64]*terminalObserver),
 	}
 }
 
@@ -77,8 +93,9 @@ func NewOperationManager() *OperationManager {
 // results; their work functions are never replayed.
 func NewOperationManagerWithStore(store operationStore) (*OperationManager, error) {
 	manager := &OperationManager{
-		ops:   make(map[string]*Operation),
-		store: store,
+		ops:               make(map[string]*Operation),
+		store:             store,
+		terminalObservers: make(map[uint64]*terminalObserver),
 	}
 	if store == nil {
 		return manager, nil
@@ -98,14 +115,7 @@ func NewOperationManagerWithStore(store operationStore) (*OperationManager, erro
 		if op == nil || op.Done || op.Status == StatusDone {
 			continue
 		}
-		op.Status = StatusDone
-		op.Done = true
-		op.Progress = 100
-		op.EndTime = time.Now().UTC().Format(time.RFC3339)
-		op.Error = &OperationError{
-			Code:    500,
-			Message: "operation interrupted by MiniSky restart; side effects were not replayed",
-		}
+		interruptOperation(op)
 		interrupted = true
 	}
 	if interrupted {
@@ -187,12 +197,12 @@ func (om *OperationManager) Advance(name string, progress int, status OperationS
 // interrupted and no work is replayed.
 func (om *OperationManager) AdvanceDurable(name string, progress int, status OperationStatus) error {
 	om.persistMu.Lock()
-	defer om.persistMu.Unlock()
 
 	om.mu.Lock()
 	op, ok := om.ops[name]
 	if !ok {
 		om.mu.Unlock()
+		om.persistMu.Unlock()
 		return nil
 	}
 
@@ -211,7 +221,14 @@ func (om *OperationManager) AdvanceDurable(name string, progress int, status Ope
 	om.mu.Unlock()
 	if err := om.persistLocked(); err != nil {
 		om.recordPersistenceFailure(name, status == StatusDone, err)
+		om.persistMu.Unlock()
 		return err
+	}
+	terminal := status == StatusDone
+	completed := om.Get(name)
+	om.persistMu.Unlock()
+	if terminal {
+		om.notifyTerminal(completed)
 	}
 	return nil
 }
@@ -251,12 +268,12 @@ func (om *OperationManager) Fail(name string, code int, message string) {
 // was saved.
 func (om *OperationManager) FailDurable(name string, code int, message string) error {
 	om.persistMu.Lock()
-	defer om.persistMu.Unlock()
 
 	om.mu.Lock()
 	op, ok := om.ops[name]
 	if !ok {
 		om.mu.Unlock()
+		om.persistMu.Unlock()
 		return nil
 	}
 	op.Status = StatusDone
@@ -267,7 +284,193 @@ func (om *OperationManager) FailDurable(name string, code int, message string) e
 	om.mu.Unlock()
 	if err := om.persistLocked(); err != nil {
 		om.recordPersistenceFailure(name, true, err)
+		om.persistMu.Unlock()
 		return err
+	}
+	completed := om.Get(name)
+	om.persistMu.Unlock()
+	om.notifyTerminal(completed)
+	return nil
+}
+
+// FinalizeDurable records a terminal result and reconciles an ambiguous Save
+// error against the operation store before returning. The returned error is
+// preserved even when readback confirms the terminal state, allowing callers
+// to enter a degraded mode for uncertain filesystem durability.
+func (om *OperationManager) FinalizeDurable(name string, code int, message string) error {
+	om.persistMu.Lock()
+
+	om.mu.Lock()
+	op, ok := om.ops[name]
+	if !ok {
+		om.mu.Unlock()
+		om.persistMu.Unlock()
+		return nil
+	}
+	op.Status = StatusDone
+	op.Done = true
+	op.Progress = 100
+	op.EndTime = time.Now().UTC().Format(time.RFC3339)
+	if code != 0 {
+		op.Error = &OperationError{Code: code, Message: message}
+	} else {
+		op.Error = nil
+	}
+	om.mu.Unlock()
+
+	if err := om.persistLocked(); err != nil {
+		var durable map[string]*Operation
+		loadErr := error(nil)
+		if om.store != nil {
+			loadErr = om.store.Load(operationStateEntry, &durable)
+		}
+		wrapped := fmt.Errorf("terminal operation persistence degraded: %w", err)
+		om.mu.Lock()
+		if loadErr == nil && durable[name] != nil {
+			reconciled := cloneOperation(durable[name])
+			if !reconciled.Done && reconciled.Status != StatusDone {
+				interruptOperation(reconciled)
+			}
+			om.ops[name] = reconciled
+		}
+		om.persistenceErr = wrapped
+		om.mu.Unlock()
+		if loadErr != nil {
+			om.persistMu.Unlock()
+			return fmt.Errorf("%w; read back operations: %v", wrapped, loadErr)
+		}
+		om.persistMu.Unlock()
+		return wrapped
+	}
+	completed := om.Get(name)
+	om.persistMu.Unlock()
+	om.notifyTerminal(completed)
+	return nil
+}
+
+// TerminalObserverSubscription controls one isolated terminal observer.
+type TerminalObserverSubscription struct {
+	manager  *OperationManager
+	observer *terminalObserver
+	once     sync.Once
+}
+
+// OnTerminal registers a callback and returns a simple idempotent unsubscribe
+// function. Lifecycle owners that must wait for an in-flight callback should
+// use ObserveTerminal and TerminalObserverSubscription.Shutdown.
+func (om *OperationManager) OnTerminal(observer func(*Operation)) func() {
+	subscription := om.ObserveTerminal(observer)
+	return subscription.Unsubscribe
+}
+
+// ObserveTerminal registers a callback for durably saved terminal states.
+// Each listener owns one worker and one coalesced pending wakeup. A blocked
+// listener cannot delay any other listener or operation completion.
+func (om *OperationManager) ObserveTerminal(observer func(*Operation)) *TerminalObserverSubscription {
+	subscription := &TerminalObserverSubscription{manager: om}
+	if observer == nil {
+		return subscription
+	}
+	om.observerMu.Lock()
+	om.nextObserverID++
+	id := om.nextObserverID
+	registered := &terminalObserver{
+		id:       id,
+		callback: observer,
+		active:   true,
+		wakeup:   make(chan struct{}, 1),
+		done:     make(chan struct{}),
+	}
+	om.terminalObservers[id] = registered
+	om.observerOrder = append(om.observerOrder, id)
+	om.observerMu.Unlock()
+	subscription.observer = registered
+	go om.runTerminalObserver(registered)
+	return subscription
+}
+
+// Unsubscribe prevents future callback delivery and is safe to call repeatedly.
+// It does not wait for a callback already in progress.
+func (subscription *TerminalObserverSubscription) Unsubscribe() {
+	if subscription == nil || subscription.observer == nil {
+		return
+	}
+	subscription.once.Do(func() {
+		om := subscription.manager
+		observer := subscription.observer
+		om.observerMu.Lock()
+		observer.active = false
+		observer.pending = nil
+		delete(om.terminalObservers, observer.id)
+		for index, observerID := range om.observerOrder {
+			if observerID == observer.id {
+				om.observerOrder = append(om.observerOrder[:index], om.observerOrder[index+1:]...)
+				break
+			}
+		}
+		om.observerMu.Unlock()
+		select {
+		case observer.wakeup <- struct{}{}:
+		default:
+		}
+	})
+}
+
+// Shutdown unsubscribes and waits until an in-flight callback has returned.
+func (subscription *TerminalObserverSubscription) Shutdown(ctx context.Context) error {
+	if subscription == nil || subscription.observer == nil {
+		return nil
+	}
+	subscription.Unsubscribe()
+	select {
+	case <-subscription.observer.done:
+		return nil
+	case <-ctx.Done():
+		select {
+		case <-subscription.observer.done:
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+// RemoveDurable expires a terminal operation from memory and durable polling
+// state. Non-terminal operations are never removed.
+func (om *OperationManager) RemoveDurable(name string) error {
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+
+	om.mu.Lock()
+	operation := om.ops[name]
+	if operation == nil {
+		om.mu.Unlock()
+		return nil
+	}
+	if !operation.Done {
+		om.mu.Unlock()
+		return fmt.Errorf("cannot remove non-terminal operation %q", name)
+	}
+	previous := cloneOperation(operation)
+	delete(om.ops, name)
+	om.mu.Unlock()
+
+	if err := om.persistLocked(); err != nil {
+		var durable map[string]*Operation
+		loadErr := error(nil)
+		if om.store != nil {
+			loadErr = om.store.Load(operationStateEntry, &durable)
+		}
+		if loadErr == nil && durable[name] == nil {
+			return nil
+		}
+		om.mu.Lock()
+		om.ops[name] = previous
+		om.mu.Unlock()
+		if loadErr != nil {
+			return fmt.Errorf("remove operation %q: %w; read back operations: %v", name, err, loadErr)
+		}
+		return fmt.Errorf("remove operation %q: %w", name, err)
 	}
 	return nil
 }
@@ -290,7 +493,12 @@ func (om *OperationManager) RunAsync(name string, workFn func() error) {
 
 		// 4. Execute actual work (container boot, provisioning, etc.)
 		if err := workFn(); err != nil {
-			om.Fail(name, 500, err.Error())
+			code := 500
+			var coded interface{ OperationCode() int }
+			if errors.As(err, &coded) {
+				code = coded.OperationCode()
+			}
+			om.Fail(name, code, err.Error())
 			return
 		}
 
@@ -342,6 +550,54 @@ func (om *OperationManager) PersistenceError() error {
 	return om.persistenceErr
 }
 
+func (om *OperationManager) notifyTerminal(operation *Operation) {
+	if operation == nil {
+		return
+	}
+	om.observerMu.Lock()
+	for _, id := range om.observerOrder {
+		observer := om.terminalObservers[id]
+		if observer == nil || !observer.active {
+			continue
+		}
+		observer.pending = cloneOperation(operation)
+		select {
+		case observer.wakeup <- struct{}{}:
+		default:
+		}
+	}
+	om.observerMu.Unlock()
+}
+
+func (om *OperationManager) runTerminalObserver(observer *terminalObserver) {
+	defer close(observer.done)
+	for {
+		<-observer.wakeup
+		om.observerMu.Lock()
+		if !observer.active {
+			observer.callback = nil
+			observer.pending = nil
+			om.observerMu.Unlock()
+			return
+		}
+		operation := observer.pending
+		observer.pending = nil
+		callback := observer.callback
+		om.observerMu.Unlock()
+
+		invokeTerminalObserver(callback, operation)
+	}
+}
+
+func invokeTerminalObserver(observer func(*Operation), operation *Operation) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("[OperationManager] terminal observer panic recovered: %v", recovered)
+		}
+	}()
+	observer(cloneOperation(operation))
+}
+
 func (om *OperationManager) recordPersistenceFailure(name string, terminal bool, err error) {
 	wrapped := fmt.Errorf("operation persistence degraded: %w", err)
 	om.mu.Lock()
@@ -370,6 +626,17 @@ func cloneOperation(op *Operation) *Operation {
 		clone.Error = &operationError
 	}
 	return &clone
+}
+
+func interruptOperation(op *Operation) {
+	op.Status = StatusDone
+	op.Done = true
+	op.Progress = 100
+	op.EndTime = time.Now().UTC().Format(time.RFC3339)
+	op.Error = &OperationError{
+		Code:    500,
+		Message: "operation interrupted by MiniSky restart; side effects were not replayed",
+	}
 }
 
 func randomSuffix(n int) string {

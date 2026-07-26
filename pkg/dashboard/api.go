@@ -1,9 +1,11 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -55,6 +57,7 @@ type API struct {
 	svcMgr       *orchestrator.ServiceManager
 	bqBackend    *bigquery.DuckDBBackend
 	gkeBackend   *gke.KindBackend
+	gkeAPI       *gke.API
 	servBackend  *serverless.BuildpacksBackend
 	logAPI       *logging.API
 	monAPI       *monitoring.API
@@ -70,6 +73,7 @@ func NewAPIHandler(
 	svcMgr *orchestrator.ServiceManager,
 	bqBackend *bigquery.DuckDBBackend,
 	gkeBackend *gke.KindBackend,
+	gkeAPI *gke.API,
 	servBackend *serverless.BuildpacksBackend,
 	logAPI *logging.API,
 	monAPI *monitoring.API,
@@ -87,6 +91,7 @@ func NewAPIHandler(
 		svcMgr:       svcMgr,
 		bqBackend:    bqBackend,
 		gkeBackend:   gkeBackend,
+		gkeAPI:       gkeAPI,
 		servBackend:  servBackend,
 		logAPI:       logAPI,
 		monAPI:       monAPI,
@@ -840,34 +845,39 @@ func (api *API) handleInstallDependency(w http.ResponseWriter, r *http.Request) 
 
 func (api *API) handleManageGke() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/api/manage/gke/clusters")
-
-		if r.Method == http.MethodGet && (path == "" || path == "/") {
-			clusters, err := api.gkeBackend.ListClusters()
+		route, err := parseDashboardGKERoute(r)
+		if err != nil {
+			http.Error(w, "invalid GKE cluster route", http.StatusBadRequest)
+			return
+		}
+		gkePath := fmt.Sprintf("/v1/projects/%s/zones/%s/clusters", route.project, route.zone)
+		if route.cluster != "" {
+			gkePath += "/" + route.cluster
+		}
+		if route.kubeconfig {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if api.gkeAPI == nil {
+				http.Error(w, "GKE API unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			data, err := api.gkeAPI.ReadKubeconfig(route.project, route.zone, route.cluster)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				http.Error(w, "kubeconfig not found", http.StatusNotFound)
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(clusters)
+			w.Header().Set("Content-Type", "application/x-yaml")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-kubeconfig.yaml\"", route.cluster))
+			_, _ = w.Write(data)
 			return
 		}
-
-		if r.Method == http.MethodDelete {
-			name := strings.TrimPrefix(path, "/")
-			if name == "" {
-				http.Error(w, "missing cluster name", http.StatusBadRequest)
-				return
-			}
-			if err := api.gkeBackend.DeleteCluster(name); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
+		if api.gkeAPI == nil {
+			http.Error(w, "GKE API unavailable", http.StatusServiceUnavailable)
 			return
 		}
-
-		if r.Method == http.MethodPost && (path == "" || path == "/") {
+		if r.Method == http.MethodPost && route.cluster == "" {
 			var req struct {
 				Name string `json:"name"`
 			}
@@ -879,39 +889,14 @@ func (api *API) handleManageGke() http.Handler {
 				http.Error(w, "missing cluster name", http.StatusBadRequest)
 				return
 			}
-
-			log.Printf("[UI/API] Request to provision GKE cluster: %s", req.Name)
-			go func() {
-				// Creation is slow, run in background
-				if _, err := api.gkeBackend.CreateCluster(req.Name); err != nil {
-					log.Printf("[UI/API] Cluster provisioning failed: %v", err)
-				}
-			}()
-
-			w.WriteHeader(http.StatusAccepted) // 202 Accepted
+			body, _ := json.Marshal(map[string]any{"cluster": map[string]any{"name": req.Name}})
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.URL.Path = gkePath
+			api.gkeAPI.ServeHTTP(w, r)
 			return
 		}
-
-		if r.Method == http.MethodGet && strings.HasSuffix(path, "/config") {
-			name := strings.TrimPrefix(strings.TrimSuffix(path, "/config"), "/")
-			if name == "" {
-				http.Error(w, "missing cluster name", http.StatusBadRequest)
-				return
-			}
-
-			configPath := fmt.Sprintf("/tmp/minisky-kubeconfig-%s.yaml", name)
-			data, err := os.ReadFile(configPath)
-			if err != nil {
-				http.Error(w, "kubeconfig not found", http.StatusNotFound)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/x-yaml")
-			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-kubeconfig.yaml\"", name))
-			w.Write(data)
-			return
-		}
-
+		r.URL.Path = gkePath
+		api.gkeAPI.ServeHTTP(w, r)
 	})
 }
 

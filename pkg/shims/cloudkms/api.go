@@ -60,9 +60,10 @@ type API struct {
 	mu        sync.RWMutex
 	persistMu sync.Mutex
 	// map[project/location] -> map[keyRingId] -> *KeyRing
-	store      map[string]map[string]*KeyRing
-	logAPI     *logging.API
-	stateStore *state.Store
+	store          map[string]map[string]*KeyRing
+	logAPI         *logging.API
+	stateStore     kmsStateStore
+	persistenceErr error
 }
 
 func NewAPI() *API {
@@ -79,7 +80,7 @@ func NewAPI() *API {
 	return api
 }
 
-func newAPI(store *state.Store) *API {
+func newAPI(store kmsStateStore) *API {
 	return &API{store: make(map[string]map[string]*KeyRing), stateStore: store}
 }
 
@@ -110,6 +111,14 @@ func jsonErr(w http.ResponseWriter, code int, msg string) {
 	})
 }
 
+func jsonErrStatus(w http.ResponseWriter, code int, status, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"code": code, "message": msg, "status": status},
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -127,6 +136,14 @@ func jsonErr(w http.ResponseWriter, code int, msg string) {
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud KMS] %s %s", r.Method, r.URL.Path)
+	api.mu.RLock()
+	persistenceErr := api.persistenceErr
+	api.mu.RUnlock()
+	if persistenceErr != nil {
+		jsonErrStatus(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"Cloud KMS persistence is degraded: "+persistenceErr.Error())
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
 	path = strings.Trim(path, "/")
 	parts := strings.Split(path, "/")
@@ -253,22 +270,33 @@ func (api *API) createKeyRing(w http.ResponseWriter, r *http.Request, project, l
 		jsonErr(w, http.StatusBadRequest, "keyRingId is required")
 		return
 	}
-	store := api.locationStore(locKey)
-	api.mu.Lock()
-	if _, exists := store[krId]; exists {
-		api.mu.Unlock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	previous := api.snapshotMetadata()
+	snapshot := cloneKMSMetadata(previous)
+	if _, exists := snapshot.Locations[locKey][krId]; exists {
 		jsonErr(w, http.StatusConflict, "KeyRing already exists: "+krId)
 		return
 	}
 	parts := strings.Split(locKey, "/")
 	name := fmt.Sprintf("projects/%s/locations/%s/keyRings/%s", parts[0], parts[1], krId)
 	kr := &KeyRing{Name: name, CreateTime: nowStr(), keys: make(map[string]*CryptoKey)}
-	store[krId] = kr
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	if snapshot.Locations[locKey] == nil {
+		snapshot.Locations[locKey] = make(map[string]persistedKeyRing)
+	}
+	snapshot.Locations[locKey][krId] = persistedKeyRing{
+		Name: kr.Name, CreateTime: kr.CreateTime, Keys: make(map[string]persistedCryptoKey),
+	}
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "persist KeyRing: "+err.Error())
 		return
 	}
+	api.mu.Lock()
+	if api.store[locKey] == nil {
+		api.store[locKey] = make(map[string]*KeyRing)
+	}
+	api.store[locKey][krId] = kr
+	api.mu.Unlock()
 	api.pushLog(project, "INFO", name, "KeyRing created: "+name)
 	jsonOK(w, map[string]any{"name": kr.Name, "createTime": kr.CreateTime})
 }
@@ -320,6 +348,8 @@ func (api *API) createCryptoKey(w http.ResponseWriter, r *http.Request, project,
 		jsonErr(w, http.StatusBadRequest, "cryptoKeyId is required")
 		return
 	}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	kr := api.getKeyRingOrErr(w, locKey, krId)
 	if kr == nil {
 		return
@@ -336,8 +366,9 @@ func (api *API) createCryptoKey(w http.ResponseWriter, r *http.Request, project,
 	}
 
 	kr.mu.Lock()
-	if _, exists := kr.keys[ckId]; exists {
-		kr.mu.Unlock()
+	_, exists := kr.keys[ckId]
+	kr.mu.Unlock()
+	if exists {
 		jsonErr(w, http.StatusConflict, "CryptoKey already exists: "+ckId)
 		return
 	}
@@ -352,12 +383,23 @@ func (api *API) createCryptoKey(w http.ResponseWriter, r *http.Request, project,
 	// Create primary version with local AES-256 key
 	v := newCryptoKeyVersion(name, 1)
 	ck.versions = append(ck.versions, v)
-	kr.keys[ckId] = ck
-	kr.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	previous := api.snapshotMetadata()
+	snapshot := cloneKMSMetadata(previous)
+	savedRing := snapshot.Locations[locKey][krId]
+	if savedRing.Keys == nil {
+		savedRing.Keys = make(map[string]persistedCryptoKey)
+	}
+	ck.mu.Lock()
+	savedRing.Keys[ckId] = persistedCryptoKeyFromKeyLocked(ck)
+	ck.mu.Unlock()
+	snapshot.Locations[locKey][krId] = savedRing
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "persist CryptoKey: "+err.Error())
 		return
 	}
+	kr.mu.Lock()
+	kr.keys[ckId] = ck
+	kr.mu.Unlock()
 
 	api.pushLog(project, "INFO", name, fmt.Sprintf("CryptoKey created: %s (purpose: %s)", name, body.Purpose))
 	jsonOK(w, cryptoKeyPublicWithPrimary(ck))
@@ -379,6 +421,8 @@ func (api *API) getCryptoKey(w http.ResponseWriter, locKey, krId, ckId string) {
 }
 
 func (api *API) updateCryptoKey(w http.ResponseWriter, r *http.Request, locKey, krId, ckId string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	kr := api.getKeyRingOrErr(w, locKey, krId)
 	if kr == nil {
 		return
@@ -395,6 +439,22 @@ func (api *API) updateCryptoKey(w http.ResponseWriter, r *http.Request, locKey, 
 		VersionTemplate map[string]any    `json:"versionTemplate"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
+	previous := api.snapshotMetadata()
+	snapshot := cloneKMSMetadata(previous)
+	savedRing := snapshot.Locations[locKey][krId]
+	savedKey := savedRing.Keys[ckId]
+	if body.Labels != nil {
+		savedKey.Labels = cloneStringMap(body.Labels)
+	}
+	if body.VersionTemplate != nil {
+		savedKey.VersionTemplate = cloneAnyMap(body.VersionTemplate)
+	}
+	savedRing.Keys[ckId] = savedKey
+	snapshot.Locations[locKey][krId] = savedRing
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "persist CryptoKey update: "+err.Error())
+		return
+	}
 	ck.mu.Lock()
 	if body.Labels != nil {
 		ck.Labels = body.Labels
@@ -403,10 +463,6 @@ func (api *API) updateCryptoKey(w http.ResponseWriter, r *http.Request, locKey, 
 		ck.VersionTemplate = body.VersionTemplate
 	}
 	ck.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		jsonErr(w, http.StatusInternalServerError, "persist CryptoKey update: "+err.Error())
-		return
-	}
 	jsonOK(w, cryptoKeyPublicWithPrimary(ck))
 }
 
@@ -448,6 +504,8 @@ func (api *API) listCryptoKeyVersions(w http.ResponseWriter, locKey, krId, ckId 
 }
 
 func (api *API) createCryptoKeyVersion(w http.ResponseWriter, project, locKey, krId, ckId string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	kr := api.getKeyRingOrErr(w, locKey, krId)
 	if kr == nil {
 		return
@@ -461,13 +519,23 @@ func (api *API) createCryptoKeyVersion(w http.ResponseWriter, project, locKey, k
 	}
 	ck.mu.Lock()
 	num := len(ck.versions) + 1
-	v := newCryptoKeyVersion(ck.Name, num)
-	ck.versions = append(ck.versions, v)
+	ckName := ck.Name
 	ck.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	v := newCryptoKeyVersion(ckName, num)
+	previous := api.snapshotMetadata()
+	snapshot := cloneKMSMetadata(previous)
+	savedRing := snapshot.Locations[locKey][krId]
+	savedKey := savedRing.Keys[ckId]
+	savedKey.Versions = append(savedKey.Versions, persistedVersion(v))
+	savedRing.Keys[ckId] = savedKey
+	snapshot.Locations[locKey][krId] = savedRing
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "persist CryptoKeyVersion: "+err.Error())
 		return
 	}
+	ck.mu.Lock()
+	ck.versions = append(ck.versions, v)
+	ck.mu.Unlock()
 	api.pushLog(project, "INFO", ck.Name, fmt.Sprintf("Version %d created", num))
 	jsonOK(w, cryptoKeyVersionPublic(v))
 }
@@ -493,6 +561,8 @@ func (api *API) getCryptoKeyVersion(w http.ResponseWriter, locKey, krId, ckId, v
 }
 
 func (api *API) destroyCryptoKeyVersion(w http.ResponseWriter, r *http.Request, project, locKey, krId, ckId, vId string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	kr := api.getKeyRingOrErr(w, locKey, krId)
 	if kr == nil {
 		return
@@ -509,15 +579,36 @@ func (api *API) destroyCryptoKeyVersion(w http.ResponseWriter, r *http.Request, 
 		jsonErr(w, http.StatusNotFound, "CryptoKeyVersion not found: "+vId)
 		return
 	}
-	ck.mu.Lock()
-	v.State = "DESTROYED"
-	v.DestroyTime = nowStr()
-	v.aesKey = nil // Wipe key material
-	ck.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
+	destroyTime := nowStr()
+	previous := api.snapshotMetadata()
+	snapshot := cloneKMSMetadata(previous)
+	savedRing := snapshot.Locations[locKey][krId]
+	savedKey := savedRing.Keys[ckId]
+	found := false
+	for index := range savedKey.Versions {
+		if savedKey.Versions[index].Name == v.Name {
+			savedKey.Versions[index].State = "DESTROYED"
+			savedKey.Versions[index].DestroyTime = destroyTime
+			savedKey.Versions[index].AESKey = nil
+			found = true
+			break
+		}
+	}
+	if !found {
+		jsonErr(w, http.StatusNotFound, "CryptoKeyVersion not found: "+vId)
+		return
+	}
+	savedRing.Keys[ckId] = savedKey
+	snapshot.Locations[locKey][krId] = savedRing
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "persist destroyed CryptoKeyVersion: "+err.Error())
 		return
 	}
+	ck.mu.Lock()
+	v.State = "DESTROYED"
+	v.DestroyTime = destroyTime
+	v.aesKey = nil // Wipe key material
+	ck.mu.Unlock()
 	api.pushLog(project, "WARNING", ck.Name, "CryptoKeyVersion destroyed: "+v.Name)
 	jsonOK(w, cryptoKeyVersionPublic(v))
 }
@@ -725,4 +816,10 @@ func cryptoKeyPublicWithPrimary(ck *CryptoKey) map[string]any {
 		m["primary"] = cryptoKeyVersionPublic(v)
 	}
 	return m
+}
+
+func (api *API) markPersistenceDegraded(err error) {
+	api.mu.Lock()
+	api.persistenceErr = err
+	api.mu.Unlock()
 }

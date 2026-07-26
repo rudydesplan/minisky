@@ -14,6 +14,11 @@ const (
 	metadataOnlyBackendState = "METADATA_ONLY"
 )
 
+type cloudSQLStore interface {
+	Load(string, any) error
+	Save(string, any) error
+}
+
 type cloudSQLMetadata struct {
 	Instances map[string]*DatabaseInstance `json:"instances"`
 	Databases map[string][]*Database       `json:"databases"`
@@ -25,7 +30,7 @@ type cloudSQLMetadata struct {
 func NewAPIWithStore(
 	opMgr *orchestrator.OperationManager,
 	svcMgr *orchestrator.ServiceManager,
-	store *state.Store,
+	store cloudSQLStore,
 ) (*API, error) {
 	api := newAPI(opMgr, svcMgr, store)
 	if store == nil {
