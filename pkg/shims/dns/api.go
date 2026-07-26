@@ -1,11 +1,15 @@
 package dns
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +17,8 @@ import (
 	"minisky/pkg/config"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 func init() {
@@ -59,7 +65,7 @@ type ResourceRecordSet struct {
 	Kind    string   `json:"kind"`
 	Name    string   `json:"name"` // FQDN, e.g. "www.example.com."
 	Type    string   `json:"type"` // A, AAAA, CNAME, MX, TXT, NS, SOA, PTR, SRV, CAA
-	TTL     int      `json:"ttl"`
+	TTL     int64    `json:"ttl"`
 	Rrdatas []string `json:"rrdatas"`
 }
 
@@ -72,6 +78,20 @@ type Change struct {
 	Additions []ResourceRecordSet `json:"additions,omitempty"`
 	Deletions []ResourceRecordSet `json:"deletions,omitempty"`
 	IsServing bool                `json:"isServing"`
+}
+
+type rrsetMutationBody struct {
+	Kind    string   `json:"kind"`
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	TTL     *int64   `json:"ttl"`
+	Rrdatas []string `json:"rrdatas"`
+}
+
+type changeMutationBody struct {
+	Kind      string              `json:"kind"`
+	Additions []rrsetMutationBody `json:"additions"`
+	Deletions []rrsetMutationBody `json:"deletions"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +118,7 @@ type API struct {
 	zones      map[string]*zoneStore // key: project:zoneName
 	zoneSeq    uint64
 	initErr    error
+	resolver   *Resolver
 }
 
 type stateStore interface {
@@ -106,6 +127,11 @@ type stateStore interface {
 }
 
 const dnsStateEntry = "dns/metadata"
+const maxDNSMutationBodyBytes int64 = 1 << 20
+
+// maxDNSChangeRRSets is a MiniSky-specific safety boundary, not a claim of
+// Google Cloud DNS parity.
+const maxDNSChangeRRSets = 1000
 
 type dnsMetadata struct {
 	Zones   map[string]persistedZone `json:"zones"`
@@ -154,15 +180,15 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	}
 	api.zoneSeq = persisted.ZoneSeq
 	for key, zone := range persisted.Zones {
-		rrsets := zone.RRSets
-		if rrsets == nil {
-			rrsets = make(map[string]*ResourceRecordSet)
+		normalized, err := normalizePersistedZone(zone)
+		if err != nil {
+			return nil, fmt.Errorf("load DNS metadata zone %q: %w", key, err)
 		}
 		api.zones[key] = &zoneStore{
-			zone:      zone.Zone,
-			rrsets:    rrsets,
-			changes:   zone.Changes,
-			changeSeq: zone.ChangeSeq,
+			zone:      normalized.Zone,
+			rrsets:    normalized.RRSets,
+			changes:   normalized.Changes,
+			changeSeq: normalized.ChangeSeq,
 		}
 	}
 	return api, nil
@@ -173,6 +199,15 @@ func newAPI(store stateStore) *API {
 		store: store,
 		zones: make(map[string]*zoneStore),
 	}
+}
+
+// Shutdown closes the optional UDP resolver through MiniSky's plugin lifecycle.
+func (api *API) Shutdown(ctx context.Context) error {
+	_ = ctx
+	if api.resolver == nil {
+		return nil
+	}
+	return api.resolver.Close()
 }
 
 func (api *API) persistMetadata() error {
@@ -238,23 +273,24 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	path := r.URL.Path
-	project := extractSegmentAfter(path, "projects")
-
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 5 || parts[0] != "dns" || parts[1] != "v1" ||
+		parts[2] != "projects" || parts[3] == "" || parts[4] != "managedZones" {
+		writeDNSNotFound(w, path)
+		return
+	}
+	project := parts[3]
 	switch {
-	case strings.Contains(path, "/changes"):
-		zoneName := extractSegmentAfter(path, "managedZones")
-		api.routeChanges(w, r, project, zoneName, path)
-
-	case strings.Contains(path, "/rrsets"):
-		zoneName := extractSegmentAfter(path, "managedZones")
-		api.routeRRSets(w, r, project, zoneName, path)
-
-	case strings.Contains(path, "/managedZones"):
+	case len(parts) == 5 || len(parts) == 6 && parts[5] != "":
 		api.routeZones(w, r, project, path)
-
+	case len(parts) == 7 && parts[5] != "" && parts[6] == "rrsets",
+		len(parts) == 9 && parts[5] != "" && parts[6] == "rrsets" && parts[7] != "" && parts[8] != "":
+		api.routeRRSets(w, r, project, parts[5], path)
+	case len(parts) == 7 && parts[5] != "" && parts[6] == "changes",
+		len(parts) == 8 && parts[5] != "" && parts[6] == "changes" && parts[7] != "":
+		api.routeChanges(w, r, project, parts[5], path)
 	default:
-		w.WriteHeader(http.StatusNotFound)
-		writeError(w, 404, "NOT_FOUND", "Cloud DNS resource not found: "+path)
+		writeDNSNotFound(w, path)
 	}
 }
 
@@ -285,7 +321,7 @@ func (api *API) routeZones(w http.ResponseWriter, r *http.Request, project, path
 
 func (api *API) createZone(w http.ResponseWriter, r *http.Request, project string) {
 	var body ManagedZone
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeDNSMutation(w, r, &body); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 		return
@@ -301,19 +337,33 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 		return
 	}
 
-	// Ensure dnsName is dot-terminated (FQDN)
-	dnsName := body.DnsName
-	if !strings.HasSuffix(dnsName, ".") {
-		dnsName += "."
+	dnsName, err := canonicalDNSName(body.DnsName)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid 'dnsName': "+err.Error())
+		return
 	}
-
-	visibility := body.Visibility
+	visibility := strings.ToLower(strings.TrimSpace(body.Visibility))
 	if visibility == "" {
 		visibility = "public"
 	}
+	if visibility != "public" && visibility != "private" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "managed-zone visibility must be public or private")
+		return
+	}
 
 	before := api.beginMutation()
+	key := zoneKey(project, body.Name)
 	api.mu.Lock()
+	if _, exists := api.zones[key]; exists {
+		api.mu.Unlock()
+		api.abortMutation()
+		w.WriteHeader(http.StatusConflict)
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS",
+			fmt.Sprintf("ManagedZone '%s' already exists in project '%s'", body.Name, project))
+		return
+	}
 	api.zoneSeq++
 	id := api.zoneSeq
 	api.mu.Unlock()
@@ -362,7 +412,6 @@ func (api *API) createZone(w http.ResponseWriter, r *http.Request, project strin
 		},
 	}
 
-	key := zoneKey(project, body.Name)
 	api.mu.Lock()
 	api.zones[key] = store
 	api.mu.Unlock()
@@ -414,6 +463,12 @@ func (api *API) listZones(w http.ResponseWriter, r *http.Request, project string
 
 func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	key := zoneKey(project, zoneName)
+	var patch ManagedZone
+	if err := decodeDNSMutation(w, r, &patch); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
 	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
@@ -425,8 +480,6 @@ func (api *API) patchZone(w http.ResponseWriter, r *http.Request, project, zoneN
 		return
 	}
 
-	var patch ManagedZone
-	json.NewDecoder(r.Body).Decode(&patch)
 	if patch.Description != "" {
 		store.zone.Description = patch.Description
 	}
@@ -486,32 +539,56 @@ func (api *API) deleteZone(w http.ResponseWriter, project, zoneName string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) routeRRSets(w http.ResponseWriter, r *http.Request, project, zoneName, path string) {
-	// Path for DELETE: /rrsets/{name}/{type}
-	// We detect this by checking segments after "rrsets"
-	rrName, rrType := extractRRPath(path)
+	rrName, rrType, item, valid := parseRRSetPath(path)
+	if !valid {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Cloud DNS resource not found: "+path)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPost:
+		if item {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Method not allowed")
+			return
+		}
 		api.createRRSet(w, r, project, zoneName)
 	case http.MethodGet:
-		api.listRRSets(w, r, project, zoneName)
+		if item {
+			api.getRRSet(w, project, zoneName, rrName, rrType)
+		} else {
+			api.listRRSets(w, r, project, zoneName)
+		}
 	case http.MethodDelete:
-		if rrName == "" || rrType == "" {
+		if !item {
 			w.WriteHeader(http.StatusBadRequest)
 			writeError(w, 400, "INVALID_ARGUMENT", "Resource record set name and type are required for delete")
 			return
 		}
 		api.deleteRRSet(w, project, zoneName, rrName, rrType)
 	case http.MethodPut:
+		if !item {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Method not allowed")
+			return
+		}
 		// PATCH/PUT updates a single RRSet
 		api.putRRSet(w, r, project, zoneName, rrName, rrType)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Method not allowed")
 	}
 }
 
 func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	key := zoneKey(project, zoneName)
+	rr, ttlSupplied, err := decodeRRSetMutation(w, r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
 	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
@@ -522,26 +599,11 @@ func (api *API) createRRSet(w http.ResponseWriter, r *http.Request, project, zon
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
 	}
-
-	var rr ResourceRecordSet
-	if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
+	if err := validateAndNormalizeRRSet(&rr, ttlSupplied, store.zone.DnsName); err != nil {
 		api.abortMutation()
 		w.WriteHeader(http.StatusBadRequest)
-		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
-	}
-	if rr.Name == "" || rr.Type == "" {
-		api.abortMutation()
-		w.WriteHeader(http.StatusBadRequest)
-		writeError(w, 400, "INVALID_ARGUMENT", "'name' and 'type' are required")
-		return
-	}
-	// Ensure FQDN
-	if !strings.HasSuffix(rr.Name, ".") {
-		rr.Name += "."
-	}
-	if rr.TTL == 0 {
-		rr.TTL = 300
 	}
 	rr.Kind = "dns#resourceRecordSet"
 
@@ -579,7 +641,16 @@ func (api *API) listRRSets(w http.ResponseWriter, r *http.Request, project, zone
 
 	// Optional filters: ?name=, ?type=
 	filterName := r.URL.Query().Get("name")
-	filterType := r.URL.Query().Get("type")
+	if filterName != "" {
+		var err error
+		filterName, err = canonicalDNSName(filterName)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid record name filter")
+			return
+		}
+	}
+	filterType := strings.ToUpper(r.URL.Query().Get("type"))
 
 	api.mu.RLock()
 	items := []*ResourceRecordSet{}
@@ -596,24 +667,37 @@ func (api *API) listRRSets(w http.ResponseWriter, r *http.Request, project, zone
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"kind":          "dns#resourceRecordSetsListResponse",
-		"rrsets":        items,
-		"nextPageToken": "",
+		"kind":   "dns#resourceRecordSetsListResponse",
+		"rrsets": items,
 	})
 }
 
-func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrType string) {
-	// Ensure FQDN
-	if !strings.HasSuffix(name, ".") {
-		name += "."
+func (api *API) getRRSet(w http.ResponseWriter, project, zoneName, name, rrType string) {
+	key := zoneKey(project, zoneName)
+	api.mu.RLock()
+	store, zoneExists := api.zones[key]
+	var rrset *ResourceRecordSet
+	if zoneExists {
+		rrset = cloneRRSet(store.rrsets[rrKey(name, rrType)])
 	}
+	api.mu.RUnlock()
+	if rrset == nil {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "NOT_FOUND",
+			fmt.Sprintf("ResourceRecordSet '%s/%s' not found in zone '%s'", name, rrType, zoneName))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(rrset)
+}
 
+func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrType string) {
 	key := zoneKey(project, zoneName)
 	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
 	if ok {
-		rrk := rrKey(name, strings.ToUpper(rrType))
+		rrk := rrKey(name, rrType)
 		if _, exists := store.rrsets[rrk]; !exists {
 			ok = false
 		} else {
@@ -636,6 +720,12 @@ func (api *API) deleteRRSet(w http.ResponseWriter, project, zoneName, name, rrTy
 
 func (api *API) putRRSet(w http.ResponseWriter, r *http.Request, project, zoneName, name, rrType string) {
 	key := zoneKey(project, zoneName)
+	rr, ttlSupplied, err := decodeRRSetMutation(w, r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
 	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[key]
@@ -646,13 +736,15 @@ func (api *API) putRRSet(w http.ResponseWriter, r *http.Request, project, zoneNa
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
 	}
-
-	var rr ResourceRecordSet
-	json.NewDecoder(r.Body).Decode(&rr)
-	if !strings.HasSuffix(rr.Name, ".") {
-		rr.Name += "."
+	if err := validateAndNormalizeRRSet(&rr, ttlSupplied, store.zone.DnsName); err != nil {
+		api.mu.Unlock()
+		api.abortMutation()
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
 	}
 	rr.Kind = "dns#resourceRecordSet"
+
 	store.rrsets[rrKey(rr.Name, rr.Type)] = &rr
 	api.mu.Unlock()
 
@@ -688,6 +780,23 @@ func (api *API) routeChanges(w http.ResponseWriter, r *http.Request, project, zo
 // The GCP spec says: deletions are applied before additions in the same request.
 func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zoneName string) {
 	zKey := zoneKey(project, zoneName)
+	var request changeMutationBody
+	if err := decodeDNSMutation(w, r, &request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
+	if len(request.Additions)+len(request.Deletions) > maxDNSChangeRRSets {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			fmt.Sprintf("changes are limited to %d total additions and deletions in MiniSky", maxDNSChangeRRSets))
+		return
+	}
+	body := Change{
+		Kind:      request.Kind,
+		Additions: make([]ResourceRecordSet, len(request.Additions)),
+		Deletions: make([]ResourceRecordSet, len(request.Deletions)),
+	}
 	before := api.beginMutation()
 	api.mu.Lock()
 	store, ok := api.zones[zKey]
@@ -698,23 +807,30 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 		writeError(w, 404, "NOT_FOUND", "ManagedZone "+zoneName+" not found")
 		return
 	}
-
-	var body Change
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		api.mu.Unlock()
-		api.abortMutation()
-		w.WriteHeader(http.StatusBadRequest)
-		writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
-		return
+	for i, addition := range request.Additions {
+		body.Additions[i] = addition.resourceRecordSet()
+		if err := validateAndNormalizeRRSet(&body.Additions[i], addition.TTL != nil, store.zone.DnsName); err != nil {
+			api.mu.Unlock()
+			api.abortMutation()
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid addition: "+err.Error())
+			return
+		}
+	}
+	for i, deletion := range request.Deletions {
+		body.Deletions[i] = deletion.resourceRecordSet()
+		if err := validateAndNormalizeRRSet(&body.Deletions[i], deletion.TTL != nil, store.zone.DnsName); err != nil {
+			api.mu.Unlock()
+			api.abortMutation()
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid deletion: "+err.Error())
+			return
+		}
 	}
 
 	// Validate: deletions must exist
 	for _, del := range body.Deletions {
-		name := del.Name
-		if !strings.HasSuffix(name, ".") {
-			name += "."
-		}
-		rrk := rrKey(name, del.Type)
+		rrk := rrKey(del.Name, del.Type)
 		if _, exists := store.rrsets[rrk]; !exists {
 			api.mu.Unlock()
 			api.abortMutation()
@@ -727,25 +843,13 @@ func (api *API) createChange(w http.ResponseWriter, r *http.Request, project, zo
 
 	// Apply deletions first
 	for _, del := range body.Deletions {
-		name := del.Name
-		if !strings.HasSuffix(name, ".") {
-			name += "."
-		}
-		delete(store.rrsets, rrKey(name, del.Type))
+		delete(store.rrsets, rrKey(del.Name, del.Type))
 	}
 
 	// Apply additions
 	for i, add := range body.Additions {
-		name := add.Name
-		if !strings.HasSuffix(name, ".") {
-			name += "."
-		}
-		if add.TTL == 0 {
-			add.TTL = 300
-		}
 		body.Additions[i].Kind = "dns#resourceRecordSet"
-		body.Additions[i].Name = name
-		store.rrsets[rrKey(name, add.Type)] = &body.Additions[i]
+		store.rrsets[rrKey(add.Name, add.Type)] = &body.Additions[i]
 	}
 
 	// Record the change
@@ -828,7 +932,9 @@ func (api *API) listChanges(w http.ResponseWriter, project, zoneName string) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func zoneKey(project, zoneName string) string { return project + ":" + zoneName }
-func rrKey(name, rrType string) string        { return name + ":" + strings.ToUpper(rrType) }
+func rrKey(name, rrType string) string {
+	return strings.ToLower(ensureFQDN(name)) + ":" + strings.ToUpper(rrType)
+}
 
 // extractSegmentAfter returns the path segment immediately after keyword.
 func extractSegmentAfter(path, keyword string) string {
@@ -841,20 +947,19 @@ func extractSegmentAfter(path, keyword string) string {
 	return ""
 }
 
-// extractRRPath returns (name, type) for DELETE /rrsets/{name}/{type}.
-// Cloud DNS encodes the name as a URL segment, but it may contain dots.
-func extractRRPath(path string) (string, string) {
+// parseRRSetPath distinguishes the exact collection path from the generated
+// client's exact item path /rrsets/{name}/{type}.
+func parseRRSetPath(path string) (name, rrType string, item, valid bool) {
 	idx := strings.Index(path, "/rrsets/")
 	if idx == -1 {
-		return "", ""
+		return "", "", false, strings.HasSuffix(path, "/rrsets")
 	}
 	rest := path[idx+len("/rrsets/"):]
-	// rest = "{name}/{type}" where name is URL-path-encoded FQDN
-	lastSlash := strings.LastIndex(rest, "/")
-	if lastSlash == -1 {
-		return "", ""
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false, false
 	}
-	return rest[:lastSlash], rest[lastSlash+1:]
+	return parts[0], parts[1], true, true
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {
@@ -865,6 +970,226 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 			"message": message,
 		},
 	})
+}
+
+func writeDNSNotFound(w http.ResponseWriter, path string) {
+	w.WriteHeader(http.StatusNotFound)
+	writeError(w, http.StatusNotFound, "NOT_FOUND", "Cloud DNS resource not found: "+path)
+}
+
+func decodeDNSMutation(w http.ResponseWriter, r *http.Request, target any) error {
+	body := http.MaxBytesReader(w, r.Body, maxDNSMutationBodyBytes)
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func decodeRRSetMutation(w http.ResponseWriter, r *http.Request) (ResourceRecordSet, bool, error) {
+	var body rrsetMutationBody
+	if err := decodeDNSMutation(w, r, &body); err != nil {
+		return ResourceRecordSet{}, false, err
+	}
+	return body.resourceRecordSet(), body.TTL != nil, nil
+}
+
+func (body rrsetMutationBody) resourceRecordSet() ResourceRecordSet {
+	rrset := ResourceRecordSet{
+		Kind:    body.Kind,
+		Name:    body.Name,
+		Type:    body.Type,
+		Rrdatas: body.Rrdatas,
+	}
+	if body.TTL != nil {
+		rrset.TTL = *body.TTL
+	}
+	return rrset
+}
+
+func validateAndNormalizeRRSet(rrset *ResourceRecordSet, ttlSupplied bool, zoneDNSName string) error {
+	if rrset.Name == "" || rrset.Type == "" {
+		return errors.New("'name' and 'type' are required")
+	}
+	name, err := canonicalDNSName(rrset.Name)
+	if err != nil {
+		return fmt.Errorf("invalid record name: %w", err)
+	}
+	zoneName, err := canonicalDNSName(zoneDNSName)
+	if err != nil {
+		return fmt.Errorf("managed zone has invalid DNS name: %w", err)
+	}
+	if !dnsNameWithinZone(name, zoneName) {
+		return fmt.Errorf("record name %q is outside managed zone %q", name, zoneName)
+	}
+	rrset.Name = name
+	rrset.Type = strings.ToUpper(rrset.Type)
+	switch {
+	case ttlSupplied && rrset.TTL <= 0:
+		return errors.New("'ttl' must be positive when supplied")
+	case !ttlSupplied:
+		rrset.TTL = 300
+	case rrset.TTL > math.MaxUint32:
+		return errors.New("'ttl' exceeds the resolver-supported maximum")
+	}
+	if len(rrset.Rrdatas) == 0 {
+		return errors.New("'rrdatas' must contain at least one value")
+	}
+	if len(rrset.Rrdatas) > 1000 {
+		return errors.New("'rrdatas' is limited to 1000 values")
+	}
+	for i, value := range rrset.Rrdatas {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return errors.New("'rrdatas' values must be nonempty")
+		}
+		switch rrset.Type {
+		case "A":
+			address, err := netip.ParseAddr(value)
+			if err != nil || !address.Is4() {
+				return fmt.Errorf("invalid A record data %q", value)
+			}
+		case "AAAA":
+			address, err := netip.ParseAddr(value)
+			if err != nil || !address.Is6() || address.Is4In6() {
+				return fmt.Errorf("invalid AAAA record data %q", value)
+			}
+		case "CNAME":
+			if !strings.HasSuffix(value, ".") {
+				return fmt.Errorf("CNAME record data %q must be an absolute dot-terminated DNS name", value)
+			}
+			value, err = canonicalDNSName(value)
+			if err != nil {
+				return fmt.Errorf("invalid CNAME record data %q", value)
+			}
+		}
+		rrset.Rrdatas[i] = value
+	}
+	return nil
+}
+
+func canonicalDNSName(value string) (string, error) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return "", errors.New("DNS name must be nonempty and contain no surrounding whitespace")
+	}
+	name := strings.ToLower(ensureFQDN(value))
+	labels := strings.Split(strings.TrimSuffix(name, "."), ".")
+	for _, label := range labels {
+		if label == "" {
+			return "", errors.New("DNS name contains an empty label")
+		}
+	}
+	if _, err := dnsmessage.NewName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func dnsNameWithinZone(name, zone string) bool {
+	if name == zone {
+		return true
+	}
+	if !strings.HasSuffix(name, zone) {
+		return false
+	}
+	prefix := strings.TrimSuffix(name, zone)
+	return strings.HasSuffix(prefix, ".")
+}
+
+func clampLegacyTTL(ttl int64) int64 {
+	if ttl < 0 {
+		return 0
+	}
+	if ttl > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return ttl
+}
+
+func normalizePersistedZone(persisted persistedZone) (persistedZone, error) {
+	normalized := persistedZone{
+		Zone:      cloneManagedZone(persisted.Zone),
+		RRSets:    make(map[string]*ResourceRecordSet, len(persisted.RRSets)),
+		Changes:   make([]*Change, len(persisted.Changes)),
+		ChangeSeq: persisted.ChangeSeq,
+	}
+	if normalized.Zone == nil {
+		return persistedZone{}, errors.New("managed zone metadata is missing")
+	}
+	dnsName, err := canonicalDNSName(normalized.Zone.DnsName)
+	if err != nil {
+		return persistedZone{}, fmt.Errorf("invalid managed-zone DNS name: %w", err)
+	}
+	normalized.Zone.DnsName = dnsName
+	visibility := strings.ToLower(strings.TrimSpace(normalized.Zone.Visibility))
+	if visibility == "" {
+		visibility = "public"
+	}
+	if visibility != "public" && visibility != "private" {
+		return persistedZone{}, fmt.Errorf("unsupported managed-zone visibility %q", normalized.Zone.Visibility)
+	}
+	normalized.Zone.Visibility = visibility
+	for _, rrset := range persisted.RRSets {
+		clone, err := normalizePersistedRRSet(rrset, dnsName)
+		if err != nil {
+			return persistedZone{}, err
+		}
+		canonicalKey := rrKey(clone.Name, clone.Type)
+		if _, exists := normalized.RRSets[canonicalKey]; exists {
+			return persistedZone{}, fmt.Errorf("canonical resource record key %q is duplicated", canonicalKey)
+		}
+		normalized.RRSets[canonicalKey] = clone
+	}
+	for i, change := range persisted.Changes {
+		if change == nil {
+			continue
+		}
+		clone := *change
+		clone.Additions = cloneRRSets(change.Additions)
+		clone.Deletions = cloneRRSets(change.Deletions)
+		for j := range clone.Additions {
+			rrset, err := normalizePersistedRRSet(&clone.Additions[j], dnsName)
+			if err != nil {
+				return persistedZone{}, err
+			}
+			clone.Additions[j] = *rrset
+		}
+		for j := range clone.Deletions {
+			rrset, err := normalizePersistedRRSet(&clone.Deletions[j], dnsName)
+			if err != nil {
+				return persistedZone{}, err
+			}
+			clone.Deletions[j] = *rrset
+		}
+		normalized.Changes[i] = &clone
+	}
+	return normalized, nil
+}
+
+func normalizePersistedRRSet(rrset *ResourceRecordSet, zoneDNSName string) (*ResourceRecordSet, error) {
+	if rrset == nil {
+		return nil, errors.New("resource record set metadata is missing")
+	}
+	clone := cloneRRSet(rrset)
+	name, err := canonicalDNSName(clone.Name)
+	if err != nil {
+		return nil, fmt.Errorf("invalid persisted record name: %w", err)
+	}
+	if !dnsNameWithinZone(name, zoneDNSName) {
+		return nil, fmt.Errorf("persisted record name %q is outside managed zone %q", name, zoneDNSName)
+	}
+	clone.Name = name
+	clone.Type = strings.ToUpper(clone.Type)
+	clone.TTL = clampLegacyTTL(clone.TTL)
+	return clone, nil
 }
 
 func snapshotDNSMetadata(zones map[string]*zoneStore, zoneSeq uint64) dnsMetadata {
@@ -898,8 +1223,15 @@ func (api *API) restoreMetadataLocked(metadata dnsMetadata) {
 	api.zones = make(map[string]*zoneStore, len(metadata.Zones))
 	for key, persisted := range metadata.Zones {
 		rrsets := make(map[string]*ResourceRecordSet, len(persisted.RRSets))
-		for rrKey, rrset := range persisted.RRSets {
-			rrsets[rrKey] = cloneRRSet(rrset)
+		for _, rrset := range persisted.RRSets {
+			clone := cloneRRSet(rrset)
+			if clone == nil {
+				continue
+			}
+			clone.Name = strings.ToLower(ensureFQDN(clone.Name))
+			clone.Type = strings.ToUpper(clone.Type)
+			clone.TTL = clampLegacyTTL(clone.TTL)
+			rrsets[rrKey(clone.Name, clone.Type)] = clone
 		}
 		changes := make([]*Change, len(persisted.Changes))
 		for i, change := range persisted.Changes {

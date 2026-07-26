@@ -180,7 +180,7 @@ func (r *Resolver) lookup(question dnsmessage.Question) ([]dnsmessage.Resource, 
 			Name:  question.Name,
 			Type:  headerType,
 			Class: dnsmessage.ClassINET,
-			TTL:   uint32(max(rrset.TTL, 0)),
+			TTL:   uint32(clampLegacyTTL(rrset.TTL)),
 		}
 		answers := make([]dnsmessage.Resource, 0, len(rrset.Rrdatas))
 		for _, value := range rrset.Rrdatas {
@@ -237,8 +237,10 @@ func startConfiguredResolver(api *API) {
 	}
 	resolver, err := NewResolver(api, address)
 	if err != nil {
-		log.Printf("[Shim: Cloud DNS] resolver disabled: %v", err)
+		api.initErr = fmt.Errorf("start Cloud DNS resolver: %w", err)
+		log.Printf("[Shim: Cloud DNS] resolver startup failed: %v", err)
 		return
 	}
+	api.resolver = resolver
 	log.Printf("[Shim: Cloud DNS] loopback resolver listening on %s", resolver.Addr())
 }

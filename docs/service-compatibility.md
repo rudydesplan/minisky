@@ -192,8 +192,20 @@ SDK coverage.
   `501 UNIMPLEMENTED`.
 - Cloud DNS retains its persisted managed-zone/RRSet control plane and can run
   an opt-in loopback-only UDP resolver through `MINISKY_DNS_ADDR`. Ports below
-  1024 and non-loopback binds are rejected. The resolver currently serves
-  A, AAAA, and CNAME records with stored TTL/update/delete/restart behavior.
+  1024 and non-loopback binds are rejected. Generated Go client
+  managed-zone and RRSet create/get/list/delete calls are covered across
+  restart, including exact RRSet item GET and filtered collection listing.
+  Mutation JSON is strict and limited to 1 MiB; RRSet data is limited to 1,000
+  values, and a change is limited to 1,000 total additions plus deletions as a
+  MiniSky-specific safety boundary. Managed-zone and RRSet names are validated
+  as absolute DNS names, stored lowercase, and matched case-insensitively;
+  records outside their managed zone are rejected. The resolver currently
+  serves A, AAAA, and CNAME records with stored TTL/update/delete/restart
+  behavior. Pagination and
+  `maxResults`, DNSSEC signing, policies and response policies,
+  forwarding/peering/service-directory targets, recursion, TCP/DoH/DoT,
+  MX/TXT/NS/SOA/PTR/SRV resolution, CNAME chaining, EDNS0, and private-network
+  enforcement are unsupported.
 - Advanced networking is limited to profile-owned Docker bridges and optional
   IPv4 IPAM. MiniSky never installs host-global iptables rules. Cloud NAT,
   peering, PSC service attachments, VPN, and interconnect data planes return

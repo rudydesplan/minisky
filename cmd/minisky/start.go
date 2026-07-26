@@ -113,9 +113,9 @@ var startCmd = &cobra.Command{
 		ctx := context.Background()
 		// 2. Docker service manager — creates the isolated minisky-net bridge network
 		//    and handles cold-starting long-lived emulator containers (GCS, Pub/Sub, etc.).
-		//    The guarded Phase 16 Logging gate is native-only and does not use Docker.
+		//    Guarded native-only integration gates do not use Docker.
 		var svcMgr *orchestrator.ServiceManager
-		if os.Getenv("MINISKY_PHASE16_LOGGING_INTEGRATION") == "1" {
+		if nativeIntegrationDisablesDocker() {
 			log.Printf("[WARN] Docker orchestration disabled; Docker-backed services are unavailable")
 		} else {
 			svcMgr, err = orchestrator.NewServiceManager()
@@ -331,6 +331,11 @@ func dashboardAuditProject(r *http.Request) string {
 		return project
 	}
 	return strings.TrimSpace(r.Header.Get("X-MiniSky-Project"))
+}
+
+func nativeIntegrationDisablesDocker() bool {
+	return os.Getenv("MINISKY_PHASE16_LOGGING_INTEGRATION") == "1" ||
+		os.Getenv("MINISKY_PHASE16_DNS_INTEGRATION") == "1"
 }
 
 func init() {

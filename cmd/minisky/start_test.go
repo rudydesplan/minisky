@@ -75,6 +75,27 @@ func TestDashboardUnavailableHandlerReturnsStableJSON(t *testing.T) {
 	}
 }
 
+func TestNativeIntegrationDockerBypassIsNarrow(t *testing.T) {
+	for _, name := range []string{
+		"MINISKY_PHASE16_LOGGING_INTEGRATION",
+		"MINISKY_PHASE16_DNS_INTEGRATION",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("MINISKY_PHASE16_LOGGING_INTEGRATION", "")
+			t.Setenv("MINISKY_PHASE16_DNS_INTEGRATION", "")
+			t.Setenv(name, "1")
+			if !nativeIntegrationDisablesDocker() {
+				t.Fatalf("%s did not activate guarded Docker bypass", name)
+			}
+		})
+	}
+	t.Setenv("MINISKY_PHASE16_LOGGING_INTEGRATION", "")
+	t.Setenv("MINISKY_PHASE16_DNS_INTEGRATION", "true")
+	if nativeIntegrationDisablesDocker() {
+		t.Fatal("non-guard value activated Docker bypass")
+	}
+}
+
 type shutdownHandler struct {
 	http.Handler
 	called bool
