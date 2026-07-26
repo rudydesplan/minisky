@@ -178,6 +178,22 @@ overlap any CIDR reported by the current Docker daemon. Cleanup removes only
 captured immutable Docker network IDs after exact ownership-label checks; it
 never prunes Docker or deletes a bridge by name alone.
 
+To verify the same bounded network and subnetwork through the pinned official
+Google Terraform provider, including import and no-drift checks across restart,
+also install Terraform and run:
+
+```bash
+make test-phase16-subnetwork-terraform
+```
+
+This separate opt-in gate applies only `google_compute_network.phase16[0]` and
+`google_compute_subnetwork.phase16[0]` in isolated state. It proves immediate
+and post-restart zero drift, removes the resources from Terraform state without
+deleting the API objects, imports both canonical IDs, verifies another restart,
+then destroys the subnetwork before the network and checks API and Docker
+cleanup. The same collision refusal, dynamic CIDR selection, immutable bridge
+identity checks, and ownership-aware cleanup rules apply.
+
 To verify the generated Vertex AI Go client against MiniSky's bounded
 deterministic endpoint prediction path, including an exact response comparison
 across a clean daemon restart, run:

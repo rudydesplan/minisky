@@ -98,6 +98,25 @@ resource "google_spanner_database" "compatibility" {
   ]
 }
 
+# This opt-in local slice exercises one custom-mode VPC and its single bounded
+# regional IPv4 subnetwork. NAT, peering, PSC, IPv6, and secondary ranges remain
+# explicit non-goals for this compatibility fixture.
+resource "google_compute_network" "phase16" {
+  count = local.use_minisky && var.enable_phase16_network_resources ? 1 : 0
+
+  name                    = var.phase16_network_name
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "phase16" {
+  count = local.use_minisky && var.enable_phase16_network_resources ? 1 : 0
+
+  name          = var.phase16_subnetwork_name
+  ip_cidr_range = var.phase16_subnetwork_cidr
+  network       = google_compute_network.phase16[0].id
+  region        = var.region
+}
+
 # The repository metadata is served by MiniSky while pushed image manifests and
 # blobs live in the profile-owned Registry v2 backend.
 resource "google_artifact_registry_repository" "phase10" {

@@ -1,4 +1,4 @@
-.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
+.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
 
 ui-build:
 	cd ui && npm ci && npm run build
@@ -36,6 +36,9 @@ test-phase16-dns:
 
 test-phase16-subnetwork:
 	MINISKY_PHASE16_SUBNETWORK_INTEGRATION=1 ./scripts/phase16-subnetwork-integration.sh
+
+test-phase16-subnetwork-terraform:
+	MINISKY_PHASE16_SUBNETWORK_TERRAFORM_INTEGRATION=1 ./scripts/phase16-subnetwork-terraform-integration.sh
 
 test-phase16-vertex:
 	MINISKY_PHASE16_VERTEX_INTEGRATION=1 ./scripts/phase16-vertex-integration.sh

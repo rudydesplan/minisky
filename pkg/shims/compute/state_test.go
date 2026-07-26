@@ -136,4 +136,33 @@ func TestComputeLegacyStateNormalizesSubnetworkMetadata(t *testing.T) {
 		t.Fatalf("legacy metadata was not normalized: subnetworks=%#v nextID=%d",
 			api.subnetworks, api.nextSubnetworkID)
 	}
+	if got := api.networks["test-project:custom"].NetworkFirewallPolicyEnforcementOrder; got != "AFTER_CLASSIC_FIREWALL" {
+		t.Fatalf("legacy network enforcement order = %q", got)
+	}
+}
+
+func TestComputeRejectsPersistedUnsupportedNetworkEnforcementOrder(t *testing.T) {
+	t.Parallel()
+	store, err := state.New(t.TempDir(), "unsupported-network-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(computeStateEntry, computeMetadata{
+		Networks: map[string]*Network{
+			"test-project:custom": {
+				Name:                                  "custom",
+				NetworkFirewallPolicyEnforcementOrder: "BEFORE_CLASSIC_FIREWALL",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), &orchestrator.ServiceManager{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.initializationError(); err == nil ||
+		!strings.Contains(err.Error(), "unsupported firewall policy enforcement order") {
+		t.Fatalf("initialization error = %v", err)
+	}
 }

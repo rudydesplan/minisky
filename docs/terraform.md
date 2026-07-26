@@ -4,7 +4,8 @@ The tracked `terraform/` configuration is a reproducible compatibility example
 for the official Google provider. Its tested local scope is deliberately
 limited to BigQuery dataset/table metadata, an IAM service account, and a
 Docker-backed Storage bucket. The fixture also contains optional local
-Phase-15 Redis and Spanner resources, disabled by default.
+Phase-15 Redis and Spanner resources and a bounded Phase-16 custom network plus
+regional IPv4 subnetwork, disabled by default.
 
 ## Local profile
 
@@ -63,6 +64,19 @@ when existing MiniSky containers or networks are present.
 Set `MINISKY_TERRAFORM_PHASE15=1` to opt the guarded script into the Redis and
 Spanner Terraform resources. The separate Phase-15 emulator integration remains
 the authoritative data-plane gate.
+
+The bounded Phase-16 network and subnetwork have a separate guarded lifecycle
+and import gate:
+
+```bash
+MINISKY_PHASE16_SUBNETWORK_TERRAFORM_INTEGRATION=1 \
+  ./scripts/phase16-subnetwork-terraform-integration.sh
+```
+
+It applies only the opt-in network resources, requires zero drift before and
+after daemon restart, detaches and imports both canonical IDs without deleting
+the API resources or Docker bridge, repeats the restart/no-drift check, then
+destroys in dependency order and verifies durable API and bridge cleanup.
 
 The metadata durability subset has a separate opt-in gate:
 

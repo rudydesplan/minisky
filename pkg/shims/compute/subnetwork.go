@@ -45,10 +45,14 @@ type Subnetwork struct {
 }
 
 type subnetworkInsertRequest struct {
-	Name                  string `json:"name"`
-	Description           string `json:"description"`
-	IPCidrRange           string `json:"ipCidrRange"`
-	Network               string `json:"network"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	IPCidrRange string `json:"ipCidrRange"`
+	Network     string `json:"network"`
+	Region      string `json:"region"`
+	LogConfig   *struct {
+		Enable bool `json:"enable"`
+	} `json:"logConfig"`
 	PrivateIPGoogleAccess bool   `json:"privateIpGoogleAccess"`
 	Purpose               string `json:"purpose"`
 	StackType             string `json:"stackType"`
@@ -91,6 +95,10 @@ func (api *API) insertSubnetwork(w http.ResponseWriter, r *http.Request, project
 	request, status, symbolic, err := decodeSubnetworkInsert(w, r)
 	if err != nil {
 		writeErrorStatus(w, status, symbolic, err.Error())
+		return
+	}
+	if err := validateSubnetworkRequestRegion(project, region, request.Region); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 	networkName, err := resolveSubnetworkNetwork(project, request.Network)
@@ -414,9 +422,10 @@ func (api *API) deleteSubnetwork(w http.ResponseWriter, r *http.Request, project
 
 func (api *API) insertNetwork(w http.ResponseWriter, r *http.Request, project string) {
 	var body struct {
-		Name                  string `json:"name"`
-		Description           string `json:"description"`
-		AutoCreateSubnetworks bool   `json:"autoCreateSubnetworks"`
+		Name                                  string `json:"name"`
+		Description                           string `json:"description"`
+		AutoCreateSubnetworks                 bool   `json:"autoCreateSubnetworks"`
+		NetworkFirewallPolicyEnforcementOrder string `json:"networkFirewallPolicyEnforcementOrder"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid network JSON")
@@ -427,17 +436,28 @@ func (api *API) insertNetwork(w http.ResponseWriter, r *http.Request, project st
 			"auto-mode VPC networks are not implemented")
 		return
 	}
+	if body.NetworkFirewallPolicyEnforcementOrder != "" &&
+		body.NetworkFirewallPolicyEnforcementOrder != "AFTER_CLASSIC_FIREWALL" {
+		writeErrorStatus(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"only network firewall policy enforcement order AFTER_CLASSIC_FIREWALL is supported")
+		return
+	}
 	network := &Network{
-		Kind:                  "compute#network",
-		ID:                    randomNumericID(),
-		Name:                  body.Name,
-		Description:           body.Description,
-		AutoCreateSubnetworks: body.AutoCreateSubnetworks,
-		SelfLink:              networkSelfLink(project, body.Name),
-		CreationTimestamp:     time.Now().UTC().Format(time.RFC3339),
+		Kind:                                  "compute#network",
+		ID:                                    randomNumericID(),
+		Name:                                  body.Name,
+		Description:                           body.Description,
+		AutoCreateSubnetworks:                 body.AutoCreateSubnetworks,
+		NetworkFirewallPolicyEnforcementOrder: "AFTER_CLASSIC_FIREWALL",
+		SelfLink:                              networkSelfLink(project, body.Name),
+		CreationTimestamp:                     time.Now().UTC().Format(time.RFC3339),
 	}
 	key := project + ":" + body.Name
 
+	if api.opMgr == nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "operation manager is unavailable")
+		return
+	}
 	api.persistMu.Lock()
 	api.mu.Lock()
 	if api.networks[key] != nil {
@@ -446,6 +466,14 @@ func (api *API) insertNetwork(w http.ResponseWriter, r *http.Request, project st
 		writeErrorStatus(w, http.StatusConflict, "ALREADY_EXISTS", "Network "+body.Name+" already exists")
 		return
 	}
+	api.mu.Unlock()
+	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", network.SelfLink, "", "")
+	if err != nil {
+		api.persistMu.Unlock()
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.mu.Lock()
 	api.networks[key] = network
 	payload, snapshotErr := api.marshalMetadataLocked()
 	api.mu.Unlock()
@@ -454,6 +482,7 @@ func (api *API) insertNetwork(w http.ResponseWriter, r *http.Request, project st
 		delete(api.networks, key)
 		api.mu.Unlock()
 		api.persistMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "network metadata snapshot failed")
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "snapshot network metadata: "+snapshotErr.Error())
 		return
 	}
@@ -462,20 +491,12 @@ func (api *API) insertNetwork(w http.ResponseWriter, r *http.Request, project st
 		delete(api.networks, key)
 		api.mu.Unlock()
 		api.persistMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "network metadata commit failed")
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist network metadata: "+err.Error())
 		return
 	}
 	api.persistMu.Unlock()
 
-	if api.opMgr == nil {
-		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "operation manager is unavailable")
-		return
-	}
-	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", network.SelfLink, "", "")
-	if err != nil {
-		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
-		return
-	}
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -537,15 +558,28 @@ func (api *API) deleteNetwork(w http.ResponseWriter, r *http.Request, project, n
 		}
 	}
 	api.mu.Unlock()
+	if api.opMgr == nil {
+		api.persistMu.Unlock()
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "operation manager is unavailable")
+		return
+	}
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", network.SelfLink, "", "")
+	if err != nil {
+		api.persistMu.Unlock()
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 	if sameNameNetworks == 1 {
 		if api.legacyVPC == nil {
 			api.persistMu.Unlock()
+			_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "legacy VPC cleanup backend is unavailable")
 			writeErrorStatus(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION",
 				"legacy VPC cleanup backend is unavailable")
 			return
 		}
 		if err := api.legacyVPC.DeleteLegacyVPCNetwork(r.Context(), name); err != nil {
 			api.persistMu.Unlock()
+			_ = api.opMgr.FailDurable(op.Name, http.StatusBadRequest, "legacy VPC bridge cleanup failed")
 			writeErrorStatus(w, http.StatusBadRequest, "FAILED_PRECONDITION",
 				"legacy VPC bridge cleanup failed: "+err.Error())
 			return
@@ -560,6 +594,7 @@ func (api *API) deleteNetwork(w http.ResponseWriter, r *http.Request, project, n
 		api.networks[key] = network
 		api.mu.Unlock()
 		api.persistMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "network metadata snapshot failed")
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "snapshot network metadata: "+snapshotErr.Error())
 		return
 	}
@@ -568,20 +603,12 @@ func (api *API) deleteNetwork(w http.ResponseWriter, r *http.Request, project, n
 		api.networks[key] = network
 		api.mu.Unlock()
 		api.persistMu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "network metadata commit failed")
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist network deletion: "+err.Error())
 		return
 	}
 	api.persistMu.Unlock()
 
-	if api.opMgr == nil {
-		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "operation manager is unavailable")
-		return
-	}
-	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", network.SelfLink, "", "")
-	if err != nil {
-		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
-		return
-	}
 	api.opMgr.RunAsync(op.Name, func() error { return nil })
 	w.WriteHeader(http.StatusOK)
 	writeComputeOperation(w, project, op)
@@ -628,6 +655,9 @@ func validateSubnetworkRequest(request subnetworkInsertRequest) (netip.Prefix, e
 	if request.PrivateIPGoogleAccess {
 		return netip.Prefix{}, &unsupportedSubnetworkFieldError{"privateIpGoogleAccess changes are not implemented"}
 	}
+	if request.LogConfig != nil && request.LogConfig.Enable {
+		return netip.Prefix{}, &unsupportedSubnetworkFieldError{"subnetwork flow logs are not implemented"}
+	}
 	if request.Purpose != "" && request.Purpose != "PRIVATE" {
 		return netip.Prefix{}, &unsupportedSubnetworkFieldError{"only purpose PRIVATE is supported"}
 	}
@@ -641,17 +671,36 @@ func resolveSubnetworkNetwork(project, value string) (string, error) {
 	if gceResourceName.MatchString(value) {
 		return value, nil
 	}
-	const marker = "https://www.googleapis.com/compute/v1/projects/"
-	if !strings.HasPrefix(value, marker) {
+	remaining := value
+	const canonicalPrefix = "https://www.googleapis.com/compute/v1/"
+	if strings.HasPrefix(remaining, canonicalPrefix) {
+		remaining = strings.TrimPrefix(remaining, canonicalPrefix)
+	}
+	if !strings.HasPrefix(remaining, "projects/") {
 		return "", errors.New("network must be a name or canonical Compute network self-link")
 	}
-	remaining := strings.TrimPrefix(value, marker)
 	parts := strings.Split(remaining, "/")
-	if len(parts) != 4 || parts[0] != project || parts[1] != "global" ||
-		parts[2] != "networks" || !gceResourceName.MatchString(parts[3]) {
+	if len(parts) != 5 || parts[0] != "projects" || parts[1] != project || parts[2] != "global" ||
+		parts[3] != "networks" || !gceResourceName.MatchString(parts[4]) {
 		return "", errors.New("network self-link must reference the same project")
 	}
-	return parts[3], nil
+	return parts[4], nil
+}
+
+func validateSubnetworkRequestRegion(project, region, value string) error {
+	if value == "" || value == region {
+		return nil
+	}
+	remaining := value
+	const canonicalPrefix = "https://www.googleapis.com/compute/v1/"
+	if strings.HasPrefix(remaining, canonicalPrefix) {
+		remaining = strings.TrimPrefix(remaining, canonicalPrefix)
+	}
+	if remaining != fmt.Sprintf("projects/%s/regions/%s", project, region) &&
+		remaining != fmt.Sprintf("projects/%s/global/regions/%s", project, region) {
+		return fmt.Errorf("region %q must match the project and region in the request path", value)
+	}
+	return nil
 }
 
 func parseSubnetworkPath(path string) (project, region, name string, collection, ok bool) {

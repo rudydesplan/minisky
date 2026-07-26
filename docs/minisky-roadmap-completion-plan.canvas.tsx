@@ -28,7 +28,7 @@ const phases = [
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
-  ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, one custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
+  ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
 ];
 
@@ -95,9 +95,9 @@ const waves = [
       "16.1 Monitoring write plus bounded PromQL instant-query subset and profile-scoped Logging filters/sinks; keep deprecated MQL unsupported.",
       "16.2 Vertex prediction MVP using deterministic mocks; optional Ollama remains a separate backend.",
       "16.3 DNS local resolution backed by the existing zone store.",
-      "16.4 Bounded subnetwork/IPv4 IPAM is complete; NAT, peering, and PSC remain future work.",
+      "16.4 Bounded subnetwork/IPv4 IPAM plus provider apply/import/no-drift/destroy is complete; workload connectivity, NAT, peering, and PSC remain future work.",
     ],
-    gate: "No fidelity promotion without SDK, persistence, and data-plane evidence; the subnet gate passed on local Docker Desktop/macOS and has opt-in Linux CI configured.",
+    gate: "No fidelity promotion without SDK, provider, persistence, and data-plane evidence; both subnet gates passed on local Docker Desktop/macOS and have opt-in Linux CI configured.",
   },
   {
     title: "Wave 7 — Delivery ecosystem before enterprise",
@@ -132,17 +132,17 @@ export default function MiniSkyRoadmapCompletionPlan() {
         Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
         delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL, Logging, DNS/UDP,
-        Subnetwork/IPAM, and Vertex prediction restart gates, and Phase-17 federated RBAC/quota/audit integration.
-        Fourteen guarded local gates have passed. Native amd64 and arm64 deb/rpm
+        Subnetwork/IPAM SDK and Terraform, and Vertex prediction restart gates, and Phase-17 federated
+        RBAC/quota/audit integration. Fifteen guarded local gates have passed. Native amd64 and arm64 deb/rpm
         build-install-smoke-uninstall jobs also pass in read-only CI; the opt-in Phase-9 event-delivery, Phase-16
-        subnetwork, and Phase-17 CI jobs are configured but have no CI pass evidence yet. Production-grade semantics
-        remain explicit external boundaries.
+        subnetwork SDK and Terraform, and Phase-17 CI jobs are configured but have no CI pass evidence yet.
+        Production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>14 passed</H2><Text tone="secondary">Including Phase-16 Subnetwork/IPAM</Text></CardBody>
+          <CardBody><H2>15 passed</H2><Text tone="secondary">Including Phase-16 provider import</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Native release smoke</CardHeader>
@@ -237,6 +237,13 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Docker bridge retained its immutable Docker ID, labels, bridge driver, and single CIDR/IPAM. Deleting the
             subnetwork and then the network removed the bridge; a third start verified API 404 and list cleanup.
           </Text>
+          <Text>
+            The pinned Google provider 7.41.0 then applied <Code>google_compute_network</Code> and
+            <Code>google_compute_subnetwork</Code>, reached zero drift, restarted without bridge-ID churn, detached
+            and imported both canonical IDs without deleting API or Docker state, reached zero drift before and after
+            another restart, and destroyed in dependency order. A final restart confirmed API 404 and exact bridge
+            cleanup. The guarded local run passed in 40 seconds.
+          </Text>
           <Text tone="secondary">
             Unit, race, and failure tests cover strict 1 MiB ingress, canonical /8–/29 IPv4, one primary subnet per
             custom VPC, project overlap rejection, page-token binding, save/LRO failure, parent and instance reference
@@ -325,9 +332,9 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: run an opt-in Google provider
-        <Code>google_compute_network</Code> + <Code>google_compute_subnetwork</Code> apply/import/no-drift/destroy gate
-        against this bounded slice before any NAT, peering, or PSC expansion.
+        Next internal executable milestone: prove one generated-client and provider-managed Compute instance can attach
+        to the bounded custom subnetwork and exchange traffic through the exact owned bridge before any NAT, peering,
+        or PSC expansion.
         Homebrew, Scoop, deb, and rpm publication remains externally blocked until maintainer-owned repositories,
         scoped credentials, protected approval environments, and native install-from-repository tests exist.
       </Callout>

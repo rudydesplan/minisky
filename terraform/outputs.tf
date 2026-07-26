@@ -43,6 +43,16 @@ output "phase15_spanner_database_name" {
   value       = var.enable_phase15_resources ? google_spanner_database.compatibility[0].name : null
 }
 
+output "phase16_network_id" {
+  description = "Canonical ID of the optional local Phase-16 custom network, or null when disabled"
+  value       = local.use_minisky && var.enable_phase16_network_resources ? google_compute_network.phase16[0].id : null
+}
+
+output "phase16_subnetwork_id" {
+  description = "Canonical ID of the optional local Phase-16 regional subnetwork, or null when disabled"
+  value       = local.use_minisky && var.enable_phase16_network_resources ? google_compute_subnetwork.phase16[0].id : null
+}
+
 output "phase10_artifact_repository_name" {
   description = "Name of the optional local Phase-10 Artifact Registry repository, or null when disabled"
   value       = var.enable_phase10_artifact_resources ? google_artifact_registry_repository.phase10[0].name : null

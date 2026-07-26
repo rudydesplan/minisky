@@ -193,7 +193,7 @@ and is not safe to invoke from standalone diagnostics.
 | Phase | Feature set | Verification | Status |
 | :--- | :--- | :--- | :---: |
 | 6 | Service fidelity baseline and compatibility matrices | Every registered domain has manifest/docs coherence and an executable in-process or backend-gated contract | ✅ Baseline |
-| 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; Phase-15 Redis and Spanner resources are optional | ✅ Baseline |
+| 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; bounded Phase-15 data and Phase-16 network resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
 | 9 | Executable serverless and event delivery | A guarded local Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes; Scheduler remains manual `:run` E2E | ✅ Verified bounded local slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
@@ -202,7 +202,7 @@ and is not safe to invoke from standalone diagnostics.
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
-| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, one custom-VPC IPv4 subnetwork/Docker bridge, and deterministic Vertex predictions; advanced networking remains bounded | ✅ Verified bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and Vertex slices |
+| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, one custom-VPC IPv4 subnetwork/Docker bridge, and deterministic Vertex predictions; the bounded network also passes provider apply/import/no-drift/destroy | ✅ Verified bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and Vertex slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
 
 ### Phase 6 — Fidelity baseline
@@ -226,8 +226,8 @@ and is not safe to invoke from standalone diagnostics.
 - Expand the Terraform example only where the provider-visible lifecycle is
   proven. The current fixture includes BigQuery, IAM, Storage, cross-project
   Pub/Sub, optional Phase-10 Compute/Artifact Registry resources, and optional
-  Phase-15 Memorystore/Spanner resources; Cloud SQL and serverless remain
-  outside this fixture.
+  Phase-15 Memorystore/Spanner and Phase-16 custom-network/subnetwork resources;
+  Cloud SQL and serverless remain outside this fixture.
 - Run `terraform apply`, resource assertions, a no-drift plan, and
   `terraform destroy` in CI.
 - Publish `docs/terraform-compatibility.md` with provider resources, endpoint
@@ -427,6 +427,19 @@ parent/instance reference guards, exact project-scoped VM/network Docker
 identities, unowned or mismatched resource refusal, ambiguous-create recovery,
 attached-endpoint delete failure, fail-closed compensation, and state-graph
 validation. The opt-in Linux CI job is configured but has no CI pass evidence.
+
+The official Google provider `7.41.0` now has a separate guarded gate for
+`google_compute_network` and `google_compute_subnetwork`. On 2026-07-26,
+`make test-phase16-subnetwork-terraform` passed locally in 40 seconds. It
+applied the two opt-in resources, required an immediate zero-change plan,
+restarted MiniSky without changing the owned Docker bridge ID, detached both
+resources from Terraform state without deleting them, imported their canonical
+IDs, required zero drift before and after another restart, destroyed the
+subnetwork before the network, and verified API `404` plus bridge cleanup after
+a final restart. Provider-generated disabled flow-log defaults, relative
+network references, regional request encoding, and classic-firewall enforcement
+defaults are accepted only within the bounded semantics. The opt-in Terraform
+CI job is configured but has no CI pass evidence.
 
 A guarded Monitoring gate used
 the official generated REST client to create a descriptor and write a sample,

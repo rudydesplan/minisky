@@ -173,13 +173,14 @@ type InstanceGroup struct {
 
 // Network represents a VPC network.
 type Network struct {
-	Kind                  string `json:"kind"`
-	ID                    string `json:"id"`
-	Name                  string `json:"name"`
-	Description           string `json:"description,omitempty"`
-	SelfLink              string `json:"selfLink"`
-	AutoCreateSubnetworks bool   `json:"autoCreateSubnetworks"`
-	CreationTimestamp     string `json:"creationTimestamp"`
+	Kind                                  string `json:"kind"`
+	ID                                    string `json:"id"`
+	Name                                  string `json:"name"`
+	Description                           string `json:"description,omitempty"`
+	SelfLink                              string `json:"selfLink"`
+	AutoCreateSubnetworks                 bool   `json:"autoCreateSubnetworks"`
+	NetworkFirewallPolicyEnforcementOrder string `json:"networkFirewallPolicyEnforcementOrder"`
+	CreationTimestamp                     string `json:"creationTimestamp"`
 }
 
 // SecurityPolicy represents a Cloud Armor WAF rule set.
