@@ -2,6 +2,7 @@ package validator
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,5 +97,53 @@ func TestValidateRequestEmitsGCPError(t *testing.T) {
 	}
 	if response.Error.Code != http.StatusBadRequest || response.Error.Status != "INVALID_ARGUMENT" {
 		t.Fatalf("unexpected error response: %+v", response.Error)
+	}
+}
+
+func TestValidateRequestRejectsBoundedSubnetworkBodyBeforeAllocation(t *testing.T) {
+	body := `{"name":"large","ipCidrRange":"10.0.0.0/24","network":"custom","description":"` +
+		strings.Repeat("x", (1<<20)+1) + `"}`
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"http://compute.googleapis.com/compute/v1/projects/demo/regions/us-central1/subnetworks",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	if ok := NewValidator().ValidateRequestForDomain(rec, req, "compute.googleapis.com"); ok {
+		t.Fatal("oversized bounded request passed validation")
+	}
+	if rec.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(rec.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	remaining, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) == len(body) {
+		t.Fatal("oversized request body was restored")
+	}
+}
+
+func TestValidateRequestPreservesUnboundedRuleBehavior(t *testing.T) {
+	body := `{"name":"network","description":"` + strings.Repeat("x", (1<<20)+1) + `"}`
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"http://compute.googleapis.com/compute/v1/projects/demo/global/networks",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if ok := NewValidator().ValidateRequestForDomain(rec, req, "compute.googleapis.com"); !ok {
+		t.Fatalf("unbounded network rule rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != body {
+		t.Fatal("unbounded request body was not preserved")
 	}
 }

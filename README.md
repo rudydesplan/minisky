@@ -202,7 +202,7 @@ and is not safe to invoke from standalone diagnostics.
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
-| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, and deterministic Vertex predictions; advanced networking remains bounded | ✅ Verified bounded Monitoring, Logging, DNS, and Vertex slices |
+| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, one custom-VPC IPv4 subnetwork/Docker bridge, and deterministic Vertex predictions; advanced networking remains bounded | ✅ Verified bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and Vertex slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
 
 ### Phase 6 — Fidelity baseline
@@ -410,9 +410,25 @@ and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
 
-**Status (2026-07-26): bounded Monitoring, Logging, DNS, and Vertex slices
-verified.** Subnetwork/IPAM contracts have focused tests. A guarded Monitoring
-gate used
+**Status (2026-07-26): bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and
+Vertex slices verified.** On 2026-07-26, `make test-phase16-subnetwork` passed
+locally on Docker Desktop/macOS in 17 seconds. The official generated
+`google.golang.org/api/compute/v1` client created a custom-mode global network
+and one regional IPv4 subnetwork, polled global and regional operations,
+captured stable supported network/subnetwork fields, restarted against the same
+profile, and verified exact supported metadata. It proved that one exact
+project/profile-owned Docker bridge retained the same immutable Docker ID,
+labels, bridge driver, and single CIDR/IPAM. It then deleted the subnetwork and
+network, proved the bridge absent, restarted a third time, and verified API
+`404` and list cleanup. Unit, race, and failure tests cover strict 1 MiB ingress,
+canonical IPv4 prefixes from `/8` through `/29`, one subnet per custom VPC,
+project overlap rejection, page-token binding, save/LRO failure,
+parent/instance reference guards, exact project-scoped VM/network Docker
+identities, unowned or mismatched resource refusal, ambiguous-create recovery,
+attached-endpoint delete failure, fail-closed compensation, and state-graph
+validation. The opt-in Linux CI job is configured but has no CI pass evidence.
+
+A guarded Monitoring gate used
 the official generated REST client to create a descriptor and write a sample,
 restarted MiniSky against the same isolated profile, and retrieved the
 persisted value through the canonical project-scoped PromQL instant-query
@@ -465,8 +481,13 @@ stores, log-based alerting, and peering/NAT/PSC remain unsupported.
   bounded PromQL query path; keep deprecated MQL explicitly unsupported.
 - Emulate Cloud Logging with bounded persisted entries and sink metadata;
   log-based metrics and alerting policy evaluation remain future work.
-- Implement VPC peering, Private Service Connect, and Cloud NAT with local
-  network routing.
+- Keep the verified networking slice bounded to one explicit primary IPv4
+  subnetwork per custom VPC mapped to one profile-owned Docker bridge.
+- Treat auto-mode networks, multiple VM network interfaces, multiple or
+  secondary ranges, IPv6, routes, workload connectivity, firewall packet
+  isolation, Shared VPC, host
+  routing/iptables, cross-host semantics, NAT, peering, PSC, VPN/interconnect,
+  and full GCP VPC parity as future work.
 - Extend the bounded persisted DNS zone, record-set, and loopback resolution
   slice only where explicit client and protocol evidence exists.
 

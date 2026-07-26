@@ -68,6 +68,22 @@ var embeddedRules = []ServiceSchema{
 				},
 			},
 
+			// subnetworks.insert — requires the bounded primary IPv4 contract
+			{
+				HTTPMethod:   "POST",
+				PathGlob:     "/compute/v1/projects/*/regions/*/subnetworks",
+				ContentType:  "application/json",
+				MaxBodyBytes: 1 << 20,
+				RequiredBody: []BodyField{
+					{Path: "name", Type: "string",
+						Message: "field 'name' is required for subnetworks.insert"},
+					{Path: "ipCidrRange", Type: "string",
+						Message: "field 'ipCidrRange' is required for subnetworks.insert"},
+					{Path: "network", Type: "string",
+						Message: "field 'network' is required for subnetworks.insert"},
+				},
+			},
+
 			// securityPolicies.insert — requires `name`
 			{
 				HTTPMethod:  "POST",

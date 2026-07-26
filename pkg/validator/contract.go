@@ -82,9 +82,17 @@ func (v *Validator) ValidateRequestForDomain(w http.ResponseWriter, r *http.Requ
 	// ── 5. JSON body and required fields ─────────────────────────────────────
 	if len(rule.RequiredBody) > 0 || rule.ContentType == "application/json" {
 		// Read body once, then restore it so the downstream shim can read it too.
-		raw, err := io.ReadAll(r.Body)
+		reader := io.Reader(r.Body)
+		if rule.MaxBodyBytes > 0 {
+			reader = io.LimitReader(r.Body, rule.MaxBodyBytes+1)
+		}
+		raw, err := io.ReadAll(reader)
 		if err != nil {
 			return v.emitError(w, 400, "INVALID_ARGUMENT", "Cannot read request body: "+err.Error())
+		}
+		if rule.MaxBodyBytes > 0 && int64(len(raw)) > rule.MaxBodyBytes {
+			return v.emitError(w, http.StatusRequestEntityTooLarge, "INVALID_ARGUMENT",
+				fmt.Sprintf("Request body exceeds %d bytes.", rule.MaxBodyBytes))
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 

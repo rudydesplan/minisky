@@ -87,6 +87,14 @@ Cloud SQL, serverless, GKE/Kind, and Compute load-balancer resources. See
 `docs/service-compatibility.md` for their implementation status; API routes
 alone do not establish provider compatibility.
 
+The separate Phase-16 subnetwork/IPAM gate uses the official generated
+`google.golang.org/api/compute/v1` client, not the Google Terraform provider.
+Its custom-network and one-subnetwork create/list/get/delete, operation polling,
+restart, and exact Docker-bridge reconciliation evidence is API evidence only.
+It does not establish Terraform schema, import, refresh/no-drift, or destroy
+compatibility; `google_compute_network` and `google_compute_subnetwork` remain
+unclaimed here.
+
 ## Go and Python SDK smoke suites
 
 Phase 7 includes self-contained smoke programs in `sdk-smoke/go` and

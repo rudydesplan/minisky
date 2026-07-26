@@ -114,3 +114,26 @@ func TestComputeStateMissingAndCorrupt(t *testing.T) {
 		t.Fatalf("corrupt state error = %v", err)
 	}
 }
+
+func TestComputeLegacyStateNormalizesSubnetworkMetadata(t *testing.T) {
+	t.Parallel()
+	store, err := state.New(t.TempDir(), "legacy-subnetworks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(computeStateEntry, computeMetadata{
+		Networks: map[string]*Network{
+			"test-project:custom": {Name: "custom"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), &orchestrator.ServiceManager{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api.subnetworks == nil || api.nextSubnetworkID != 1 {
+		t.Fatalf("legacy metadata was not normalized: subnetworks=%#v nextID=%d",
+			api.subnetworks, api.nextSubnetworkID)
+	}
+}

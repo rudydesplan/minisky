@@ -1049,6 +1049,35 @@ func TestServeHTTPCanonicalEndpointUsesResolvedDomainForValidation(t *testing.T)
 	}
 }
 
+func TestServeHTTPCanonicalComputeEndpointRejectsOversizedSubnetworkBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	dispatched := false
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("compute.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatched = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	body := `{"name":"large","ipCidrRange":"10.0.0.0/24","network":"custom","description":"` +
+		strings.Repeat("x", (1<<20)+1) + `"}`
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost:8080/_minisky/compute/compute/v1/projects/demo/regions/us-central1/subnetworks",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(rec.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if dispatched {
+		t.Fatal("oversized request reached Compute shim")
+	}
+}
+
 func TestServeHTTPRoutesLocalComputeRequest(t *testing.T) {
 	t.Parallel()
 

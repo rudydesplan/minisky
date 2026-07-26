@@ -156,6 +156,28 @@ change batches have MiniSky-specific safety bounds, and the gate does not imply
 pagination, DNSSEC signing, recursion, private-network enforcement, or broader
 DNS protocol support.
 
+To verify the Phase 16 custom-network and regional-subnetwork slice through the
+generated `google.golang.org/api/compute/v1` client and a real Docker bridge,
+start Docker and install `curl`, `docker`, `go`, and `python3`, then run:
+
+```bash
+make test-phase16-subnetwork
+```
+
+This opt-in gate creates one fixed-name custom network and one regional IPv4
+subnetwork in isolated temporary MiniSky state. It proves generated-client
+global and regional operation polling, stable metadata across restart, exact
+Docker bridge labels/IPAM, bridge-ID preservation during reconciliation, and
+durable API cleanup after a third start. It does not claim auto-mode networks,
+IPv6, secondary ranges, workload attachment, routes, firewall isolation, or
+general GCP VPC parity.
+
+The harness serializes access to MiniSky's fixed `minisky-net`, refuses to run
+if that network already exists, and chooses a canonical `/24` that does not
+overlap any CIDR reported by the current Docker daemon. Cleanup removes only
+captured immutable Docker network IDs after exact ownership-label checks; it
+never prunes Docker or deletes a bridge by name alone.
+
 To verify the generated Vertex AI Go client against MiniSky's bounded
 deterministic endpoint prediction path, including an exact response comparison
 across a clean daemon restart, run:

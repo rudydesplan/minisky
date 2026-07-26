@@ -24,6 +24,9 @@ type MethodSchema struct {
 	// ContentType enforces a specific Content-Type header on the request.
 	// Leave empty to skip Content-Type checking.
 	ContentType string
+	// MaxBodyBytes bounds this method's body before allocation. Zero leaves the
+	// existing unbounded behavior unchanged.
+	MaxBodyBytes int64
 }
 
 // BodyField describes one required JSON field with its expected type.
