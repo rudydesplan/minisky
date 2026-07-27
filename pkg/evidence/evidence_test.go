@@ -3,6 +3,7 @@ package evidence
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -33,6 +34,7 @@ func TestPhase18To25InventoryMatchesRegistryTruth(t *testing.T) {
 	}
 
 	seen := make(map[string]bool, len(inventory))
+	terraformClaims := 0
 	for _, entry := range inventory {
 		if seen[entry.Domain] {
 			t.Errorf("duplicate evidence entry for %s", entry.Domain)
@@ -56,7 +58,17 @@ func TestPhase18To25InventoryMatchesRegistryTruth(t *testing.T) {
 			t.Errorf("%s has no offline strict-IAM gateway evidence route", entry.Domain)
 		}
 		if entry.TerraformClaim {
-			t.Errorf("%s must not claim Terraform compatibility", entry.Domain)
+			terraformClaims++
+			if entry.Domain != "workflows.googleapis.com" && entry.Domain != "eventarc.googleapis.com" &&
+				entry.Domain != "composer.googleapis.com" && entry.Domain != "managedkafka.googleapis.com" &&
+				entry.Domain != "file.googleapis.com" && entry.Domain != "identityplatform.googleapis.com" &&
+				entry.Domain != "alloydb.googleapis.com" && entry.Domain != "servicedirectory.googleapis.com" &&
+				entry.Domain != "documentai.googleapis.com" && entry.Domain != "orgpolicy.googleapis.com" {
+				if entry.Domain == "storagetransfer.googleapis.com" {
+					continue
+				}
+				t.Errorf("%s has an unexpected Terraform compatibility claim", entry.Domain)
+			}
 		}
 		if service.Persistence == registry.PersistenceFile ||
 			service.Persistence == registry.PersistenceHybrid {
@@ -71,6 +83,9 @@ func TestPhase18To25InventoryMatchesRegistryTruth(t *testing.T) {
 				t.Errorf("%s claims durable persistence without named restart evidence", entry.Domain)
 			}
 		}
+	}
+	if terraformClaims != 11 {
+		t.Errorf("Terraform claims = %d, want eleven passed bounded provider lifecycles", terraformClaims)
 	}
 }
 
@@ -121,6 +136,7 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 	}
 	byID := make(map[string]BatchGate, len(gates))
 	domainGate := make(map[string]string)
+	terraformCheckByDomain := make(map[string]string)
 	cache := make(map[string]string)
 	makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
 	if err != nil {
@@ -158,7 +174,6 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			"daemonRestart":            gate.DaemonRestart,
 			"realBackendDocker":        gate.RealBackendDocker,
 			"strictIAM":                gate.StrictIAM,
-			"terraform":                gate.Terraform,
 			"cleanup":                  gate.Cleanup,
 			"ci":                       gate.CI,
 		}
@@ -210,7 +225,6 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			gate.DaemonRestart.Status != restartStatus ||
 			gate.RealBackendDocker.Status != backendStatus ||
 			gate.StrictIAM.Status != EvidenceLocalPassed ||
-			gate.Terraform.Status != EvidenceAbsent ||
 			gate.Cleanup.Status != cleanupStatus ||
 			gate.CI.Status != EvidenceCIPassed {
 			t.Errorf("%s overstates or conflates batch evidence: %+v", gate.ID, gate)
@@ -219,9 +233,27 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			gate.CI.Commit != "62d6fa245774f3ff3bdd9b82e19d1c617650d448" {
 			t.Errorf("%s CI evidence does not identify the passing run and commit: %+v", gate.ID, gate.CI)
 		}
-		if len(gate.Terraform.References) != 0 || gate.Terraform.Script != "" ||
-			gate.Terraform.MakeTarget != "" {
-			t.Errorf("%s creates a Terraform claim without a provider gate", gate.ID)
+		for _, check := range gate.TerraformChecks {
+			if prior := terraformCheckByDomain[check.Domain]; prior != "" {
+				t.Errorf("%s has Terraform checks in both %s and %s", check.Domain, prior, gate.ID)
+			}
+			terraformCheckByDomain[check.Domain] = gate.ID
+			if domainGate[check.Domain] != gate.ID {
+				t.Errorf("%s Terraform check is not owned by batch %s", check.Domain, gate.ID)
+			}
+			if check.Status != EvidenceLocalPassed || check.Note == "" ||
+				len(check.References) == 0 || check.Script == "" || check.MakeTarget == "" {
+				t.Errorf("%s has incomplete per-domain Terraform evidence: %+v", check.Domain, check)
+			}
+			for _, reference := range check.References {
+				assertTestReferences(t, root, cache, check.Domain+" terraform", reference.Package, reference.Tests)
+			}
+			if _, err := os.Stat(filepath.Join(root, check.Script)); err != nil {
+				t.Errorf("%s Terraform script %q: %v", check.Domain, check.Script, err)
+			}
+			if !strings.Contains(string(makefile), "\n"+check.MakeTarget+":") {
+				t.Errorf("%s references missing Terraform Make target %q", check.Domain, check.MakeTarget)
+			}
 		}
 		generatedSource := ""
 		for _, reference := range gate.GeneratedClientLifecycle.References {
@@ -251,6 +283,16 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			t.Errorf("%s has unknown generated-client boundary %q",
 				entry.Domain, entry.GeneratedClientBoundary)
 		}
+		checkGate, hasCheck := terraformCheckByDomain[entry.Domain]
+		if entry.TerraformClaim && (!hasCheck || checkGate != entry.BatchGate) {
+			t.Errorf("%s claims Terraform without its own batch-scoped check", entry.Domain)
+		}
+		if !entry.TerraformClaim && hasCheck {
+			t.Errorf("%s has Terraform check without a domain claim", entry.Domain)
+		}
+	}
+	if len(terraformCheckByDomain) != 11 {
+		t.Errorf("per-domain Terraform checks = %d, want 11", len(terraformCheckByDomain))
 	}
 }
 
@@ -331,14 +373,15 @@ func TestPhase19HeavyBackendCIIsExplicitAndIsolated(t *testing.T) {
 			break
 		}
 	}
-	if phase19.BackendCI.Status != EvidenceConfiguredUnverified ||
+	if phase19.BackendCI.Status != EvidenceCIPassed ||
 		phase19.BackendCI.Workflow != ".github/workflows/ci.yml" ||
 		phase19.BackendCI.Job != "phase19-heavy-backend-integration" ||
 		phase19.BackendCI.MakeTarget != "test-phase19-heavy-backend" {
-		t.Fatalf("Phase 19 heavy backend CI evidence is not configured-unverified: %+v", phase19.BackendCI)
+		t.Fatalf("Phase 19 heavy backend CI evidence is not passed: %+v", phase19.BackendCI)
 	}
-	if phase19.BackendCI.RunURL != "" || phase19.BackendCI.Commit != "" {
-		t.Fatalf("unverified Phase 19 heavy backend CI must not claim a run: %+v", phase19.BackendCI)
+	if phase19.BackendCI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30287887431" ||
+		phase19.BackendCI.Commit != "d657e4b0b77a34ddb615124db2d82da810238502" {
+		t.Fatalf("Phase 19 heavy backend CI does not identify the passing run: %+v", phase19.BackendCI)
 	}
 
 	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
@@ -427,6 +470,732 @@ func TestPhase20IntegrationSeedsStorageBeforeTransferBoundary(t *testing.T) {
 	}
 }
 
+func TestPhase18WorkflowsTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	providers := read("terraform/providers.tf")
+	main := read("terraform/main.tf")
+	variables := read("terraform/variables.tf")
+	makefile := read("Makefile")
+	script := read("scripts/phase18-workflows-terraform-integration.sh")
+
+	for path, contract := range map[string]struct {
+		source string
+		wants  []string
+	}{
+		"terraform/providers.tf": {providers, []string{"workflows_custom_endpoint", "/_minisky/workflows/v1/"}},
+		"terraform/main.tf":      {main, []string{"google_workflows_workflow", "enable_phase18_workflows_resource", "deletion_protection = false"}},
+		"terraform/variables.tf": {variables, []string{"enable_phase18_workflows_resource"}},
+		"Makefile":               {makefile, []string{"test-phase18-workflows-terraform", "MINISKY_PHASE18_WORKFLOWS_TERRAFORM_INTEGRATION=1"}},
+		"scripts/phase18-workflows-terraform-integration.sh": {script, []string{
+			"MINISKY_PHASE18_WORKFLOWS_TERRAFORM_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"unset GOOGLE_APPLICATION_CREDENTIALS CLOUDSDK_CONFIG GOOGLE_CLOUD_PROJECT GCLOUD_PROJECT",
+			"terraform.tfstate",
+			"plan -detailed-exitcode",
+			"does not support import",
+			"destroy",
+			"Expected destroyed workflow",
+		}},
+	} {
+		for _, want := range contract.wants {
+			if !strings.Contains(contract.source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase18EventarcTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	providers := read("terraform/providers.tf")
+	main := read("terraform/main.tf")
+	variables := read("terraform/variables.tf")
+	makefile := read("Makefile")
+	script := read("scripts/phase18-eventarc-terraform-integration.sh")
+
+	for path, contract := range map[string]struct {
+		source string
+		wants  []string
+	}{
+		"terraform/providers.tf": {providers, []string{"eventarc_custom_endpoint", "/_minisky/eventarc/v1/"}},
+		"terraform/main.tf": {main, []string{
+			"google_eventarc_trigger", "enable_phase18_eventarc_resource",
+			"matching_criteria", "destination", "workflow", "transport", "pubsub",
+		}},
+		"terraform/variables.tf": {variables, []string{
+			"enable_phase18_eventarc_resource", "phase18_eventarc_trigger_name",
+			"phase18_eventarc_transport_topic",
+		}},
+		"Makefile": {makefile, []string{
+			"test-phase18-eventarc-terraform",
+			"MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION=1",
+		}},
+		"scripts/phase18-eventarc-terraform-integration.sh": {script, []string{
+			"MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"unset GOOGLE_APPLICATION_CREDENTIALS CLOUDSDK_CONFIG GOOGLE_CLOUD_PROJECT GCLOUD_PROJECT",
+			"terraform.tfstate",
+			"plan -detailed-exitcode",
+			"state rm",
+			"terraform -chdir=\"${terraform_dir}\" import",
+			"destroy",
+			"Eventarc trigger ${trigger_canonical}",
+			"does not exercise event delivery",
+		}},
+	} {
+		for _, want := range contract.wants {
+			if !strings.Contains(contract.source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase19ComposerTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"composer_custom_endpoint", "/_minisky/composer/v1/"},
+		"terraform/main.tf":      {"google_composer_environment", "enable_phase19_composer_resource"},
+		"terraform/variables.tf": {"enable_phase19_composer_resource", "phase19_composer_environment_name"},
+		"Makefile":               {"test-phase19-composer-terraform", "MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase19-composer-terraform-integration.sh": {
+			"MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION",
+			"MINISKY_PHASE19_DOCKER_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"plan -detailed-exitcode", "state rm", " import ", "destroy",
+			"airflow dags trigger",
+			"apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79",
+			"does not claim Cloud Composer parity",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase19ManagedKafkaTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"managed_kafka_custom_endpoint", "/_minisky/managedkafka/v1/"},
+		"terraform/main.tf":      {"google_managed_kafka_cluster", "enable_phase19_managed_kafka_resource"},
+		"terraform/variables.tf": {"enable_phase19_managed_kafka_resource", "phase19_managed_kafka_cluster_id"},
+		"Makefile":               {"test-phase19-managed-kafka-terraform", "MINISKY_PHASE19_MANAGED_KAFKA_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase19-managed-kafka-terraform-integration.sh": {
+			"MINISKY_PHASE19_MANAGED_KAFKA_TERRAFORM_INTEGRATION",
+			"MINISKY_PHASE19_DOCKER_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"plan -detailed-exitcode", "state rm", " import ", "destroy",
+			"kafka-console-producer.sh", "kafka-console-consumer.sh",
+			"apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase20FilestoreTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"filestore_custom_endpoint", "/_minisky/file/v1/"},
+		"terraform/main.tf":      {"google_filestore_instance", "enable_phase20_filestore_resource"},
+		"terraform/variables.tf": {"enable_phase20_filestore_resource", "phase20_filestore_instance_name"},
+		"Makefile":               {"test-phase20-filestore-terraform", "MINISKY_PHASE20_FILESTORE_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase20-filestore-terraform-integration.sh": {
+			"MINISKY_PHASE20_FILESTORE_TERRAFORM_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"plan -detailed-exitcode", "state rm", " import ", "destroy",
+			"filestore-data", "minisky-metadata-only", "durable 404",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase20IdentityPlatformTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"identity_platform_custom_endpoint", "/_minisky/identityplatform/v2/"},
+		"terraform/main.tf":      {"google_identity_platform_config", "enable_phase20_identity_platform_config"},
+		"terraform/variables.tf": {"enable_phase20_identity_platform_config", "phase20_identity_platform_authorized_domains"},
+		"Makefile":               {"test-phase20-identity-platform-terraform", "MINISKY_PHASE20_IDENTITY_PLATFORM_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase20-identity-platform-terraform-integration.sh": {
+			"MINISKY_PHASE20_IDENTITY_PLATFORM_TERRAFORM_INTEGRATION",
+			"plan -detailed-exitcode", "state rm", " import ", "destroy",
+			"reset", "authorizedDomains", "MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase20StorageTransferTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"storage_transfer_custom_endpoint", "/_minisky/storagetransfer/v1/"},
+		"terraform/main.tf":      {"google_storage_transfer_job", "enable_phase20_storage_transfer_job"},
+		"terraform/variables.tf": {"enable_phase20_storage_transfer_job", "phase20_storage_transfer_source_bucket"},
+		"Makefile":               {"test-phase20-storage-transfer-terraform", "MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase20-storage-transfer-terraform-integration.sh": {
+			"MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION",
+			"transferJobs", ":run", "plan -detailed-exitcode", "state rm", " import ", "destroy",
+			"minisky-net-integration.lock",
+			"Another MiniSky Docker integration is active",
+			"baseline-containers",
+			"baseline-volumes",
+			"baseline-networks",
+			"baseline_ready",
+			"trap cleanup EXIT INT TERM",
+			"Failed to capture baseline Docker inventory",
+			`--filter "label=managed-by=minisky"`,
+			`--filter "label=minisky.profile=${profile}"`,
+			"preflight_owned_resources",
+			"Refusing live Phase 20 Storage Transfer run",
+			"docker rm -f",
+			"docker volume rm",
+			"docker network rm",
+			"Storage Transfer cleanup incomplete",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase20StorageTransferCollisionRefusalPreservesPreexistingResources(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmp, "docker.log")
+	writeFakeStorageTransferCommands(t, bin)
+	command := exec.Command("bash", filepath.Join(root, "scripts", "phase20-storage-transfer-terraform-integration.sh"))
+	command.Dir = root
+	command.Env = append(os.Environ(),
+		"MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION=1",
+		"FAKE_DOCKER_COLLISION=1",
+		"FAKE_DOCKER_LOG="+logPath,
+		"TMPDIR="+tmp,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	outputPath := filepath.Join(tmp, "command.log")
+	outputFile, createErr := os.Create(outputPath)
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	err := command.Run()
+	if closeErr := outputFile.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	output, readOutputErr := os.ReadFile(outputPath)
+	if readOutputErr != nil {
+		t.Fatal(readOutputErr)
+	}
+	if err == nil {
+		t.Fatal("collision run unexpectedly succeeded")
+	}
+	if !strings.Contains(string(output), "Refusing live Phase 20 Storage Transfer run") {
+		t.Fatalf("collision refusal missing from output: %s", output)
+	}
+	log, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, destructive := range []string{"rm -f", "volume rm", "network rm"} {
+		if strings.Contains(string(log), destructive) {
+			t.Fatalf("collision cleanup mutated pre-existing resource with %q:\n%s", destructive, log)
+		}
+	}
+}
+
+func TestPhase20StorageTransferHonorsSharedNetworkLock(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	if err := os.Mkdir(filepath.Join(tmp, "minisky-net-integration.lock"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmp, "docker.log")
+	writeFakeStorageTransferCommands(t, bin)
+	command := exec.Command("bash", filepath.Join(root, "scripts", "phase20-storage-transfer-terraform-integration.sh"))
+	command.Dir = root
+	command.Env = append(os.Environ(),
+		"MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION=1",
+		"FAKE_DOCKER_LOG="+logPath,
+		"TMPDIR="+tmp,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	outputPath := filepath.Join(tmp, "command.log")
+	outputFile, createErr := os.Create(outputPath)
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	err := command.Run()
+	if closeErr := outputFile.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	output, readOutputErr := os.ReadFile(outputPath)
+	if readOutputErr != nil {
+		t.Fatal(readOutputErr)
+	}
+	if err == nil {
+		t.Fatal("shared-lock collision unexpectedly succeeded")
+	}
+	if !strings.Contains(string(output), "Another MiniSky Docker integration is active") {
+		t.Fatalf("shared-lock refusal missing from output: %s", output)
+	}
+	if log, readErr := os.ReadFile(logPath); readErr == nil && len(log) != 0 {
+		t.Fatalf("Docker was inspected before shared-lock refusal:\n%s", log)
+	}
+}
+
+func TestPhase20StorageTransferEarlySetupFailuresReleaseLocks(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		source  string
+	}{
+		{
+			name:    "repository root resolution",
+			command: "dirname",
+			source:  "#!/usr/bin/env bash\nprintf '%s\\n' \"${TMPDIR}/missing/child\"\n",
+		},
+		{
+			name:    "temporary workdir",
+			command: "mktemp",
+			source:  "#!/usr/bin/env bash\nexit 91\n",
+		},
+		{
+			name:    "workdir children",
+			command: "mkdir",
+			source: `#!/usr/bin/env bash
+set -eu
+count=0
+[[ -f "${FAKE_MKDIR_COUNT}" ]] && count="$(<"${FAKE_MKDIR_COUNT}")"
+count=$((count + 1))
+printf '%s' "${count}" >"${FAKE_MKDIR_COUNT}"
+if [[ "${count}" -ge 3 ]]; then exit 92; fi
+exec /bin/mkdir "$@"
+`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := repositoryRoot(t)
+			tmp := t.TempDir()
+			bin := filepath.Join(tmp, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeFakeStorageTransferCommands(t, bin)
+			if err := os.WriteFile(filepath.Join(bin, test.command), []byte(test.source), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			result := runStorageTransferScriptTest(t, root, tmp, bin, nil)
+			if result.err == nil {
+				t.Fatal("injected early setup failure unexpectedly succeeded")
+			}
+			assertStorageTransferLocksReleased(t, tmp)
+			assertNoStorageTransferDockerDeletion(t, result.dockerLog)
+		})
+	}
+}
+
+func TestPhase20StorageTransferCleanupFailureStillReleasesLocks(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeStorageTransferCommands(t, bin)
+	if err := os.WriteFile(filepath.Join(bin, "rm"), []byte("#!/usr/bin/env bash\nexit 93\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := runStorageTransferScriptTest(t, root, tmp, bin, []string{"FAKE_DOCKER_COLLISION=1"})
+	if result.err == nil {
+		t.Fatal("collision with injected cleanup failure unexpectedly succeeded")
+	}
+	assertStorageTransferLocksReleased(t, tmp)
+	assertNoStorageTransferDockerDeletion(t, result.dockerLog)
+}
+
+func TestPhase20StorageTransferInventoryFailureFailsClosed(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeStorageTransferCommands(t, bin)
+	result := runStorageTransferScriptTest(t, root, tmp, bin, []string{
+		"FAKE_DOCKER_INVENTORY_FAIL_ONCE=1",
+		"FAKE_DOCKER_STATE=" + filepath.Join(tmp, "docker.state"),
+	})
+	if result.err == nil {
+		t.Fatal("Docker inventory failure unexpectedly succeeded")
+	}
+	if !strings.Contains(result.output, "Failed to capture baseline Docker inventory") {
+		t.Fatalf("inventory failure did not fail closed: %s", result.output)
+	}
+	followup := exec.Command(filepath.Join(bin, "docker"), "ps", "-aq")
+	followup.Env = append(os.Environ(),
+		"FAKE_DOCKER_INVENTORY_FAIL_ONCE=1",
+		"FAKE_DOCKER_LOG="+filepath.Join(tmp, "docker.log"),
+		"FAKE_DOCKER_STATE="+filepath.Join(tmp, "docker.state"),
+	)
+	output, err := followup.Output()
+	if err != nil {
+		t.Fatalf("follow-up Docker inventory did not recover: %v", err)
+	}
+	if !strings.Contains(string(output), "preexisting-container") {
+		t.Fatalf("follow-up inventory did not expose pre-existing resource: %s", output)
+	}
+	assertStorageTransferLocksReleased(t, tmp)
+	log, err := os.ReadFile(filepath.Join(tmp, "docker.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoStorageTransferDockerDeletion(t, string(log))
+}
+
+type storageTransferScriptResult struct {
+	output    string
+	dockerLog string
+	err       error
+}
+
+func runStorageTransferScriptTest(
+	t *testing.T,
+	root, tmp, bin string,
+	extraEnv []string,
+) storageTransferScriptResult {
+	t.Helper()
+	logPath := filepath.Join(tmp, "docker.log")
+	command := exec.Command("bash", filepath.Join(root, "scripts", "phase20-storage-transfer-terraform-integration.sh"))
+	command.Dir = root
+	command.Env = append(os.Environ(),
+		"MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION=1",
+		"FAKE_DOCKER_LOG="+logPath,
+		"FAKE_MKDIR_COUNT="+filepath.Join(tmp, "mkdir.count"),
+		"TMPDIR="+tmp,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	command.Env = append(command.Env, extraEnv...)
+	outputPath := filepath.Join(tmp, "command.log")
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	runErr := command.Run()
+	if err := outputFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerLog, err := os.ReadFile(logPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return storageTransferScriptResult{output: string(output), dockerLog: string(dockerLog), err: runErr}
+}
+
+func assertStorageTransferLocksReleased(t *testing.T, tmp string) {
+	t.Helper()
+	for _, lock := range []string{
+		"minisky-net-integration.lock",
+		"minisky-phase20-storage-transfer-terraform.lock",
+	} {
+		if _, err := os.Stat(filepath.Join(tmp, lock)); !os.IsNotExist(err) {
+			t.Errorf("lock %s was not released: %v", lock, err)
+		}
+	}
+}
+
+func assertNoStorageTransferDockerDeletion(t *testing.T, log string) {
+	t.Helper()
+	for _, destructive := range []string{"rm -f", "volume rm", "network rm"} {
+		if strings.Contains(log, destructive) {
+			t.Errorf("cleanup mutated a pre-existing resource with %q:\n%s", destructive, log)
+		}
+	}
+}
+
+func writeFakeStorageTransferCommands(t *testing.T, bin string) {
+	t.Helper()
+	docker := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG}"
+if [[ "${FAKE_DOCKER_INVENTORY_FAIL_ONCE:-}" == "1" && "$1 $2" == "ps -aq" ]]; then
+  count=0
+  [[ -f "${FAKE_DOCKER_STATE}" ]] && count="$(<"${FAKE_DOCKER_STATE}")"
+  count=$((count + 1))
+  printf '%s' "${count}" >"${FAKE_DOCKER_STATE}"
+  if [[ "${count}" == "1" ]]; then exit 94; fi
+  echo preexisting-container
+fi
+if [[ "${FAKE_DOCKER_COLLISION:-}" == "1" ]]; then
+  case "$1 $2" in
+    "ps -aq") echo preexisting-container ;;
+    "volume ls") echo preexisting-volume ;;
+    "network ls") echo preexisting-network ;;
+    "network inspect") exit 1 ;;
+  esac
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	goCommand := "#!/usr/bin/env bash\necho 'go build must not run during preflight tests' >&2\nexit 97\n"
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(goCommand), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPhase20AlloyDBTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"alloydb_custom_endpoint", "/_minisky/alloydb/v1/"},
+		"terraform/main.tf":      {"google_alloydb_cluster", "google_alloydb_instance", "PRIMARY", "minisky-metadata-only"},
+		"Makefile":               {"test-phase20-alloydb-terraform", "MINISKY_PHASE20_ALLOYDB_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase20-alloydb-terraform-integration.sh": {
+			"MINISKY_PHASE20_ALLOYDB_DOCKER_INTEGRATION", "postgres:15.8-bookworm",
+			"psql", "plan -detailed-exitcode", "state rm", " import ", "destroy",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase21ServiceDirectoryTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"service_directory_custom_endpoint", "/_minisky/servicedirectory/v1/"},
+		"terraform/main.tf": {
+			"google_service_directory_namespace", "google_service_directory_service",
+			"google_service_directory_endpoint", "enable_phase21_service_directory_resources",
+		},
+		"Makefile": {"test-phase21-service-directory-terraform", "MINISKY_PHASE21_SERVICE_DIRECTORY_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase21-service-directory-terraform-integration.sh": {
+			"MINISKY_PHASE21_SERVICE_DIRECTORY_TERRAFORM_INTEGRATION", "plan -detailed-exitcode",
+			"state rm", " import ", "destroy",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase23DocumentAITerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"document_ai_custom_endpoint", "/_minisky/documentai/v1/"},
+		"terraform/main.tf":      {"google_document_ai_processor", "enable_phase23_document_ai_processor", "OCR_PROCESSOR"},
+		"Makefile":               {"test-phase23-document-ai-terraform", "MINISKY_PHASE23_DOCUMENT_AI_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase23-document-ai-terraform-integration.sh": {
+			"MINISKY_PHASE23_DOCUMENT_AI_TERRAFORM_INTEGRATION", "plan -detailed-exitcode",
+			"state rm", " import ", "destroy",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase24OrgPolicyTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {"org_policy_custom_endpoint", "/_minisky/orgpolicy/v2/"},
+		"terraform/main.tf":      {"google_org_policy_policy", "enable_phase24_org_policy", "compute.disableSerialPortAccess"},
+		"Makefile":               {"test-phase24-org-policy-terraform", "MINISKY_PHASE24_ORG_POLICY_TERRAFORM_INTEGRATION=1"},
+		"scripts/phase24-org-policy-terraform-integration.sh": {
+			"MINISKY_PHASE24_ORG_POLICY_TERRAFORM_INTEGRATION", ":evaluate",
+			"plan -detailed-exitcode", "state rm", " import ", "destroy",
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPromotedTerraformStateRemovalBackupsStayInTemporaryWorkdirs(t *testing.T) {
+	root := repositoryRoot(t)
+	scripts := []string{
+		"scripts/phase18-eventarc-terraform-integration.sh",
+		"scripts/phase19-composer-terraform-integration.sh",
+		"scripts/phase19-managed-kafka-terraform-integration.sh",
+		"scripts/phase20-filestore-terraform-integration.sh",
+		"scripts/phase20-identity-platform-terraform-integration.sh",
+		"scripts/phase20-storage-transfer-terraform-integration.sh",
+		"scripts/phase20-alloydb-terraform-integration.sh",
+		"scripts/phase21-service-directory-terraform-integration.sh",
+		"scripts/phase23-document-ai-terraform-integration.sh",
+		"scripts/phase24-org-policy-terraform-integration.sh",
+	}
+	for _, script := range scripts {
+		data, err := os.ReadFile(filepath.Join(root, script))
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(data)
+		if !strings.Contains(source, "state rm") ||
+			!strings.Contains(source, `-backup="${work}/state-before-import.backup"`) {
+			t.Errorf("%s does not keep state-rm backup in its temporary workdir", script)
+		}
+	}
+}
+
 func TestRegistryCountDocsAndTerraformClaimsStayAligned(t *testing.T) {
 	root := repositoryRoot(t)
 	services, err := registry.Services()
@@ -471,9 +1240,37 @@ func TestRegistryCountDocsAndTerraformClaimsStayAligned(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, entry := range inventory {
-			if strings.Contains(string(data), entry.Domain) {
+			if strings.Contains(string(data), entry.Domain) && !entry.TerraformClaim {
 				t.Errorf("%s contains unproved experimental endpoint %s", path, entry.Domain)
 			}
+		}
+	}
+}
+
+func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
+	root := repositoryRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "docs", "minisky-roadmap-completion-plan.canvas.tsx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, want := range []string{
+		"eleven independently recorded, domain-scoped Terraform",
+		"Eleven bounded provider lifecycles now pass",
+		"without batch-wide production promotion",
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("roadmap canvas does not contain %q", want)
+		}
+	}
+	for _, stale := range []string{
+		"Zero Phase 18–25 provider claims",
+		"Phase 18–25 Terraform evidence remain unverified or absent",
+		"first Phase 18 Terraform slice for one default-off",
+		"one Workflows provider slice passes locally",
+	} {
+		if strings.Contains(source, stale) {
+			t.Errorf("roadmap canvas retains stale Terraform claim %q", stale)
 		}
 	}
 }

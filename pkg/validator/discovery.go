@@ -688,8 +688,7 @@ var embeddedRules = []ServiceSchema{
 	// Phase 20
 	{Domain: "alloydb.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/clusters", ContentType: "application/json",
-			RequiredQuery: []string{"clusterId"},
-			RequiredBody:  []BodyField{{Path: "network", Type: "string", Message: "field 'network' is required for clusters.create"}}},
+			RequiredQuery: []string{"clusterId"}},
 	}},
 	{Domain: "identityplatform.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/tenants", ContentType: "application/json",

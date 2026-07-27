@@ -80,6 +80,9 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	if err := validateHandwrittenClaims(updatedDocs); err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
 
 	readmePath := filepath.Join(root, "README.md")
 	readme, err := os.ReadFile(readmePath)
@@ -126,6 +129,13 @@ func generate(root string, check bool) error {
 	}
 	if len(drift) > 0 {
 		return fmt.Errorf("generated documentation drift: %s; run go run ./cmd/docs-truth", strings.Join(drift, ", "))
+	}
+	return nil
+}
+
+func validateHandwrittenClaims(document string) error {
+	if strings.Contains(document, "Terraform provider evidence remains absent") {
+		return errors.New("stale batch-wide Terraform absence claim; use generated per-domain evidence")
 	}
 	return nil
 }
@@ -248,6 +258,10 @@ func renderPhaseSummary(
 		categories = append(categories, fmt.Sprintf("%s=%d", category, count))
 	}
 	sort.Strings(categories)
+	terraformClaimNoun := "claims"
+	if terraformClaims == 1 {
+		terraformClaimNoun = "claim"
+	}
 
 	packageLocal := 0
 	strictIAMLocal := 0
@@ -260,7 +274,9 @@ func renderPhaseSummary(
 	backendCITotal := 0
 	backendCIPassed := 0
 	backendCIConfigured := 0
+	terraformChecks := 0
 	for _, gate := range gates {
+		terraformChecks += len(gate.TerraformChecks)
 		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
 			packageLocal++
 		}
@@ -295,11 +311,10 @@ func renderPhaseSummary(
 			backendCIConfigured++
 		}
 	}
-
 	return fmt.Sprintf(
-		"**Generated truth:** %d experimental; %d default-off; %d Terraform claims. "+
+		"**Generated truth:** %d experimental; %d default-off; %d Terraform %s. "+
 			"Persistence inventory: %s.\n\n"+
-			"Machine-readable promotion matrix: %d batch gates. Package-unit gates passed locally: %d/%d; "+
+			"Machine-readable promotion matrix: %d batch gates and %d per-domain Terraform checks. Package-unit gates passed locally: %d/%d; "+
 			"strict-IAM gates passed locally: %d/%d. Generated-client lifecycle gates passed locally: %d/%d; "+
 			"configured but unverified: %d/%d. Restart gates passed locally: %d/%d; cleanup gates passed locally: %d/%d; "+
 			"CI gates passed: %d/%d; configured but unverified: %d/%d. "+
@@ -309,8 +324,10 @@ func renderPhaseSummary(
 		experimental,
 		experimental,
 		terraformClaims,
+		terraformClaimNoun,
 		strings.Join(categories, ", "),
 		len(gates),
+		terraformChecks,
 		packageLocal,
 		len(gates),
 		strictIAMLocal,

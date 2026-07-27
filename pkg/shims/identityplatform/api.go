@@ -72,17 +72,18 @@ type authConfigBackend interface {
 
 // API implements the Identity Platform v2 REST shim.
 type API struct {
-	mu             sync.RWMutex
-	persistMu      sync.Mutex
-	opMgr          *orchestrator.OperationManager
-	stateStore     identityPlatformStateStore
-	tenants        map[string]*Tenant
-	oauthConfigs   map[string]*OAuthIdpConfig
-	projectConfigs map[string]*ProjectConfig
-	tenantConfigs  map[string]*TenantConfig
-	authBackend    authConfigBackend
-	authHandler    http.Handler
-	tenantSeq      int
+	mu              sync.RWMutex
+	persistMu       sync.Mutex
+	projectConfigMu sync.Mutex
+	opMgr           *orchestrator.OperationManager
+	stateStore      identityPlatformStateStore
+	tenants         map[string]*Tenant
+	oauthConfigs    map[string]*OAuthIdpConfig
+	projectConfigs  map[string]*ProjectConfig
+	tenantConfigs   map[string]*TenantConfig
+	authBackend     authConfigBackend
+	authHandler     http.Handler
+	tenantSeq       int
 }
 
 // NewAPI creates a new Identity Platform API shim with persistence.
@@ -134,6 +135,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case isIdentityToolkitUserMethod(r.URL.Path) && r.Method == http.MethodPost:
 		api.forwardIdentityToolkitUserMethod(w, r)
+	case strings.HasSuffix(r.URL.Path, ":initializeAuth") && r.Method == http.MethodPost:
+		api.initializeProjectConfig(w, r)
 	case isTenantConfig(r.URL.Path) && r.Method == http.MethodGet:
 		api.getTenantConfig(w, r)
 	case isTenantConfig(r.URL.Path) && r.Method == http.MethodPatch:
@@ -169,6 +172,48 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (api *API) initializeProjectConfig(w http.ResponseWriter, r *http.Request) {
+	project := strings.TrimSuffix(extractAfter(r.URL.Path, "projects"), ":initializeAuth")
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "project is required")
+		return
+	}
+	api.projectConfigMu.Lock()
+	defer api.projectConfigMu.Unlock()
+
+	name := "projects/" + project + "/config"
+	api.mu.Lock()
+	prior := cloneProjectConfig(api.projectConfigs[name])
+	config := cloneProjectConfig(prior)
+	if config == nil {
+		config = &ProjectConfig{Name: name}
+		api.projectConfigs[name] = config
+	}
+	api.mu.Unlock()
+	if err := api.persistState(); err != nil {
+		durable, committed, reconcileErr := api.reconcileProjectConfig(name, config)
+		if reconcileErr != nil {
+			api.mu.Lock()
+			if prior == nil {
+				delete(api.projectConfigs, name)
+			} else {
+				api.projectConfigs[name] = prior
+			}
+			api.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence failed and durable state could not be reconciled")
+			return
+		}
+		if committed {
+			_ = json.NewEncoder(w).Encode(durable)
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(config)
+}
+
 func (api *API) forwardIdentityToolkitUserMethod(w http.ResponseWriter, r *http.Request) {
 	api.mu.RLock()
 	handler := api.authHandler
@@ -181,6 +226,9 @@ func (api *API) forwardIdentityToolkitUserMethod(w http.ResponseWriter, r *http.
 }
 
 func (api *API) getProjectConfig(w http.ResponseWriter, r *http.Request) {
+	api.projectConfigMu.Lock()
+	defer api.projectConfigMu.Unlock()
+
 	project := extractAfter(r.URL.Path, "projects")
 	name := "projects/" + project + "/config"
 	api.mu.RLock()
@@ -203,9 +251,13 @@ func (api *API) patchProjectConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid project config JSON")
 		return
 	}
+	api.projectConfigMu.Lock()
+	defer api.projectConfigMu.Unlock()
+
 	name := "projects/" + project + "/config"
 	api.mu.RLock()
-	updated := cloneProjectConfig(api.projectConfigs[name])
+	prior := cloneProjectConfig(api.projectConfigs[name])
+	updated := cloneProjectConfig(prior)
 	backend := api.authBackend
 	api.mu.RUnlock()
 	if updated == nil {
@@ -235,7 +287,11 @@ func (api *API) patchProjectConfig(w http.ResponseWriter, r *http.Request) {
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
 		api.mu.Lock()
-		delete(api.projectConfigs, name)
+		if prior == nil {
+			delete(api.projectConfigs, name)
+		} else {
+			api.projectConfigs[name] = prior
+		}
 		api.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return

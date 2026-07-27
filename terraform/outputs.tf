@@ -63,6 +63,61 @@ output "phase16_instance_network_ip" {
   value       = local.use_minisky && var.enable_phase16_network_resources && var.enable_phase16_compute_instance ? google_compute_instance.phase16[0].network_interface[0].network_ip : null
 }
 
+output "phase18_workflow_name" {
+  description = "Canonical name of the optional local Phase-18 workflow, or null when disabled"
+  value       = local.use_minisky && var.enable_phase18_workflows_resource ? google_workflows_workflow.phase18[0].id : null
+}
+
+output "phase18_eventarc_trigger_name" {
+  description = "Canonical name of the optional local Phase-18 Eventarc trigger, or null when disabled"
+  value       = local.use_minisky && var.enable_phase18_eventarc_resource && var.enable_phase18_workflows_resource ? google_eventarc_trigger.phase18[0].id : null
+}
+
+output "phase19_composer_environment_name" {
+  description = "Canonical name of the optional heavy local Phase-19 Composer environment, or null when disabled"
+  value       = local.use_minisky && var.enable_phase19_composer_resource ? google_composer_environment.phase19[0].id : null
+}
+
+output "phase19_managed_kafka_cluster_name" {
+  description = "Canonical name of the optional heavy local Phase-19 Managed Kafka cluster, or null when disabled"
+  value       = local.use_minisky && var.enable_phase19_managed_kafka_resource ? google_managed_kafka_cluster.phase19[0].id : null
+}
+
+output "phase20_filestore_instance_name" {
+  description = "Canonical name of the optional local Phase-20 Filestore instance, or null when disabled"
+  value       = local.use_minisky && var.enable_phase20_filestore_resource ? google_filestore_instance.phase20[0].id : null
+}
+
+output "phase20_identity_platform_config_name" {
+  description = "Canonical name of the optional local Phase-20 Identity Platform project config, or null when disabled"
+  value       = local.use_minisky && var.enable_phase20_identity_platform_config ? google_identity_platform_config.phase20[0].name : null
+}
+
+output "phase20_storage_transfer_job_name" {
+  description = "Generated name of the optional local Phase-20 Storage Transfer job, or null when disabled"
+  value       = local.use_minisky && var.enable_phase20_storage_transfer_job ? google_storage_transfer_job.phase20[0].name : null
+}
+
+output "phase20_alloydb_instance_name" {
+  description = "Canonical name of the optional local Phase-20 AlloyDB primary instance, or null when disabled"
+  value       = local.use_minisky && var.enable_phase20_alloydb_resources ? google_alloydb_instance.phase20[0].name : null
+}
+
+output "phase21_service_directory_endpoint_name" {
+  description = "Canonical endpoint name for the optional Service Directory hierarchy, or null when disabled"
+  value       = local.use_minisky && var.enable_phase21_service_directory_resources ? google_service_directory_endpoint.phase21[0].name : null
+}
+
+output "phase23_document_ai_processor_name" {
+  description = "Provider processor identifier for the optional metadata-only Document AI lifecycle, or null when disabled"
+  value       = local.use_minisky && var.enable_phase23_document_ai_processor ? google_document_ai_processor.phase23[0].name : null
+}
+
+output "phase24_org_policy_name" {
+  description = "Canonical name of the optional local Organization Policy, or null when disabled"
+  value       = local.use_minisky && var.enable_phase24_org_policy ? "projects/${var.project_id}/policies/compute.disableSerialPortAccess" : null
+}
+
 output "phase10_artifact_repository_name" {
   description = "Name of the optional local Phase-10 Artifact Registry repository, or null when disabled"
   value       = var.enable_phase10_artifact_resources ? google_artifact_registry_repository.phase10[0].name : null

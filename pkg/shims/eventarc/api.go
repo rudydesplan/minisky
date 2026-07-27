@@ -414,22 +414,20 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 	var merged map[string]any
 	_ = json.Unmarshal(existingRaw, &merged)
 
-	if updateMask != "" {
+	mutableFields := []string{"destination", "labels"}
+	if updateMask != "" && updateMask != "*" {
 		fields := strings.Split(updateMask, ",")
 		for _, field := range fields {
 			field = strings.TrimSpace(field)
-			if field == "*" {
-				field = "destination"
-			}
 			if v, exists := patch[field]; exists {
 				merged[field] = v
 			}
 		}
 	} else {
-		// An empty mask updates all mutable fields. Eventarc currently exposes
-		// destination as the only mutable Trigger field.
-		if v, exists := patch["destination"]; exists {
-			merged["destination"] = v
+		for _, field := range mutableFields {
+			if v, exists := patch[field]; exists {
+				merged[field] = v
+			}
 		}
 	}
 
@@ -673,8 +671,8 @@ func validateTriggerUpdateMask(mask string) error {
 	}
 	for _, field := range strings.Split(mask, ",") {
 		field = strings.TrimSpace(field)
-		if field != "destination" && field != "*" {
-			return fmt.Errorf("Eventarc triggers only support updating destination")
+		if field != "destination" && field != "labels" && field != "*" {
+			return fmt.Errorf("Eventarc triggers only support updating destination and labels")
 		}
 	}
 	return nil

@@ -883,6 +883,7 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v1/projects/{project}/locations/{location}/workloadIdentityPools/{pool}/providers"}, "iam.workloadIdentityPoolProviders", false},
 	},
 	"identityplatform.googleapis.com": {
+		{[]string{"/v2/projects/{project}:initializeAuth"}, "identityplatform.configs", false},
 		{[]string{"/v2/projects/{project}/tenants"}, "identityplatform.tenants", false},
 		{[]string{"/v2/projects/{project}/oauthIdpConfigs"}, "identityplatform.oauthIdpConfigs", false},
 		{[]string{"/v2/projects/{project}/tenants/{tenant}/oauthIdpConfigs"}, "identityplatform.oauthIdpConfigs", false},
@@ -969,6 +970,10 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 }
 
 var strictIAMCustomRoutes = []strictIAMCustomRoute{
+	{"orgpolicy.googleapis.com", http.MethodPost, "/v2/policies:evaluate", "orgpolicy.policies.get"},
+	{"identityplatform.googleapis.com", http.MethodPost, "/projects/{project}:initializeAuth", "identityplatform.configs.create"},
+	{"identityplatform.googleapis.com", http.MethodPost, "/v2/projects/{project}:initializeAuth", "identityplatform.configs.create"},
+	{"identityplatform.googleapis.com", http.MethodPost, "/v2/projects/{project}/identityPlatform:initializeAuth", "identityplatform.configs.create"},
 	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/endpoints/{endpoint}:predict", "aiplatform.endpoints.predict"},
 	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent", "aiplatform.endpoints.predict"},
 	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent", "aiplatform.endpoints.predict"},

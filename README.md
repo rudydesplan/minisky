@@ -45,9 +45,9 @@ run offline; first use may pull lazily loaded emulator images.
 ### Phase 18–25 Services (Experimental)
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
-**Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -83,13 +83,54 @@ lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
 GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
 restart truth, and cleanup. All six external generated-client jobs passed on
 commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its
-Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. The overall run
-failed before the Linux AMD64 release snapshot because GoReleaser was not on
-the release-validation step's `PATH`; the local workflow fix is not CI-verified.
-No Phase 18–25 Terraform
-compatibility is claimed. Unsupported methods return canonical 501 responses
-rather than simulated success; Cloud CDN/Armor remains within the Compute
-domain and does not claim full GCP data-plane parity.
+Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. On commit
+`d657e4b0b77a34ddb615124db2d82da810238502`,
+[run 30287887431](https://github.com/rudydesplan/minisky/actions/runs/30287887431)
+passed the Phase 19 Kafka/Airflow backend gate, corrected GoReleaser validation,
+Linux AMD64 release snapshot, both native Linux package jobs, and the native
+Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs. Two bounded Phase 18
+provider gates now cover default-off `google_workflows_workflow` and
+`google_eventarc_trigger` control-plane lifecycles. Both pass apply, restart,
+no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
+canonical import, while provider 7.41.0 does not support Workflows import. The
+Eventarc gate persists one filter, workflow destination, and Pub/Sub transport
+topic but does not claim event delivery or transport provisioning. No other
+Phase 18 Terraform compatibility is claimed. Separate heavy Phase 19 gates pass
+`google_composer_environment` and `google_managed_kafka_cluster` lifecycles and
+canonical imports against digest-pinned exact-owned backends. Managed Kafka
+capacity/subnet are metadata and its loopback broker is plaintext; neither gate
+claims real GCP networking/TLS or managed-service parity.
+A bounded Phase 20 `google_filestore_instance` gate covers persisted metadata
+and traversal-protected profile-local files only; it does not provide NFS or
+VPC semantics.
+A second Phase 20 gate covers only Identity Platform project authorized-domain
+metadata, including canonical singleton initialization, import, and reset;
+it does not claim authentication or production Firebase security.
+A third Phase 20 gate proves one bounded local GCS-to-GCS Storage Transfer job,
+including restart, import, repeat execution, and durable soft deletion.
+The AlloyDB gate couples one metadata-only cluster to one `PRIMARY` instance,
+proves real SQL persistence through the pinned exact-owned PostgreSQL backend,
+and passes restart, no-drift, canonical imports, ordered destroy, and cleanup.
+It does not claim VPC, HA, encryption, backup, capacity, user, or production
+AlloyDB parity.
+A Phase 21 provider gate proves the complete Service Directory
+namespace/service/endpoint metadata hierarchy, including restart, zero drift,
+canonical imports, child-first destroy, durable 404s, and empty-list cleanup.
+Endpoint addresses and ports remain opaque registration metadata; MiniSky does
+not claim Service Directory DNS, routing, health checking, or network resolution.
+A Phase 23 provider gate proves one metadata-only Document AI
+`OCR_PROCESSOR`, including restart, zero drift, canonical import
+reconciliation, LRO-backed delete, durable 404, and empty-list cleanup. It does
+not claim document processing quality, model inference, external artifacts, or
+sensitive-document handling.
+A Phase 24 provider gate proves one project-scoped boolean Organization Policy,
+including a real bounded local advisory decision, restart, zero drift, canonical
+import reconciliation, delete, durable 404, empty-list cleanup, and fallback to
+the seeded constraint default. This is local simulation, not production
+enforcement, IAM, organization hierarchy, or compliance.
+Unsupported methods return canonical 501
+responses rather than simulated success; Cloud CDN/Armor remains within the
+Compute domain and does not claim full GCP data-plane parity.
 
 ## 📋 Prerequisites
 Install the tools required by the slices you use:
@@ -442,12 +483,14 @@ GCP package/version mutation, and registry blob snapshots remain unsupported.
 
 ### Phase 11 — Developer experience and distribution
 
-**Status (2026-07-25): local tooling slice implemented.** Doctor, safe fixes,
+**Status (2026-07-27): CI-verified tooling slice.** Doctor, safe fixes,
 gateway-first delivery/artifact commands, Make targets, and release smoke
-validation are present. GoReleaser v2 configuration, a native macOS ARM64
-snapshot, `version`, and `doctor bigquery` passed locally. Native amd64 and
-arm64 deb/rpm build → install → smoke → uninstall validation passed in
-read-only CI on 2026-07-25. Homebrew, Scoop, deb, and rpm are not published.
+validation are present. On commit `d657e4b0b77a34ddb615124db2d82da810238502`,
+CI installed pinned GoReleaser 2.17.0, passed static distribution validation,
+and built the Linux AMD64 release snapshot. Native AMD64 and ARM64 deb/rpm
+build → install → smoke → uninstall plus Linux ARM64, macOS ARM64, and Windows
+AMD64 CGO conformance passed in the same read-only run. Homebrew, Scoop, deb,
+and rpm are not published.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.

@@ -40,7 +40,18 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `sql_custom_endpoint` | `http://127.0.0.1:8080/_minisky/sqladmin/sql/v1beta4/` | `sqladmin.googleapis.com` |
 | `spanner_custom_endpoint` | `http://127.0.0.1:8080/_minisky/spanner/v1/` | `spanner.googleapis.com` |
 | `storage_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storage/storage/v1/` | `storage.googleapis.com` |
+| `storage_transfer_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storagetransfer/v1/` | `storagetransfer.googleapis.com` |
+| `alloydb_custom_endpoint` | `http://127.0.0.1:8080/_minisky/alloydb/v1/` | `alloydb.googleapis.com` |
+| `service_directory_custom_endpoint` | `http://127.0.0.1:8080/_minisky/servicedirectory/v1/` | `servicedirectory.googleapis.com` |
+| `document_ai_custom_endpoint` | `http://127.0.0.1:8080/_minisky/documentai/v1/` | `documentai.googleapis.com` |
+| `org_policy_custom_endpoint` | `http://127.0.0.1:8080/_minisky/orgpolicy/v2/` | `orgpolicy.googleapis.com` |
 | `container_custom_endpoint` | `http://127.0.0.1:8080/_minisky/container/v1/` | `container.googleapis.com` |
+| `composer_custom_endpoint` | `http://127.0.0.1:8080/_minisky/composer/v1/` | `composer.googleapis.com` |
+| `eventarc_custom_endpoint` | `http://127.0.0.1:8080/_minisky/eventarc/v1/` | `eventarc.googleapis.com` |
+| `filestore_custom_endpoint` | `http://127.0.0.1:8080/_minisky/file/v1/` | `file.googleapis.com` |
+| `identity_platform_custom_endpoint` | `http://127.0.0.1:8080/_minisky/identityplatform/v2/` | `identityplatform.googleapis.com` |
+| `managed_kafka_custom_endpoint` | `http://127.0.0.1:8080/_minisky/managedkafka/v1/` | `managedkafka.googleapis.com` |
+| `workflows_custom_endpoint` | `http://127.0.0.1:8080/_minisky/workflows/v1/` | `workflows.googleapis.com` |
 
 The repeated `bigquery/bigquery` segments are intentional: the first is the
 MiniSky service selector and is removed by the router; the second is part of
@@ -72,6 +83,17 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
+| `google_eventarc_trigger` (optional Phase 18) | Profile-persisted trigger control-plane metadata with a Workflows destination | Service LRO | Filter, destination, and Pub/Sub transport metadata survive restart and canonical import; destroy remains 404 after a final restart |
+| `google_workflows_workflow` (optional Phase 18) | Profile-persisted workflow metadata and source | Service LRO | Apply and immediate no-drift pass; metadata and no-drift survive restart; destroy remains 404 after a final restart |
+| `google_composer_environment` (heavy optional Phase 19) | Persisted environment metadata plus one pinned exact-owned Airflow container | Service LRO | API/backend observation, restart no-drift, canonical import/reconciliation, destroy, durable 404, and exact container/volume cleanup pass |
+| `google_managed_kafka_cluster` (heavy optional Phase 19) | Persisted capacity and opaque subnet metadata plus one pinned exact-owned plaintext loopback Kafka broker | Service LRO | Real broker protocol observation before/after restart, no-drift, canonical import/reconciliation, destroy, durable 404, and exact cleanup pass |
+| `google_filestore_instance` (optional Phase 20) | Persisted instance metadata plus traversal-protected profile-local share files | Service LRO | Local file data and metadata survive restart; no-drift, canonical import/reconciliation, destroy, durable 404, and exact filesystem cleanup pass |
+| `google_identity_platform_config` (optional Phase 20) | Persisted project authorized-domain metadata | Singleton config | Initialize, restart no-drift, project-ID import, empty reset, state-only destroy, and reset persistence pass |
+| `google_storage_transfer_job` (optional Phase 20) | Persisted bounded local GCS-to-GCS job and run outcome | Soft-delete lifecycle | Object copy before/after restart, no-drift, project/job import, destroy to durable `DELETED` pass |
+| `google_alloydb_cluster` + `google_alloydb_instance` (heavy optional Phase 20) | Persisted cluster/primary metadata plus one pinned exact-owned PostgreSQL backend | Coupled service LROs | SQL before/after restart, stable backend identity, no-drift, canonical imports/reconciliation, ordered destroy, durable 404s, and exact cleanup pass |
+| `google_service_directory_namespace` + `google_service_directory_service` + `google_service_directory_endpoint` (optional Phase 21) | Persisted isolated hierarchy and opaque endpoint registration metadata | Synchronous hierarchy | API observation before/after restart, no-drift, three canonical imports/reconciliation, child-first destroy, durable 404s, and empty-list cleanup pass |
+| `google_document_ai_processor` (optional Phase 23) | Persisted processor control-plane metadata | Create synchronous; delete service LRO | API observation before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, and empty-list cleanup pass |
+| `google_org_policy_policy` (optional Phase 24) | Persisted project boolean policy and bounded advisory evaluation | Synchronous policy lifecycle | Local enforced decision before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, empty-list cleanup, and constraint-default fallback pass |
 
 The table sets `deletion_protection = false`, and the dataset sets
 `delete_contents_on_destroy = true`, so the example can be destroyed
@@ -81,16 +103,18 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Spanner, and
-Phase-16 networking/instance resources are disabled by default and
-local-profile-only. Artifact Registry
+The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Spanner,
+Phase-16 networking/instance, and Phase-18 Workflows/Eventarc resources are
+disabled by default and local-profile-only. Artifact Registry
 uses profile-owned Registry v2, and `emulator-config` is not a production
 Spanner configuration. Enable Artifact Registry with
 `enable_phase10_artifact_resources = true`, WIF with
 `enable_phase13_wif_resources = true`, Redis and Spanner with
 `enable_phase15_resources = true`, and the bounded custom network plus
 subnetwork with `enable_phase16_network_resources = true`; their outputs are
-`null` or empty while disabled.
+`null` or empty while disabled. Enable the bounded Workflows resource with
+`enable_phase18_workflows_resource = true`; the dependent Eventarc trigger also
+requires `enable_phase18_eventarc_resource = true`.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
@@ -101,8 +125,9 @@ workflow enables all three. Native Windows GKE metadata compiles, but secure
 Kind kubeconfig ownership and publish operations fail safe as unsupported.
 
 Resources not listed above are not claimed as Terraform-compatible. In
-particular, serverless, broad Compute/VPC/load-balancer surfaces, and general
-Cloud SQL or GKE APIs remain outside the claim. See
+particular, Batch jobs, workflow executions, serverless, broad
+Compute/VPC/load-balancer surfaces, and general Cloud SQL or GKE APIs remain
+outside the claim. See
 `docs/service-compatibility.md`; API routes alone do not establish provider
 compatibility.
 
@@ -118,6 +143,114 @@ to the provider's disabled flow-log default, same-path region encoding, and
 same-project relative network reference. Auto-mode networks, updates, multiple
 or secondary ranges, IPv6, workload connectivity, routes, NAT, peering, PSC,
 and general VPC parity remain unclaimed.
+
+The separate guarded Phase-18 Terraform gate targets only
+`google_workflows_workflow.phase18[0]`. On 2026-07-27, provider `7.41.0`
+applied one workflow through the canonical Workflows endpoint, observed its
+source and stable metadata, reached zero drift before and after restarting
+MiniSky against the same isolated profile, destroyed the resource, and
+confirmed API `404` both immediately and after a final restart. The provider
+resource itself reports that import is unsupported, so import is not
+applicable to this gate. The runner requires
+`MINISKY_PHASE18_WORKFLOWS_TERRAFORM_INTEGRATION=1`, uses temporary HOME,
+provider data, profile state, ports, and Terraform state, clears cloud
+credential environment variables, refuses existing MiniSky Docker resources,
+and has a ten-minute budget. This is persisted workflow metadata compatibility,
+not Workflow Executions, Eventarc delivery, broader Workflows field parity, or
+promotion from experimental/default-off status.
+
+The second guarded Phase-18 gate targets
+`google_eventarc_trigger.phase18[0]` and its existing Workflows dependency. On
+2026-07-27, provider `7.41.0` applied one trigger with an exact event-type
+filter, a persisted workflow destination, and explicit Pub/Sub topic transport
+metadata. The gate observed both resources, reached zero drift before and after
+MiniSky restart, imported the canonical trigger ID, reconciled the provider's
+standard label through Eventarc PATCH, then reached zero drift again. Destroy
+removed both resources, and trigger/workflow GET returned `404` immediately and
+after a final restart. The runner requires
+`MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION=1` and retains the same
+temporary-state, collision, credential-clearing, and ten-minute guards as the
+Workflows gate. It does not publish an event or claim that MiniSky provisions a
+real Eventarc Pub/Sub transport; delivery, subscription creation, and broader
+trigger destinations remain outside this Terraform claim.
+
+The guarded Phase-19 Composer gate requires both
+`MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION=1` and
+`MINISKY_PHASE19_DOCKER_INTEGRATION=1`. Provider `7.41.0` applies the smallest
+environment configuration, observes the digest-pinned Airflow 2.10.5 backend,
+uploads and triggers one bounded DAG through the backend CLI, survives restart
+without Terraform drift, imports and reconciles the canonical ID, then destroys
+and verifies durable `404` plus exact container, anonymous volume, and network
+cleanup. Restarted metadata deliberately reports `ERROR`
+and suppresses its stale loopback URI while the owned backend remains
+observable. This is not real Cloud Composer, GKE, GCS DAG, IAM, autoscaling,
+upgrade, or production Airflow parity.
+
+The guarded Phase-19 Managed Kafka gate likewise requires both explicit
+Terraform and Docker opt-ins. Provider `7.41.0` applies the required
+`capacity_config` and one subnet reference, observes a real produce/consume
+round trip through the digest-pinned Kafka 4.1.0 broker, then repeats API and
+protocol observation after restart. It reaches zero drift, imports and
+reconciles the canonical cluster, destroys it, and verifies durable `404` plus
+exact container, anonymous-volume, and network cleanup. The subnet is opaque
+control-plane metadata: MiniSky does not attach the broker to a GCP VPC, and
+the local listener is plaintext because optional managed TLS is not emulated.
+Multi-broker availability, autoscaling, CMEK, GCP networking/TLS, Dataflow,
+Dataform, and Pub/Sub Lite Terraform compatibility remain unclaimed.
+
+The guarded Phase-20 Filestore gate applies the provider's smallest required
+share and network configuration. It verifies bounded data in MiniSky's
+profile-local share tree before and after restart, canonical import
+reconciliation, destroy, durable `404`, and exact filesystem cleanup. The
+network value is opaque metadata: no NFS endpoint, mount behavior, VPC
+attachment, address allocation, IAM, or production Filestore parity is claimed.
+
+The second Phase-20 gate manages only `authorized_domains = ["localhost"]`.
+Provider `7.41.0` exercises the canonical `identityPlatform:initializeAuth`
+custom method, PATCH/read persistence, restart no-drift, and project-ID import.
+Because this singleton cannot be deleted, the gate resets authorized domains to
+empty before Terraform destroy and verifies that reset after restart. It does
+not claim real sign-in, users, email/SMS delivery, OAuth providers, tenant
+isolation, IAM enforcement, or production Firebase/Identity Platform security.
+
+The third Phase-20 gate copies one bounded object between isolated local
+Storage-emulator buckets before and after restart, imports the canonical
+`project/job` identifier, and verifies provider destroy as durable soft-delete.
+External sources, credentials, transfer agents, schedules, cloud networking,
+and production Storage Transfer parity remain unsupported.
+
+The explicit-opt-in AlloyDB gate creates the smallest provider dependency
+graph: one cluster with an opaque metadata-only network reference and one
+`PRIMARY` instance. It verifies real PostgreSQL protocol writes and reads,
+restart persistence without backend identity churn, zero drift, full-name
+cluster and instance imports with reconciliation, dependency-ordered destroy,
+durable 404s, and exact container/volume/network cleanup. It does not emulate
+VPC connectivity, encryption, HA, backups, capacity, database users, or
+production AlloyDB semantics.
+
+The Service Directory gate creates one project/location-scoped namespace,
+service, and endpoint. It verifies the full hierarchy before and after restart,
+zero drift, canonical full-name imports with reconciliation, child-first
+destroy, durable 404s, and an empty namespace collection after a final restart.
+The endpoint's loopback address and port are opaque registration metadata only;
+MiniSky does not perform DNS publication, health checks, routing, or network
+resolution.
+
+The Document AI gate creates one metadata-only `OCR_PROCESSOR`, observes its
+stable control-plane fields before and after restart, reaches zero drift,
+imports the canonical full resource identifier with reconciliation, deletes
+through the service operation contract, and verifies durable 404 and empty-list
+cleanup after a final restart. It does not claim document processing or OCR
+quality, model inference, external model artifacts, or production handling of
+sensitive document content.
+
+The Organization Policy gate creates one project-scoped policy for the seeded
+`compute.disableSerialPortAccess` boolean constraint. It verifies the persisted
+API resource and local advisory enforced decision before and after restart,
+zero drift, canonical full-ID import with reconciliation, delete, durable 404,
+empty-list cleanup, and fallback to the seeded constraint default. This is a
+bounded local policy simulation, not production enforcement, IAM, inferred
+organization hierarchy, or compliance.
 
 ## Go, Python, and Java SDK smoke suites
 

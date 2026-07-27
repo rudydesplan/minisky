@@ -24,7 +24,7 @@ import (
 func TestCreateCluster(t *testing.T) {
 	api := newTestAPI()
 	api.backend = &fakeKafkaBackend{bootstrap: "127.0.0.1:19092"}
-	body := `{"capacity":{"vcpuCount":"3","memoryBytes":"3221225472"},"gcpConfig":{"accessConfig":{"networkConfigs":[{"subnet":"projects/test/regions/us-central1/subnetworks/default"}]}}}`
+	body := `{"capacityConfig":{"vcpuCount":"3","memoryBytes":"3221225472"},"gcpConfig":{"accessConfig":{"networkConfigs":[{"subnet":"projects/test/regions/us-central1/subnetworks/default"}]}}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/clusters?clusterId=my-cluster", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
@@ -42,7 +42,7 @@ func TestCreateCluster(t *testing.T) {
 
 func TestCreateClusterMissingClusterId(t *testing.T) {
 	api := newTestAPI()
-	body := `{"capacity":{"vcpuCount":"3"}}`
+	body := `{"capacityConfig":{"vcpuCount":"3"}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/clusters", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
@@ -783,6 +783,7 @@ func TestPersistAndReload(t *testing.T) {
 		stateStore: store,
 		clusters:   make(map[string]*Cluster),
 		topics:     make(map[string]*Topic),
+		backend:    &fakeKafkaBackend{bootstrap: "127.0.0.1:19092"},
 	}
 	if err := api2.loadState(); err != nil {
 		t.Fatalf("load failed: %v", err)
@@ -796,11 +797,11 @@ func TestPersistAndReload(t *testing.T) {
 	if cluster.Capacity == nil || cluster.Capacity.VcpuCount != "3" {
 		t.Fatal("capacity lost after reload")
 	}
-	if cluster.State != "FAILED" {
-		t.Fatalf("rehydrated cluster must not claim a live broker backend, got %q", cluster.State)
+	if cluster.State != "ACTIVE" {
+		t.Fatalf("rehydrated exact-owned broker must be active, got %q", cluster.State)
 	}
-	if cluster.BootstrapAddress != "" {
-		t.Fatalf("rehydrated cluster exposed stale broker address %q", cluster.BootstrapAddress)
+	if cluster.BootstrapAddress != "127.0.0.1:19092" {
+		t.Fatalf("rehydrated cluster has broker address %q", cluster.BootstrapAddress)
 	}
 	topic, ok := api2.topics["projects/p/locations/l/clusters/c1/topics/t1"]
 	if !ok {
@@ -821,7 +822,7 @@ func TestConcurrentCreateAndGet(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			body := `{"capacity":{"vcpuCount":"3"}}`
+			body := `{"capacityConfig":{"vcpuCount":"3"}}`
 			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v1/projects/test/locations/us-central1/clusters?clusterId=c-%d", idx), bytes.NewBufferString(body))
 			w := httptest.NewRecorder()
 			api.ServeHTTP(w, req)

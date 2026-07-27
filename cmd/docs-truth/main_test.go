@@ -80,7 +80,7 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		Package:        "pkg/shims/example",
 		Tests:          []string{"TestPersistAndReload"},
 		MethodNote:     "metadata-only lifecycle",
-		TerraformClaim: false,
+		TerraformClaim: true,
 	}}
 	got, err := renderPhaseSummary(services, inventory)
 	if err != nil {
@@ -89,8 +89,9 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 	for _, want := range []string{
 		"1 experimental",
 		"1 default-off",
-		"0 Terraform claims",
+		"1 Terraform claim",
 		"6 batch gates",
+		"11 per-domain Terraform checks",
 		"Package-unit gates passed locally: 6/6",
 		"strict-IAM gates passed locally: 6/6",
 		"Generated-client lifecycle gates passed locally: 6/6",
@@ -98,7 +99,7 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"Restart gates passed locally: 6/6",
 		"cleanup gates passed locally: 6/6",
 		"CI gates passed: 6/6; configured but unverified: 0/6",
-		"Heavy backend CI gates passed: 0/1; configured but unverified: 1/1",
+		"Heavy backend CI gates passed: 1/1; configured but unverified: 0/1",
 		"Package and IAM passes do not promote compatibility",
 	} {
 		if !strings.Contains(got, want) {
@@ -120,6 +121,17 @@ func TestWriteOrCheckDetectsDrift(t *testing.T) {
 	}
 	if err := writeOrCheck(path, []byte("fresh"), true); err != nil {
 		t.Fatalf("check mode rejected current documentation: %v", err)
+	}
+}
+
+func TestValidateHandwrittenClaimsRejectsStaleTerraformAbsence(t *testing.T) {
+	stale := "Terraform provider evidence remains absent, so every experimental domain remains default-off."
+	if err := validateHandwrittenClaims(stale); err == nil {
+		t.Fatal("accepted stale batch-wide Terraform absence claim")
+	}
+	if err := validateHandwrittenClaims(
+		"Per-domain Terraform claims and boundaries are listed in the generated catalog."); err != nil {
+		t.Fatalf("rejected current per-domain wording: %v", err)
 	}
 }
 

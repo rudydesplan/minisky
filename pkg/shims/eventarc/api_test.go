@@ -785,6 +785,85 @@ func TestPatchTrigger(t *testing.T) {
 	}
 }
 
+func TestPatchTriggerLabelsForProviderImportReconciliation(t *testing.T) {
+	api := newTestAPI()
+	name := "projects/test/locations/us-central1/triggers/t1"
+	api.triggers[name] = &Trigger{
+		Name:         name,
+		UID:          "uid-1",
+		CreateTime:   "2024-01-01T00:00:00Z",
+		EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+		Destination:  &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
+	}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v1/"+name+"?updateMask=labels",
+		bytes.NewBufferString(`{"labels":{"goog-terraform-provisioned":"true"}}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if got := api.triggers[name].Labels["goog-terraform-provisioned"]; got != "true" {
+		t.Fatalf("provider label = %q, want true", got)
+	}
+}
+
+func TestPatchTriggerAllMutableFieldsForWildcardAndEmptyMasksPersist(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mask string
+	}{
+		{name: "wildcard", mask: "*"},
+		{name: "empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &mockStore{data: make(map[string][]byte)}
+			api := newTestAPI()
+			api.stateStore = store
+			name := "projects/test/locations/us-central1/triggers/t1"
+			api.triggers[name] = &Trigger{
+				Name:         name,
+				UID:          "uid-1",
+				CreateTime:   "2024-01-01T00:00:00Z",
+				EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+				Destination:  &Destination{Workflow: "projects/test/locations/us-central1/workflows/old"},
+				Labels:       map[string]string{"old": "label"},
+			}
+
+			path := "/v1/" + name
+			if test.mask != "" {
+				path += "?updateMask=" + test.mask
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch, path,
+				bytes.NewBufferString(`{"destination":{"workflow":"projects/test/locations/us-central1/workflows/new"},"labels":{"new":"label"}}`)))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			updated := api.triggers[name]
+			if updated.Destination == nil ||
+				updated.Destination.Workflow != "projects/test/locations/us-central1/workflows/new" {
+				t.Fatalf("destination = %#v", updated.Destination)
+			}
+			if len(updated.Labels) != 1 || updated.Labels["new"] != "label" {
+				t.Fatalf("labels = %#v", updated.Labels)
+			}
+
+			restarted := newTestAPI()
+			restarted.stateStore = store
+			if err := restarted.loadState(); err != nil {
+				t.Fatal(err)
+			}
+			reloaded := restarted.triggers[name]
+			if reloaded == nil || reloaded.Destination == nil ||
+				reloaded.Destination.Workflow != "projects/test/locations/us-central1/workflows/new" ||
+				len(reloaded.Labels) != 1 || reloaded.Labels["new"] != "label" {
+				t.Fatalf("reloaded trigger = %#v", reloaded)
+			}
+		})
+	}
+}
+
 func TestPatchTriggerRejectsImmutableFieldMaskWithoutMutation(t *testing.T) {
 	api := newTestAPI()
 	name := "projects/test/locations/us-central1/triggers/t1"

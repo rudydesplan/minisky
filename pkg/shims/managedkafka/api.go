@@ -34,7 +34,7 @@ type Cluster struct {
 	CreateTime       string            `json:"createTime,omitempty"`
 	UpdateTime       string            `json:"updateTime,omitempty"`
 	State            string            `json:"state,omitempty"`
-	Capacity         *Capacity         `json:"capacity,omitempty"`
+	Capacity         *Capacity         `json:"capacityConfig,omitempty"`
 	GcpConfig        *GcpConfig        `json:"gcpConfig,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
 	BootstrapAddress string            `json:"bootstrapAddress,omitempty"`

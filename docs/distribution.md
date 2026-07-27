@@ -61,6 +61,17 @@ The guarded path retains the package test's refusal to replace an existing
 MiniSky installation, `/usr/bin/minisky`, or GoReleaser `dist` directory, and
 requires root or passwordless `sudo`.
 
+On 2026-07-27,
+[CI run 30287887431](https://github.com/rudydesplan/minisky/actions/runs/30287887431)
+passed on commit `d657e4b0b77a34ddb615124db2d82da810238502`.
+The read-only jobs installed pinned GoReleaser 2.17.0, passed the static
+distribution contract, built the Linux AMD64 release snapshot, and completed
+native AMD64 and ARM64 deb/rpm build → install → smoke → uninstall. The same
+run passed Linux ARM64, macOS ARM64, and Windows AMD64 DuckDB/CGO conformance;
+the Windows job also passed its MinGW runtime DLL audit. This is CI evidence,
+not publication evidence: no release, image, package repository, tap, or bucket
+was published.
+
 ## GHCR
 
 MiniSky publishes no GHCR tags: not exact semantic versions and not moving

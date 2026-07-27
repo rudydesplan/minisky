@@ -39,9 +39,15 @@ type Cluster struct {
 	UpdateTime      string            `json:"updateTime,omitempty"`
 	State           string            `json:"state,omitempty"`
 	DatabaseVersion string            `json:"databaseVersion,omitempty"`
+	ClusterType     string            `json:"clusterType,omitempty"`
 	Network         string            `json:"network,omitempty"`
+	NetworkConfig   *NetworkConfig    `json:"networkConfig,omitempty"`
 	DisplayName     string            `json:"displayName,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
+}
+
+type NetworkConfig struct {
+	Network string `json:"network,omitempty"`
 }
 
 // Instance represents the bounded fields supported from
@@ -196,9 +202,15 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if cluster.Network == "" && cluster.NetworkConfig != nil {
+		cluster.Network = cluster.NetworkConfig.Network
+	}
 	if cluster.Network == "" {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "network is required")
 		return
+	}
+	if cluster.NetworkConfig == nil {
+		cluster.NetworkConfig = &NetworkConfig{Network: cluster.Network}
 	}
 	if api.backend == nil {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
@@ -214,6 +226,9 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 	cluster.CreateTime = now
 	cluster.UpdateTime = now
 	cluster.State = "READY"
+	if cluster.ClusterType == "" {
+		cluster.ClusterType = "PRIMARY"
+	}
 
 	api.mu.Lock()
 	if _, exists := api.clusters[name]; exists {

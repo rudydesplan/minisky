@@ -82,11 +82,15 @@ func TestClusterToPrimaryInstanceLifecycleUsesBackend(t *testing.T) {
 
 	clusterRequest := httptest.NewRequest(http.MethodPost,
 		"/v1/projects/test/locations/us-central1/clusters?clusterId=c1",
-		bytes.NewBufferString(`{"network":"projects/test/global/networks/default","databaseVersion":"POSTGRES_15"}`))
+		bytes.NewBufferString(`{"networkConfig":{"network":"projects/test/global/networks/default"},"databaseVersion":"POSTGRES_15"}`))
 	clusterResponse := httptest.NewRecorder()
 	api.ServeHTTP(clusterResponse, clusterRequest)
 	if clusterResponse.Code != http.StatusOK {
 		t.Fatalf("create cluster = %d: %s", clusterResponse.Code, clusterResponse.Body.String())
+	}
+	cluster := api.clusters["projects/test/locations/us-central1/clusters/c1"]
+	if cluster.NetworkConfig == nil || cluster.NetworkConfig.Network == "" || cluster.ClusterType != "PRIMARY" {
+		t.Fatalf("provider-shaped cluster defaults = %#v", cluster)
 	}
 
 	instanceRequest := httptest.NewRequest(http.MethodPost,

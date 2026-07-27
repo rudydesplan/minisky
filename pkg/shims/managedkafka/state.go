@@ -1,6 +1,7 @@
 package managedkafka
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,6 +82,12 @@ func (api *API) loadState() error {
 			restored := deepCopyCluster(cluster)
 			restored.State = "FAILED"
 			restored.BootstrapAddress = ""
+			if api.backend != nil {
+				if bootstrap, provisionErr := api.backend.Provision(context.Background(), name); provisionErr == nil {
+					restored.State = "ACTIVE"
+					restored.BootstrapAddress = bootstrap
+				}
+			}
 			api.clusters[name] = restored
 		}
 	}

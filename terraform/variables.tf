@@ -58,6 +58,192 @@ variable "enable_phase16_compute_instance" {
   default     = false
 }
 
+variable "enable_phase18_eventarc_resource" {
+  description = "Create the optional local Phase-18 Eventarc trigger provider lifecycle resource"
+  type        = bool
+  default     = false
+}
+
+variable "enable_phase18_workflows_resource" {
+  description = "Create the optional local Phase-18 Workflows provider lifecycle resource"
+  type        = bool
+  default     = false
+}
+
+variable "phase18_eventarc_transport_topic" {
+  description = "Pub/Sub transport topic name persisted as metadata by the optional local Eventarc trigger"
+  type        = string
+  default     = "minisky-phase18-eventarc-transport"
+
+  validation {
+    condition     = can(regex("^[a-z]([-a-z0-9]{1,253}[a-z0-9])?$", var.phase18_eventarc_transport_topic))
+    error_message = "phase18_eventarc_transport_topic must start with a letter, contain only lowercase letters, digits, and hyphens, and be between 3 and 255 characters."
+  }
+}
+
+variable "phase18_eventarc_trigger_name" {
+  description = "Name of the optional local Phase-18 Eventarc trigger lifecycle resource"
+  type        = string
+  default     = "minisky-phase18-eventarc"
+
+  validation {
+    condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.phase18_eventarc_trigger_name))
+    error_message = "phase18_eventarc_trigger_name must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 63 characters."
+  }
+}
+
+variable "phase18_workflow_name" {
+  description = "Name of the optional local Phase-18 Workflows lifecycle resource"
+  type        = string
+  default     = "minisky-phase18"
+
+  validation {
+    condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.phase18_workflow_name))
+    error_message = "phase18_workflow_name must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 63 characters."
+  }
+}
+
+variable "enable_phase19_composer_resource" {
+  description = "Create the optional heavy local Phase-19 Composer provider lifecycle resource"
+  type        = bool
+  default     = false
+}
+
+variable "phase19_composer_environment_name" {
+  description = "Name of the optional heavy local Phase-19 Composer environment"
+  type        = string
+  default     = "minisky-phase19-composer"
+
+  validation {
+    condition     = can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.phase19_composer_environment_name))
+    error_message = "phase19_composer_environment_name must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 63 characters."
+  }
+}
+
+variable "enable_phase19_managed_kafka_resource" {
+  description = "Create the optional heavy local Phase-19 Managed Kafka provider lifecycle resource"
+  type        = bool
+  default     = false
+}
+
+variable "phase19_managed_kafka_cluster_id" {
+  description = "ID of the optional heavy local Phase-19 Managed Kafka cluster"
+  type        = string
+  default     = "minisky-phase19-kafka"
+
+  validation {
+    condition     = can(regex("^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$", var.phase19_managed_kafka_cluster_id))
+    error_message = "phase19_managed_kafka_cluster_id must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 63 characters."
+  }
+}
+
+variable "enable_phase20_filestore_resource" {
+  description = "Create the optional local Phase-20 Filestore provider lifecycle resource"
+  type        = bool
+  default     = false
+}
+
+variable "phase20_filestore_instance_name" {
+  description = "Name of the optional local Phase-20 Filestore instance"
+  type        = string
+  default     = "minisky-phase20-filestore"
+
+  validation {
+    condition     = can(regex("^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$", var.phase20_filestore_instance_name))
+    error_message = "phase20_filestore_instance_name must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 63 characters."
+  }
+}
+
+variable "enable_phase20_identity_platform_config" {
+  description = "Manage the optional local Phase-20 Identity Platform project config"
+  type        = bool
+  default     = false
+}
+
+variable "phase20_identity_platform_authorized_domains" {
+  description = "Authorized-domain metadata for the optional local Identity Platform project config"
+  type        = list(string)
+  default     = ["localhost"]
+}
+
+variable "enable_phase20_storage_transfer_job" {
+  description = "Create the optional local Phase-20 Storage Transfer job"
+  type        = bool
+  default     = false
+}
+
+variable "phase20_storage_transfer_source_bucket" {
+  description = "Source bucket for the optional local Storage Transfer job"
+  type        = string
+  default     = "minisky-phase20-transfer-source"
+}
+
+variable "phase20_storage_transfer_sink_bucket" {
+  description = "Sink bucket for the optional local Storage Transfer job"
+  type        = string
+  default     = "minisky-phase20-transfer-sink"
+}
+
+variable "enable_phase20_alloydb_resources" {
+  description = "Create the optional heavy local Phase-20 AlloyDB cluster and primary instance"
+  type        = bool
+  default     = false
+}
+
+variable "phase20_alloydb_cluster_id" {
+  description = "Cluster ID for the optional local AlloyDB lifecycle"
+  type        = string
+  default     = "minisky-phase20-alloydb"
+}
+
+variable "phase20_alloydb_instance_id" {
+  description = "Primary instance ID for the optional local AlloyDB lifecycle"
+  type        = string
+  default     = "minisky-primary"
+}
+
+variable "enable_phase21_service_directory_resources" {
+  description = "Create the optional Phase-21 Service Directory namespace/service/endpoint hierarchy"
+  type        = bool
+  default     = false
+}
+
+variable "phase21_service_directory_namespace_id" {
+  description = "Namespace ID for the optional Service Directory lifecycle"
+  type        = string
+  default     = "minisky-phase21"
+}
+
+variable "phase21_service_directory_service_id" {
+  description = "Service ID for the optional Service Directory lifecycle"
+  type        = string
+  default     = "local-service"
+}
+
+variable "phase21_service_directory_endpoint_id" {
+  description = "Endpoint ID for the optional Service Directory lifecycle"
+  type        = string
+  default     = "local-endpoint"
+}
+
+variable "enable_phase23_document_ai_processor" {
+  description = "Create the optional Phase-23 metadata-only Document AI processor"
+  type        = bool
+  default     = false
+}
+
+variable "phase23_document_ai_processor_display_name" {
+  description = "Display name for the optional local Document AI processor"
+  type        = string
+  default     = "minisky-phase23-processor"
+}
+
+variable "enable_phase24_org_policy" {
+  description = "Create the optional Phase-24 project Organization Policy simulation"
+  type        = bool
+  default     = false
+}
+
 variable "phase16_instance_name" {
   description = "Name of the optional local Phase-16 Compute instance"
   type        = string

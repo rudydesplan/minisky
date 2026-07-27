@@ -77,22 +77,30 @@ type EvidenceCheck struct {
 	Note       string          `json:"note"`
 }
 
+// TerraformCheck records one provider lifecycle for exactly one service
+// domain. Terraform evidence is intentionally not represented as a batch-wide
+// check because each claimed domain has its own fixture and executable gate.
+type TerraformCheck struct {
+	Domain string `json:"domain"`
+	EvidenceCheck
+}
+
 // BatchGate consolidates one generated-client integration batch without
 // promoting its experimental domains or implying Terraform compatibility.
 type BatchGate struct {
-	ID                          string        `json:"id"`
-	Domains                     []string      `json:"domains"`
-	RelatedDomains              []string      `json:"relatedDomains,omitempty"`
-	UnsupportedGeneratedDomains []string      `json:"unsupportedGeneratedDomains,omitempty"`
-	PackageUnit                 EvidenceCheck `json:"packageUnit"`
-	GeneratedClientLifecycle    EvidenceCheck `json:"generatedClientLifecycle"`
-	DaemonRestart               EvidenceCheck `json:"daemonRestart"`
-	RealBackendDocker           EvidenceCheck `json:"realBackendDocker"`
-	StrictIAM                   EvidenceCheck `json:"strictIAM"`
-	Terraform                   EvidenceCheck `json:"terraform"`
-	Cleanup                     EvidenceCheck `json:"cleanup"`
-	CI                          EvidenceCheck `json:"ci"`
-	BackendCI                   EvidenceCheck `json:"backendCI,omitempty"`
+	ID                          string           `json:"id"`
+	Domains                     []string         `json:"domains"`
+	RelatedDomains              []string         `json:"relatedDomains,omitempty"`
+	UnsupportedGeneratedDomains []string         `json:"unsupportedGeneratedDomains,omitempty"`
+	PackageUnit                 EvidenceCheck    `json:"packageUnit"`
+	GeneratedClientLifecycle    EvidenceCheck    `json:"generatedClientLifecycle"`
+	DaemonRestart               EvidenceCheck    `json:"daemonRestart"`
+	RealBackendDocker           EvidenceCheck    `json:"realBackendDocker"`
+	StrictIAM                   EvidenceCheck    `json:"strictIAM"`
+	TerraformChecks             []TerraformCheck `json:"terraformChecks,omitempty"`
+	Cleanup                     EvidenceCheck    `json:"cleanup"`
+	CI                          EvidenceCheck    `json:"ci"`
+	BackendCI                   EvidenceCheck    `json:"backendCI,omitempty"`
 }
 
 //go:embed batch_gates.json

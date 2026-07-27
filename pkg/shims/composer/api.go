@@ -213,6 +213,9 @@ func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 				if current.Config == nil {
 					current.Config = &EnvironmentConfig{}
 				}
+				if current.Config.SoftwareConfig == nil {
+					current.Config.SoftwareConfig = &SoftwareConfig{ImageVersion: "composer-3-airflow-2.10.5"}
+				}
 				current.Config.AirflowURI = endpoint
 				current.Config.DagGcsPrefix = "minisky://" + name + "/dags"
 			}

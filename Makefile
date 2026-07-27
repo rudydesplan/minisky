@@ -1,4 +1,4 @@
-.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase19-sdk test-phase19-heavy-backend test-phase20-sdk test-phase21-22-sdk test-phase23-sdk test-phase24-25-sdk benchmark
+.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase18-eventarc-terraform test-phase18-workflows-terraform test-phase19-sdk test-phase19-heavy-backend test-phase19-composer-terraform test-phase19-managed-kafka-terraform test-phase20-sdk test-phase20-alloydb-terraform test-phase20-filestore-terraform test-phase20-identity-platform-terraform test-phase20-storage-transfer-terraform test-phase21-22-sdk test-phase21-service-directory-terraform test-phase23-sdk test-phase23-document-ai-terraform test-phase24-25-sdk test-phase24-org-policy-terraform benchmark
 
 ui-install:
 	cd ui && npm ci
@@ -85,23 +85,56 @@ test-phase18-25-evidence:
 test-phase18-25-sdk:
 	MINISKY_PHASE18_25_SDK_INTEGRATION=1 ./scripts/phase18-25-sdk-integration.sh
 
+test-phase18-eventarc-terraform:
+	MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION=1 ./scripts/phase18-eventarc-terraform-integration.sh
+
+test-phase18-workflows-terraform:
+	MINISKY_PHASE18_WORKFLOWS_TERRAFORM_INTEGRATION=1 ./scripts/phase18-workflows-terraform-integration.sh
+
 test-phase19-sdk:
 	MINISKY_PHASE19_SDK_INTEGRATION=1 ./scripts/phase19-sdk-integration.sh
 
 test-phase19-heavy-backend:
 	MINISKY_PHASE19_SDK_INTEGRATION=1 MINISKY_PHASE19_DOCKER_INTEGRATION=1 ./scripts/phase19-sdk-integration.sh
 
+test-phase19-composer-terraform:
+	MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION=1 MINISKY_PHASE19_DOCKER_INTEGRATION=1 ./scripts/phase19-composer-terraform-integration.sh
+
+test-phase19-managed-kafka-terraform:
+	MINISKY_PHASE19_MANAGED_KAFKA_TERRAFORM_INTEGRATION=1 MINISKY_PHASE19_DOCKER_INTEGRATION=1 ./scripts/phase19-managed-kafka-terraform-integration.sh
+
 test-phase20-sdk:
 	MINISKY_PHASE20_SDK_INTEGRATION=1 ./scripts/phase20-sdk-integration.sh
+
+test-phase20-filestore-terraform:
+	MINISKY_PHASE20_FILESTORE_TERRAFORM_INTEGRATION=1 ./scripts/phase20-filestore-terraform-integration.sh
+
+test-phase20-identity-platform-terraform:
+	MINISKY_PHASE20_IDENTITY_PLATFORM_TERRAFORM_INTEGRATION=1 ./scripts/phase20-identity-platform-terraform-integration.sh
+
+test-phase20-storage-transfer-terraform:
+	MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION=1 ./scripts/phase20-storage-transfer-terraform-integration.sh
+
+test-phase20-alloydb-terraform:
+	MINISKY_PHASE20_ALLOYDB_TERRAFORM_INTEGRATION=1 MINISKY_PHASE20_ALLOYDB_DOCKER_INTEGRATION=1 ./scripts/phase20-alloydb-terraform-integration.sh
 
 test-phase21-22-sdk:
 	MINISKY_PHASE21_22_SDK_INTEGRATION=1 ./scripts/phase21-22-sdk-integration.sh
 
+test-phase21-service-directory-terraform:
+	MINISKY_PHASE21_SERVICE_DIRECTORY_TERRAFORM_INTEGRATION=1 ./scripts/phase21-service-directory-terraform-integration.sh
+
 test-phase23-sdk:
 	MINISKY_PHASE23_SDK_INTEGRATION=1 ./scripts/phase23-sdk-integration.sh
 
+test-phase23-document-ai-terraform:
+	MINISKY_PHASE23_DOCUMENT_AI_TERRAFORM_INTEGRATION=1 ./scripts/phase23-document-ai-terraform-integration.sh
+
 test-phase24-25-sdk:
 	MINISKY_PHASE24_25_SDK_INTEGRATION=1 ./scripts/phase24-25-sdk-integration.sh
+
+test-phase24-org-policy-terraform:
+	MINISKY_PHASE24_ORG_POLICY_TERRAFORM_INTEGRATION=1 ./scripts/phase24-org-policy-terraform-integration.sh
 
 benchmark:
 	go test -run='^$$' -bench=BenchmarkGatewayRouting -benchmem -count=5 ./pkg/router

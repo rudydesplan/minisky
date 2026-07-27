@@ -23,19 +23,19 @@ const phases = [
   ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
   ["9", "Serverless and events", "Verified bounded local slice", "Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes pass; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
-  ["11", "DX and distribution", "Verified local slice", "Native amd64/arm64 deb/rpm install gates pass; publication remains external"],
+  ["11", "DX and distribution", "CI-verified distribution slice", "GoReleaser Linux AMD64 snapshot, native amd64/arm64 deb/rpm, and Linux ARM64/macOS ARM64/Windows AMD64 CGO gates pass; publication remains external"],
   ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
-  ["18", "Event workflows", "Experimental · local + CI lifecycle passed", "Generated clients proved default-off behavior plus Eventarc, Workflows, Workflow Executions, and exact-owned Batch create → restart → observe → delete"],
-  ["19", "Pipelines and streaming", "Experimental · core CI passed; heavy CI configured", "Dataflow/Dataform lifecycle passes in CI; exact-owned Kafka protocol and Airflow DAG execution pass locally with a separate workflow-dispatch job awaiting its first pushed run; Pub/Sub Lite stays explicit 501"],
-  ["20", "Extended databases", "Experimental · local + CI lifecycle passed", "AlloyDB, Valkey, Identity Platform, Filestore, Storage Transfer, pinned backends, restart, and exact cleanup pass locally and in CI"],
-  ["21–22", "Observability and API management", "Experimental · local + CI lifecycle passed", "Durable ingestion, hierarchy, local gateway, directory, rollout, policy, restart, and cleanup gates pass; external deployment parity remains unsupported"],
-  ["23", "AI and ML services", "Experimental · local + CI lifecycle passed", "Bounded deterministic and explicit-unsupported client contracts, restart, sensitive-data absence, and cleanup pass; real model-semantic inference is not claimed"],
-  ["24–25", "Security and networking", "Experimental · local + CI lifecycle passed", "CA, Binary Authorization, DLP, asset, org-policy, perimeter, routing, two isolated backends, restart, and cleanup pass locally and in CI"],
+  ["18", "Event workflows", "Experimental · lifecycle + two Terraform gates passed", "Generated clients cover Eventarc, Workflows, Workflow Executions, and Batch; provider 7.41.0 proves bounded Workflows and Eventarc trigger control-plane lifecycles, including Eventarc import"],
+  ["19", "Pipelines and streaming", "Experimental · core + heavy CI + two Terraform gates passed", "Dataflow/Dataform lifecycle plus exact-owned Kafka protocol and Airflow DAG execution pass; provider 7.41.0 proves bounded Composer and Managed Kafka lifecycles/imports; Pub/Sub Lite stays explicit 501"],
+  ["20", "Extended databases", "Experimental · local + CI + four Terraform gates passed", "Provider 7.41.0 proves bounded AlloyDB cluster/primary, Filestore, Identity Platform singleton, and local GCS-to-GCS Storage Transfer lifecycles; production networking remains outside the claims"],
+  ["21–22", "Observability and API management", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves the Service Directory namespace/service/endpoint hierarchy; durable ingestion, gateway, rollout, policy, restart, and cleanup gates pass while external deployment and DNS parity remain unsupported"],
+  ["23", "AI and ML services", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one metadata-only Document AI processor lifecycle; bounded client contracts, restart, sensitive-data absence, and cleanup pass while processing and inference parity remain unsupported"],
+  ["24–25", "Security and networking", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one project Organization Policy lifecycle and bounded local decision; CA, Binary Authorization, DLP, asset, perimeter, routing, restart, and cleanup pass without production enforcement claims"],
 ];
 
 const waves = [
@@ -126,7 +126,7 @@ const waves = [
       "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI on commit 62d6fa2. Applicable backend boundaries pass locally; Phase 19 heavy backend CI is configured-unverified and no Phase 18–25 Terraform claim exists.",
+    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI. Phase 19 heavy Kafka/Airflow backend CI passed on commit d657e4b; bounded local Workflows and Eventarc Terraform claims now exist.",
   },
 ];
 
@@ -155,9 +155,11 @@ export default function MiniSkyRoadmapCompletionPlan() {
         pagination, routing, strict IAM, exact-owned Docker cleanup, and machine-readable evidence while remaining
         default-off experimental. All six package-unit, strict-IAM, generated-client, restart, and cleanup batch gates
         pass locally, including the applicable Docker and loopback backend boundaries. All six external CI gates
-        passed on commit 62d6fa2. Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs also passed in that
-        run, while its release snapshot was blocked by a GoReleaser PATH defect now fixed only locally. Phase 18–25
-        Terraform evidence remains absent. Production-grade semantics remain explicit external boundaries.
+        passed on commit 62d6fa2. On commit d657e4b, Phase 19 Kafka/Airflow, the corrected GoReleaser validation,
+        Linux AMD64 release snapshot, native AMD64/ARM64 packages, and Linux ARM64, macOS ARM64, and Windows AMD64
+        CGO jobs all passed. Provider 7.41.0 now passes eleven independently recorded, domain-scoped Terraform
+        lifecycles while every Phase 18–25 service remains default-off and bounded by its documented local contract.
+        Production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -171,7 +173,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Card>
         <Card>
           <CardHeader>Promotion status</CardHeader>
-          <CardBody><H2>Default-off</H2><Text tone="secondary">CI passed; release-equivalent and Terraform evidence pending</Text></CardBody>
+          <CardBody><H2>Default-off</H2><Text tone="secondary">Eleven bounded provider lifecycles pass without batch-wide production promotion</Text></CardBody>
         </Card>
       </Grid>
 
@@ -188,16 +190,23 @@ export default function MiniSkyRoadmapCompletionPlan() {
             All six Phase 18–25 SDK/restart/cleanup workflows passed
             locally on 2026-07-27, including terminal exact-owned Batch cleanup, Phase 19&apos;s heavy Kafka/Airflow
             path, pinned Phase 20 backends, and isolated Phase 24–25 routing backends. The six GitHub jobs passed in
-            run 30285572232 on commit 62d6fa2. That run also passed Linux ARM64, macOS ARM64, and Windows AMD64 CGO
-            jobs, but the Linux AMD64 release snapshot was skipped after an earlier release-validation PATH failure.
-            A separate explicit Phase 19 Kafka/Airflow workflow-dispatch job is now configured but unverified.
+            run 30285572232 on commit 62d6fa2. Run 30287887431 on commit d657e4b then passed the explicit Phase 19
+            Kafka/Airflow workflow, exact cleanup, corrected GoReleaser validation, Linux AMD64 snapshot, native
+            Linux package jobs, and Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs.
           </Text>
         </Stack>
         <Stack gap={8}>
           <H3>Terraform status</H3>
           <Text tone="secondary">
-            Zero Phase 18–25 provider claims. Add one only after isolated apply, restart, no-drift, import where
-            relevant, destroy, and cleanup evidence passes.
+            Eleven bounded provider lifecycles now pass with provider 7.41.0, including the coupled
+            <Code>google_alloydb_cluster</Code> and <Code>google_alloydb_instance</Code> gate. AlloyDB proves
+            real PostgreSQL protocol persistence, restart reconciliation, no drift, canonical imports, ordered
+            destroy, durable 404s, and exact-owned cleanup without claiming production networking or HA parity.
+            Service Directory additionally proves a complete namespace/service/endpoint metadata hierarchy without
+            claiming DNS or network resolution. Document AI proves one processor control-plane lifecycle without
+            claiming document processing, OCR quality, or model inference.
+            Organization Policy additionally proves one project boolean policy and advisory decision without claiming
+            production enforcement, IAM, or compliance.
           </Text>
         </Stack>
       </Grid>
@@ -379,10 +388,14 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Stack>
       </Grid>
 
-      <Callout tone="info" title="Next evidence milestone">
-        After commit and push, CI-verify the Phase 19 Kafka/Airflow job and the GoReleaser PATH fix, then complete
-        the release-equivalent snapshot gate. Keep every domain experimental while Terraform evidence remains
-        absent; add provider claims only after isolated lifecycle evidence exists.
+      <Callout tone="info" title="Next provider evidence milestone">
+        Workflows and Eventarc trigger control-plane gates now pass with provider 7.41.0; Eventarc delivery and
+        Pub/Sub transport provisioning remain explicitly outside the claim. Provider 7.41.0 exposes no Batch job
+        resource or Batch custom endpoint. Bounded Composer and Managed Kafka heavy provider gates now pass; the
+        Kafka subnet is metadata-only and its local broker is plaintext, so no GCP VPC or managed TLS parity is
+        claimed. Phase 19 has no Dataform resource, and the current Dataflow API does not expose the provider&apos;s
+        template-launch path. Evaluate the smallest truthful Phase 20 provider resource next. Keep every domain experimental and default-off; distribution publication
+        remains a separate release workflow.
       </Callout>
     </Stack>
   );

@@ -36,6 +36,23 @@ func TestCreateEnvironment(t *testing.T) {
 	}
 }
 
+func TestCreateEnvironmentProvidesReadableConfigForMinimalProviderRequest(t *testing.T) {
+	api := newTestAPI()
+	api.backend = &fakeAirflowBackend{endpoint: "http://127.0.0.1:18080"}
+	name := "projects/test/locations/us-central1/environments/provider"
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/environments",
+		bytes.NewBufferString(`{"name":"`+name+`","labels":{"goog-terraform-provisioned":"true"}}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	waitForEnvironmentState(t, api, name, "RUNNING")
+	if got := api.environments[name].Config; got == nil || got.SoftwareConfig == nil || got.SoftwareConfig.ImageVersion == "" {
+		t.Fatalf("minimal provider response has unreadable config: %#v", got)
+	}
+}
+
 func TestCreateEnvironmentMissingName(t *testing.T) {
 	api := newTestAPI()
 	body := `{"config":{"nodeCount":3}}`
