@@ -7,6 +7,79 @@ import (
 	"strings"
 )
 
+// RouteHTTP is the bounded serving-path contract used by the Compute HTTP
+// proxy. It supports exact/prefix path matching and one unweighted destination.
+// Ambiguous routes and unsupported regex/weighted semantics fail closed.
+func (api *API) RouteHTTP(
+	project, location, host, requestPath string,
+) (matched bool, destination, routeName string, err error) {
+	if !validRouteScopePart(project) || !validRouteScopePart(location) {
+		return false, "", "", fmt.Errorf("invalid service mesh route scope")
+	}
+	prefix := fmt.Sprintf("projects/%s/locations/%s/httpRoutes/", project, location)
+	api.mu.RLock()
+	routes := make([]*HttpRoute, 0)
+	for name, route := range api.httpRoutes {
+		if strings.HasPrefix(name, prefix) {
+			routes = append(routes, cloneHttpRoute(route))
+		}
+	}
+	api.mu.RUnlock()
+	sort.Slice(routes, func(i, j int) bool { return routes[i].Name < routes[j].Name })
+
+	type candidate struct {
+		route       string
+		destination string
+	}
+	candidates := make([]candidate, 0, 1)
+	for _, route := range routes {
+		if !matchesHostname(route.Hostnames, host) {
+			continue
+		}
+		matchedRules := make([]RouteRule, 0, 1)
+		for _, rule := range route.Rules {
+			for _, match := range rule.Matches {
+				if match.RegexMatch != "" {
+					return false, "", "", fmt.Errorf("HTTP route %q uses unsupported regex matching", route.Name)
+				}
+			}
+			if matchesRoute(rule.Matches, requestPath) {
+				matchedRules = append(matchedRules, rule)
+			}
+		}
+		if len(matchedRules) == 0 {
+			continue
+		}
+		if len(matchedRules) != 1 {
+			return false, "", "", fmt.Errorf("HTTP route %q has multiple matching rules", route.Name)
+		}
+		action := matchedRules[0].Action
+		if action == nil || len(action.Destinations) != 1 {
+			return false, "", "", fmt.Errorf("HTTP route %q must resolve to exactly one destination", route.Name)
+		}
+		selected := action.Destinations[0]
+		if selected.ServiceName == "" {
+			return false, "", "", fmt.Errorf("HTTP route %q has an empty destination serviceName", route.Name)
+		}
+		if selected.Weight != 0 && selected.Weight != 100 {
+			return false, "", "", fmt.Errorf("HTTP route %q uses unsupported weighted traffic", route.Name)
+		}
+		candidates = append(candidates, candidate{route: route.Name, destination: selected.ServiceName})
+	}
+	if len(candidates) == 0 {
+		return false, "", "", nil
+	}
+	if len(candidates) != 1 {
+		return false, "", "", fmt.Errorf("multiple HTTP routes match host %q and path %q", host, requestPath)
+	}
+	return true, candidates[0].destination, candidates[0].route, nil
+}
+
+func validRouteScopePart(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return value == trimmed && value != "" && value != "." && value != ".." && !strings.ContainsAny(value, `/\`)
+}
+
 // RouteDecision is advisory metadata; MiniSky does not program a mesh proxy.
 type RouteDecision struct {
 	Matched      bool               `json:"matched"`

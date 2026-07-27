@@ -135,6 +135,14 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	if persisted.Tasks != nil {
 		api.tasks = persisted.Tasks
 	}
+	api.mu.Lock()
+	interrupted := api.markInterruptedTasksLocked()
+	api.mu.Unlock()
+	if interrupted {
+		if err := api.persistMetadata(); err != nil {
+			return nil, fmt.Errorf("persist interrupted Cloud Tasks metadata: %w", err)
+		}
+	}
 	return api, nil
 }
 
@@ -211,6 +219,9 @@ func (api *API) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		api.mu.Lock()
+		api.markInterruptedTasksLocked()
+		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
 			return fmt.Errorf("persist Cloud Tasks shutdown metadata: %w", err)
 		}
@@ -218,6 +229,25 @@ func (api *API) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (api *API) markInterruptedTasksLocked() bool {
+	changed := false
+	for _, tasks := range api.tasks {
+		for _, task := range tasks {
+			if task == nil || task.Status != "PENDING" && task.Status != "RETRYING" {
+				continue
+			}
+			task.Status = "FAILED"
+			if task.AttemptCount > 0 {
+				task.LastError = "delivery interrupted by emulator restart or shutdown; target outcome is unknown; task was not replayed to avoid duplicate delivery"
+			} else {
+				task.LastError = "delivery interrupted by emulator restart or shutdown; task was not replayed"
+			}
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
@@ -580,16 +610,22 @@ func (api *API) executeTask(
 
 		body, err := decodeTaskBody(request.Body)
 		if err != nil {
-			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			if persistErr := api.recordAttemptOutcome(queueName, taskName, 0, err, true); persistErr != nil {
+				log.Printf("[Shim: Cloud Tasks] persist invalid task outcome: %v", persistErr)
+			}
 			return
 		}
 		if err = validateTaskHTTPRequest(request); err != nil {
-			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			if persistErr := api.recordAttemptOutcome(queueName, taskName, 0, err, true); persistErr != nil {
+				log.Printf("[Shim: Cloud Tasks] persist invalid target outcome: %v", persistErr)
+			}
 			return
 		}
 		pinnedContext, err := api.pinTaskTarget(ctx, request.URL)
 		if err != nil {
-			api.recordAttemptOutcome(queueName, taskName, 0, err, true)
+			if persistErr := api.recordAttemptOutcome(queueName, taskName, 0, err, true); persistErr != nil {
+				log.Printf("[Shim: Cloud Tasks] persist target resolution outcome: %v", persistErr)
+			}
 			return
 		}
 
@@ -623,7 +659,10 @@ func (api *API) executeTask(
 			return
 		}
 		if err == nil {
-			api.recordAttemptOutcome(queueName, taskName, statusCode, nil, true)
+			if persistErr := api.recordAttemptOutcome(queueName, taskName, statusCode, nil, true); persistErr != nil {
+				log.Printf("[Shim: Cloud Tasks] persist successful task outcome: %v", persistErr)
+				return
+			}
 			api.pushLog(project, "INFO", queueName, fmt.Sprintf("Task executed successfully: %s (Target: %s)", taskName, request.URL))
 			return
 		}
@@ -631,7 +670,10 @@ func (api *API) executeTask(
 		delay := retryDelay(minBackoff, maxBackoff, config.MaxDoublings, attempt)
 		retryDurationExpired := maxRetryDuration > 0 && time.Since(firstAttempt)+delay >= maxRetryDuration
 		terminal := attempt >= maxAttempts || retryDurationExpired
-		api.recordAttemptOutcome(queueName, taskName, statusCode, err, terminal)
+		if persistErr := api.recordAttemptOutcome(queueName, taskName, statusCode, err, terminal); persistErr != nil {
+			log.Printf("[Shim: Cloud Tasks] persist failed task outcome: %v", persistErr)
+			return
+		}
 		if terminal {
 			api.pushLog(project, "ERROR", queueName, fmt.Sprintf("Task failed after %d attempts: %s (%v)", attempt, taskName, err))
 			return
@@ -762,12 +804,23 @@ func (api *API) recordAttemptStart(
 	return attempt, firstAttempt, exhausted, nil
 }
 
-func (api *API) recordAttemptOutcome(queueName, taskName string, statusCode int, err error, terminal bool) {
+func (api *API) recordAttemptOutcome(
+	queueName, taskName string,
+	statusCode int,
+	err error,
+	terminal bool,
+) error {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+
 	api.mu.Lock()
+	var previous *Task
 	for _, task := range api.tasks[queueName] {
 		if task.Name != taskName {
 			continue
 		}
+		snapshot := *task
+		previous = &snapshot
 		task.LastStatusCode = statusCode
 		if err == nil {
 			task.Status = "COMPLETED"
@@ -782,10 +835,23 @@ func (api *API) recordAttemptOutcome(queueName, taskName string, statusCode int,
 		}
 		break
 	}
+	metadata := cloneMetadata(api.queues, api.tasks)
 	api.mu.Unlock()
-	if persistErr := api.persistMetadata(); persistErr != nil {
-		log.Printf("[Shim: Cloud Tasks] persist attempt metadata: %v", persistErr)
+	if previous == nil || api.store == nil {
+		return nil
 	}
+	if persistErr := api.store.Save(cloudTasksStateEntry, metadata); persistErr != nil {
+		api.mu.Lock()
+		for _, task := range api.tasks[queueName] {
+			if task.Name == taskName {
+				*task = *previous
+				break
+			}
+		}
+		api.mu.Unlock()
+		return persistErr
+	}
+	return nil
 }
 
 func parseAttemptTime(value string) time.Time {

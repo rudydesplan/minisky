@@ -39,6 +39,7 @@ type ProxyRouter struct {
 	authorizer      routeAuthorizer
 	projects        projectRegistry
 	enforceProjects bool
+	perimeters      servicePerimeterEvaluator
 	tokenAudience   string
 	quota           *QuotaLimiter
 	quotaObserver   func(observability.RequestLabels, string)
@@ -61,6 +62,10 @@ type routeAuthorizer interface {
 
 type projectRegistry interface {
 	Exists(projectID string) bool
+}
+
+type servicePerimeterEvaluator interface {
+	EvaluateServicePerimeter(project, service, sourceIP, region string) (configured, allowed bool)
 }
 
 type completedUploadReplayProbe interface {
@@ -95,6 +100,14 @@ func (p *ProxyRouter) ConfigureSecurity(authorizer routeAuthorizer, projects pro
 	if configurer, ok := authorizer.(interface{ SetTokenAudience(string) }); ok {
 		configurer.SetTokenAudience(audience)
 	}
+}
+
+// ConfigureServicePerimeters installs the profile-scoped VPC Service Controls
+// decision provider. A nil provider preserves the default-off behavior.
+func (p *ProxyRouter) ConfigureServicePerimeters(evaluator servicePerimeterEvaluator) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.perimeters = evaluator
 }
 
 // NewProxyRouter creates a standalone router (for backward compatibility).
@@ -227,6 +240,9 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !p.validateProject(w, r, targetDomain) {
 				return
 			}
+			if !p.enforceServicePerimeter(w, r, targetDomain) {
+				return
+			}
 			if !p.checkQuota(w, r, targetDomain) {
 				return
 			}
@@ -251,6 +267,9 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !p.validateProject(w, r, targetDomain) {
+		return
+	}
+	if !p.enforceServicePerimeter(w, r, targetDomain) {
 		return
 	}
 	if !p.checkQuota(w, r, targetDomain) {
@@ -299,6 +318,43 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	handler.ServeHTTP(w, r)
+}
+
+func (p *ProxyRouter) enforceServicePerimeter(w http.ResponseWriter, r *http.Request, service string) bool {
+	if !strings.HasSuffix(service, ".googleapis.com") {
+		return true
+	}
+	projects := projectsFromRequest(r)
+	if len(projects) == 0 {
+		return true
+	}
+
+	p.mu.RLock()
+	evaluator := p.perimeters
+	authorizer := p.authorizer
+	p.mu.RUnlock()
+	if evaluator == nil {
+		return true
+	}
+
+	sourceIP, _, splitErr := net.SplitHostPort(r.RemoteAddr)
+	if splitErr != nil {
+		sourceIP = r.RemoteAddr
+	}
+	strict := authorizer != nil && authorizer.EnforcementEnabled()
+	for _, project := range projects {
+		if !strings.HasPrefix(project, "projects/") {
+			project = "projects/" + project
+		}
+		configured, allowed := evaluator.EvaluateServicePerimeter(project, service, sourceIP, "")
+		if allowed || (!configured && !strict) {
+			continue
+		}
+		p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED",
+			"Request is prohibited by VPC Service Controls")
+		return false
+	}
+	return true
 }
 
 func (p *ProxyRouter) enforceRequestBodyLimit(
@@ -936,6 +992,7 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"bigquery.googleapis.com", http.MethodPut, "/upload/bigquery/v2/projects/{project}/jobs", "bigquery.jobs.create"},
 	{"bigtable.googleapis.com", http.MethodPost, "/v2/projects/{project}/instances/{instance}/tables/{table}:readRows", "bigtable.tables.readRows"},
 	{"bigtableadmin.googleapis.com", http.MethodGet, "/v2/operations/{operation}", "bigtable.instances.get"},
+	{"batch.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/jobs/{job}:cancel", "batch.jobs.delete"},
 	{"cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/{project}/triggers/{trigger}:run", "cloudbuild.builds.create"},
 	{"cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/{project}/builds/{build}:cancel", "cloudbuild.builds.update"},
 	{"cloudfunctions.googleapis.com", http.MethodPost, "/v2/deploy", "cloudfunctions.functions.create"},
@@ -1041,12 +1098,17 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"binaryauthorization.googleapis.com", http.MethodPut, "/v1/projects/{project}/policy", "binaryauthorization.policy.update"},
 	{"binaryauthorization.googleapis.com", http.MethodPost, "/v1/projects/{project}/policy:evaluate", "binaryauthorization.policy.evaluate"},
 	{"privateca.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/caPools/{pool}/certificates", "privateca.certificates.create"},
+	{"privateca.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/caPools/{pool}/certificates/{certificate}:revoke", "privateca.certificates.revoke"},
+	{"accesscontextmanager.googleapis.com", http.MethodPost, "/v1/accessPolicies/{policy}:checkAccess", "accesscontextmanager.accessPolicies.get"},
+	{"networksecurity.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/authorizationPolicies:evaluate", "networksecurity.authorizationPolicies.get"},
+	{"networkservices.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/httpRoutes:resolve", "networkservices.httpRoutes.get"},
 	{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/{service}:check", "servicecontrol.services.check"},
 	{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/{service}:report", "servicecontrol.services.report"},
 	{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/{service}/configs", "servicemanagement.services.update"},
 	{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/{service}/rollouts", "servicemanagement.services.update"},
 	{"speech.googleapis.com", http.MethodPost, "/v1/speech:recognize", "speech.recognizers.recognize"},
 	{"speech.googleapis.com", http.MethodPost, "/v1/speech:longrunningrecognize", "speech.recognizers.recognize"},
+	{"storagetransfer.googleapis.com", http.MethodPost, "/v1/transferJobs/{job}:run", "storagetransfer.jobs.run"},
 	{"texttospeech.googleapis.com", http.MethodPost, "/v1/text:synthesize", "texttospeech.synthesizers.synthesize"},
 	// Phase 18-25 custom action routes
 	{"cloudtrace.googleapis.com", http.MethodPost, "/v2/projects/{project}/traces:batchWrite", "cloudtrace.traces.batchWrite"},

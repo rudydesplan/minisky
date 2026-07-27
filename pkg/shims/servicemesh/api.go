@@ -591,6 +591,7 @@ func (api *API) patchHttpRoute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "httpRoute not found: "+name)
 		return
 	}
+	before := cloneHttpRoute(existing)
 
 	var patch map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
@@ -625,10 +626,18 @@ func (api *API) patchHttpRoute(w http.ResponseWriter, r *http.Request) {
 	updatedRaw, _ := json.Marshal(merged)
 	var updated HttpRoute
 	_ = json.Unmarshal(updatedRaw, &updated)
+	if err := api.ValidateReferences(&updated); err != nil {
+		api.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
 	api.httpRoutes[name] = &updated
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
+		api.mu.Lock()
+		api.httpRoutes[name] = before
+		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
@@ -636,6 +645,12 @@ func (api *API) patchHttpRoute(w http.ResponseWriter, r *http.Request) {
 	project, location, _ := parseParent(r.URL.Path)
 	op, err := api.opMgr.RegisterDurable("networkservices#operation", "update", name, "", location)
 	if err != nil {
+		api.mu.Lock()
+		api.httpRoutes[name] = before
+		api.mu.Unlock()
+		if persistErr := api.persistState(); persistErr != nil {
+			api.opMgr.MarkPersistenceFailure(persistErr)
+		}
 		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
 		return
 	}

@@ -297,8 +297,8 @@ func TestDeidentifyContent(t *testing.T) {
 	var resp map[string]any
 	json.NewDecoder(w.Body).Decode(&resp)
 	item := resp["item"].(map[string]any)
-	if item["value"] != "[REDACTED]" {
-		t.Fatalf("expected [REDACTED], got %v", item["value"])
+	if item["value"] != "email: [REDACTED]" {
+		t.Fatalf("expected bounded email redaction, got %v", item["value"])
 	}
 	overview := resp["overview"].(map[string]any)
 	if overview["transformedBytes"] == nil {

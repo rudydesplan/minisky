@@ -482,6 +482,35 @@ func (k *KindBackend) CheckDeleteAvailability(
 	return err
 }
 
+// ReconcileClusterContext observes only the nonce-named Kind cluster bound to
+// durable ownership metadata. It never creates or adopts a backend.
+func (k *KindBackend) ReconcileClusterContext(
+	ctx context.Context,
+	identity ClusterIdentity,
+	ownership *kubeconfigOwnership,
+) (bool, error) {
+	if !ownership.matchesIdentity(identity) || !ownership.isDurable() {
+		return false, fmt.Errorf("refusing reconciliation without trusted content-bound ownership")
+	}
+	logicalName, err := kindBackendName(identity)
+	if err != nil {
+		return false, err
+	}
+	raw, ok := k.kubeconfigOwners.Load(logicalName)
+	restored, _ := raw.(*kubeconfigOwnership)
+	if !ok || restored == nil || restored.BackendName != ownership.BackendName ||
+		restored.Device != ownership.Device || restored.Inode != ownership.Inode ||
+		restored.SHA256 != ownership.SHA256 {
+		return false, fmt.Errorf("refusing reconciliation with ambiguous ownership")
+	}
+	if !k.Enabled() {
+		return false, &backendUnavailableCause{
+			operation: "Kind backend", err: errors.New("backend disabled"),
+		}
+	}
+	return kindClusterExists(ctx, ownership.BackendName)
+}
+
 func (k *KindBackend) classifyDeleteFailure(
 	identity ClusterIdentity,
 	ownership *kubeconfigOwnership,

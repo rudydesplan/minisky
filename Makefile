@@ -1,4 +1,4 @@
-.PHONY: dev test ui-install ui-build ui-test test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence benchmark
+.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase19-sdk test-phase20-sdk test-phase21-22-sdk test-phase23-sdk test-phase24-25-sdk benchmark
 
 ui-install:
 	cd ui && npm ci
@@ -14,6 +14,9 @@ dev: ui-build
 
 test: ui-test ui-build
 	go test -race ./cmd/... ./pkg/... ./ui
+
+check-docs-truth:
+	go run ./cmd/docs-truth -check
 
 test-integration:
 	@test "$${MINISKY_INTEGRATION:-}" = "1" || (echo "Set MINISKY_INTEGRATION=1 to run Docker-backed integration tests" >&2; exit 1)
@@ -36,6 +39,13 @@ test-event-delivery:
 
 test-phase10-artifact:
 	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
+
+test-phase11-distribution:
+	./scripts/phase11-distribution-test.sh --self-test
+	./scripts/phase11-distribution-test.sh --static
+
+test-phase12-observability:
+	MINISKY_PHASE12_OBSERVABILITY_INTEGRATION=1 ./scripts/phase12-observability-integration.sh
 
 test-phase13-wif:
 	MINISKY_PHASE13_INTEGRATION=1 ./scripts/phase13-wif-integration.sh
@@ -71,6 +81,24 @@ test-phase17-enterprise:
 
 test-phase18-25-evidence:
 	go test -count=1 ./pkg/evidence ./pkg/orchestrator ./pkg/pagination ./pkg/registry ./pkg/router ./pkg/shims/...
+
+test-phase18-25-sdk:
+	MINISKY_PHASE18_25_SDK_INTEGRATION=1 ./scripts/phase18-25-sdk-integration.sh
+
+test-phase19-sdk:
+	MINISKY_PHASE19_SDK_INTEGRATION=1 ./scripts/phase19-sdk-integration.sh
+
+test-phase20-sdk:
+	MINISKY_PHASE20_SDK_INTEGRATION=1 ./scripts/phase20-sdk-integration.sh
+
+test-phase21-22-sdk:
+	MINISKY_PHASE21_22_SDK_INTEGRATION=1 ./scripts/phase21-22-sdk-integration.sh
+
+test-phase23-sdk:
+	MINISKY_PHASE23_SDK_INTEGRATION=1 ./scripts/phase23-sdk-integration.sh
+
+test-phase24-25-sdk:
+	MINISKY_PHASE24_25_SDK_INTEGRATION=1 ./scripts/phase24-25-sdk-integration.sh
 
 benchmark:
 	go test -run='^$$' -bench=BenchmarkGatewayRouting -benchmem -count=5 ./pkg/router

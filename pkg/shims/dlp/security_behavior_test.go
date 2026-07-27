@@ -71,3 +71,56 @@ func TestDeidentifyContentAppliesReplaceConfigOnlyToFindings(t *testing.T) {
 		t.Fatalf("value = %q", response.Item.Value)
 	}
 }
+
+func TestDeidentifyContentDefaultTransformPreservesNonFindings(t *testing.T) {
+	api := newAPI(nil)
+	body := `{"item":{"value":"mail a@example.com; keep this"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v2/projects/p/locations/global/content:deidentify", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Item struct {
+			Value string `json:"value"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Item.Value != "mail [REDACTED]; keep this" {
+		t.Fatalf("value = %q", response.Item.Value)
+	}
+}
+
+func TestInspectContentRejectsUnsupportedDetector(t *testing.T) {
+	api := newAPI(nil)
+	body := `{"item":{"value":"555-0100"},"inspectConfig":{"infoTypes":[{"name":"PHONE_NUMBER"}]}}`
+	req := httptest.NewRequest(http.MethodPost, "/v2/projects/p/locations/global/content:inspect", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDeidentifyContentRejectsUnsupportedTransformation(t *testing.T) {
+	api := newAPI(nil)
+	body := `{
+		"item":{"value":"mail a@example.com"},
+		"inspectConfig":{"infoTypes":[{"name":"EMAIL_ADDRESS"}]},
+		"deidentifyConfig":{"infoTypeTransformations":{"transformations":[{
+			"primitiveTransformation":{"cryptoHashConfig":{}}
+		}]}}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v2/projects/p/locations/global/content:deidentify", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}

@@ -59,7 +59,7 @@ func TestRolloutExecutesLoopbackTarget(t *testing.T) {
 	release := "projects/p1/locations/us-central1/deliveryPipelines/pipe1/releases/r1"
 	api.pipelines["projects/p1/locations/us-central1/deliveryPipelines/pipe1"] = &DeliveryPipeline{Name: "projects/p1/locations/us-central1/deliveryPipelines/pipe1"}
 	api.releases[release] = &Release{Name: release}
-	body := `{"targetId":"local","localTarget":"` + target.URL + `"}`
+	body := `{"targetId":"local","image":"example.test/app@sha256:abc","localTarget":"` + target.URL + `"}`
 	rec := httptest.NewRecorder()
 	api.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/"+release+"/rollouts?rolloutId=roll1", bytes.NewBufferString(body)))
 	if rec.Code != http.StatusOK {
@@ -82,7 +82,7 @@ func TestRolloutRejectsSSRFAndUnsupportedStrategy(t *testing.T) {
 		body string
 		code int
 	}{
-		{"ssrf", `{"targetId":"local","localTarget":"http://169.254.169.254/latest"}`, http.StatusBadRequest},
+		{"ssrf", `{"targetId":"local","image":"example.test/app@sha256:abc","localTarget":"http://169.254.169.254/latest"}`, http.StatusBadRequest},
 		{"strategy", `{"targetId":"prod","strategy":{"canary":{"percentages":[10,100]}}}`, http.StatusNotImplemented},
 	}
 	for _, test := range tests {
@@ -94,6 +94,53 @@ func TestRolloutRejectsSSRFAndUnsupportedStrategy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRolloutWithoutExecutableLocalTargetIsUnimplemented(t *testing.T) {
+	api := newTestAPI()
+	pipeline := "projects/p1/locations/us-central1/deliveryPipelines/pipe1"
+	release := pipeline + "/releases/r1"
+	api.pipelines[pipeline] = &DeliveryPipeline{Name: pipeline}
+	api.releases[release] = &Release{Name: release}
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/"+release+"/rollouts?rolloutId=roll1",
+		bytes.NewBufferString(`{"targetId":"prod"}`)))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status=%d, want 501: %s", rec.Code, rec.Body.String())
+	}
+	if len(api.rollouts) != 0 {
+		t.Fatal("unsupported rollout created state")
+	}
+}
+
+func TestRolloutRecordsFailedLocalDelivery(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer target.Close()
+	api := newTestAPI()
+	pipeline := "projects/p1/locations/us-central1/deliveryPipelines/pipe1"
+	release := pipeline + "/releases/r1"
+	name := release + "/rollouts/roll1"
+	api.pipelines[pipeline] = &DeliveryPipeline{Name: pipeline}
+	api.releases[release] = &Release{Name: release}
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/"+release+"/rollouts?rolloutId=roll1",
+		bytes.NewBufferString(`{"targetId":"local","image":"example.test/app@sha256:abc","localTarget":"`+target.URL+`"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d: %s", rec.Code, rec.Body.String())
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		api.mu.RLock()
+		state := api.rollouts[name].State
+		api.mu.RUnlock()
+		if state == "FAILED" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("rollout did not record failed local delivery")
 }
 
 func TestCloudDeployHierarchySurvivesRestart(t *testing.T) {
@@ -131,7 +178,7 @@ func TestRolloutSaveFailureRollsBack(t *testing.T) {
 	api.releases[release] = &Release{Name: release}
 	rec := httptest.NewRecorder()
 	api.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
-		"/v1/"+release+"/rollouts?rolloutId=ro1", bytes.NewBufferString(`{"targetId":"local"}`)))
+		"/v1/"+release+"/rollouts?rolloutId=ro1", bytes.NewBufferString(`{"targetId":"local","image":"example.test/app@sha256:abc","localTarget":"http://127.0.0.1:1"}`)))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d, want 503: %s", rec.Code, rec.Body.String())
 	}

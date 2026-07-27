@@ -214,6 +214,53 @@ func TestProjectAndTenantConfigUseInjectedAuthBackend(t *testing.T) {
 	}
 }
 
+func TestIdentityToolkitUserWorkflowUsesInjectedAuthHandler(t *testing.T) {
+	var paths []string
+	api := newAPI(newTestAPI().opMgr, nil)
+	api.authHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"localId":"user-1","idToken":"token"}`))
+	})
+
+	for _, path := range []string{
+		"/v1/accounts:signUp",
+		"/v1/accounts:signInWithPassword",
+		"/v1/accounts:lookup",
+	} {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path,
+			bytes.NewBufferString(`{"email":"user@example.test","password":"secret","returnSecureToken":true}`)))
+		if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"localId":"user-1"`)) {
+			t.Fatalf("%s = %d %s", path, response.Code, response.Body.String())
+		}
+	}
+	if len(paths) != 3 {
+		t.Fatalf("forwarded paths = %#v", paths)
+	}
+}
+
+func TestIdentityToolkitUserWorkflowWithoutBackendIsUnsupported(t *testing.T) {
+	api := newTestAPI()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/accounts:signUp",
+		bytes.NewBufferString(`{"email":"user@example.test","password":"secret"}`)))
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Status != "UNIMPLEMENTED" {
+		t.Fatalf("error status = %q", envelope.Error.Status)
+	}
+}
+
 func TestCreateOAuthIdpConfigNoParent(t *testing.T) {
 	api := newTestAPI()
 	body := `{"clientId":"c"}`

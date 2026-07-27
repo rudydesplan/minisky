@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_phase12_observability_integration:
+        description: Run Phase 12 loopback observability acceptance
+        required: false
+        type: boolean
+        default: false
       run_phase15_emulator_integration:
         description: Run Firestore, Datastore, and Spanner SDK emulator acceptance
         required: false
@@ -68,6 +73,36 @@ on:
         default: false
       run_phase17_enterprise_integration:
         description: Run enterprise WIF, RBAC, quota, and audit acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase18_25_sdk_integration:
+        description: Run Phase 18-25 generated Go client restart acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase19_sdk_integration:
+        description: Run Phase 19 generated Go client restart acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase20_sdk_integration:
+        description: Run Phase 20 Docker-backed generated Go client acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase21_22_sdk_integration:
+        description: Run Phase 21-22 Docker-isolated generated Go client acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase23_sdk_integration:
+        description: Run Phase 23 Docker-isolated generated Go client acceptance
+        required: false
+        type: boolean
+        default: false
+      run_phase24_25_sdk_integration:
+        description: Run Phase 24-25 generated Go client restart acceptance
         required: false
         type: boolean
         default: false
@@ -129,6 +164,9 @@ jobs:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
+
+      - name: Check generated documentation truth
+        run: make check-docs-truth
 
       - name: Check Go formatting
         run: test -z "$(gofmt -l cmd pkg ui)"
@@ -217,11 +255,48 @@ jobs:
 
       - name: Validate integration script syntax
         run: |
-          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          ./scripts/phase11-distribution-test.sh --self-test
+          MINISKY_PHASE12_OBSERVABILITY_SELF_TEST=1 ./scripts/phase12-observability-integration.sh
           MINISKY_KIND_SELF_TEST=1 ./scripts/kind-integration.sh
           MINISKY_RELEASE_TAG_POLICY_SELF_TEST=1 ./scripts/release-tag-policy.sh
           MINISKY_PHASE16_SUBNETWORK_SELF_TEST=1 ./scripts/phase16-subnetwork-integration.sh
           MINISKY_PHASE16_SUBNETWORK_TERRAFORM_SELF_TEST=1 ./scripts/phase16-subnetwork-terraform-integration.sh
+          set +e
+          env -u MINISKY_PHASE19_SDK_INTEGRATION ./scripts/phase19-sdk-integration.sh >phase19-refusal.log 2>&1
+          phase19_refusal_status=$?
+          set -e
+          test "${phase19_refusal_status}" -eq 2
+          grep -F "Refusing Phase 19 SDK integration" phase19-refusal.log >/dev/null
+          rm phase19-refusal.log
+          set +e
+          env -u MINISKY_PHASE20_SDK_INTEGRATION ./scripts/phase20-sdk-integration.sh >phase20-refusal.log 2>&1
+          phase20_refusal_status=$?
+          set -e
+          test "${phase20_refusal_status}" -eq 2
+          grep -F "Refusing Phase 20 SDK integration" phase20-refusal.log >/dev/null
+          rm phase20-refusal.log
+          set +e
+          env -u MINISKY_PHASE21_22_SDK_INTEGRATION ./scripts/phase21-22-sdk-integration.sh >phase21-22-refusal.log 2>&1
+          phase21_22_refusal_status=$?
+          set -e
+          test "${phase21_22_refusal_status}" -eq 2
+          grep -F "Refusing Phase 21-22 SDK integration" phase21-22-refusal.log >/dev/null
+          rm phase21-22-refusal.log
+          set +e
+          env -u MINISKY_PHASE23_SDK_INTEGRATION ./scripts/phase23-sdk-integration.sh >phase23-refusal.log 2>&1
+          phase23_refusal_status=$?
+          set -e
+          test "${phase23_refusal_status}" -eq 2
+          grep -F "Refusing Phase 23 SDK integration" phase23-refusal.log >/dev/null
+          rm phase23-refusal.log
+          set +e
+          env -u MINISKY_PHASE24_25_SDK_INTEGRATION ./scripts/phase24-25-sdk-integration.sh >phase24-25-refusal.log 2>&1
+          phase24_25_refusal_status=$?
+          set -e
+          test "${phase24_25_refusal_status}" -eq 2
+          grep -F "Refusing Phase 24-25 SDK integration" phase24-25-refusal.log >/dev/null
+          rm phase24-25-refusal.log
 
       - name: Verify air-gapped bundle workflow
         run: ./scripts/airgap-bundle-test.sh
@@ -278,13 +353,268 @@ jobs:
         run: python -m pip install --requirement sdk-smoke/python/requirements.txt
 
       - name: Compile Go SDK smoke
-        run: go test ./sdk-smoke/go ./sdk-smoke/phase15 ./sdk-smoke/phase16 ./sdk-smoke/phase16-logging ./sdk-smoke/phase16-dns ./sdk-smoke/phase16-subnetwork ./sdk-smoke/phase16-vertex
+        run: go test ./sdk-smoke/go ./sdk-smoke/phase15 ./sdk-smoke/phase16 ./sdk-smoke/phase16-logging ./sdk-smoke/phase16-dns ./sdk-smoke/phase16-subnetwork ./sdk-smoke/phase16-vertex ./sdk-smoke/phase18-25 ./sdk-smoke/phase19 ./sdk-smoke/phase20 ./sdk-smoke/phase21-22 ./sdk-smoke/phase23 ./sdk-smoke/phase24-25
 
       - name: Compile Python SDK smoke
         run: python -m compileall -q sdk-smoke/python
 
       - name: Compile Java SDK smoke in pinned container
         run: make test-java-sdk-compile
+
+  phase18-25-evidence:
+    name: Phase 18-25 offline evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 18-25 offline evidence
+        run: make test-phase18-25-evidence
+
+  phase18-25-sdk-integration:
+    name: Phase 18-25 generated Go client restart acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase18_25_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 18-25 generated-client integration
+        run: make test-phase18-25-sdk
+
+  phase19-sdk-integration:
+    name: Phase 19 generated Go client restart acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase19_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 19 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase19-sdk 2>&1 | tee phase19-sdk-integration.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase19-sdk-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase19-sdk-integration.log
+          if-no-files-found: error
+          retention-days: 7
+
+  phase20-sdk-integration:
+    name: Phase 20 Docker-backed generated Go client acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase20_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 20 Docker-backed generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase20-sdk 2>&1 | tee phase20-sdk-integration.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase20-sdk-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase20-sdk-integration.log
+          if-no-files-found: error
+          retention-days: 7
+
+  phase21-22-sdk-integration:
+    name: Phase 21-22 Docker-isolated generated Go client acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase21_22_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 21-22 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase21-22-sdk 2>&1 | tee phase21-22-sdk-integration.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase21-22-sdk-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase21-22-sdk-integration.log
+          if-no-files-found: error
+          retention-days: 7
+
+  phase23-sdk-integration:
+    name: Phase 23 Docker-isolated generated Go client acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase23_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 23 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase23-sdk 2>&1 | tee phase23-sdk-integration.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase23-sdk-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase23-sdk-integration.log
+          if-no-files-found: error
+          retention-days: 7
+
+  phase24-25-sdk-integration:
+    name: Phase 24-25 generated Go client restart acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase24_25_sdk_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 24-25 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase24-25-sdk 2>&1 | tee phase24-25-sdk-integration.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase24-25-sdk-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase24-25-sdk-integration.log
+          if-no-files-found: error
+          retention-days: 7
 
   terraform-integration:
     name: Terraform apply, no-drift, and destroy
@@ -406,6 +736,32 @@ jobs:
 
       - name: Run event delivery integration
         run: make test-event-delivery
+
+  phase12-observability-integration:
+    name: Phase 12 loopback observability acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase12_observability_integration
+    needs: quality
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 12 observability integration
+        run: make test-phase12-observability
 
   phase15-emulator-integration:
     name: Firestore, Datastore, and Spanner SDK acceptance
@@ -725,6 +1081,11 @@ jobs:
           distribution: goreleaser
           version: v2.17.0
           args: check
+
+      - name: Validate non-publishing Phase 11 distribution contracts
+        env:
+          MINISKY_PHASE11_DISTRIBUTION_BUILD: "0"
+        run: make test-phase11-distribution
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         name: Build Linux amd64 release snapshot

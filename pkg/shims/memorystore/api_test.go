@@ -77,6 +77,27 @@ func TestRedisLifecycleValidationPersistenceAndOwnedReconciliation(t *testing.T)
 	}
 }
 
+func TestRedisDomainUsesValkeyBackendImage(t *testing.T) {
+	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := redisRequest(api, http.MethodPost,
+		"/v1/projects/test/locations/us-central1/instances?instanceId=cache",
+		`{"tier":"BASIC","memorySizeGb":1,"redisVersion":"REDIS_7_2"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", create.Code, create.Body.String())
+	}
+	waitForRedisOperation(t, api, operationNameFromResponse(t, create))
+	backend.mu.Lock()
+	image := backend.lastImage
+	backend.mu.Unlock()
+	if !strings.Contains(image, "valkey") {
+		t.Fatalf("backend image = %q, want Valkey", image)
+	}
+}
+
 func TestValkeyCreateIsCanonicalUnsupportedBeforeMutation(t *testing.T) {
 	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
 	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)
@@ -302,6 +323,7 @@ type fakeRedisBackend struct {
 	endpoint       string
 	owned          bool
 	err            error
+	lastImage      string
 	provisionCalls int
 	reconcileCalls int
 	deleteCalls    int
@@ -350,10 +372,11 @@ func (s *failCombinedRedisStore) resetFailure() {
 	s.failing = false
 }
 
-func (b *fakeRedisBackend) ProvisionRedis(context.Context, string, string) (string, error) {
+func (b *fakeRedisBackend) ProvisionRedis(_ context.Context, _, image string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.provisionCalls++
+	b.lastImage = image
 	if b.err != nil {
 		return "", b.err
 	}

@@ -17,42 +17,100 @@ import (
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
+	"minisky/pkg/state"
 )
+
+const cloudBuildExecutionTimeout = 15 * time.Minute
 
 func init() {
 	registry.Register("cloudbuild.googleapis.com", func(ctx *registry.Context) http.Handler {
-		return newAPI(ctx.SvcMgr, ctx.OpMgr)
+		return NewAPI(ctx.SvcMgr, ctx.OpMgr)
 	})
 }
 
+type cloudBuildBackend interface {
+	ReconcileBuildResources(context.Context) error
+	EnsureBuildWorkspace(context.Context, string, string) error
+	RemoveBuildWorkspace(context.Context, string, string) error
+	ProvisionBuildStep(context.Context, string, string, string, []string, []string, []string) error
+	WaitBuildContainer(context.Context, string, string) (orchestrator.BuildContainerResult, error)
+	StopAndRemoveBuildContainer(context.Context, string, string) error
+}
+
 type API struct {
-	mu       sync.Mutex
-	svcMgr   *orchestrator.ServiceManager
-	opMgr    *orchestrator.OperationManager
-	buildIDs map[string]struct{}
-	randomID func([]byte) (int, error)
-	runAsync func(string, func() error)
+	mu          sync.RWMutex
+	mutationMu  sync.Mutex
+	svcMgr      cloudBuildBackend
+	opMgr       *orchestrator.OperationManager
+	stateStore  cloudBuildStateStore
+	degradedErr error
+	builds      map[string]*Build
+	triggers    map[string]*BuildTrigger
+	buildIDs    map[string]struct{}
+	randomID    func([]byte) (int, error)
+	runAsync    func(string, func() error)
+}
+
+// NewAPI creates a Cloud Build shim with profile-scoped durable metadata.
+func NewAPI(svcMgr *orchestrator.ServiceManager, opMgr *orchestrator.OperationManager) *API {
+	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	guarded := state.NewGuardedEntryStore(store, err)
+	api, loadErr := newAPIWithStore(cloudBuildBackendFrom(svcMgr), opMgr, guarded, nil)
+	if err != nil {
+		log.Printf("[Shim: Cloud Build] persistence degraded: %v", err)
+	}
+	if loadErr != nil {
+		log.Printf("[Shim: Cloud Build] state rehydration failed: %v", loadErr)
+	}
+	return api
 }
 
 func newAPI(svcMgr *orchestrator.ServiceManager, opMgr *orchestrator.OperationManager) *API {
-	api := &API{
-		svcMgr:   svcMgr,
-		opMgr:    opMgr,
-		buildIDs: make(map[string]struct{}),
-		randomID: rand.Read,
+	api, _ := newAPIWithStore(cloudBuildBackendFrom(svcMgr), opMgr, nil, nil)
+	return api
+}
+
+func cloudBuildBackendFrom(svcMgr *orchestrator.ServiceManager) cloudBuildBackend {
+	if svcMgr == nil {
+		return nil
 	}
-	if opMgr != nil {
-		api.runAsync = opMgr.RunAsync
-		for _, operation := range opMgr.List() {
-			if operation.Kind != "cloudbuild#operation" {
-				continue
-			}
-			if index := strings.LastIndex(operation.TargetLink, "/builds/"); index >= 0 {
-				api.buildIDs[operation.TargetLink[index+len("/builds/"):]] = struct{}{}
-			}
+	return svcMgr
+}
+
+func newAPIWithStore(
+	svcMgr cloudBuildBackend,
+	opMgr *orchestrator.OperationManager,
+	store cloudBuildStateStore,
+	reconcile func() error,
+) (*API, error) {
+	if opMgr == nil {
+		opMgr = orchestrator.NewOperationManager()
+	}
+	api := &API{
+		svcMgr:     svcMgr,
+		opMgr:      opMgr,
+		stateStore: store,
+		builds:     make(map[string]*Build),
+		triggers:   make(map[string]*BuildTrigger),
+		buildIDs:   make(map[string]struct{}),
+		randomID:   rand.Read,
+	}
+	api.runAsync = opMgr.RunAsync
+	if reconcile == nil && svcMgr != nil {
+		reconcile = func() error {
+			return svcMgr.ReconcileBuildResources(context.Background())
 		}
 	}
-	return api
+	if err := api.loadState(); err != nil {
+		api.degradedErr = err
+		return api, err
+	}
+	if reconcile != nil {
+		if err := reconcile(); err != nil {
+			log.Printf("[Shim: Cloud Build] reconcile owned build resources: %v", err)
+		}
+	}
+	return api, nil
 }
 
 func (api *API) allocateBuildID(prefix string) (string, error) {
@@ -79,14 +137,15 @@ func (api *API) allocateBuildID(prefix string) (string, error) {
 }
 
 type Build struct {
-	Id         string  `json:"id,omitempty"`
-	ProjectId  string  `json:"projectId,omitempty"`
-	Status     string  `json:"status,omitempty"`
-	Steps      []Step  `json:"steps,omitempty"`
-	CreateTime string  `json:"createTime,omitempty"`
-	StartTime  string  `json:"startTime,omitempty"`
-	FinishTime string  `json:"finishTime,omitempty"`
-	Source     *Source `json:"source,omitempty"`
+	Id           string  `json:"id,omitempty"`
+	ProjectId    string  `json:"projectId,omitempty"`
+	Status       string  `json:"status,omitempty"`
+	StatusDetail string  `json:"statusDetail,omitempty"`
+	Steps        []Step  `json:"steps,omitempty"`
+	CreateTime   string  `json:"createTime,omitempty"`
+	StartTime    string  `json:"startTime,omitempty"`
+	FinishTime   string  `json:"finishTime,omitempty"`
+	Source       *Source `json:"source,omitempty"`
 }
 
 type Source struct {
@@ -158,6 +217,11 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == "GET" && strings.Contains(path, "/operations/") {
+		api.handleGetOperation(w, path)
+		return
+	}
+
 	if r.Method == "POST" && strings.HasSuffix(path, "/triggers") {
 		writeUnimplemented(w, "Cloud Build triggers are not implemented")
 		return
@@ -184,6 +248,10 @@ func writeUnimplemented(w http.ResponseWriter, message string) {
 }
 
 func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, project string) {
+	if err := api.persistenceError(); err != nil {
+		writeUnavailable(w, "Cloud Build metadata persistence is unavailable")
+		return
+	}
 	var build Build
 	if err := json.NewDecoder(r.Body).Decode(&build); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
@@ -199,10 +267,22 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 	build.ProjectId = project
 	build.Status = "QUEUED"
 	build.CreateTime = time.Now().UTC().Format(time.RFC3339)
+	resourceID := fmt.Sprintf("projects/%s/builds/%s", project, build.Id)
 
-	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "CREATE", fmt.Sprintf("/v1/projects/%s/builds/%s", project, build.Id), "", "")
+	if err := api.commitBuild(resourceID, &build); err != nil {
+		api.releaseBuildID(buildID)
+		writeUnavailable(w, "Cloud Build metadata persistence is unavailable")
+		return
+	}
+
+	op, err := api.opMgr.RegisterDurable("cloudbuild#operation", "CREATE", "/v1/"+resourceID, "", "")
 	if err != nil {
-		http.Error(w, "failed to persist build operation", http.StatusInternalServerError)
+		if rollbackErr := api.removeBuild(resourceID); rollbackErr != nil {
+			log.Printf("[Shim: Cloud Build] rollback build after operation failure: %v", rollbackErr)
+		} else {
+			api.releaseBuildID(buildID)
+		}
+		writeUnavailable(w, "Cloud Build operation persistence is unavailable")
 		return
 	}
 	api.opMgr.UpdateMetadata(op.Name, build)
@@ -211,54 +291,68 @@ func (api *API) handleCreateBuild(w http.ResponseWriter, r *http.Request, projec
 	api.runAsync(op.Name, func() error { return api.executeBuild(project, build, op.Name) })
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(op)
+	_ = json.NewEncoder(w).Encode(api.opMgr.Get(op.Name))
 }
 
 func (api *API) handleListBuilds(w http.ResponseWriter, r *http.Request, project string) {
-	ops := api.opMgr.List()
+	api.mu.RLock()
 	var builds []Build
-	for _, op := range ops {
-		if op.Kind == "cloudbuild#operation" {
-			if b, ok := op.Metadata.(Build); ok && b.ProjectId == project {
-				builds = append(builds, b)
-			} else {
-				// Try map decoding if it's from JSON unmarshal
-				bBytes, _ := json.Marshal(op.Metadata)
-				var b2 Build
-				if err := json.Unmarshal(bBytes, &b2); err == nil && b2.ProjectId == project {
-					builds = append(builds, b2)
-				}
-			}
+	for _, build := range api.builds {
+		if build != nil && build.ProjectId == project {
+			builds = append(builds, *cloneBuild(build))
 		}
 	}
+	api.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"builds": builds})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"builds": builds})
 }
 
 func (api *API) executeBuild(project string, build Build, opName string) error {
 	build.Status = "WORKING"
 	build.StartTime = time.Now().UTC().Format(time.RFC3339)
+	resourceID := fmt.Sprintf("projects/%s/builds/%s", project, build.Id)
+	if err := api.commitBuild(resourceID, &build); err != nil {
+		return fmt.Errorf("persist working build: %w", err)
+	}
 	api.opMgr.UpdateMetadata(opName, build)
 
 	// Workspace volume for sharing code between steps
-	resourceID := fmt.Sprintf("projects/%s/builds/%s", project, build.Id)
 	identity := cloudBuildDockerIdentity(resourceID)
 	workspaceVol := identity + "-workspace"
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), cloudBuildExecutionTimeout)
+	defer cancel()
+	if api.svcMgr == nil {
+		build.Status = "FAILURE"
+		build.StatusDetail = "Cloud Build execution backend is unavailable"
+		build.FinishTime = time.Now().UTC().Format(time.RFC3339)
+		if err := api.commitBuild(resourceID, &build); err != nil {
+			return fmt.Errorf("persist unavailable build backend: %w", err)
+		}
+		api.opMgr.UpdateMetadata(opName, build)
+		return fmt.Errorf("Cloud Build execution backend is unavailable")
+	}
 	if err := api.svcMgr.EnsureBuildWorkspace(ctx, workspaceVol, resourceID); err != nil {
 		build.Status = "FAILURE"
+		build.StatusDetail = err.Error()
 		build.FinishTime = time.Now().UTC().Format(time.RFC3339)
+		if persistErr := api.commitBuild(resourceID, &build); persistErr != nil {
+			return fmt.Errorf("prepare build workspace: %v; persist failure: %w", err, persistErr)
+		}
 		api.opMgr.UpdateMetadata(opName, build)
 		return fmt.Errorf("prepare build workspace: %w", err)
 	}
 	defer func() {
-		if err := api.svcMgr.RemoveBuildWorkspace(context.Background(), workspaceVol, resourceID); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := api.svcMgr.RemoveBuildWorkspace(cleanupCtx, workspaceVol, resourceID); err != nil {
 			log.Printf("[Shim: Cloud Build] cleanup workspace %s: %v", workspaceVol, err)
 		}
 	}()
 
 	failed := false
+	failureDetail := ""
+	executed := 0
 
 	// Implicit step: Clone source if provided
 	if build.Source != nil && build.Source.RepoSource != nil {
@@ -279,12 +373,28 @@ func (api *API) executeBuild(project string, build Build, opName string) error {
 		if err != nil {
 			api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone failed: %v", err))
 			failed = true
+			failureDetail = fmt.Sprintf("source clone start failed: %v", err)
 		} else {
 			defer api.cleanupBuildContainer(cloneContainer, resourceID)
-			time.Sleep(3 * time.Second)
-			if err := api.svcMgr.StopAndRemoveBuildContainer(ctx, cloneContainer, resourceID); err != nil {
+			executed++
+			result, waitErr := api.svcMgr.WaitBuildContainer(ctx, cloneContainer, resourceID)
+			if waitErr != nil {
+				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone wait failed: %v", waitErr))
+				failed = true
+				failureDetail = fmt.Sprintf("source clone did not complete: %v", waitErr)
+			} else if result.ExitCode != 0 {
+				failed = true
+				failureDetail = buildExitDetail("source clone", result)
+				api.pushLog(project, "ERROR", build.Id, failureDetail)
+			} else if strings.TrimSpace(result.Logs) != "" {
+				api.pushLog(project, "INFO", build.Id, result.Logs)
+			}
+			if err := api.removeBuildContainer(cloneContainer, resourceID); err != nil {
 				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Source clone cleanup failed: %v", err))
 				failed = true
+				if failureDetail == "" {
+					failureDetail = fmt.Sprintf("source clone cleanup failed: %v", err)
+				}
 			}
 		}
 	}
@@ -311,28 +421,62 @@ func (api *API) executeBuild(project string, build Build, opName string) error {
 			if err != nil {
 				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d failed: %v", i, err))
 				failed = true
+				failureDetail = fmt.Sprintf("step #%d start failed: %v", i, err)
 				break
 			}
 			defer api.cleanupBuildContainer(containerName, resourceID)
+			executed++
 
-			time.Sleep(3 * time.Second) // Simulate build time
-			api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Step #%d finished successfully", i))
-			if err := api.svcMgr.StopAndRemoveBuildContainer(ctx, containerName, resourceID); err != nil {
+			result, waitErr := api.svcMgr.WaitBuildContainer(ctx, containerName, resourceID)
+			if waitErr != nil {
+				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d wait failed: %v", i, waitErr))
+				failed = true
+				failureDetail = fmt.Sprintf("step #%d did not complete: %v", i, waitErr)
+			} else if result.ExitCode != 0 {
+				failed = true
+				failureDetail = buildExitDetail(fmt.Sprintf("step #%d", i), result)
+				api.pushLog(project, "ERROR", build.Id, failureDetail)
+			} else {
+				if strings.TrimSpace(result.Logs) != "" {
+					api.pushLog(project, "INFO", build.Id, result.Logs)
+				}
+				api.pushLog(project, "INFO", build.Id, fmt.Sprintf("Step #%d finished successfully", i))
+			}
+			if err := api.removeBuildContainer(containerName, resourceID); err != nil {
 				api.pushLog(project, "ERROR", build.Id, fmt.Sprintf("Step #%d cleanup failed: %v", i, err))
 				failed = true
+				if failureDetail == "" {
+					failureDetail = fmt.Sprintf("step #%d cleanup failed: %v", i, err)
+				}
+			}
+			if failed {
 				break
 			}
 		}
 	}
 
 	build.FinishTime = time.Now().UTC().Format(time.RFC3339)
+	if !failed && executed == 0 {
+		failed = true
+		failureDetail = "build contained no executable steps"
+	}
 	if failed {
 		build.Status = "FAILURE"
+		build.StatusDetail = failureDetail
+		if build.StatusDetail == "" {
+			build.StatusDetail = "one or more build steps failed"
+		}
+		if err := api.commitBuild(resourceID, &build); err != nil {
+			return fmt.Errorf("persist failed build: %w", err)
+		}
 		api.opMgr.UpdateMetadata(opName, build)
 		return fmt.Errorf("build failed")
-	} else {
-		build.Status = "SUCCESS"
-		api.pushLog(project, "INFO", build.Id, "Build SUCCESS")
+	}
+	build.Status = "SUCCESS"
+	build.StatusDetail = ""
+	api.pushLog(project, "INFO", build.Id, "Build SUCCESS")
+	if err := api.commitBuild(resourceID, &build); err != nil {
+		return fmt.Errorf("persist successful build: %w", err)
 	}
 	api.opMgr.UpdateMetadata(opName, build)
 	return nil
@@ -344,9 +488,55 @@ func cloudBuildDockerIdentity(resourceID string) string {
 }
 
 func (api *API) cleanupBuildContainer(name, resourceID string) {
-	if err := api.svcMgr.StopAndRemoveBuildContainer(context.Background(), name, resourceID); err != nil {
+	if err := api.removeBuildContainer(name, resourceID); err != nil {
 		log.Printf("[Shim: Cloud Build] cleanup container %s: %v", name, err)
 	}
+}
+
+func (api *API) removeBuildContainer(name, resourceID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return api.svcMgr.StopAndRemoveBuildContainer(cleanupCtx, name, resourceID)
+}
+
+func buildExitDetail(action string, result orchestrator.BuildContainerResult) string {
+	detail := fmt.Sprintf("%s failed with exit code %d", action, result.ExitCode)
+	if logs := strings.TrimSpace(result.Logs); logs != "" {
+		detail += ": " + logs
+	}
+	if result.LogsTruncated {
+		detail += " [logs truncated]"
+	}
+	return detail
+}
+
+func (api *API) handleGetOperation(w http.ResponseWriter, path string) {
+	name := path[strings.LastIndex(path, "/")+1:]
+	operation := api.opMgr.Get(name)
+	if operation == nil || operation.Kind != "cloudbuild#operation" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(operation)
+}
+
+func writeUnavailable(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":    http.StatusServiceUnavailable,
+			"message": message,
+			"status":  "UNAVAILABLE",
+		},
+	})
+}
+
+func (api *API) releaseBuildID(id string) {
+	api.mu.Lock()
+	delete(api.buildIDs, id)
+	api.mu.Unlock()
 }
 
 func (api *API) handleCreateTrigger(w http.ResponseWriter, r *http.Request, project string) {

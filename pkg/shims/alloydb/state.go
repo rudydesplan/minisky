@@ -1,8 +1,11 @@
 package alloydb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -19,7 +22,8 @@ type alloydbStateStore interface {
 }
 
 type alloydbMetadata struct {
-	Clusters map[string]*Cluster `json:"clusters"`
+	Clusters  map[string]*Cluster  `json:"clusters"`
+	Instances map[string]*Instance `json:"instances"`
 }
 
 // persistState deep-copies clusters and writes to durable storage.
@@ -30,19 +34,23 @@ func (api *API) persistState() error {
 	api.persistMu.Lock()
 	defer api.persistMu.Unlock()
 
-	snapshot := api.snapshotClusters()
-	return api.stateStore.Save(alloydbStateEntry, alloydbMetadata{Clusters: snapshot})
+	clusters, instances := api.snapshotMetadata()
+	return api.stateStore.Save(alloydbStateEntry, alloydbMetadata{Clusters: clusters, Instances: instances})
 }
 
-// snapshotClusters returns a deep copy of all clusters for safe serialization.
-func (api *API) snapshotClusters() map[string]*Cluster {
+func (api *API) snapshotMetadata() (map[string]*Cluster, map[string]*Instance) {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
-	snapshot := make(map[string]*Cluster, len(api.clusters))
+	clusters := make(map[string]*Cluster, len(api.clusters))
 	for k, v := range api.clusters {
-		snapshot[k] = deepCopyCluster(v)
+		clusters[k] = deepCopyCluster(v)
 	}
-	return snapshot
+	instances := make(map[string]*Instance, len(api.instances))
+	for k, v := range api.instances {
+		instances[k] = deepCopyInstance(v)
+		instances[k].backendEndpoint = ""
+	}
+	return clusters, instances
 }
 
 // loadState rehydrates clusters from durable storage.
@@ -60,7 +68,64 @@ func (api *API) loadState() error {
 	if meta.Clusters != nil {
 		api.clusters = meta.Clusters
 	}
+	if meta.Instances != nil {
+		api.instances = meta.Instances
+	}
 	return nil
+}
+
+// reconcileBackends observes exact-owned Docker resources without creating or
+// adopting anything. Ephemeral ports are rediscovered after every restart.
+func (api *API) reconcileBackends() {
+	if api.backend == nil {
+		return
+	}
+	api.mu.RLock()
+	names := make([]string, 0, len(api.instances))
+	for name := range api.instances {
+		names = append(names, name)
+	}
+	api.mu.RUnlock()
+	changed := false
+	for _, name := range names {
+		identity, ok := parseIdentityFromName(name)
+		if !ok {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		endpoint, exists, err := api.backend.Reconcile(ctx, identity)
+		cancel()
+		api.mu.Lock()
+		instance := api.instances[name]
+		if instance != nil {
+			instance.backendEndpoint = ""
+			instance.IPAddress = ""
+			switch {
+			case err != nil:
+				instance.State = "ERROR"
+			case !exists && instance.State == "DELETING":
+				delete(api.instances, name)
+			case !exists:
+				instance.State = "STOPPED"
+			default:
+				host, _, splitErr := net.SplitHostPort(endpoint)
+				if splitErr != nil || host != "127.0.0.1" {
+					instance.State = "ERROR"
+				} else {
+					instance.State = "READY"
+					instance.IPAddress = host
+					instance.backendEndpoint = endpoint
+				}
+			}
+			changed = true
+		}
+		api.mu.Unlock()
+	}
+	if changed {
+		if err := api.persistState(); err != nil {
+			api.opMgr.MarkPersistenceFailure(err)
+		}
+	}
 }
 
 // deepCopyCluster returns a fully independent copy of a Cluster.

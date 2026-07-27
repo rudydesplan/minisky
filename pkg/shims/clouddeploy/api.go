@@ -26,6 +26,14 @@ func init() {
 	})
 }
 
+type imagePolicyEvaluator interface {
+	EvaluateImage(project, image string) error
+}
+
+type allowImagePolicyEvaluator struct{}
+
+func (allowImagePolicyEvaluator) EvaluateImage(string, string) error { return nil }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resources (Cloud Deploy v1 contract)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +75,7 @@ type Rollout struct {
 	CreateTime  string            `json:"createTime,omitempty"`
 	UpdateTime  string            `json:"updateTime,omitempty"`
 	TargetID    string            `json:"targetId,omitempty"`
+	Image       string            `json:"image,omitempty"`
 	State       string            `json:"state,omitempty"`
 	LocalTarget string            `json:"localTarget,omitempty"`
 	Strategy    json.RawMessage   `json:"strategy,omitempty"`
@@ -79,13 +88,14 @@ type Rollout struct {
 
 // API implements the Cloud Deploy v1 REST shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	stateStore clouddeployStateStore
-	pipelines  map[string]*DeliveryPipeline
-	releases   map[string]*Release
-	rollouts   map[string]*Rollout
+	mu              sync.RWMutex
+	persistMu       sync.Mutex
+	opMgr           *orchestrator.OperationManager
+	stateStore      clouddeployStateStore
+	policyEvaluator imagePolicyEvaluator
+	pipelines       map[string]*DeliveryPipeline
+	releases        map[string]*Release
+	rollouts        map[string]*Rollout
 }
 
 // NewAPI creates a new Cloud Deploy shim with persistence.
@@ -114,10 +124,19 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 // newTestAPI creates an in-memory API for testing (no persistence).
 func newTestAPI() *API {
 	return &API{
-		opMgr:     orchestrator.NewOperationManager(),
-		pipelines: make(map[string]*DeliveryPipeline),
-		releases:  make(map[string]*Release),
-		rollouts:  make(map[string]*Rollout),
+		opMgr:           orchestrator.NewOperationManager(),
+		policyEvaluator: allowImagePolicyEvaluator{},
+		pipelines:       make(map[string]*DeliveryPipeline),
+		releases:        make(map[string]*Release),
+		rollouts:        make(map[string]*Rollout),
+	}
+}
+
+// OnPostBoot injects the Binary Authorization evaluator after all experimental
+// shims have been instantiated. The structural interface avoids package cycles.
+func (api *API) OnPostBoot(ctx *registry.Context) {
+	if evaluator, ok := ctx.GetShim("binaryauthorization.googleapis.com").(imagePolicyEvaluator); ok {
+		api.policyEvaluator = evaluator
 	}
 }
 
@@ -511,20 +530,33 @@ func (api *API) createRollout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON: "+err.Error())
 		return
 	}
+	api.mu.RLock()
+	_, parentExists := api.releases[releaseName]
+	api.mu.RUnlock()
+	if !parentExists {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "parent release not found: "+releaseName)
+		return
+	}
 	if len(resource.Strategy) != 0 {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "rollout strategies are not supported")
 		return
 	}
-	var localTarget *url.URL
-	if resource.LocalTarget != "" {
-		var err error
-		localTarget, err = validateLocalTarget(resource.LocalTarget)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
-			return
-		}
-		resource.LocalTarget = localTarget.String()
+	if resource.LocalTarget == "" {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "only executable loopback localTarget rollouts are supported")
+		return
 	}
+	if strings.TrimSpace(resource.Image) == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "image is required for executable localTarget rollouts")
+		return
+	}
+	var localTarget *url.URL
+	var err error
+	localTarget, err = validateLocalTarget(resource.LocalTarget)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	resource.LocalTarget = localTarget.String()
 
 	name := releaseName + "/rollouts/" + rolloutID
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -572,38 +604,91 @@ func (api *API) createRollout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "state persistence failed")
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
-		if localTarget != nil {
-			request, err := http.NewRequest(http.MethodPost, localTarget.String(), strings.NewReader(`{"release":"`+releaseName+`"}`))
-			if err != nil {
-				return err
-			}
+	go api.executeRollout(op.Name, name, releaseName, resource.Image, localTarget)
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
+}
+
+func (api *API) executeRollout(operationName, rolloutName, releaseName, image string, localTarget *url.URL) {
+	if err := api.opMgr.AdvanceDurable(operationName, 0, orchestrator.StatusRunning); err != nil {
+		api.finishRolloutExecution(operationName, rolloutName,
+			fmt.Errorf("operation persistence failed"), http.StatusServiceUnavailable)
+		return
+	}
+	project := "projects/" + extractAfter(releaseName, "projects")
+	if api.policyEvaluator == nil {
+		api.finishRolloutExecution(operationName, rolloutName,
+			fmt.Errorf("Binary Authorization evaluator unavailable"), http.StatusServiceUnavailable)
+		return
+	}
+	if err := api.policyEvaluator.EvaluateImage(project, image); err != nil {
+		api.finishRolloutExecution(operationName, rolloutName,
+			fmt.Errorf("Binary Authorization denied image: %w", err), http.StatusForbidden)
+		return
+	}
+
+	payload, err := json.Marshal(map[string]string{"release": releaseName, "image": image})
+	if err == nil {
+		var request *http.Request
+		request, err = http.NewRequest(http.MethodPost, localTarget.String(), strings.NewReader(string(payload)))
+		if err == nil {
+			request.Header.Set("Content-Type", "application/json")
 			client := &http.Client{
 				Timeout: 2 * time.Second,
 				CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 					return fmt.Errorf("redirects are not followed")
 				},
 			}
-			response, err := client.Do(request)
-			if err != nil {
-				return err
-			}
-			_ = response.Body.Close()
-			if response.StatusCode < 200 || response.StatusCode >= 300 {
-				return fmt.Errorf("local target returned HTTP %d", response.StatusCode)
+			var response *http.Response
+			response, err = client.Do(request)
+			if response != nil {
+				_ = response.Body.Close()
+				if err == nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
+					err = fmt.Errorf("local target returned HTTP %d", response.StatusCode)
+				}
 			}
 		}
-		api.mu.Lock()
-		if saved := api.rollouts[name]; saved != nil {
-			saved.State = "SUCCEEDED"
-			saved.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
-		}
-		api.mu.Unlock()
-		return api.persistState()
-	})
+	}
+	api.finishRolloutExecution(operationName, rolloutName, err, http.StatusInternalServerError)
+}
 
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(op))
+func (api *API) finishRolloutExecution(operationName, rolloutName string, executionErr error, errorCode int) {
+	api.mu.Lock()
+	saved := api.rollouts[rolloutName]
+	if saved != nil {
+		if executionErr == nil {
+			saved.State = "SUCCEEDED"
+		} else {
+			saved.State = "FAILED"
+		}
+		saved.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	rollout := deepCopyRollout(saved)
+	api.mu.Unlock()
+
+	if err := api.persistState(); err != nil {
+		if finalizeErr := api.opMgr.FinalizeScopedDurable(operationName, nil,
+			http.StatusServiceUnavailable, "rollout state persistence failed"); finalizeErr != nil {
+			log.Printf("[Shim: CloudDeploy] rollout persistence failure could not be finalized: %v", finalizeErr)
+		}
+		return
+	}
+	if executionErr != nil {
+		if err := api.opMgr.FinalizeScopedDurable(operationName, nil, errorCode, executionErr.Error()); err != nil {
+			log.Printf("[Shim: CloudDeploy] failed rollout operation persistence degraded: %v", err)
+		}
+		return
+	}
+	response, err := json.Marshal(rollout)
+	if err != nil {
+		_ = api.opMgr.FinalizeScopedDurable(operationName, nil,
+			http.StatusInternalServerError, "failed to encode rollout response")
+		return
+	}
+	if err := api.opMgr.FinalizeScopedDurable(operationName, response, 0, ""); err != nil {
+		log.Printf("[Shim: CloudDeploy] successful rollout operation persistence degraded: %v", err)
+	}
 }
 
 func (api *API) getRollout(w http.ResponseWriter, r *http.Request) {

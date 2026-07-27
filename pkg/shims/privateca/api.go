@@ -34,6 +34,17 @@ var (
 	parentPattern        = regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/caPools/[^/]+$`)
 )
 
+var revocationReasons = map[string]bool{
+	"KEY_COMPROMISE":                   true,
+	"CERTIFICATE_AUTHORITY_COMPROMISE": true,
+	"AFFILIATION_CHANGED":              true,
+	"SUPERSEDED":                       true,
+	"CESSATION_OF_OPERATION":           true,
+	"CERTIFICATE_HOLD":                 true,
+	"PRIVILEGE_WITHDRAWN":              true,
+	"ATTRIBUTE_AUTHORITY_COMPROMISE":   true,
+}
+
 func init() {
 	state.MustRegisterEntryValidator(privateCAStateEntry, state.StrictEntryValidator[metadata](nil))
 	registry.Register("privateca.googleapis.com", func(*registry.Context) http.Handler {
@@ -195,6 +206,9 @@ func (api *API) Revoke(name, reason string) error {
 	if api.initializationErr != nil {
 		return fmt.Errorf("certificate persistence unavailable: %w", api.initializationErr)
 	}
+	if !revocationReasons[reason] {
+		return fmt.Errorf("%w: unsupported revocation reason", ErrInvalidArgument)
+	}
 	if err := api.authorizer.Authorize("privateca.certificates.revoke", name); err != nil {
 		return fmt.Errorf("%w: %v", ErrPermissionDenied, err)
 	}
@@ -242,6 +256,28 @@ func (api *API) persist() error {
 
 func (api *API) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, ":revoke") {
+		request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || strings.TrimSpace(body.Reason) == "" {
+			writeError(w, 400, "INVALID_ARGUMENT", "revocation reason is required")
+			return
+		}
+		name := strings.TrimPrefix(strings.TrimSuffix(request.URL.Path, ":revoke"), "/v1/")
+		if err := api.Revoke(name, body.Reason); err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		certificate, ok := api.Get(name)
+		if !ok {
+			writeError(w, 500, "INTERNAL", "revoked certificate is unavailable")
+			return
+		}
+		_ = json.NewEncoder(w).Encode(certificate)
+		return
+	}
 	if request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/certificates") {
 		request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
 		var body struct {

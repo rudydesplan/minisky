@@ -19,10 +19,12 @@ run offline; first use may pull lazily loaded emulator images.
 
 ## ✨ Features
 
-- **🚀 71 Registry-Verified Domains**: The exact catalog count and machine-readable
-  compatibility rows are checked by registry tests. Core services have verified
-  Terraform/SDK slices; experimental services remain default-off.
+<!-- BEGIN GENERATED REGISTRY COUNT -->
+- **🚀 71 Registry-Verified Domains**: The exact catalog count and generated
+  compatibility rows come from `registry.Services()`. Phase 18–25
+  inventory entries remain experimental and default-off.
   See [Service Compatibility](docs/service-compatibility.md).
+<!-- END GENERATED REGISTRY COUNT -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
   and operational views.
 - **🛠️ Terraform Gates**: The pinned Google provider is tested only for resources
@@ -35,11 +37,11 @@ run offline; first use may pull lazily loaded emulator images.
 
 ### Phase 18–25 Services (Experimental)
 
-Phase 18–25 services remain registered for manifest and package-level
-development, but are classified as **experimental**, not Standard or
-implemented. Their data-driven Go gate covers public routing, restart evidence,
-scoped operations, pagination, event delivery, cancellation, and loopback
-safety. It does not prove Terraform/provider or external-backend lifecycles.
+<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
+**Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+
+Generated-client evidence: not recorded. CI evidence: not recorded. Package tests are not promotion evidence; every inventoried service remains experimental until separate machine-readable promotion evidence exists.
+<!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
 `501 UNIMPLEMENTED` with the opt-in and evidence status. To inspect the existing

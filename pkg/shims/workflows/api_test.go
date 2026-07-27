@@ -242,6 +242,10 @@ func TestDeleteWorkflow(t *testing.T) {
 	if resp["done"] != true {
 		t.Fatal("expected LRO done=true for delete")
 	}
+	deleteResult, _ := resp["response"].(map[string]any)
+	if deleteResult["@type"] != "type.googleapis.com/google.protobuf.Empty" {
+		t.Fatalf("delete response = %#v", deleteResult)
+	}
 	meta := resp["metadata"].(map[string]any)
 	if meta["verb"] != "delete" {
 		t.Fatalf("expected verb=delete, got %v", meta["verb"])
@@ -286,6 +290,10 @@ func TestPatchWorkflow(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["done"] != true {
 		t.Fatal("expected LRO done=true for patch")
+	}
+	patchResult, _ := resp["response"].(map[string]any)
+	if patchResult["@type"] != "type.googleapis.com/google.cloud.workflows.v1.Workflow" {
+		t.Fatalf("patch response = %#v", patchResult)
 	}
 
 	// Verify the workflow was updated
@@ -349,6 +357,40 @@ func TestPatchWorkflowCompensatesPostCommitSaveAndOperation(t *testing.T) {
 	}
 	if api.opMgr.PersistenceError() == nil {
 		t.Fatal("ambiguous resource save did not leave sticky degradation")
+	}
+}
+
+func TestPatchWorkflowRejectsUnsupportedAndImmutableMasksWithoutMutation(t *testing.T) {
+	for name, mask := range map[string]string{
+		"unsupported official field": "userEnvVars",
+		"output only field":          "revisionId",
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newTestAPI()
+			workflowName := "projects/test/locations/us-central1/workflows/wf1"
+			api.workflows[workflowName] = &Workflow{
+				Name: workflowName, State: "ACTIVE", RevisionID: "000001-a",
+				Description: "old", SourceContents: `[{"return":"ok"}]`,
+			}
+			api.revCounter = 1
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+				"/v1/"+workflowName+"?updateMask="+mask,
+				bytes.NewBufferString(`{"description":"new","userEnvVars":{"key":"value"},"revisionId":"forged"}`)))
+			want := http.StatusBadRequest
+			if mask == "userEnvVars" {
+				want = http.StatusNotImplemented
+			}
+			if response.Code != want {
+				t.Fatalf("status = %d, want %d: %s", response.Code, want, response.Body.String())
+			}
+			if got := api.workflows[workflowName]; got.Description != "old" || got.RevisionID != "000001-a" {
+				t.Fatalf("workflow mutated: %#v", got)
+			}
+			if api.revCounter != 1 {
+				t.Fatalf("revision counter = %d", api.revCounter)
+			}
+		})
 	}
 }
 
@@ -694,6 +736,40 @@ func TestGetOperation(t *testing.T) {
 	}
 	if meta["target"] != "projects/test/locations/us-central1/workflows/op-test" {
 		t.Fatalf("unexpected target: %v", meta["target"])
+	}
+}
+
+func TestCreateWorkflowTerminalOperationContainsTypedWorkflow(t *testing.T) {
+	api := newTestAPI()
+	create := httptest.NewRecorder()
+	api.ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/workflows?workflowId=typed",
+		bytes.NewBufferString(`{"sourceContents":"[{\"return\":\"ok\"}]"}`)))
+	var initial map[string]any
+	if err := json.Unmarshal(create.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	operationName, _ := initial["name"].(string)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		poll := httptest.NewRecorder()
+		api.ServeHTTP(poll, httptest.NewRequest(http.MethodGet, "/v1/"+operationName, nil))
+		var operation map[string]any
+		if err := json.Unmarshal(poll.Body.Bytes(), &operation); err != nil {
+			t.Fatal(err)
+		}
+		if operation["done"] == true {
+			result, _ := operation["response"].(map[string]any)
+			if result["@type"] != "type.googleapis.com/google.cloud.workflows.v1.Workflow" ||
+				result["name"] != "projects/test/locations/us-central1/workflows/typed" {
+				t.Fatalf("terminal response = %#v", result)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation did not finish: %#v", operation)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

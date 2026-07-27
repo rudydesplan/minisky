@@ -1,6 +1,7 @@
 package managedkafka
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,13 +30,14 @@ func init() {
 
 // Cluster represents a google.cloud.managedkafka.v1.Cluster resource.
 type Cluster struct {
-	Name       string            `json:"name"`
-	CreateTime string            `json:"createTime,omitempty"`
-	UpdateTime string            `json:"updateTime,omitempty"`
-	State      string            `json:"state,omitempty"`
-	Capacity   *Capacity         `json:"capacity,omitempty"`
-	GcpConfig  *GcpConfig        `json:"gcpConfig,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
+	Name             string            `json:"name"`
+	CreateTime       string            `json:"createTime,omitempty"`
+	UpdateTime       string            `json:"updateTime,omitempty"`
+	State            string            `json:"state,omitempty"`
+	Capacity         *Capacity         `json:"capacity,omitempty"`
+	GcpConfig        *GcpConfig        `json:"gcpConfig,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	BootstrapAddress string            `json:"bootstrapAddress,omitempty"`
 }
 
 // Capacity holds cluster capacity configuration.
@@ -79,9 +81,16 @@ type API struct {
 	stateStore managedKafkaStateStore
 	clusters   map[string]*Cluster
 	topics     map[string]*Topic
+	backend    kafkaBackend
 }
 
-const provisioningBackendAvailable = false
+type kafkaBackend interface {
+	Provision(context.Context, string) (string, error)
+	Delete(context.Context, string) error
+	CreateTopic(context.Context, string, *Topic) error
+	UpdateTopic(context.Context, string, *Topic) error
+	DeleteTopic(context.Context, string, string) error
+}
 
 // NewAPI creates a new Managed Kafka API shim with persistence.
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
@@ -94,6 +103,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 		stateStore: state.NewGuardedEntryStore(store, err),
 		clusters:   make(map[string]*Cluster),
 		topics:     make(map[string]*Topic),
+		backend:    newDockerKafkaBackend(),
 	}
 	if err != nil {
 		log.Printf("[Shim: ManagedKafka] persistence degraded: %v", err)
@@ -171,7 +181,7 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON: "+err.Error())
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka cluster provisioning requires a backend that MiniSky does not implement")
 		return
@@ -209,14 +219,35 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		delete(api.clusters, name)
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Metadata-only: resource stays in CREATING state.
-		// Real provisioning requires Docker (not available in this experimental shim).
-		return nil
+		bootstrap, err := api.backend.Provision(context.Background(), name)
+		api.mu.Lock()
+		current := api.clusters[name]
+		if current != nil {
+			current.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
+			if err != nil {
+				current.State = "FAILED"
+			} else {
+				current.State = "ACTIVE"
+				current.BootstrapAddress = bootstrap
+			}
+		}
+		api.mu.Unlock()
+		if persistErr := api.persistState(); persistErr != nil && err == nil {
+			api.mu.Lock()
+			if current := api.clusters[name]; current != nil {
+				current.State = "FAILED"
+				current.BootstrapAddress = ""
+			}
+			api.mu.Unlock()
+			return persistErr
+		}
+		return err
 	})
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
@@ -312,7 +343,7 @@ func (api *API) patchCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "cluster not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka cluster updates require an owned broker backend that MiniSky does not implement")
@@ -353,6 +384,22 @@ func (api *API) patchCluster(w http.ResponseWriter, r *http.Request) {
 	var updated Cluster
 	_ = json.Unmarshal(updatedRaw, &updated)
 	oldCluster := api.clusters[name]
+	api.mu.Unlock()
+
+	project, location, _ := parseParent(r.URL.Path)
+	op, err := api.opMgr.RegisterDurable("managedkafka#operation", "update", name, "", location)
+	if err != nil {
+		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+		return
+	}
+
+	api.mu.Lock()
+	if api.clusters[name] != oldCluster {
+		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, 503, "UNAVAILABLE", "Cluster changed while registering operation")
+		return
+	}
 	api.clusters[name] = &updated
 	api.mu.Unlock()
 
@@ -361,17 +408,15 @@ func (api *API) patchCluster(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		api.clusters[name] = oldCluster
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
 
-	project, location, _ := parseParent(r.URL.Path)
-	op, err := api.opMgr.RegisterDurable("managedkafka#operation", "update", name, "", location)
-	if err != nil {
-		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+	if err := api.opMgr.FinalizeScopedDurable(op.Name, nil, 0, ""); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to persist operation result")
 		return
 	}
-	api.opMgr.MarkDone(op.Name)
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 
@@ -402,10 +447,30 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "cluster not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka cluster deletion requires an owned broker backend that MiniSky does not implement")
+		return
+	}
+	api.mu.Unlock()
+
+	op, err := api.opMgr.RegisterDurable("managedkafka#operation", "delete", name, "", location)
+	if err != nil {
+		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+		return
+	}
+	if err := api.backend.Delete(r.Context(), name); err != nil {
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Kafka backend deletion failed: "+err.Error())
+		return
+	}
+	api.mu.Lock()
+	cluster, exists = api.clusters[name]
+	if !exists {
+		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "cluster not found: "+name)
 		return
 	}
 	delete(api.clusters, name)
@@ -424,21 +489,23 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request) {
 	if err := api.persistState(); err != nil {
 		// Re-add the resources since persist failed
 		api.mu.Lock()
-		api.clusters[name] = cluster
+		restored := deepCopyCluster(cluster)
+		restored.State = "FAILED"
+		restored.BootstrapAddress = ""
+		api.clusters[name] = restored
 		for k, v := range deletedTopics {
 			api.topics[k] = v
 		}
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "State persistence failed")
 		return
 	}
 
-	op, err := api.opMgr.RegisterDurable("managedkafka#operation", "delete", name, "", location)
-	if err != nil {
-		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+	if err := api.opMgr.FinalizeScopedDurable(op.Name, nil, 0, ""); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to persist operation result")
 		return
 	}
-	api.opMgr.MarkDone(op.Name)
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 
@@ -487,7 +554,7 @@ func (api *API) createTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "parent cluster not found: "+clusterName)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka topic creation requires an owned broker backend that MiniSky does not implement")
@@ -498,14 +565,30 @@ func (api *API) createTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "topic already exists: "+topicID)
 		return
 	}
+	api.mu.Unlock()
+	if err := api.backend.CreateTopic(r.Context(), clusterName, &topic); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Kafka topic creation failed: "+err.Error())
+		return
+	}
+	api.mu.Lock()
+	if _, exists := api.topics[name]; exists {
+		api.mu.Unlock()
+		_ = api.backend.DeleteTopic(r.Context(), clusterName, name)
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "topic already exists: "+topicID)
+		return
+	}
 	api.topics[name] = &topic
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
-		// Roll back
 		api.mu.Lock()
 		delete(api.topics, name)
 		api.mu.Unlock()
+		if cleanupErr := api.backend.DeleteTopic(r.Context(), clusterName, name); cleanupErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence failed and Kafka topic cleanup failed")
+			return
+		}
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
@@ -594,7 +677,7 @@ func (api *API) patchTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "topic not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka topic updates require an owned broker backend that MiniSky does not implement")
@@ -636,11 +719,23 @@ func (api *API) patchTopic(w http.ResponseWriter, r *http.Request) {
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
-		// Roll back
 		api.mu.Lock()
 		api.topics[name] = oldTopic
 		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
+		return
+	}
+	clusterName := strings.Split(name, "/topics/")[0]
+	if err := api.backend.UpdateTopic(r.Context(), clusterName, &updated); err != nil {
+		api.mu.Lock()
+		api.topics[name] = oldTopic
+		api.mu.Unlock()
+		if persistErr := api.persistState(); persistErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"Kafka topic update failed and metadata rollback could not be persisted")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Kafka topic update failed: "+err.Error())
 		return
 	}
 
@@ -659,10 +754,23 @@ func (api *API) deleteTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "topic not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"Managed Kafka topic deletion requires an owned broker backend that MiniSky does not implement")
+		return
+	}
+	api.mu.Unlock()
+	clusterName := strings.Split(name, "/topics/")[0]
+	if err := api.backend.DeleteTopic(r.Context(), clusterName, name); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Kafka topic deletion failed: "+err.Error())
+		return
+	}
+	api.mu.Lock()
+	topic, exists = api.topics[name]
+	if !exists {
+		api.mu.Unlock()
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "topic not found: "+name)
 		return
 	}
 	delete(api.topics, name)

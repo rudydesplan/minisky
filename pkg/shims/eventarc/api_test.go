@@ -75,6 +75,32 @@ func TestCreateTriggerMissingTriggerId(t *testing.T) {
 	}
 }
 
+func TestCreateTriggerValidateOnlyReturnsTypedPreviewWithoutMutation(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/triggers?triggerId=preview&validateOnly=true",
+		bytes.NewBufferString(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var operation map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation["done"] != true {
+		t.Fatalf("preview operation = %#v", operation)
+	}
+	result, _ := operation["response"].(map[string]any)
+	if result["@type"] != "type.googleapis.com/google.cloud.eventarc.v1.Trigger" {
+		t.Fatalf("preview response = %#v", result)
+	}
+	if len(api.triggers) != 0 {
+		t.Fatal("validateOnly create mutated triggers")
+	}
+}
+
 func TestCreateTriggerMissingEventFilters(t *testing.T) {
 	api := newTestAPI()
 	body := `{"destination":{"cloudRun":{"service":"svc"}}}`
@@ -670,6 +696,41 @@ func TestDeleteTriggerNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteTriggerAllowMissingReturnsTypedOperation(t *testing.T) {
+	api := newTestAPI()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
+		"/v1/projects/test/locations/us-central1/triggers/missing?allowMissing=true", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var operation map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := operation["response"].(map[string]any)
+	if operation["done"] != true || result["@type"] != "type.googleapis.com/google.protobuf.Empty" {
+		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestDeleteTriggerEtagMismatchDoesNotMutate(t *testing.T) {
+	api := newTestAPI()
+	name := "projects/test/locations/us-central1/triggers/t1"
+	api.triggers[name] = &Trigger{
+		Name: name, Etag: "current",
+		Destination: &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/"+name+"?etag=stale", nil))
+	if response.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if api.triggers[name] == nil {
+		t.Fatal("etag mismatch deleted trigger")
+	}
+}
+
 func TestPatchTrigger(t *testing.T) {
 	api := newTestAPI()
 	api.mu.Lock()
@@ -688,8 +749,8 @@ func TestPatchTrigger(t *testing.T) {
 	}
 	api.mu.Unlock()
 
-	body := `{"serviceAccount":"new-sa@project.iam.gserviceaccount.com"}`
-	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/triggers/t1?updateMask=serviceAccount", bytes.NewBufferString(body))
+	body := `{"destination":{"workflow":"projects/test/locations/us-central1/workflows/new"}}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/triggers/t1?updateMask=destination", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -706,8 +767,8 @@ func TestPatchTrigger(t *testing.T) {
 	api.mu.RLock()
 	trigger := api.triggers["projects/test/locations/us-central1/triggers/t1"]
 	api.mu.RUnlock()
-	if trigger.ServiceAccount != "new-sa@project.iam.gserviceaccount.com" {
-		t.Fatalf("expected updated serviceAccount, got %s", trigger.ServiceAccount)
+	if trigger.Destination == nil || trigger.Destination.Workflow != "projects/test/locations/us-central1/workflows/new" {
+		t.Fatalf("expected updated destination, got %#v", trigger.Destination)
 	}
 	// Verify output-only fields preserved
 	if trigger.UID != "uid-1" {
@@ -719,9 +780,93 @@ func TestPatchTrigger(t *testing.T) {
 	if trigger.UpdateTime == "2024-01-01T00:00:00Z" {
 		t.Fatal("updateTime should have been updated")
 	}
-	// Verify destination was NOT changed (not in updateMask)
-	if trigger.Destination == nil || trigger.Destination.Workflow != "projects/test/locations/us-central1/workflows/w" {
-		t.Fatal("destination should not have changed")
+	if trigger.ServiceAccount != "old-sa@project.iam.gserviceaccount.com" {
+		t.Fatal("immutable serviceAccount should not have changed")
+	}
+}
+
+func TestPatchTriggerRejectsImmutableFieldMaskWithoutMutation(t *testing.T) {
+	api := newTestAPI()
+	name := "projects/test/locations/us-central1/triggers/t1"
+	api.triggers[name] = &Trigger{
+		Name: name, UID: "uid", EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+		Destination:    &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
+		ServiceAccount: "old@test.iam.gserviceaccount.com",
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v1/"+name+"?updateMask=serviceAccount",
+		bytes.NewBufferString(`{"serviceAccount":"new@test.iam.gserviceaccount.com"}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if got := api.triggers[name].ServiceAccount; got != "old@test.iam.gserviceaccount.com" {
+		t.Fatalf("immutable field changed to %q", got)
+	}
+}
+
+func TestPatchTriggerValidateOnlyReturnsTypedPreviewWithoutMutation(t *testing.T) {
+	api := newTestAPI()
+	name := "projects/test/locations/us-central1/triggers/t1"
+	api.triggers[name] = &Trigger{
+		Name: name, UID: "uid", EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+		Destination: &Destination{Workflow: "projects/test/locations/us-central1/workflows/old"},
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v1/"+name+"?updateMask=destination&validateOnly=true",
+		bytes.NewBufferString(`{"destination":{"workflow":"projects/test/locations/us-central1/workflows/new"}}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var operation map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := operation["response"].(map[string]any)
+	destination, _ := result["destination"].(map[string]any)
+	if operation["done"] != true ||
+		result["@type"] != "type.googleapis.com/google.cloud.eventarc.v1.Trigger" ||
+		destination["workflow"] != "projects/test/locations/us-central1/workflows/new" {
+		t.Fatalf("preview operation = %#v", operation)
+	}
+	if got := api.triggers[name].Destination.Workflow; got != "projects/test/locations/us-central1/workflows/old" {
+		t.Fatalf("validateOnly mutated destination to %q", got)
+	}
+}
+
+func TestCreateTriggerTerminalOperationContainsTypedTrigger(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	create := httptest.NewRecorder()
+	api.ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/triggers?triggerId=typed",
+		bytes.NewBufferString(body)))
+	var initial map[string]any
+	if err := json.Unmarshal(create.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	operationName, _ := initial["name"].(string)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		poll := httptest.NewRecorder()
+		api.ServeHTTP(poll, httptest.NewRequest(http.MethodGet, "/v1/"+operationName, nil))
+		var operation map[string]any
+		if err := json.Unmarshal(poll.Body.Bytes(), &operation); err != nil {
+			t.Fatal(err)
+		}
+		if operation["done"] == true {
+			result, _ := operation["response"].(map[string]any)
+			if result["@type"] != "type.googleapis.com/google.cloud.eventarc.v1.Trigger" ||
+				result["name"] != "projects/test/locations/us-central1/triggers/typed" {
+				t.Fatalf("terminal response = %#v", result)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation did not finish: %#v", operation)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -732,8 +877,7 @@ func TestPatchTriggerCompensatesPostCommitSaveAndOperation(t *testing.T) {
 	name := "projects/test/locations/us-central1/triggers/t1"
 	api.triggers[name] = &Trigger{
 		Name: name, UID: "uid", EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
-		Destination:    &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
-		ServiceAccount: "old",
+		Destination: &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
 	}
 	if err := api.persistState(); err != nil {
 		t.Fatal(err)
@@ -742,19 +886,20 @@ func TestPatchTriggerCompensatesPostCommitSaveAndOperation(t *testing.T) {
 
 	response := httptest.NewRecorder()
 	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
-		"/v1/"+name+"?updateMask=serviceAccount", bytes.NewBufferString(`{"serviceAccount":"new"}`)))
+		"/v1/"+name+"?updateMask=destination",
+		bytes.NewBufferString(`{"destination":{"workflow":"projects/test/locations/us-central1/workflows/new"}}`)))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
 	}
-	if got := api.triggers[name].ServiceAccount; got != "old" {
-		t.Fatalf("visible service account = %q, want old", got)
+	if got := api.triggers[name].Destination.Workflow; got != "projects/test/locations/us-central1/workflows/w" {
+		t.Fatalf("visible destination = %q, want old", got)
 	}
 	var durable eventarcMetadata
 	if err := store.Load(eventarcStateEntry, &durable); err != nil {
 		t.Fatal(err)
 	}
-	if got := durable.Triggers[name].ServiceAccount; got != "old" {
-		t.Fatalf("durable service account = %q, want compensated old", got)
+	if got := durable.Triggers[name].Destination.Workflow; got != "projects/test/locations/us-central1/workflows/w" {
+		t.Fatalf("durable destination = %q, want compensated old", got)
 	}
 	if operations := api.opMgr.List(); len(operations) != 0 {
 		t.Fatalf("compensated mutation retained operations: %#v", operations)

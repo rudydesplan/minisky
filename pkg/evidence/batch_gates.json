@@ -1,0 +1,80 @@
+[
+  {
+    "id": "phase18-25",
+    "domains": ["batch.googleapis.com", "eventarc.googleapis.com", "workflows.googleapis.com", "workflowexecutions.googleapis.com"],
+    "relatedDomains": ["speech.googleapis.com", "texttospeech.googleapis.com"],
+    "packageUnit": {"status":"configured-unverified","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Evidence reference validation passed, but the broader race run hit the existing Eventarc restart-delivery cleanup failure; this batch is not recorded as locally passed."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase18-25","tests":["TestGeneratedClientsUseFullDomainCanonicalPaths","TestGeneratedBatchRunnableAndTerminalExitCode"]}],"script":"scripts/phase18-25-sdk-integration.sh","makeTarget":"test-phase18-25-sdk","note":"Generated-client create, verify-after-restart, delete, and Batch terminal-state lifecycle is configured; this consolidation did not rerun the guarded integration."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase18-25-sdk-integration.sh","makeTarget":"test-phase18-25-sdk","note":"The guarded script restarts MiniSky against the same isolated profile before verification."},
+    "realBackendDocker": {"status":"configured-unverified","references":[{"package":"pkg/shims/batch","tests":["TestDockerExecutableJobIntegration"]}],"script":"scripts/phase18-25-sdk-integration.sh","makeTarget":"test-phase18-25-sdk","note":"Digest-pinned Batch runnable execution is Docker-backed and guarded; no pass is claimed by this record."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase18-25-sdk-integration.sh","makeTarget":"test-phase18-25-sdk","note":"Exact-owned Batch container and generated resource cleanup assertions are configured but were not rerun here."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase18-25-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+  },
+  {
+    "id": "phase19",
+    "domains": ["composer.googleapis.com", "dataflow.googleapis.com", "dataform.googleapis.com", "managedkafka.googleapis.com", "pubsublite.googleapis.com"],
+    "unsupportedGeneratedDomains": ["pubsublite.googleapis.com"],
+    "packageUnit": {"status":"local-passed","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Local evidence and referenced package tests passed; per-domain package test names remain in phase18_25.json."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase19","tests":["TestGeneratedClientsUseCanonicalFullDomainPaths","TestDefaultGateUsesGeneratedClientsAndPubSubLiteReceives501"]}],"script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-sdk","note":"Generated-client create, restart verification, delete, and Pub/Sub Lite explicit unsupported behavior are configured but not rerun here."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-sdk","note":"Core metadata and optional backend verification restart the daemon against one isolated profile."},
+    "realBackendDocker": {"status":"optional-unverified","script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-sdk","note":"Kafka protocol and Airflow DAG execution require the additional MINISKY_PHASE19_DOCKER_INTEGRATION=1 opt-in; the CI target does not enable it."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-sdk","note":"Generated resources are deleted in the core gate; exact-owned container and volume cleanup belongs to the optional heavy gate."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase19-sdk-integration","note":"The workflow-dispatch job is configured for the core gate; no GitHub result or heavy-backend run is recorded."}
+  },
+  {
+    "id": "phase20",
+    "domains": ["alloydb.googleapis.com", "file.googleapis.com", "identityplatform.googleapis.com", "storagetransfer.googleapis.com"],
+    "relatedDomains": ["redis.googleapis.com", "storage.googleapis.com"],
+    "packageUnit": {"status":"local-passed","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Local evidence and referenced package tests passed; per-domain package test names remain in phase18_25.json."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase20","tests":["TestGeneratedClientsUseCanonicalFullDomainPaths","TestGeneratedCustomMethodReturnsSupportedLROAndStorageUploadStaysCanonical"]}],"script":"scripts/phase20-sdk-integration.sh","makeTarget":"test-phase20-sdk","note":"Generated-client create, restart verification, successful transfer LRO, and delete modes are configured but not rerun here."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase20-sdk-integration.sh","makeTarget":"test-phase20-sdk","note":"The guarded script verifies metadata and owned backends after daemon restart."},
+    "realBackendDocker": {"status":"configured-unverified","script":"scripts/phase20-sdk-integration.sh","makeTarget":"test-phase20-sdk","note":"Digest-pinned PostgreSQL, Valkey, and Storage backends are asserted by exact image identity; no pass is claimed here."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase20-sdk-integration.sh","makeTarget":"test-phase20-sdk","note":"Exact-owned containers, volumes, and networks have configured terminal cleanup assertions."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase20-sdk-integration","note":"The workflow-dispatch Docker job is configured; no actual GitHub run result is recorded."}
+  },
+  {
+    "id": "phase21-22",
+    "domains": ["apigateway.googleapis.com", "binaryauthorization.googleapis.com", "clouddeploy.googleapis.com", "clouderrorreporting.googleapis.com", "cloudprofiler.googleapis.com", "cloudtrace.googleapis.com", "servicecontrol.googleapis.com", "servicedirectory.googleapis.com", "servicemanagement.googleapis.com"],
+    "packageUnit": {"status":"local-passed","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Local evidence and referenced package tests passed; per-domain package test names remain in phase18_25.json."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase21-22","tests":["TestGeneratedClientsUseCanonicalFullDomainPaths","TestMiniSkyLocalGatewayProxyIsExecutableAndLoopbackBound"]}],"script":"scripts/phase21-22-sdk-integration.sh","makeTarget":"test-phase21-22-sdk","note":"Generated-client create, restart verification, delete, and loopback proxy behavior are configured but not rerun here."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase21-22-sdk-integration.sh","makeTarget":"test-phase21-22-sdk","note":"The guarded script restarts MiniSky against the same isolated profile before verification."},
+    "realBackendDocker": {"status":"not-applicable","note":"This batch uses metadata and isolated loopback behavior; Docker is used only for MiniSky network isolation, not a claimed service backend."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase21-22-sdk-integration.sh","makeTarget":"test-phase21-22-sdk","note":"Generated resources and the exact-owned isolated Docker network have configured cleanup assertions."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase21-22-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+  },
+  {
+    "id": "phase23",
+    "domains": ["dialogflow.googleapis.com", "documentai.googleapis.com", "language.googleapis.com", "speech.googleapis.com", "texttospeech.googleapis.com", "translate.googleapis.com", "vision.googleapis.com"],
+    "relatedDomains": ["aiplatform.googleapis.com"],
+    "unsupportedGeneratedDomains": ["speech.googleapis.com", "texttospeech.googleapis.com"],
+    "packageUnit": {"status":"local-passed","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Local evidence and referenced package tests passed; per-domain package test names remain in phase18_25.json."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase23","tests":["TestGeneratedClientsUseCanonicalFullDomainPaths","TestGeneratedClientErrorsRetainGCPStatus"]}],"script":"scripts/phase23-sdk-integration.sh","makeTarget":"test-phase23-sdk","note":"Generated-client create, restart verification, delete, and explicit unsupported semantic boundaries are configured but not rerun here."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase23-sdk-integration.sh","makeTarget":"test-phase23-sdk","note":"The guarded script restarts MiniSky against the same isolated profile before verification."},
+    "realBackendDocker": {"status":"not-applicable","note":"This batch claims bounded local or explicit unsupported semantics, not a real service backend; Docker is only used for network isolation."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase23-sdk-integration.sh","makeTarget":"test-phase23-sdk","note":"Generated resources, sensitive-probe absence, and exact-owned network cleanup assertions are configured."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase23-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+  },
+  {
+    "id": "phase24-25",
+    "domains": ["accesscontextmanager.googleapis.com", "cloudasset.googleapis.com", "dlp.googleapis.com", "networksecurity.googleapis.com", "networkservices.googleapis.com", "orgpolicy.googleapis.com", "privateca.googleapis.com"],
+    "relatedDomains": ["binaryauthorization.googleapis.com", "compute.googleapis.com", "storage.googleapis.com"],
+    "packageUnit": {"status":"local-passed","references":[{"package":"pkg/evidence","tests":["TestPhase18To25InventoryReferencesExecutablePackageTests"]}],"note":"Local evidence and referenced package tests passed; per-domain package test names remain in phase18_25.json."},
+    "generatedClientLifecycle": {"status":"configured-unverified","references":[{"package":"sdk-smoke/phase24-25","tests":["TestGeneratedClientsUseCanonicalFullDomainPaths","TestGeneratedClientErrorsRetainGCPStatus","TestDirectLocalComputeBoundariesUseCanonicalScopedPaths"]}],"script":"scripts/phase24-25-sdk-integration.sh","makeTarget":"test-phase24-25-sdk","note":"Generated-client create, restart verification, delete, policy denial, and local proxy routing are configured but not rerun here."},
+    "daemonRestart": {"status":"configured-unverified","script":"scripts/phase24-25-sdk-integration.sh","makeTarget":"test-phase24-25-sdk","note":"The guarded script restarts MiniSky against the same isolated profile before verification."},
+    "realBackendDocker": {"status":"configured-unverified","script":"scripts/phase24-25-sdk-integration.sh","makeTarget":"test-phase24-25-sdk","note":"Two real isolated loopback HTTP backends prove deny and route selection; this is not a Docker service-backend claim and was not rerun here."},
+    "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
+    "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
+    "cleanup": {"status":"configured-unverified","script":"scripts/phase24-25-sdk-integration.sh","makeTarget":"test-phase24-25-sdk","note":"Generated resources, daemon, and isolated local backends have configured cleanup paths."},
+    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase24-25-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+  }
+]

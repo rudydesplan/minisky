@@ -485,7 +485,9 @@ func (api *API) createTransferJob(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	var job TransferJob
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&job); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON: "+err.Error())
 		return
 	}
@@ -497,8 +499,12 @@ func (api *API) createTransferJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "status must be ENABLED or DISABLED")
 		return
 	}
-	if job.ProjectID == "" || job.TransferSpec == nil {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "projectId and transferSpec are required")
+	if err := validateStorageTransferJob(&job, false); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	if err := validateStorageTransferSpec(job.TransferSpec); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 
@@ -644,6 +650,7 @@ func (api *API) patchTransferJob(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(raw, &merged)
 
 	fields := strings.Split(wrapper.UpdateTransferJobFieldMask, ",")
+	updatingTransferSpec := false
 	for _, field := range fields {
 		field = strings.TrimSpace(field)
 		switch field {
@@ -653,9 +660,14 @@ func (api *API) patchTransferJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "unsupported update field mask: "+field)
 			return
 		}
-		if v, exists := wrapper.TransferJob[field]; exists {
-			merged[field] = v
+		v, exists := wrapper.TransferJob[field]
+		if !exists {
+			api.mu.Unlock()
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "masked field is missing from transferJob: "+field)
+			return
 		}
+		merged[field] = v
+		updatingTransferSpec = updatingTransferSpec || field == "transferSpec"
 	}
 
 	merged["name"] = existing.Name
@@ -665,6 +677,18 @@ func (api *API) patchTransferJob(w http.ResponseWriter, r *http.Request) {
 	updatedRaw, _ := json.Marshal(merged)
 	var updated TransferJob
 	_ = json.Unmarshal(updatedRaw, &updated)
+	if err := validateStorageTransferJob(&updated, true); err != nil {
+		api.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	if updatingTransferSpec {
+		if err := validateStorageTransferSpec(updated.TransferSpec); err != nil {
+			api.mu.Unlock()
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+			return
+		}
+	}
 	api.jobs[name] = &updated
 	api.mu.Unlock()
 
@@ -688,6 +712,26 @@ func extractJobName(path string) string {
 	// Path: /v1/transferJobs/{id}
 	trimmed := strings.TrimPrefix(path, "/v1/")
 	return trimmed
+}
+
+func validateStorageTransferJob(job *TransferJob, allowDeleted bool) error {
+	if job.ProjectID == "" {
+		return fmt.Errorf("projectId is required")
+	}
+	if job.Status != "ENABLED" && job.Status != "DISABLED" && (!allowDeleted || job.Status != "DELETED") {
+		return fmt.Errorf("status must be ENABLED or DISABLED")
+	}
+	return nil
+}
+
+func validateStorageTransferSpec(spec *TransferSpec) error {
+	if spec == nil || spec.GcsDataSource == nil || spec.GcsDataSink == nil {
+		return fmt.Errorf("bounded execution requires GCS source and sink")
+	}
+	if spec.GcsDataSource.BucketName == "" || spec.GcsDataSink.BucketName == "" {
+		return fmt.Errorf("source and sink bucketName are required")
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

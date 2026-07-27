@@ -33,6 +33,34 @@ For disconnected transfer, `scripts/airgap-bundle.sh` packages a supplied
 binary and optionally an already-present image, emits SHA-256 metadata, and
 verifies all files before optional `docker load`. It never publishes or pulls.
 
+## Local Phase 11 distribution gate
+
+`make test-phase11-distribution` is the non-destructive local and CI entry
+point. It runs `goreleaser check`, verifies the GoReleaser v2 snapshot artifact
+contract against the supported release archives and local action targets,
+checks the local action JavaScript syntax, exercises the air-gap bundle, and
+renders the Compose configuration. It does not create a release, push an image,
+or update any package repository. The harness itself has a dependency-light
+static self-test:
+
+```bash
+./scripts/phase11-distribution-test.sh --self-test
+make test-phase11-distribution
+```
+
+The native `deb`/`rpm` build, install, smoke-test, and uninstall lifecycle
+changes the host package database and builds CGO artifacts. It is therefore
+disabled by default and runs only on native Linux `x86_64` or `aarch64` when
+explicitly requested:
+
+```bash
+MINISKY_PHASE11_DISTRIBUTION_BUILD=1 make test-phase11-distribution
+```
+
+The guarded path retains the package test's refusal to replace an existing
+MiniSky installation, `/usr/bin/minisky`, or GoReleaser `dist` directory, and
+requires root or passwordless `sudo`.
+
 ## GHCR
 
 MiniSky publishes no GHCR tags: not exact semantic versions and not moving
@@ -127,3 +155,10 @@ builds the macOS ARM64 snapshot, and runs both `minisky version` and
 Pack 0.40.8, which is compatible with Docker daemons that reject the legacy
 API level used by Pack 0.34.2. This evidence does not replace native Linux
 install-from-repository tests or credentialed package publication.
+
+External `deb` and `rpm` repository publication remains blocked for the same
+operational reasons as Homebrew and Scoop: maintainers must first provision
+the destination repositories, narrowly scoped publishing tokens, and protected
+environments with required approval. Until those controls and
+install-from-repository tests exist, the project has local package-build
+evidence only and must not claim repository publication.

@@ -727,6 +727,249 @@ func TestDataprocRestartNormalizationIsDurablySaved(t *testing.T) {
 	}
 }
 
+func TestDataprocRestartCleansExactOwnedBackendsWithoutReplay(t *testing.T) {
+	store := newDataprocFailingStore()
+	key := clusterKey("test", "us", "cluster")
+	master := dataprocDockerName("test", "us", "cluster", "m", 0)
+	worker := dataprocDockerName("test", "us", "cluster", "w", 0)
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			key: {
+				ProjectId: "test", ClusterName: "cluster", ClusterUuid: "uuid",
+				Config: ClusterConfig{WorkerConfig: &InstanceGroupConfig{NumInstances: 1}},
+				Status: ClusterStatus{State: "RUNNING"},
+			},
+		},
+		Runtimes: map[string]*dataprocRuntimeIntent{
+			key: {ContainerNames: []string{master, worker}},
+		},
+	})
+	backend := &dataprocBackendSpy{}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.provisions != 0 || backend.commands != 0 {
+		t.Fatalf("restart replayed work: %#v", backend)
+	}
+	if strings.Join(backend.deleteNames, ",") != master+","+worker {
+		t.Fatalf("restart cleanup = %#v, want exact persisted ownership", backend.deleteNames)
+	}
+	api.mu.RLock()
+	cluster := cloneCluster(api.clusters[key])
+	runtimeCount := len(api.runtimes)
+	api.mu.RUnlock()
+	if cluster.Status.State != "ERROR" || runtimeCount != 0 {
+		t.Fatalf("normalized cluster=%#v runtimes=%d", cluster, runtimeCount)
+	}
+	var persisted dataprocMetadata
+	if err := store.Load(dataprocStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Runtimes) != 0 || persisted.Clusters[key].Status.State != "ERROR" {
+		t.Fatalf("durable restart result = %#v", persisted)
+	}
+}
+
+func TestDataprocRestartRefusesUnownedBackendAndPreservesCleanupIntent(t *testing.T) {
+	store := newDataprocFailingStore()
+	key := clusterKey("test", "us", "cluster")
+	master := dataprocDockerName("test", "us", "cluster", "m", 0)
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			key: {
+				ProjectId: "test", ClusterName: "cluster",
+				Config: ClusterConfig{WorkerConfig: &InstanceGroupConfig{NumInstances: 0}},
+				Status: ClusterStatus{State: "CREATING"},
+			},
+		},
+		Runtimes: map[string]*dataprocRuntimeIntent{
+			key: {ContainerNames: []string{master}},
+		},
+	})
+	backend := newDataprocAmbiguousProvisionBackend(0, false, nil)
+	if _, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, store); err == nil ||
+		!strings.Contains(err.Error(), "unowned") {
+		t.Fatalf("restart cleanup error = %v", err)
+	}
+	if strings.Join(backend.attemptedDeletes, ",") != master || len(backend.deleted) != 0 {
+		t.Fatalf("unowned cleanup mutated backend: attempted=%#v deleted=%#v",
+			backend.attemptedDeletes, backend.deleted)
+	}
+	var persisted dataprocMetadata
+	if err := store.Load(dataprocStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Clusters[key].Status.State != "CREATING" || len(persisted.Runtimes) != 1 {
+		t.Fatalf("failed reconciliation changed durable truth: %#v", persisted)
+	}
+}
+
+func TestDataprocRestartPreservesTerminalJobsAndOperationOutcomes(t *testing.T) {
+	store, err := state.New(t.TempDir(), "terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clusterKey("test", "us", "cluster")
+	if err := store.Save(dataprocStateEntry, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			key: {ProjectId: "test", ClusterName: "cluster", Status: ClusterStatus{State: "ERROR", Detail: "stable"}},
+		},
+		Jobs: map[string]*Job{
+			jobKey("test", "us", "done"): {
+				Reference: JobReference{ProjectId: "test", JobId: "done"},
+				Status:    JobStatus{State: "DONE", Details: "result"},
+			},
+			jobKey("test", "us", "failed"): {
+				Reference: JobReference{ProjectId: "test", JobId: "failed"},
+				Status:    JobStatus{State: "ERROR", Details: "work failed"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := manager.RegisterDurable("dataproc#operation", "CREATE",
+		"https://dataproc.googleapis.com/v1/projects/test/regions/us/clusters/cluster", "", "us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AdvanceDurable(operation.Name, 100, orchestrator.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	restartedManager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &dataprocBackendSpy{}
+	api, err := NewAPIWithStore(restartedManager, backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.provisions != 0 || backend.deletes != 0 || backend.commands != 0 {
+		t.Fatalf("terminal restart touched backend: %#v", backend)
+	}
+	for id, wantDetails := range map[string]string{"done": "result", "failed": "work failed"} {
+		response := dataprocRequest(api, http.MethodGet,
+			"/v1/projects/test/regions/us/jobs/"+id, "")
+		var job Job
+		decodeDataprocResponse(t, response, &job)
+		if job.Status.Details != wantDetails {
+			t.Fatalf("job %s after restart = %#v", id, job.Status)
+		}
+	}
+	polled := restartedManager.Get(operation.Name)
+	if polled == nil || !polled.Done || polled.Error != nil {
+		t.Fatalf("terminal operation after restart = %#v", polled)
+	}
+}
+
+func TestDataprocRestartInterruptsActiveOperationWithoutBackendReplay(t *testing.T) {
+	store, err := state.New(t.TempDir(), "active-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := manager.RegisterDurable("dataproc#operation", "CREATE",
+		"https://dataproc.googleapis.com/v1/projects/test/regions/us/clusters/cluster", "", "us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AdvanceDurable(operation.Name, 25, orchestrator.StatusRunning); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedManager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &dataprocBackendSpy{}
+	api, err := NewAPIWithStore(restartedManager, backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := dataprocRequest(api, http.MethodGet,
+		"/v1/projects/test/regions/us/operations/"+operation.Name, "")
+	var result struct {
+		Done  bool                         `json:"done"`
+		Error *orchestrator.OperationError `json:"error"`
+	}
+	decodeDataprocResponse(t, response, &result)
+	if !result.Done || result.Error == nil ||
+		!strings.Contains(result.Error.Message, "interrupted by MiniSky restart") {
+		t.Fatalf("restarted operation = %#v", result)
+	}
+	if backend.provisions != 0 || backend.deletes != 0 || backend.commands != 0 {
+		t.Fatalf("operation restart replayed backend: %#v", backend)
+	}
+}
+
+func TestDataprocRestartCleanupSaveFailureKeepsRetryableIntent(t *testing.T) {
+	store := newDataprocFailingStore()
+	key := clusterKey("test", "us", "cluster")
+	master := dataprocDockerName("test", "us", "cluster", "m", 0)
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			key: {
+				ProjectId: "test", ClusterName: "cluster",
+				Config: ClusterConfig{WorkerConfig: &InstanceGroupConfig{NumInstances: 0}},
+				Status: ClusterStatus{State: "CREATING"},
+			},
+		},
+		Runtimes: map[string]*dataprocRuntimeIntent{
+			key: {ContainerNames: []string{master}},
+		},
+	})
+	store.fail = true
+	backend := &dataprocBackendSpy{}
+	if _, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, store); err == nil {
+		t.Fatal("restart cleanup normalization save failure was ignored")
+	}
+	if strings.Join(backend.deleteNames, ",") != master {
+		t.Fatalf("cleanup calls = %#v", backend.deleteNames)
+	}
+	var persisted dataprocMetadata
+	if err := store.Load(dataprocStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Clusters[key].Status.State != "CREATING" || len(persisted.Runtimes) != 1 {
+		t.Fatalf("failed cleanup commit lost retry intent: %#v", persisted)
+	}
+}
+
+func TestDataprocRejectsMutationAfterOperationPersistenceFailure(t *testing.T) {
+	operationStore := newDataprocFailingStore()
+	manager, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := manager.RegisterDurable("dataproc#operation", "CREATE",
+		"https://dataproc.googleapis.com/v1/projects/test/regions/us/clusters/existing", "", "us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationStore.fail = true
+	if err := manager.FailDurable(operation.Name, 500, "backend failed"); err == nil {
+		t.Fatal("injected operation persistence failure returned nil")
+	}
+	api, err := NewAPIWithStore(manager, &dataprocBackendSpy{}, newDataprocFailingStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := dataprocRequest(api, http.MethodPost,
+		"/v1/projects/test/regions/us/clusters", `{"clusterName":"blocked"}`)
+	assertDataprocError(t, response, http.StatusServiceUnavailable, "UNAVAILABLE")
+	if got := len(manager.List()); got != 1 {
+		t.Fatalf("mutation registered operation after degradation: %d", got)
+	}
+}
+
 func TestDataprocNormalizationSaveFailureFailsConstruction(t *testing.T) {
 	store := newDataprocFailingStore()
 	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{

@@ -12,7 +12,9 @@ package documentai
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -20,12 +22,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/pagination"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
+)
+
+const (
+	maxRawDocumentBytes = 5 << 20
+	maxLoggedPathBytes  = 256
+	maxProcessors       = 1000
+	maxStoredOperations = 2000
 )
 
 func init() {
@@ -102,7 +112,7 @@ func NewAPIWithStore(store documentAIStateStore) *API {
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Shim: Document AI] %s %s", r.Method, r.URL.Path)
+	log.Printf("[Shim: Document AI] %s %s", r.Method, boundedLogPath(r.URL.Path))
 	w.Header().Set("Content-Type", "application/json")
 
 	path := strings.TrimPrefix(r.URL.Path, "/v1/")
@@ -165,8 +175,14 @@ func (api *API) createProcessor(w http.ResponseWriter, r *http.Request, path str
 		Type        string `json:"type"`
 		DisplayName string `json:"displayName"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
 		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid request body: "+err.Error())
+		return
+	}
+	if !documentJSONEOF(decoder) {
+		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
 	if body.Type == "" {
@@ -182,6 +198,12 @@ func (api *API) createProcessor(w http.ResponseWriter, r *http.Request, path str
 	api.mutationMu.Lock()
 	defer api.mutationMu.Unlock()
 	api.mu.Lock()
+	if len(api.processors) >= maxProcessors {
+		api.mu.Unlock()
+		gcpError(w, http.StatusTooManyRequests, "RESOURCE_EXHAUSTED",
+			"processor state limit reached")
+		return
+	}
 	api.seq++
 	processorID := fmt.Sprintf("proc-%d", api.seq)
 	name := parent + "/processors/" + processorID
@@ -287,6 +309,12 @@ func (api *API) deleteProcessor(w http.ResponseWriter, _ *http.Request, path str
 		gcpError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("processor %q not found", path))
 		return
 	}
+	if len(api.operations) >= maxStoredOperations {
+		api.mu.Unlock()
+		gcpError(w, http.StatusTooManyRequests, "RESOURCE_EXHAUSTED",
+			"operation state limit reached")
+		return
+	}
 	delete(api.processors, path)
 	api.seq++
 	parent := extractParent(path)
@@ -335,6 +363,10 @@ func (api *API) processDocument(w http.ResponseWriter, r *http.Request, processo
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
+		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
+	if !documentJSONEOF(decoder) {
 		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
@@ -389,6 +421,11 @@ func (api *API) processDocument(w http.ResponseWriter, r *http.Request, processo
 		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "field 'rawDocument.content' must be non-empty base64")
 		return
 	}
+	if len(content) > maxRawDocumentBytes {
+		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"field 'rawDocument.content' exceeds the 5 MiB local limit")
+		return
+	}
 	w.Header().Set("X-MiniSky-Simulated", "true")
 	gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 		"document processing is not implemented; no text, entities, or confidence values were generated")
@@ -436,6 +473,27 @@ func validParent(parent string) bool {
 	parts := strings.Split(parent, "/")
 	return len(parts) == 4 && parts[0] == "projects" && parts[1] != "" &&
 		parts[2] == "locations" && parts[3] != ""
+}
+
+func documentJSONEOF(decoder *json.Decoder) bool {
+	var trailing any
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
+}
+
+func boundedLogPath(path string) string {
+	var bounded strings.Builder
+	bounded.Grow(min(len(path), maxLoggedPathBytes))
+	for _, value := range path {
+		if value < 0x20 || value == 0x7f {
+			value = ' '
+		}
+		size := utf8.RuneLen(value)
+		if size < 0 || bounded.Len()+size > maxLoggedPathBytes {
+			break
+		}
+		bounded.WriteRune(value)
+	}
+	return bounded.String()
 }
 
 func gcpError(w http.ResponseWriter, code int, status, message string) {

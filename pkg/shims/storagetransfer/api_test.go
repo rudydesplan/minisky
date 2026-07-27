@@ -40,6 +40,28 @@ func TestCreateTransferJob(t *testing.T) {
 	}
 }
 
+func TestCreateTransferJobRejectsUnsupportedOrIncompleteTransferSpecs(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing source": `{"projectId":"test","transferSpec":{"gcsDataSink":{"bucketName":"dst"}}}`,
+		"missing sink":   `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"}}}`,
+		"empty bucket":   `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":""},"gcsDataSink":{"bucketName":"dst"}}}`,
+		"unknown field":  `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"},"gcsDataSink":{"bucketName":"dst"},"awsS3DataSource":{"bucketName":"foreign"}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newTestAPI()
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/transferJobs",
+				bytes.NewBufferString(body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			if len(api.jobs) != 0 {
+				t.Fatalf("invalid request created %d jobs", len(api.jobs))
+			}
+		})
+	}
+}
+
 func TestRunTransferJobCopiesObjectsAndPersistsOutcome(t *testing.T) {
 	store := &mockStore{data: make(map[string][]byte)}
 	copier := &fakeObjectCopier{copied: 3, bytes: 17}
@@ -416,6 +438,30 @@ func TestPatchTransferJob(t *testing.T) {
 	}
 	if job.CreationTime != "2024-01-01T00:00:00Z" {
 		t.Fatal("creationTime should be preserved")
+	}
+}
+
+func TestPatchTransferJobRequiresMaskedFieldAndValidOutcomeState(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing masked field": `{"projectId":"test","transferJob":{"description":"new"},"updateTransferJobFieldMask":"status"}`,
+		"invalid status":       `{"projectId":"test","transferJob":{"status":"BROKEN"},"updateTransferJobFieldMask":"status"}`,
+		"immutable project":    `{"projectId":"test","transferJob":{"projectId":"other"},"updateTransferJobFieldMask":"projectId"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newTestAPI()
+			api.jobs["transferJobs/1"] = &TransferJob{
+				Name: "transferJobs/1", ProjectID: "test", Status: "ENABLED", Description: "old",
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/v1/transferJobs/1",
+				bytes.NewBufferString(body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			if job := api.jobs["transferJobs/1"]; job.Status != "ENABLED" || job.Description != "old" {
+				t.Fatalf("invalid patch mutated job: %+v", job)
+			}
+		})
 	}
 }
 

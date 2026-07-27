@@ -81,3 +81,31 @@ func TestExportWithoutConfiguredLocalRootIsExplicitlyUnsupported(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestExportRejectsParentSymlinkSwap(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "exports"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPIWithInventory(staticInventory{{Name: "//example/item", AssetType: "example/Item"}}, root)
+	api.beforeExportWrite = func() {
+		if err := os.Remove(filepath.Join(root, "exports")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(root, "exports")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/demo:exportAssets",
+		strings.NewReader(`{"outputConfig":{"localDestination":{"path":"exports/assets.json"}}}`))
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outside, "assets.json")); !os.IsNotExist(err) {
+		t.Fatalf("outside destination exists: %v", err)
+	}
+}

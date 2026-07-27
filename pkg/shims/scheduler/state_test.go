@@ -2,13 +2,16 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -273,6 +276,148 @@ func TestSchedulerCreateReconcilesPostCommitSaveError(t *testing.T) {
 		t.Fatalf("post-commit state did not reconcile across restart: jobs=%#v cron=%#v",
 			restarted.jobs, restarted.cronIDs)
 	}
+}
+
+func TestSchedulerManualRunOutcomeSurvivesRestart(t *testing.T) {
+	store := &sequencedSchedulerStore{}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Status:     "204 No Content",
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	api, err := NewAPIWithConfigAndStore(nil, Config{HTTPClient: client}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "projects/test/locations/us-central1/jobs/manual"
+	create := schedulerRequest(api, http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs",
+		`{"name":"manual","schedule":"0 0 * * *","httpTarget":{"uri":"https://example.invalid"}}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create: %d: %s", create.Code, create.Body.String())
+	}
+	run := schedulerRequest(api, http.MethodPost, "/v1/"+name+":run", "")
+	if run.Code != http.StatusOK {
+		t.Fatalf("run: %d: %s", run.Code, run.Body.String())
+	}
+	waitForSchedulerOutcome(t, api, name)
+	api.Close()
+
+	restarted, err := NewAPIWithConfigAndStore(nil, Config{HTTPClient: client}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	job := restarted.snapshotJobs()[name]
+	if job == nil || job.LastAttemptStatus != http.StatusNoContent ||
+		job.Status == nil || job.Status.Code != 0 || job.LastAttemptError != "" {
+		t.Fatalf("restarted manual outcome = %+v", job)
+	}
+}
+
+func TestSchedulerExecutionOutcomeRollsBackWhenSaveFails(t *testing.T) {
+	store := &sequencedSchedulerStore{}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Status:     "204 No Content",
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	api, err := NewAPIWithConfigAndStore(nil, Config{HTTPClient: client}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer api.Close()
+	const name = "projects/test/locations/us-central1/jobs/outcome"
+	api.jobs[name] = &Job{
+		Name: name, State: "ENABLED", Schedule: "0 0 * * *",
+		Status:     &Status{Code: 0, Message: "Job created"},
+		HttpTarget: &HttpTarget{Uri: "https://example.invalid"},
+	}
+	if err := api.saveJobs(api.snapshotJobs()); err != nil {
+		t.Fatal(err)
+	}
+	store.failOnSave = map[int]error{store.saveCount + 1: errors.New("injected outcome save failure")}
+
+	api.executeJob(context.Background(), cloneJob(api.jobs[name]))
+
+	live := api.snapshotJobs()[name]
+	if live.LastAttemptTime != "" || live.LastAttemptStatus != 0 ||
+		live.LastAttemptError != "" || live.Status == nil || live.Status.Message != "Job created" {
+		t.Fatalf("failed outcome save changed live job: %+v", live)
+	}
+	var durable schedulerMetadata
+	if err := store.Load(schedulerStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if !jobsEqual(map[string]*Job{name: live}, durable.Jobs) {
+		t.Fatalf("live and durable state diverged: live=%+v durable=%+v", live, durable.Jobs[name])
+	}
+}
+
+func TestSchedulerConcurrentOutcomesPersistCompleteSnapshot(t *testing.T) {
+	store := &sequencedSchedulerStore{}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Status:     "204 No Content",
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	api, err := NewAPIWithConfigAndStore(nil, Config{HTTPClient: client}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer api.Close()
+	for _, suffix := range []string{"a", "b"} {
+		name := "projects/test/locations/us-central1/jobs/" + suffix
+		api.jobs[name] = &Job{
+			Name: name, State: "ENABLED", Schedule: "0 0 * * *",
+			HttpTarget: &HttpTarget{Uri: "https://example.invalid"},
+		}
+	}
+	if err := api.saveJobs(api.snapshotJobs()); err != nil {
+		t.Fatal(err)
+	}
+
+	var workers sync.WaitGroup
+	for _, job := range api.snapshotJobs() {
+		workers.Add(1)
+		go func(job *Job) {
+			defer workers.Done()
+			api.executeJob(context.Background(), job)
+		}(job)
+	}
+	workers.Wait()
+
+	var durable schedulerMetadata
+	if err := store.Load(schedulerStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if !jobsEqual(api.snapshotJobs(), durable.Jobs) {
+		t.Fatalf("concurrent outcomes lost from durable snapshot: live=%+v durable=%+v",
+			api.snapshotJobs(), durable.Jobs)
+	}
+}
+
+func waitForSchedulerOutcome(t *testing.T, api *API, name string) *Job {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		job := api.snapshotJobs()[name]
+		if job != nil && job.LastAttemptTime != "" {
+			return job
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for Scheduler outcome for %s", name)
+	return nil
 }
 
 type checkingSchedulerStore struct {

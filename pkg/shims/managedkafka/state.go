@@ -80,6 +80,7 @@ func (api *API) loadState() error {
 		for name, cluster := range meta.Clusters {
 			restored := deepCopyCluster(cluster)
 			restored.State = "FAILED"
+			restored.BootstrapAddress = ""
 			api.clusters[name] = restored
 		}
 	}

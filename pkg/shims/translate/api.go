@@ -53,9 +53,8 @@ type translateRequest struct {
 }
 
 type translationEntry struct {
-	TranslatedText         string `json:"translatedText"`
-	DetectedSourceLanguage string `json:"detectedSourceLanguage"`
-	Model                  string `json:"model,omitempty"`
+	TranslatedText string `json:"translatedText"`
+	Model          string `json:"model,omitempty"`
 }
 
 func (api *API) translateText(w http.ResponseWriter, r *http.Request) {
@@ -114,8 +113,7 @@ func (api *API) translateText(w http.ResponseWriter, r *http.Request) {
 	translations := make([]translationEntry, 0, len(req.Contents))
 	for _, content := range req.Contents {
 		translations = append(translations, translationEntry{
-			TranslatedText:         content,
-			DetectedSourceLanguage: req.SourceLanguageCode,
+			TranslatedText: content,
 		})
 	}
 

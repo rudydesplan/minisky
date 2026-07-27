@@ -81,6 +81,7 @@ type API struct {
 	projectConfigs map[string]*ProjectConfig
 	tenantConfigs  map[string]*TenantConfig
 	authBackend    authConfigBackend
+	authHandler    http.Handler
 	tenantSeq      int
 }
 
@@ -118,6 +119,9 @@ func newTestAPI() *API {
 
 func (api *API) OnPostBoot(ctx *registry.Context) {
 	if handler := ctx.GetShim("identitytoolkit.googleapis.com"); handler != nil {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		api.authHandler = handler
 		api.authBackend = firebaseAuthConfigBackend{handler: handler}
 	}
 }
@@ -128,6 +132,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch {
+	case isIdentityToolkitUserMethod(r.URL.Path) && r.Method == http.MethodPost:
+		api.forwardIdentityToolkitUserMethod(w, r)
 	case isTenantConfig(r.URL.Path) && r.Method == http.MethodGet:
 		api.getTenantConfig(w, r)
 	case isTenantConfig(r.URL.Path) && r.Method == http.MethodPatch:
@@ -161,6 +167,17 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "Identity Platform resource not found")
 	}
+}
+
+func (api *API) forwardIdentityToolkitUserMethod(w http.ResponseWriter, r *http.Request) {
+	api.mu.RLock()
+	handler := api.authHandler
+	api.mu.RUnlock()
+	if handler == nil {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Firebase Auth backend is unavailable")
+		return
+	}
+	handler.ServeHTTP(w, r)
 }
 
 func (api *API) getProjectConfig(w http.ResponseWriter, r *http.Request) {
@@ -799,6 +816,16 @@ func isOAuthConfigCollection(path string) bool {
 
 func isOAuthConfigResource(path string) bool {
 	return strings.Contains(path, "/oauthIdpConfigs/")
+}
+
+func isIdentityToolkitUserMethod(path string) bool {
+	switch path {
+	case "/v1/accounts:signUp", "/v1/accounts:signInWithPassword", "/v1/accounts:lookup",
+		"/v1/accounts:update", "/v1/accounts:delete":
+		return true
+	default:
+		return false
+	}
 }
 
 func publicOAuthConfig(config *OAuthIdpConfig) *OAuthIdpConfig {

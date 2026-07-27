@@ -3,6 +3,8 @@ package texttospeech
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -56,6 +58,11 @@ func (api *API) synthesize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
 	if request.Input == nil {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'input' is required")
 		return
@@ -86,8 +93,17 @@ func (api *API) synthesize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'voice.languageCode' is required")
 		return
 	}
+	if request.Voice.Name != "" {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'voice.name' is not implemented")
+		return
+	}
 	if request.AudioConfig == nil || request.AudioConfig.AudioEncoding == "" {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'audioConfig.audioEncoding' is required")
+		return
+	}
+	if request.AudioConfig.SpeakingRate != 0 || request.AudioConfig.Pitch != 0 {
+		writeError(w, 501, "UNIMPLEMENTED",
+			"fields 'audioConfig.speakingRate' and 'audioConfig.pitch' are not implemented")
 		return
 	}
 	writeError(w, 501, "UNIMPLEMENTED", "speech synthesis is not implemented; no audio content was generated")

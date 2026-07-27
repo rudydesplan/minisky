@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ type gkeMetadata struct {
 	Backend           string                          `json:"backend"`
 	Clusters          map[string]*Cluster             `json:"clusters"`
 	Ownerships        map[string]*kubeconfigOwnership `json:"kubeconfigOwnerships,omitempty"`
+	Operations        map[string]*GkeOperation        `json:"operations,omitempty"`
 	OwnershipChecksum string                          `json:"kubeconfigOwnershipChecksum,omitempty"`
 }
 
@@ -40,7 +42,15 @@ func kubeconfigOwnershipChecksum(ownerships map[string]*kubeconfigOwnership) (st
 }
 
 func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API, error) {
-	api := newAPI(opMgr, store)
+	return newAPIWithStoreAndBackend(opMgr, store, NewKindBackend())
+}
+
+func newAPIWithStoreAndBackend(
+	opMgr *orchestrator.OperationManager,
+	store gkeStore,
+	backend gkeBackend,
+) (*API, error) {
+	api := newAPIWithBackend(opMgr, backend, "", nil, store)
 	if store == nil {
 		return api, nil
 	}
@@ -65,6 +75,9 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API
 	if persisted.Ownerships != nil {
 		api.ownerships = persisted.Ownerships
 	}
+	if persisted.Operations != nil {
+		api.operations = persisted.Operations
+	}
 	if backend, ok := api.backend.(*KindBackend); ok {
 		for _, ownership := range api.ownerships {
 			backend.RestoreKubeconfigOwnership(ClusterIdentity{
@@ -79,19 +92,72 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, store gkeStore) (*API
 			log.Printf("[Shim: GKE] kubeconfig reconciliation remains pending: %v", err)
 		}
 	}
-	// Rehydration intentionally restores metadata only. Kind/Docker workloads
-	// are never recreated implicitly when their containers are absent.
+	changed := false
+	const interrupted = "operation interrupted by MiniSky restart; side effects were not replayed"
+	for _, operation := range api.operations {
+		if operation == nil || operation.Status == "DONE" {
+			continue
+		}
+		operation.Status = "DONE"
+		operation.EndTime = time.Now().UTC().Format(time.RFC3339)
+		operation.StatusMessage = interrupted
+		operation.Error = &orchestrator.OperationError{
+			Code: http.StatusInternalServerError, Message: interrupted,
+		}
+		changed = true
+	}
+	reconciler, canReconcile := api.backend.(interface {
+		ReconcileClusterContext(context.Context, ClusterIdentity, *kubeconfigOwnership) (bool, error)
+	})
 	for key, cluster := range api.clusters {
 		if cluster == nil {
 			delete(api.clusters, key)
+			changed = true
 			continue
 		}
-		cluster.Status = "ERROR"
-		cluster.StatusMessage = "metadata restored; backend availability was not reconciled after restart"
-		cluster.Endpoint = ""
-		cluster.MasterAuth = nil
+		ownership := api.ownerships[key]
+		if persisted.Backend == "kind" && ownership != nil && canReconcile {
+			identity := ClusterIdentity{
+				Profile: ownership.Profile, Project: ownership.Project,
+				Zone: ownership.Zone, Cluster: ownership.Cluster,
+			}
+			exists, err := reconciler.ReconcileClusterContext(
+				context.Background(), identity, ownership)
+			if err == nil && exists {
+				if cluster.Status != "RUNNING" || cluster.StatusMessage != "" {
+					cluster.Status = "RUNNING"
+					cluster.StatusMessage = ""
+					changed = true
+				}
+				continue
+			}
+			message := "metadata restored; exactly owned Kind backend is absent"
+			if err != nil {
+				message = "metadata restored; Kind backend reconciliation failed: " + err.Error()
+			}
+			degradeRestoredCluster(cluster, message)
+			changed = true
+			continue
+		}
+		degradeRestoredCluster(
+			cluster,
+			"metadata restored; backend availability was not reconciled after restart",
+		)
+		changed = true
+	}
+	if changed {
+		if err := api.persistMetadata(); err != nil {
+			return nil, fmt.Errorf("persist GKE restart reconciliation: %w", err)
+		}
 	}
 	return api, nil
+}
+
+func degradeRestoredCluster(cluster *Cluster, message string) {
+	cluster.Status = "ERROR"
+	cluster.StatusMessage = message
+	cluster.Endpoint = ""
+	cluster.MasterAuth = nil
 }
 
 func validateGKEMetadataImport(context state.EntryValidationContext, metadata *gkeMetadata) error {
@@ -120,6 +186,30 @@ func validateGKEMetadataImport(context state.EntryValidationContext, metadata *g
 		}
 		if location != parts[1] {
 			return fmt.Errorf("cluster slot %q does not match location %q", key, location)
+		}
+	}
+	for name, operation := range metadata.Operations {
+		if name == "" || operation == nil || operation.Name != name {
+			return fmt.Errorf("invalid GKE operation slot %q", name)
+		}
+		if operation.Zone == "" || operation.TargetLink == "" ||
+			operation.OperationType != "CREATE_CLUSTER" &&
+				operation.OperationType != "DELETE_CLUSTER" {
+			return fmt.Errorf("invalid GKE operation %q", name)
+		}
+		targetProject := extractSegmentAfter(operation.TargetLink, "projects")
+		targetZone := firstOf(
+			extractSegmentAfter(operation.TargetLink, "zones"),
+			extractSegmentAfter(operation.TargetLink, "locations"),
+		)
+		if targetProject == "" || targetZone != operation.Zone ||
+			extractSegmentAfter(operation.TargetLink, "clusters") == "" {
+			return fmt.Errorf("GKE operation %q has ambiguous target scope", name)
+		}
+		switch operation.Status {
+		case "PENDING", "RUNNING", "DONE":
+		default:
+			return fmt.Errorf("invalid GKE operation status %q", operation.Status)
 		}
 	}
 
@@ -178,6 +268,7 @@ func (api *API) persistMetadata() error {
 	snapshot := gkeMetadata{
 		Backend: backend, Clusters: make(map[string]*Cluster, len(api.clusters)),
 		Ownerships: make(map[string]*kubeconfigOwnership, len(api.ownerships)),
+		Operations: make(map[string]*GkeOperation, len(api.operations)),
 	}
 	for key, cluster := range api.clusters {
 		snapshot.Clusters[key] = cloneCluster(cluster)
@@ -187,6 +278,9 @@ func (api *API) persistMetadata() error {
 			clone := *ownership
 			snapshot.Ownerships[key] = &clone
 		}
+	}
+	for key, operation := range api.operations {
+		snapshot.Operations[key] = cloneGKEOperation(operation)
 	}
 	api.mu.RUnlock()
 	checksum, err := kubeconfigOwnershipChecksum(snapshot.Ownerships)

@@ -492,12 +492,12 @@ func redisImage(version string) string {
 	registry := config.GetImageRegistry()
 	target := strings.TrimPrefix(version, "REDIS_")
 	target = strings.ReplaceAll(target, "_", ".")
-	for _, version := range registry.Memorystore.Redis.Versions {
+	for _, version := range registry.Memorystore.Valkey.Versions {
 		if strings.HasPrefix(version.Version, target) {
 			return version.Image
 		}
 	}
-	return registry.Memorystore.Redis.DefaultImage
+	return registry.Memorystore.Valkey.DefaultImage
 }
 
 func parseLoopbackEndpoint(endpoint string) (string, int, error) {

@@ -32,6 +32,12 @@ func validateDocumentAIMetadata(_ state.EntryValidationContext, metadata *docume
 	if metadata.Seq < 0 {
 		return fmt.Errorf("seq must not be negative")
 	}
+	if len(metadata.Processors) > maxProcessors {
+		return fmt.Errorf("processors exceed local limit of %d", maxProcessors)
+	}
+	if len(metadata.Operations) > maxStoredOperations {
+		return fmt.Errorf("operations exceed local limit of %d", maxStoredOperations)
+	}
 	for name, processor := range metadata.Processors {
 		if processor != nil {
 			switch processor.State {

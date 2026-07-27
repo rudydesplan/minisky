@@ -3,6 +3,9 @@ package binaryauthorization
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -104,6 +107,56 @@ func TestMissingPolicyFailsClosed(t *testing.T) {
 	decision := api.Evaluate("projects/demo", "example/image")
 	if decision.Allowed || decision.Reason != "policy not found" {
 		t.Fatalf("decision = %#v", decision)
+	}
+	if err := api.EvaluateImage("projects/demo", "example/image"); !errors.Is(err, ErrAdmissionDenied) {
+		t.Fatalf("deployment evaluation error = %v", err)
+	}
+}
+
+func TestEvaluateRequestUsesActivePolicy(t *testing.T) {
+	api, err := NewAPIWithStore(nil, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.SetPolicy("projects/demo", Policy{
+		Name:                 "projects/demo/policy",
+		DefaultAdmissionRule: AdmissionRule{EvaluationMode: "DISALLOWED"},
+		AdmissionWhitelistPatterns: []AdmissionWhitelistPattern{{
+			NamePattern: "us-docker.pkg.dev/demo/releases/*",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/demo/policy:evaluate",
+		strings.NewReader(`{"image":"us-docker.pkg.dev/demo/releases/app@sha256:abc"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var decision Decision
+	if err := json.Unmarshal(response.Body.Bytes(), &decision); err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Allowed || decision.Policy != "projects/demo/policy" {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestAttestationRoutesRemainUnimplemented(t *testing.T) {
+	api, err := NewAPIWithStore(nil, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/demo/attestors", strings.NewReader(`{}`)))
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("status=%d, want 501: %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"status":"UNIMPLEMENTED"`) {
+		t.Fatalf("response = %s", response.Body.String())
 	}
 }
 

@@ -76,9 +76,10 @@ if [[ "${MINISKY_RELEASE_TAG_POLICY_SELF_TEST:-}" == "1" ]]; then
     exit 1
   fi
   test "$(grep -Fc -- '--verify-tag-sha' "${workflow}")" -ge 5
-  grep -Fq 'queue: max' "${workflow}"
-  if grep -Fq 'cancel-in-progress:' "${workflow}"; then
-    echo "FIFO release concurrency must not mix queue and cancellation keys" >&2
+  grep -Fq 'group: release-promotion-${{ github.repository }}' "${workflow}"
+  grep -Fq 'cancel-in-progress: false' "${workflow}"
+  if grep -Fq 'queue:' "${workflow}"; then
+    echo "Release concurrency must use only supported GitHub Actions keys" >&2
     exit 1
   fi
   expected_assets=(

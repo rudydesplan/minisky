@@ -402,6 +402,102 @@ func TestManifestTruthForPersistedAndDeferredServices(t *testing.T) {
 	}
 }
 
+func TestRunnableDockerServicesCannotClaimFileOnlyPersistence(t *testing.T) {
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hybridDomains := map[string]bool{
+		"alloydb.googleapis.com":      false,
+		"batch.googleapis.com":        false,
+		"composer.googleapis.com":     false,
+		"managedkafka.googleapis.com": false,
+		"redis.googleapis.com":        false,
+	}
+	for _, service := range services {
+		if _, expected := hybridDomains[service.Domain]; expected {
+			hybridDomains[service.Domain] = true
+			if service.Persistence != registry.PersistenceHybrid {
+				t.Errorf("%s persistence = %q, want %q for metadata plus an owned backend",
+					service.Domain, service.Persistence, registry.PersistenceHybrid)
+			}
+		}
+		if service.BackendContract == "" {
+			continue
+		}
+		switch service.Persistence {
+		case registry.PersistenceDocker, registry.PersistenceHybrid:
+		default:
+			t.Errorf(
+				"%s has a runnable Docker contract but persistence = %q",
+				service.Domain,
+				service.Persistence,
+			)
+		}
+	}
+	for domain, found := range hybridDomains {
+		if !found {
+			t.Errorf("missing hybrid service %s", domain)
+		}
+	}
+}
+
+func TestExecutableDockerOperationContractsAreExplicit(t *testing.T) {
+	expected := map[string][]registry.DockerOperation{
+		"alloydb.googleapis.com": {
+			{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/clusters/*/instances", RequestBody: registry.DockerRequestBodyAlloyDBPrimary},
+			{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/clusters/*/instances/*"},
+		},
+		"batch.googleapis.com": {
+			{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/jobs", RequestBody: registry.DockerRequestBodyBatchRunnable},
+		},
+		"composer.googleapis.com": {
+			{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/environments"},
+			{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/environments/*"},
+		},
+		"managedkafka.googleapis.com": {
+			{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/clusters"},
+			{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/clusters/*"},
+		},
+		"redis.googleapis.com": {
+			{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/instances"},
+			{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/instances/*"},
+		},
+	}
+
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, service := range services {
+		want, executable := expected[service.Domain]
+		if !executable {
+			if len(service.DockerOperations) != 0 {
+				t.Errorf("%s unexpectedly declares Docker operations: %#v", service.Domain, service.DockerOperations)
+			}
+			continue
+		}
+		seen[service.Domain] = true
+		if len(service.DockerOperations) != len(want) {
+			t.Errorf("%s Docker operation count = %d, want %d", service.Domain, len(service.DockerOperations), len(want))
+			continue
+		}
+		for index := range want {
+			if service.DockerOperations[index] != want[index] {
+				t.Errorf("%s Docker operation %d = %#v, want %#v",
+					service.Domain, index, service.DockerOperations[index], want[index])
+			}
+		}
+	}
+	for domain := range expected {
+		if !seen[domain] {
+			t.Errorf("missing executable Docker contract for %s", domain)
+		}
+	}
+}
+
 func TestChangedDurableEntriesRegisterImportValidators(t *testing.T) {
 	entries := []string{
 		"appengine/metadata",

@@ -19,6 +19,7 @@ const stateEntry = "binaryauthorization/metadata"
 var (
 	ErrInvalidArgument  = errors.New("invalid argument")
 	ErrPermissionDenied = errors.New("permission denied")
+	ErrAdmissionDenied  = errors.New("admission denied")
 )
 
 func init() {
@@ -74,7 +75,7 @@ type metadata struct {
 
 // Evaluator is the injection point supported deployment packages can consume.
 type Evaluator interface {
-	Evaluate(project, image string) Decision
+	EvaluateImage(project, image string) error
 }
 
 type API struct {
@@ -176,6 +177,17 @@ func (api *API) Evaluate(project, image string) Decision {
 	default:
 		return Decision{Reason: "unsupported admission evaluation mode", Policy: policy.Name}
 	}
+}
+
+// EvaluateImage exposes the policy decision through a package-neutral error
+// contract so deployment shims can inject an evaluator without importing this
+// package or sharing global state.
+func (api *API) EvaluateImage(project, image string) error {
+	decision := api.Evaluate(project, image)
+	if decision.Allowed {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrAdmissionDenied, decision.Reason)
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, request *http.Request) {

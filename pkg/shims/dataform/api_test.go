@@ -375,6 +375,33 @@ func TestDeleteRepositoryCascadesExecutionResources(t *testing.T) {
 	}
 }
 
+func TestDeleteWorkspaceCascadesCompilationAndInvocationResults(t *testing.T) {
+	api := newTestAPI()
+	repoName := "projects/test/locations/us-central1/repositories/r1"
+	workspaceName := repoName + "/workspaces/ws1"
+	compilationName := repoName + "/compilationResults/cr-1"
+	invocationName := repoName + "/workflowInvocations/wi-1"
+	api.repositories[repoName] = &Repository{Name: repoName}
+	api.workspaces[workspaceName] = &Workspace{Name: workspaceName}
+	api.compilationResults[compilationName] = &CompilationResult{
+		Name: compilationName, Workspace: workspaceName, CompilationErrors: []CompilationError{},
+	}
+	api.workflowInvocations[invocationName] = &WorkflowInvocation{
+		Name: invocationName, CompilationResult: compilationName, State: "SUCCEEDED",
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1beta1/"+workspaceName, nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete workspace: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if api.workspaces[workspaceName] != nil || api.compilationResults[compilationName] != nil ||
+		api.workflowInvocations[invocationName] != nil {
+		t.Fatal("workspace delete left durable execution descendants behind")
+	}
+}
+
 func TestConcurrentWorkspaceCreateAndParentDeleteNeverOrphans(t *testing.T) {
 	const repoName = "projects/test/locations/us-central1/repositories/r1"
 	for i := 0; i < 50; i++ {

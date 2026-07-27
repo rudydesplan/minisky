@@ -28,6 +28,7 @@ import (
 	"minisky/pkg/router"
 	localsecurity "minisky/pkg/security"
 	_ "minisky/pkg/shims" // Triggers all shim registrations
+	"minisky/pkg/shims/accesscontextmanager"
 	"minisky/pkg/shims/appengine"
 	"minisky/pkg/shims/bigquery"
 	"minisky/pkg/shims/compute"
@@ -260,6 +261,11 @@ var startCmd = &cobra.Command{
 		iamAPI := shims["iam.googleapis.com"].(*iam.API)
 		projectAPI := shims["cloudresourcemanager.googleapis.com"].(*resourcemanager.API)
 		proxyRouter.ConfigureSecurity(iamAPI, projectAPI, enforceProjects, tokenAudience)
+		perimeterAPI, ok := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API)
+		if !ok {
+			perimeterAPI = accesscontextmanager.NewAPI(opMgr)
+		}
+		proxyRouter.ConfigureServicePerimeters(perimeterAPI)
 		proxyRouter.ConfigureQuota(quotaLimiter, gatewayObservability.ObserveQuotaRejection)
 
 		for domain, handler := range exposedShims {

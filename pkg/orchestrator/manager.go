@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ const (
 	networkName            = "minisky-net"
 	dockerImagePullTimeout = 15 * time.Minute
 	dockerRequestTimeout   = 10 * time.Second
+	alloyDBPostgresImage   = "postgres:15.8-bookworm"
+	maxBuildLogBytes       = 64 << 10
+	buildCleanupTimeout    = 30 * time.Second
 )
 
 var (
@@ -37,6 +41,7 @@ var ErrServerlessLifecycleInProgress = errors.New("Serverless lifecycle already 
 // ServiceManager handles native REST-driven lifecycle events over the Docker Unix Socket.
 type ServiceManager struct {
 	mu               sync.RWMutex
+	emulatorMu       sync.Mutex
 	serverlessMu     sync.Mutex
 	dockerClient     *http.Client
 	dockerTimeout    time.Duration
@@ -45,6 +50,7 @@ type ServiceManager struct {
 	fwRules          map[string][]FirewallEntry // vpcName → rules
 	serverlessActive map[ServerlessIdentity]struct{}
 	serverlessReady  func(string, time.Duration) error
+	emulatorReady    func(string, time.Duration) error
 }
 
 type deadlineRoundTripper struct {
@@ -88,6 +94,23 @@ type ContainerConfig struct {
 	Env             []string
 }
 
+// BuildContainerResult is the terminal result of one exact-owned Cloud Build
+// container. Logs are bounded to maxBuildLogBytes.
+type BuildContainerResult struct {
+	ExitCode      int
+	Logs          string
+	LogsTruncated bool
+}
+
+// AlloyDBIdentity is the immutable ownership boundary for one local AlloyDB
+// PostgreSQL data plane.
+type AlloyDBIdentity struct {
+	Project  string
+	Location string
+	Cluster  string
+	Instance string
+}
+
 type cleanupResource struct {
 	ID     string            `json:"Id"`
 	Name   string            `json:"Name"`
@@ -129,6 +152,7 @@ func NewServiceManager() (*ServiceManager, error) {
 		fwRules:          make(map[string][]FirewallEntry),
 		serverlessActive: make(map[ServerlessIdentity]struct{}),
 		serverlessReady:  waitUntilHTTPReady,
+		emulatorReady:    waitUntilHTTPReady,
 	}
 	transport := &http.Transport{
 		DialContext: sm.dialDocker,
@@ -212,6 +236,9 @@ func (sm *ServiceManager) EnsureServiceRunning(ctx context.Context, domain strin
 	if !exists {
 		// Native Go shims never need Docker containers
 		return "", nil
+	}
+	if isDurableEmulator(domain) {
+		return sm.ensureDurableEmulatorRunning(ctx, domain, cfg, env...)
 	}
 
 	// Map config to internal ContainerConfig
@@ -313,14 +340,26 @@ func (sm *ServiceManager) StopServiceContainer(ctx context.Context, domain strin
 		return fmt.Errorf("domain %s not found in registry", domain)
 	}
 
-	status, err := sm.checkStatus(cfg.Name)
+	name := emulatorContainerName(domain, cfg.Name)
+	status, labels, err := sm.inspectContainerContext(ctx, name)
 	if err != nil {
 		return fmt.Errorf("status check failed: %v", err)
 	}
+	if status != "not_found" {
+		if isDurableEmulator(domain) {
+			if !hasExpectedDurableOwnership(labels, durableEmulatorLabels(domain)) {
+				return fmt.Errorf("%w: refusing to stop emulator container %q",
+					ErrDockerOwnershipConflict, name)
+			}
+		} else if !isOwnedDockerResource(labels) {
+			return fmt.Errorf("%w: refusing to stop emulator container %q",
+				ErrDockerOwnershipConflict, name)
+		}
+	}
 
 	if status == "running" {
-		log.Printf("[Orchestrator] Stopping service container '%s'...", cfg.Name)
-		stopURL := fmt.Sprintf("http://localhost/containers/%s/stop", cfg.Name)
+		log.Printf("[Orchestrator] Stopping service container '%s'...", name)
+		stopURL := fmt.Sprintf("http://localhost/containers/%s/stop", name)
 		req, _ := http.NewRequestWithContext(ctx, "POST", stopURL, nil)
 		resp, err := sm.dockerClient.Do(req)
 		if err != nil {
@@ -330,9 +369,9 @@ func (sm *ServiceManager) StopServiceContainer(ctx context.Context, domain strin
 		if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotModified {
 			return fmt.Errorf("stop rejected %d", resp.StatusCode)
 		}
-		log.Printf("[Orchestrator] Container '%s' stopped successfully.", cfg.Name)
+		log.Printf("[Orchestrator] Container '%s' stopped successfully.", name)
 	} else {
-		log.Printf("[Orchestrator] Container '%s' is already not running (status: %s)", cfg.Name, status)
+		log.Printf("[Orchestrator] Container '%s' is already not running (status: %s)", name, status)
 	}
 
 	return nil
@@ -400,7 +439,13 @@ func (sm *ServiceManager) GetContainerHostPort(containerName string, containerPo
 func (sm *ServiceManager) Teardown(ctx context.Context) error {
 	var failures error
 	reg := config.GetImageRegistry()
-	for _, cfg := range reg.Emulators {
+	for domain, cfg := range reg.Emulators {
+		if isDurableEmulator(domain) {
+			if err := sm.removeDurableEmulatorContainer(ctx, domain, cfg); err != nil {
+				failures = errors.Join(failures, err)
+			}
+			continue
+		}
 		id, status, labels, err := sm.inspectTeardownContainer(ctx, cfg.Name)
 		if err != nil {
 			failures = errors.Join(failures, fmt.Errorf("inspect container %q: %w", cfg.Name, err))
@@ -562,7 +607,13 @@ func (sm *ServiceManager) cleanupDockerResources(
 			if !owned(resource.Labels) || resource.ID == "" {
 				continue
 			}
-			if err := sm.deleteCleanupResource(ctx, "/containers/"+url.PathEscape(resource.ID)+"?force=true"); err != nil {
+			if err := sm.deleteCleanupResource(
+				ctx,
+				"/containers/"+url.PathEscape(resource.ID)+"?"+url.Values{
+					"force": {"true"},
+					"v":     {"true"},
+				}.Encode(),
+			); err != nil {
 				failures = errors.Join(failures, fmt.Errorf("remove profile container %q: %w", resource.ID, err))
 			}
 		}
@@ -1057,7 +1108,7 @@ func (sm *ServiceManager) provisionComputeVM(ctx context.Context, containerName 
 // named volume. The only published endpoint is a Docker-assigned loopback port.
 func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image string) (string, error) {
 	containerName, volumeName := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return "", err
 	}
@@ -1070,7 +1121,14 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 				return "", err
 			}
 		}
-		return sm.redisEndpoint(containerName)
+		endpoint, err := sm.redisEndpoint(containerName)
+		if err != nil {
+			return "", err
+		}
+		if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
+			return "", err
+		}
+		return endpoint, nil
 	}
 
 	exists, err := sm.ImageExistsPublic(image)
@@ -1156,7 +1214,7 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 	if err != nil {
 		return "", err
 	}
-	if err := sm.waitUntilReady(endpoint, 30*time.Second); err != nil {
+	if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
 		return "", err
 	}
 	return endpoint, nil
@@ -1164,9 +1222,9 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 
 // ReconcileRedis returns the loopback endpoint only when the existing backend
 // has exact profile and resource ownership labels.
-func (sm *ServiceManager) ReconcileRedis(_ context.Context, resourceID string) (string, bool, error) {
+func (sm *ServiceManager) ReconcileRedis(ctx context.Context, resourceID string) (string, bool, error) {
 	containerName, _ := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return "", false, err
 	}
@@ -1180,7 +1238,13 @@ func (sm *ServiceManager) ReconcileRedis(_ context.Context, resourceID string) (
 		return "", true, fmt.Errorf("owned Redis container is %s", status)
 	}
 	endpoint, err := sm.redisEndpoint(containerName)
-	return endpoint, true, err
+	if err != nil {
+		return "", true, err
+	}
+	if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
+		return "", true, err
+	}
+	return endpoint, true, nil
 }
 
 // DeleteRedis removes only the exactly owned container and volume.
@@ -1393,15 +1457,218 @@ func (sm *ServiceManager) ProvisionBuildStep(ctx context.Context, containerName,
 		return fmt.Errorf("build step creation rejected %d: %s", resp.StatusCode, b)
 	}
 
-	if err := sm.startContainer(containerName); err != nil {
-		_ = sm.StopAndRemoveBuildContainer(ctx, containerName, resourceID)
+	if err := sm.startContainerContext(ctx, containerName); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), buildCleanupTimeout)
+		defer cancel()
+		_ = sm.StopAndRemoveBuildContainer(cleanupCtx, containerName, resourceID)
 		return err
 	}
 	return nil
 }
 
+type buildContainerInfo struct {
+	ID       string
+	Status   string
+	Running  bool
+	ExitCode int
+}
+
+// WaitBuildContainer waits for one exact-owned Cloud Build container to stop,
+// then returns its real exit code and bounded stdout/stderr. Cancellation or a
+// deadline removes only the container that still has exact build ownership.
+func (sm *ServiceManager) WaitBuildContainer(
+	ctx context.Context,
+	containerName, resourceID string,
+) (BuildContainerResult, error) {
+	info, err := sm.inspectOwnedBuildContainer(ctx, containerName, resourceID)
+	if err != nil {
+		return BuildContainerResult{}, err
+	}
+	if !info.Running && info.Status != "exited" && info.Status != "dead" {
+		return BuildContainerResult{}, fmt.Errorf(
+			"build container %q is %s, not terminal", containerName, info.Status)
+	}
+	if info.Running {
+		waitRequest, requestErr := http.NewRequestWithContext(ctx, http.MethodPost,
+			"http://localhost/containers/"+url.PathEscape(info.ID)+"/wait?condition=not-running", nil)
+		if requestErr != nil {
+			return BuildContainerResult{}, requestErr
+		}
+		waitResponse, waitErr := sm.doDocker(waitRequest)
+		if waitErr != nil {
+			return BuildContainerResult{}, sm.cleanupCanceledBuildContainer(
+				ctx, containerName, resourceID, waitErr)
+		}
+		var waited struct {
+			StatusCode int `json:"StatusCode"`
+			Error      *struct {
+				Message string `json:"Message"`
+			} `json:"Error"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(waitResponse.Body, 1<<20)).Decode(&waited)
+		closeErr := waitResponse.Body.Close()
+		if waitResponse.StatusCode != http.StatusOK || decodeErr != nil || closeErr != nil {
+			if ctx.Err() != nil {
+				return BuildContainerResult{}, sm.cleanupCanceledBuildContainer(
+					ctx, containerName, resourceID, errors.Join(decodeErr, closeErr))
+			}
+			return BuildContainerResult{}, errors.Join(
+				fmt.Errorf("wait for build container returned %d", waitResponse.StatusCode),
+				decodeErr, closeErr,
+			)
+		}
+		if waited.Error != nil && waited.Error.Message != "" {
+			return BuildContainerResult{}, fmt.Errorf("wait for build container: %s", waited.Error.Message)
+		}
+	}
+
+	terminal, err := sm.inspectOwnedBuildContainer(ctx, info.ID, resourceID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return BuildContainerResult{}, sm.cleanupCanceledBuildContainer(
+				ctx, containerName, resourceID, err)
+		}
+		return BuildContainerResult{}, err
+	}
+	if terminal.Running || terminal.Status != "exited" && terminal.Status != "dead" {
+		return BuildContainerResult{}, fmt.Errorf(
+			"build container %q is %s after wait, not terminal", containerName, terminal.Status)
+	}
+	logs, truncated, err := sm.readBuildContainerLogs(ctx, terminal.ID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return BuildContainerResult{}, sm.cleanupCanceledBuildContainer(
+				ctx, containerName, resourceID, err)
+		}
+		return BuildContainerResult{}, err
+	}
+	return BuildContainerResult{
+		ExitCode:      terminal.ExitCode,
+		Logs:          logs,
+		LogsTruncated: truncated,
+	}, nil
+}
+
+func (sm *ServiceManager) inspectOwnedBuildContainer(
+	ctx context.Context,
+	identity, resourceID string,
+) (buildContainerInfo, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/containers/"+url.PathEscape(identity)+"/json", nil)
+	if err != nil {
+		return buildContainerInfo{}, err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return buildContainerInfo{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return buildContainerInfo{}, fmt.Errorf("build container %q was not found", identity)
+	}
+	if response.StatusCode != http.StatusOK {
+		return buildContainerInfo{}, fmt.Errorf("inspect build container returned %d", response.StatusCode)
+	}
+	var inspected struct {
+		ID    string `json:"Id"`
+		State struct {
+			Status   string `json:"Status"`
+			Running  bool   `json:"Running"`
+			ExitCode int    `json:"ExitCode"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&inspected); err != nil {
+		return buildContainerInfo{}, fmt.Errorf("decode build container inspect: %w", err)
+	}
+	if inspected.ID == "" {
+		return buildContainerInfo{}, fmt.Errorf("build container %q has no immutable ID", identity)
+	}
+	if !exactLabels(inspected.Config.Labels, buildResourceLabels(resourceID)) {
+		return buildContainerInfo{}, fmt.Errorf(
+			"%w: build container %q", ErrDockerOwnershipConflict, identity)
+	}
+	return buildContainerInfo{
+		ID:       inspected.ID,
+		Status:   inspected.State.Status,
+		Running:  inspected.State.Running,
+		ExitCode: inspected.State.ExitCode,
+	}, nil
+}
+
+func (sm *ServiceManager) cleanupCanceledBuildContainer(
+	ctx context.Context,
+	containerName, resourceID string,
+	waitErr error,
+) error {
+	cause := waitErr
+	if ctx.Err() != nil {
+		cause = ctx.Err()
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), buildCleanupTimeout)
+	defer cancel()
+	if err := sm.StopAndRemoveBuildContainer(cleanupCtx, containerName, resourceID); err != nil {
+		return errors.Join(cause, fmt.Errorf("cleanup canceled build container: %w", err))
+	}
+	return cause
+}
+
+func (sm *ServiceManager) readBuildContainerLogs(ctx context.Context, containerID string) (string, bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/containers/"+url.PathEscape(containerID)+
+			"/logs?stdout=true&stderr=true&timestamps=false", nil)
+	if err != nil {
+		return "", false, err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return "", false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("read build container logs returned %d", response.StatusCode)
+	}
+	logs, truncated, err := readDockerLogStream(response.Body, maxBuildLogBytes)
+	if err != nil {
+		return "", false, fmt.Errorf("decode build container logs: %w", err)
+	}
+	return logs, truncated, nil
+}
+
+func readDockerLogStream(reader io.Reader, limit int) (string, bool, error) {
+	var output strings.Builder
+	truncated := false
+	for {
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			if errors.Is(err, io.EOF) {
+				return output.String(), truncated, nil
+			}
+			return "", false, err
+		}
+		size := int64(binary.BigEndian.Uint32(header[4:8]))
+		remaining := int64(limit - output.Len())
+		readSize := min(size, max(remaining, 0))
+		if readSize > 0 {
+			chunk := make([]byte, readSize)
+			if _, err := io.ReadFull(reader, chunk); err != nil {
+				return "", false, err
+			}
+			output.Write(chunk)
+		}
+		if unread := size - readSize; unread > 0 {
+			truncated = true
+			if _, err := io.CopyN(io.Discard, reader, unread); err != nil {
+				return "", false, err
+			}
+		}
+	}
+}
+
 func (sm *ServiceManager) StopAndRemoveBuildContainer(ctx context.Context, containerName, resourceID string) error {
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return err
 	}
@@ -1409,7 +1676,8 @@ func (sm *ServiceManager) StopAndRemoveBuildContainer(ctx context.Context, conta
 		return nil
 	}
 	if !exactLabels(labels, buildResourceLabels(resourceID)) {
-		return fmt.Errorf("refusing to remove unowned build container %q", containerName)
+		return fmt.Errorf("%w: refusing to remove build container %q",
+			ErrDockerOwnershipConflict, containerName)
 	}
 	stop, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://localhost/containers/"+url.PathEscape(containerName)+"/stop?t=2", nil)
@@ -1427,6 +1695,319 @@ func (sm *ServiceManager) StopAndRemoveBuildContainer(ctx context.Context, conta
 		return fmt.Errorf("remove build container returned %d", response.StatusCode)
 	}
 	return nil
+}
+
+func (identity AlloyDBIdentity) canonicalResource() string {
+	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s/instances/%s",
+		identity.Project, identity.Location, identity.Cluster, identity.Instance)
+}
+
+func alloyDBDockerNames(identity AlloyDBIdentity) (string, string) {
+	sum := sha256.Sum256([]byte(config.GetProfile() + "/" + identity.canonicalResource()))
+	suffix := fmt.Sprintf("%x", sum[:8])
+	return "minisky-alloydb-" + suffix, "minisky-alloydb-data-" + suffix
+}
+
+func alloyDBLabels(identity AlloyDBIdentity) map[string]string {
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = "alloydb"
+	labels["minisky.project"] = identity.Project
+	labels["minisky.location"] = identity.Location
+	labels["minisky.cluster"] = identity.Cluster
+	labels["minisky.instance"] = identity.Instance
+	return labels
+}
+
+func validateAlloyDBIdentity(identity AlloyDBIdentity) error {
+	if identity.Project == "" || identity.Location == "" || identity.Cluster == "" || identity.Instance == "" {
+		return fmt.Errorf("AlloyDB identity fields must be non-empty")
+	}
+	return nil
+}
+
+// ProvisionAlloyDB creates one exact-owned PostgreSQL-compatible AlloyDB data
+// plane. It never adopts an existing container, even when exactly owned.
+func (sm *ServiceManager) ProvisionAlloyDB(ctx context.Context, identity AlloyDBIdentity) (string, bool, error) {
+	if err := validateAlloyDBIdentity(identity); err != nil {
+		return "", false, err
+	}
+	containerName, volumeName := alloyDBDockerNames(identity)
+	expected := alloyDBLabels(identity)
+
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect AlloyDB container: %w", err)
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, expected) {
+			return "", false, fmt.Errorf("%w: AlloyDB container %q", ErrDockerOwnershipConflict, containerName)
+		}
+		return "", false, fmt.Errorf("owned AlloyDB container %q already exists", containerName)
+	}
+
+	exists, err := sm.imageExistsContext(ctx, alloyDBPostgresImage)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect AlloyDB image: %w", err)
+	}
+	if !exists {
+		if err := sm.pullImageInternal(ctx, alloyDBPostgresImage); err != nil {
+			return "", false, fmt.Errorf("pull AlloyDB image: %w", err)
+		}
+	}
+	volumeCreated, err := sm.ensureCloudSQLVolume(ctx, volumeName, expected)
+	if err != nil {
+		return "", false, fmt.Errorf("ensure AlloyDB volume: %w", err)
+	}
+	cleanupVolume := func() {
+		if volumeCreated {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = sm.deleteCloudSQLVolume(cleanupCtx, volumeName, expected)
+		}
+	}
+
+	payload := map[string]any{
+		"Image": alloyDBPostgresImage,
+		"Env": append(sm.standardEnv(),
+			"POSTGRES_HOST_AUTH_METHOD=trust",
+			"POSTGRES_DB=postgres",
+			"PGDATA=/var/lib/postgresql/data/pgdata",
+		),
+		"ExposedPorts": map[string]any{"5432/tcp": struct{}{}},
+		"HostConfig": map[string]any{
+			"NetworkMode": "bridge",
+			"PortBindings": map[string]any{
+				"5432/tcp": []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "0"}},
+			},
+			"Binds": []string{volumeName + ":/var/lib/postgresql/data"},
+		},
+		"Labels": expected,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		cleanupVolume()
+		return "", false, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/create?name="+url.QueryEscape(containerName), bytes.NewReader(body))
+	if err != nil {
+		cleanupVolume()
+		return "", false, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := sm.doDocker(request)
+	if err != nil {
+		cleanupVolume()
+		return "", false, fmt.Errorf("create AlloyDB container: %w", err)
+	}
+	_, drainErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+	closeErr := response.Body.Close()
+	if response.StatusCode != http.StatusCreated || drainErr != nil || closeErr != nil {
+		cleanupVolume()
+		return "", false, errors.Join(
+			fmt.Errorf("create AlloyDB container returned %d", response.StatusCode), drainErr, closeErr)
+	}
+	created := true
+	cleanupBackend := func(cause error) (string, bool, error) {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cleanupErr := sm.DeleteAlloyDB(cleanupCtx, identity)
+		if cleanupErr != nil {
+			return "", created, errors.Join(cause, fmt.Errorf("cleanup owned AlloyDB backend: %w", cleanupErr))
+		}
+		return "", created, cause
+	}
+	if err := sm.startContainerContext(ctx, containerName); err != nil {
+		return cleanupBackend(fmt.Errorf("start AlloyDB container: %w", err))
+	}
+	endpoint, err := sm.alloyDBEndpoint(ctx, containerName)
+	if err != nil {
+		return cleanupBackend(fmt.Errorf("discover AlloyDB endpoint: %w", err))
+	}
+	if err := waitUntilPostgresReady(ctx, endpoint, 30*time.Second); err != nil {
+		return cleanupBackend(err)
+	}
+	if err := sm.runOwnedCloudSQLCommand(ctx, containerName, expected,
+		[]string{"psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1"}); err != nil {
+		return cleanupBackend(fmt.Errorf("AlloyDB SQL smoke failed: %w", err))
+	}
+	return endpoint, created, nil
+}
+
+// ReconcileAlloyDB returns an endpoint only for an exactly owned, running and
+// protocol-ready backend. Missing resources are reported without mutation.
+func (sm *ServiceManager) ReconcileAlloyDB(ctx context.Context, identity AlloyDBIdentity) (string, bool, error) {
+	if err := validateAlloyDBIdentity(identity); err != nil {
+		return "", false, err
+	}
+	containerName, _ := alloyDBDockerNames(identity)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect AlloyDB container: %w", err)
+	}
+	if status == "not_found" {
+		return "", false, nil
+	}
+	if !exactLabels(labels, alloyDBLabels(identity)) {
+		return "", true, fmt.Errorf("%w: AlloyDB container %q", ErrDockerOwnershipConflict, containerName)
+	}
+	if status != "running" {
+		return "", true, fmt.Errorf("owned AlloyDB container is %s", status)
+	}
+	endpoint, err := sm.alloyDBEndpoint(ctx, containerName)
+	if err != nil {
+		return "", true, err
+	}
+	if err := waitUntilPostgresReady(ctx, endpoint, 30*time.Second); err != nil {
+		return "", true, err
+	}
+	return endpoint, true, nil
+}
+
+// DeleteAlloyDB removes only the container and volume with the complete
+// immutable identity label set.
+func (sm *ServiceManager) DeleteAlloyDB(ctx context.Context, identity AlloyDBIdentity) error {
+	if err := validateAlloyDBIdentity(identity); err != nil {
+		return err
+	}
+	containerName, volumeName := alloyDBDockerNames(identity)
+	expected := alloyDBLabels(identity)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
+	if err != nil {
+		return fmt.Errorf("inspect AlloyDB container: %w", err)
+	}
+	if status != "not_found" {
+		if !exactLabels(labels, expected) {
+			return fmt.Errorf("refusing to delete unowned AlloyDB container %q", containerName)
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+		if err != nil {
+			return err
+		}
+		response, err := sm.doDocker(request)
+		if err != nil {
+			return err
+		}
+		_, drainErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+		closeErr := response.Body.Close()
+		if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+			return errors.Join(fmt.Errorf("delete AlloyDB container returned %d", response.StatusCode), drainErr, closeErr)
+		}
+		if drainErr != nil || closeErr != nil {
+			return errors.Join(drainErr, closeErr)
+		}
+	}
+	if err := sm.deleteCloudSQLVolume(ctx, volumeName, expected); err != nil {
+		return fmt.Errorf("delete AlloyDB volume: %w", err)
+	}
+	return nil
+}
+
+func (sm *ServiceManager) alloyDBEndpoint(ctx context.Context, containerName string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/containers/"+url.PathEscape(containerName)+"/json", nil)
+	if err != nil {
+		return "", err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("inspect AlloyDB port returned %d", response.StatusCode)
+	}
+	var info struct {
+		NetworkSettings struct {
+			Ports map[string][]struct {
+				HostIP   string `json:"HostIp"`
+				HostPort string `json:"HostPort"`
+			} `json:"Ports"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&info); err != nil {
+		return "", err
+	}
+	bindings := info.NetworkSettings.Ports["5432/tcp"]
+	if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" || bindings[0].HostPort == "" {
+		return "", fmt.Errorf("AlloyDB container has no unique loopback PostgreSQL binding")
+	}
+	return net.JoinHostPort(bindings[0].HostIP, bindings[0].HostPort), nil
+}
+
+func (sm *ServiceManager) imageExistsContext(ctx context.Context, image string) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/images/"+url.PathEscape(image)+"/json", nil)
+	if err != nil {
+		return false, err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect image returned %d", response.StatusCode)
+	}
+}
+
+func waitUntilPostgresReady(ctx context.Context, endpoint string, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	parameters := []byte("user\x00postgres\x00database\x00postgres\x00\x00")
+	packet := make([]byte, 8+len(parameters))
+	binary.BigEndian.PutUint32(packet[:4], uint32(len(packet)))
+	binary.BigEndian.PutUint32(packet[4:8], 196608)
+	copy(packet[8:], parameters)
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	for {
+		connection, err := dialer.DialContext(waitCtx, "tcp", endpoint)
+		if err == nil {
+			deadline := time.Now().Add(time.Second)
+			if contextDeadline, ok := waitCtx.Deadline(); ok && contextDeadline.Before(deadline) {
+				deadline = contextDeadline
+			}
+			_ = connection.SetDeadline(deadline)
+			_, err = connection.Write(packet)
+			for err == nil {
+				header := make([]byte, 5)
+				if _, err = io.ReadFull(connection, header); err != nil {
+					break
+				}
+				length := int(binary.BigEndian.Uint32(header[1:]))
+				if length < 4 || length > 1<<20 {
+					err = fmt.Errorf("invalid PostgreSQL response length")
+					break
+				}
+				message := make([]byte, length-4)
+				if _, err = io.ReadFull(connection, message); err != nil {
+					break
+				}
+				if header[0] == 'E' {
+					err = fmt.Errorf("PostgreSQL startup rejected")
+					break
+				}
+				if header[0] == 'Z' {
+					_ = connection.Close()
+					return nil
+				}
+			}
+			_ = connection.Close()
+		}
+		timer := time.NewTimer(300 * time.Millisecond)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return fmt.Errorf("PostgreSQL at %q not protocol-ready after %s: %w", endpoint, timeout, waitCtx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, project, instanceName string, version string, rootPassword string) (string, bool, error) {
@@ -1779,7 +2360,12 @@ func validCloudSQLAdminName(name string) bool {
 }
 
 func (sm *ServiceManager) ensureCloudSQLVolume(ctx context.Context, name string, labels map[string]string) (bool, error) {
-	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/volumes/"+url.PathEscape(name), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := sm.doDocker(request)
 	if err != nil {
 		return false, fmt.Errorf("inspect Cloud SQL volume: %w", err)
 	}
@@ -1817,7 +2403,12 @@ func (sm *ServiceManager) ensureCloudSQLVolume(ctx context.Context, name string,
 }
 
 func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string, labels map[string]string) error {
-	resp, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(name))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/volumes/"+url.PathEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := sm.doDocker(request)
 	if err != nil {
 		return err
 	}
@@ -2347,6 +2938,10 @@ func resolveEmulatorVolume(domain, configured string) (string, error) {
 		runtimeName = "datastore"
 	case "firestore.googleapis.com":
 		runtimeName = "firestore"
+	case "storage.googleapis.com":
+		runtimeName = "storage"
+	case "pubsub.googleapis.com":
+		runtimeName = "pubsub"
 	default:
 		return configured, nil
 	}
@@ -2357,16 +2952,425 @@ func resolveEmulatorVolume(domain, configured string) (string, error) {
 	}
 	hostPath := filepath.Join(config.GetRuntimeDir(), runtimeName)
 	if err := os.MkdirAll(hostPath, 0o700); err != nil {
-		return "", fmt.Errorf("create Datastore profile runtime directory: %w", err)
+		return "", fmt.Errorf("create %s profile runtime directory: %w", runtimeName, err)
+	}
+	info, err := os.Lstat(hostPath)
+	if err != nil {
+		return "", fmt.Errorf("inspect %s profile runtime directory: %w", runtimeName, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%s profile runtime path is not a directory", runtimeName)
+	}
+	if err := os.Chmod(hostPath, 0o700); err != nil {
+		return "", fmt.Errorf("secure %s profile runtime directory: %w", runtimeName, err)
 	}
 	return hostPath + ":" + containerPath, nil
 }
 
-func ownedDockerLabels() map[string]string {
+func isDurableEmulator(domain string) bool {
+	return domain == "storage.googleapis.com" || domain == "pubsub.googleapis.com"
+}
+
+func emulatorContainerName(domain, configured string) string {
+	if !isDurableEmulator(domain) {
+		return configured
+	}
+	service := strings.TrimSuffix(domain, ".googleapis.com")
+	sum := sha256.Sum256([]byte(config.GetProfile() + "\x00" + domain))
+	return fmt.Sprintf("minisky-%s-%x", service, sum[:8])
+}
+
+func durableEmulatorLabels(domain string) map[string]string {
+	labels := ownedDockerLabels()
+	labels["minisky.service"] = domain
+	return labels
+}
+
+func durableEmulatorConfig(
+	domain string,
+	cfg config.EmulatorConfig,
+	env []string,
+) (ContainerConfig, map[string]string, error) {
+	if !isDurableEmulator(domain) {
+		return ContainerConfig{}, nil, fmt.Errorf("domain %q has no durable emulator contract", domain)
+	}
+	volume, err := resolveEmulatorVolume(domain, ":/data")
+	if err != nil {
+		return ContainerConfig{}, nil, err
+	}
+	command := append([]string(nil), cfg.Cmd...)
+	switch domain {
+	case "storage.googleapis.com":
+		command, err = ensureCommandFlag(command, "-backend", "filesystem")
+		if err != nil {
+			return ContainerConfig{}, nil, err
+		}
+		command, err = ensureCommandFlag(command, "-filesystem-root", "/data")
+		if err != nil {
+			return ContainerConfig{}, nil, err
+		}
+	case "pubsub.googleapis.com":
+		command, err = ensureCommandFlag(command, "--data-dir", "/data")
+		if err != nil {
+			return ContainerConfig{}, nil, err
+		}
+	}
+	return ContainerConfig{
+		Name:            emulatorContainerName(domain, cfg.Name),
+		Image:           cfg.Image,
+		ContainerPort:   cfg.Port,
+		AdditionalPorts: append([]string(nil), cfg.AdditionalPorts...),
+		Cmd:             command,
+		Volume:          volume,
+		Env:             append([]string(nil), env...),
+	}, durableEmulatorLabels(domain), nil
+}
+
+func ensureCommandFlag(command []string, flagName, expected string) ([]string, error) {
+	for index, argument := range command {
+		switch {
+		case argument == flagName:
+			if index+1 >= len(command) || command[index+1] != expected {
+				return nil, fmt.Errorf("%w: %s must be %q",
+					ErrDockerConfiguration, flagName, expected)
+			}
+			return command, nil
+		case strings.HasPrefix(argument, flagName+"="):
+			if strings.TrimPrefix(argument, flagName+"=") != expected {
+				return nil, fmt.Errorf("%w: %s must be %q",
+					ErrDockerConfiguration, flagName, expected)
+			}
+			return command, nil
+		}
+	}
+	return append(command, flagName+"="+expected), nil
+}
+
+type durableEmulatorInspect struct {
+	ID     string
+	Status string
+	Labels map[string]string
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
+	Ports map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}
+}
+
+func (sm *ServiceManager) ensureDurableEmulatorRunning(
+	ctx context.Context,
+	domain string,
+	cfg config.EmulatorConfig,
+	env ...string,
+) (string, error) {
+	container, expectedLabels, err := durableEmulatorConfig(domain, cfg, env)
+	if err != nil {
+		return "", err
+	}
+	sm.emulatorMu.Lock()
+	defer sm.emulatorMu.Unlock()
+
+	inspected, found, err := sm.inspectDurableEmulator(ctx, container.Name)
+	if err != nil {
+		return "", fmt.Errorf("inspect %s emulator: %w", domain, err)
+	}
+	if found {
+		if err := validateDurableEmulator(inspected, container, expectedLabels); err != nil {
+			return "", err
+		}
+		if inspected.Status != "running" {
+			if err := sm.startContainerContext(ctx, container.Name); err != nil {
+				return "", fmt.Errorf("start %s emulator: %w", domain, err)
+			}
+		}
+	} else {
+		exists, err := sm.imageExistsContext(ctx, container.Image)
+		if err != nil {
+			return "", fmt.Errorf("inspect %s emulator image: %w", domain, err)
+		}
+		if !exists {
+			if err := sm.pullImageInternal(ctx, container.Image); err != nil {
+				return "", fmt.Errorf("pull %s emulator image: %w", domain, err)
+			}
+		}
+		if err := sm.createDurableEmulator(ctx, container, expectedLabels); err != nil {
+			if !errors.Is(err, errDockerCreateConflict) {
+				return "", fmt.Errorf("create %s emulator: %w", domain, err)
+			}
+			winner, winnerFound, inspectErr := sm.inspectDurableEmulator(ctx, container.Name)
+			if inspectErr != nil {
+				return "", errors.Join(err, inspectErr)
+			}
+			if !winnerFound {
+				return "", err
+			}
+			if validateErr := validateDurableEmulator(winner, container, expectedLabels); validateErr != nil {
+				return "", errors.Join(err, validateErr)
+			}
+		}
+		if err := sm.startContainerContext(ctx, container.Name); err != nil {
+			return "", fmt.Errorf("start %s emulator: %w", domain, err)
+		}
+	}
+
+	running, found, err := sm.inspectDurableEmulator(ctx, container.Name)
+	if err != nil {
+		return "", fmt.Errorf("discover %s emulator endpoint: %w", domain, err)
+	}
+	if !found {
+		return "", fmt.Errorf("%s emulator disappeared after start", domain)
+	}
+	if err := validateDurableEmulator(running, container, expectedLabels); err != nil {
+		return "", err
+	}
+	if running.Status != "running" {
+		return "", fmt.Errorf("%s emulator is %s after start", domain, running.Status)
+	}
+	bindings := running.Ports[container.ContainerPort]
+	if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" || bindings[0].HostPort == "" {
+		return "", fmt.Errorf("%s emulator has no unique loopback port binding", domain)
+	}
+	endpoint := "http://" + net.JoinHostPort(bindings[0].HostIP, bindings[0].HostPort)
+	ready := sm.emulatorReady
+	if ready == nil {
+		ready = waitUntilHTTPReady
+	}
+	if err := ready(endpoint, 60*time.Second); err != nil {
+		return "", fmt.Errorf("%s emulator readiness: %w", domain, err)
+	}
+	return endpoint, nil
+}
+
+func validateDurableEmulator(
+	inspected durableEmulatorInspect,
+	container ContainerConfig,
+	expectedLabels map[string]string,
+) error {
+	if !hasExpectedDurableOwnership(inspected.Labels, expectedLabels) {
+		return fmt.Errorf("%w: emulator container %q", ErrDockerOwnershipConflict, container.Name)
+	}
+	separator := strings.LastIndex(container.Volume, ":")
+	if separator <= 0 {
+		return fmt.Errorf("%w: emulator container %q has ambiguous mount configuration",
+			ErrDockerConfiguration, container.Name)
+	}
+	expectedSource := filepath.Clean(container.Volume[:separator])
+	expectedDestination := container.Volume[separator+1:]
+	if len(inspected.Mounts) != 1 ||
+		inspected.Mounts[0].Type != "bind" ||
+		filepath.Clean(inspected.Mounts[0].Source) != expectedSource ||
+		inspected.Mounts[0].Destination != expectedDestination ||
+		!inspected.Mounts[0].RW {
+		return fmt.Errorf("%w: emulator container %q has an unexpected data mount",
+			ErrDockerOwnershipConflict, container.Name)
+	}
+	return nil
+}
+
+func hasExpectedDurableOwnership(actual, expected map[string]string) bool {
+	for key, value := range expected {
+		if actual[key] != value {
+			return false
+		}
+	}
+	for key := range actual {
+		if _, owned := expected[key]; owned {
+			continue
+		}
+		normalized := strings.ToLower(key)
+		if strings.HasPrefix(normalized, "minisky.") {
+			return false
+		}
+	}
+	return true
+}
+
+func (sm *ServiceManager) inspectDurableEmulator(
+	ctx context.Context,
+	name string,
+) (durableEmulatorInspect, bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/containers/"+url.PathEscape(name)+"/json", nil)
+	if err != nil {
+		return durableEmulatorInspect{}, false, err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return durableEmulatorInspect{}, false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return durableEmulatorInspect{}, false, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return durableEmulatorInspect{}, false,
+			fmt.Errorf("Docker returned HTTP %d", response.StatusCode)
+	}
+	var raw struct {
+		ID    string `json:"Id"`
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+		Mounts []struct {
+			Type        string `json:"Type"`
+			Source      string `json:"Source"`
+			Destination string `json:"Destination"`
+			RW          bool   `json:"RW"`
+		} `json:"Mounts"`
+		NetworkSettings struct {
+			Ports map[string][]struct {
+				HostIP   string `json:"HostIp"`
+				HostPort string `json:"HostPort"`
+			} `json:"Ports"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&raw); err != nil {
+		return durableEmulatorInspect{}, false, err
+	}
+	return durableEmulatorInspect{
+		ID:     raw.ID,
+		Status: raw.State.Status,
+		Labels: raw.Config.Labels,
+		Mounts: raw.Mounts,
+		Ports:  raw.NetworkSettings.Ports,
+	}, true, nil
+}
+
+var errDockerCreateConflict = errors.New("Docker container create conflict")
+
+func (sm *ServiceManager) createDurableEmulator(
+	ctx context.Context,
+	container ContainerConfig,
+	labels map[string]string,
+) error {
+	exposedPorts := map[string]any{container.ContainerPort: struct{}{}}
+	portBindings := map[string]any{
+		container.ContainerPort: []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "0"}},
+	}
+	for _, port := range container.AdditionalPorts {
+		exposedPorts[port] = struct{}{}
+		portBindings[port] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "0"}}
+	}
+	payload := map[string]any{
+		"Image":        container.Image,
+		"Cmd":          container.Cmd,
+		"Env":          container.Env,
+		"ExposedPorts": exposedPorts,
+		"Labels":       labels,
+		"HostConfig": map[string]any{
+			"NetworkMode":  "bridge",
+			"PortBindings": portBindings,
+			"Binds":        []string{container.Volume},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/create?name="+url.QueryEscape(container.Name), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusConflict {
+		return errDockerCreateConflict
+	}
+	if response.StatusCode != http.StatusCreated {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return fmt.Errorf("Docker returned HTTP %d: %s",
+			response.StatusCode, strings.TrimSpace(string(detail)))
+	}
+	return nil
+}
+
+func (sm *ServiceManager) removeDurableEmulatorContainer(
+	ctx context.Context,
+	domain string,
+	cfg config.EmulatorConfig,
+) error {
+	if !isDurableEmulator(domain) {
+		return fmt.Errorf("domain %q has no durable emulator contract", domain)
+	}
+	service := strings.TrimSuffix(domain, ".googleapis.com")
+	container := ContainerConfig{
+		Name:   emulatorContainerName(domain, cfg.Name),
+		Volume: filepath.Join(config.GetRuntimeDir(), service) + ":/data",
+	}
+	expectedLabels := durableEmulatorLabels(domain)
+	inspected, found, err := sm.inspectDurableEmulator(ctx, container.Name)
+	if err != nil {
+		return fmt.Errorf("inspect %s emulator for cleanup: %w", domain, err)
+	}
+	if !found {
+		return nil
+	}
+	if err := validateDurableEmulator(inspected, container, expectedLabels); err != nil {
+		return fmt.Errorf("refusing to remove %s emulator: %w", domain, err)
+	}
+	if inspected.ID == "" {
+		return fmt.Errorf("refusing to remove %s emulator without immutable container ID", domain)
+	}
+	if inspected.Status == "running" {
+		stopRequest, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			"http://localhost/containers/"+url.PathEscape(inspected.ID)+"/stop?t=10", nil)
+		if err != nil {
+			return err
+		}
+		stopResponse, err := sm.doDocker(stopRequest)
+		if err != nil {
+			return err
+		}
+		stopStatus := stopResponse.StatusCode
+		closeErr := stopResponse.Body.Close()
+		if closeErr != nil {
+			return closeErr
+		}
+		if stopStatus != http.StatusNoContent && stopStatus != http.StatusNotModified &&
+			stopStatus != http.StatusNotFound {
+			return fmt.Errorf("stop %s emulator returned HTTP %d", domain, stopStatus)
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		"http://localhost/containers/"+url.PathEscape(inspected.ID)+"?force=true", nil)
+	if err != nil {
+		return err
+	}
+	response, err := sm.doDocker(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("remove %s emulator returned HTTP %d", domain, response.StatusCode)
+	}
+	return nil
+}
+
+// DockerOwnershipLabels returns the canonical labels shared by every Docker
+// resource owned by the active MiniSky profile.
+func DockerOwnershipLabels() map[string]string {
 	return map[string]string{
 		"managed-by":      "minisky",
 		"minisky.profile": config.GetProfile(),
 	}
+}
+
+func ownedDockerLabels() map[string]string {
+	return DockerOwnershipLabels()
 }
 
 func isOwnedDockerResource(labels map[string]string) bool {
@@ -2374,9 +3378,16 @@ func isOwnedDockerResource(labels map[string]string) bool {
 }
 
 func (sm *ServiceManager) startContainer(name string) error {
+	return sm.startContainerContext(context.Background(), name)
+}
+
+func (sm *ServiceManager) startContainerContext(ctx context.Context, name string) error {
 	url := fmt.Sprintf("http://localhost/containers/%s/start", name)
-	req, _ := http.NewRequest("POST", url, nil)
-	resp, err := sm.dockerClient.Do(req)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := sm.doDocker(req)
 	if err != nil {
 		return err
 	}
@@ -2388,17 +3399,38 @@ func (sm *ServiceManager) startContainer(name string) error {
 	return nil
 }
 
-func (sm *ServiceManager) waitUntilReady(addr string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+func waitUntilRedisReady(ctx context.Context, addr string, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	for {
+		connection, err := dialer.DialContext(waitCtx, "tcp", addr)
 		if err == nil {
-			conn.Close()
-			return nil
+			deadline := time.Now().Add(500 * time.Millisecond)
+			if contextDeadline, ok := waitCtx.Deadline(); ok && contextDeadline.Before(deadline) {
+				deadline = contextDeadline
+			}
+			_ = connection.SetDeadline(deadline)
+			if _, err = io.WriteString(connection, "*1\r\n$4\r\nPING\r\n"); err == nil {
+				var response string
+				response, err = bufio.NewReader(connection).ReadString('\n')
+				if err == nil && response == "+PONG\r\n" {
+					_ = connection.Close()
+					return nil
+				}
+			}
+			_ = connection.Close()
 		}
-		time.Sleep(300 * time.Millisecond)
+
+		timer := time.NewTimer(300 * time.Millisecond)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return fmt.Errorf("Redis at %q not protocol-ready after %s: %w", addr, timeout, waitCtx.Err())
+		case <-timer.C:
+		}
 	}
-	return fmt.Errorf("'%s' not reachable after %s", addr, timeout)
 }
 
 func waitUntilHTTPReady(target string, timeout time.Duration) error {

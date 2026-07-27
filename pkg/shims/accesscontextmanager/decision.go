@@ -7,10 +7,10 @@ import (
 
 // AccessRequest is the package-local VPC Service Controls decision input.
 type AccessRequest struct {
-	Project  string
-	Service  string
-	SourceIP string
-	Region   string
+	Project  string `json:"project"`
+	Service  string `json:"service"`
+	SourceIP string `json:"sourceIp"`
+	Region   string `json:"region"`
 }
 
 // AccessDecision reports the bounded local perimeter decision.
@@ -46,6 +46,18 @@ func (api *API) CheckAccess(request AccessRequest) AccessDecision {
 		return AccessDecision{Reason: "restricted by service perimeter", Perimeter: perimeter.Name}
 	}
 	return AccessDecision{Allowed: true, Reason: "not restricted by a service perimeter"}
+}
+
+// EvaluateServicePerimeter exposes the bounded persisted decision to the
+// gateway without coupling the router to this shim package.
+func (api *API) EvaluateServicePerimeter(project, service, sourceIP, region string) (bool, bool) {
+	decision := api.CheckAccess(AccessRequest{
+		Project:  project,
+		Service:  service,
+		SourceIP: sourceIP,
+		Region:   region,
+	})
+	return decision.Perimeter != "", decision.Allowed
 }
 
 func validProjectResource(project string) bool {

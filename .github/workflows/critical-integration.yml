@@ -14,7 +14,21 @@ on:
       - "scripts/state-durability-integration.sh"
       - "scripts/kind-integration.sh"
       - "scripts/terraform-integration.sh"
+      - "scripts/event-delivery-integration.sh"
+      - "scripts/install-pack.sh"
+      - "scripts/phase10-artifact-integration.sh"
+      - "scripts/phase13-wif-integration.sh"
+      - "scripts/phase15-emulator-integration.sh"
+      - "scripts/phase16-monitoring-integration.sh"
+      - "scripts/phase16-logging-integration.sh"
+      - "scripts/phase16-dns-integration.sh"
+      - "scripts/phase16-vertex-integration.sh"
+      - "scripts/phase16-subnetwork-integration.sh"
+      - "scripts/phase16-subnetwork-terraform-integration.sh"
+      - "scripts/phase17-enterprise-wif-integration.sh"
+      - "sdk-smoke/**"
       - "terraform/**"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - "ui/package-lock.json"
@@ -30,7 +44,21 @@ on:
       - "scripts/state-durability-integration.sh"
       - "scripts/kind-integration.sh"
       - "scripts/terraform-integration.sh"
+      - "scripts/event-delivery-integration.sh"
+      - "scripts/install-pack.sh"
+      - "scripts/phase10-artifact-integration.sh"
+      - "scripts/phase13-wif-integration.sh"
+      - "scripts/phase15-emulator-integration.sh"
+      - "scripts/phase16-monitoring-integration.sh"
+      - "scripts/phase16-logging-integration.sh"
+      - "scripts/phase16-dns-integration.sh"
+      - "scripts/phase16-vertex-integration.sh"
+      - "scripts/phase16-subnetwork-integration.sh"
+      - "scripts/phase16-subnetwork-terraform-integration.sh"
+      - "scripts/phase17-enterprise-wif-integration.sh"
+      - "sdk-smoke/**"
       - "terraform/**"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - "ui/package-lock.json"
@@ -72,7 +100,7 @@ jobs:
     name: Critical Terraform provider lifecycle
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -102,6 +130,7 @@ jobs:
           MINISKY_TERRAFORM_CLOUDSQL: "1"
           MINISKY_TERRAFORM_GKE: "1"
           MINISKY_TERRAFORM_JAVA_SMOKE: "1"
+          MINISKY_TERRAFORM_PHASE15: "1"
         run: ./scripts/terraform-integration.sh
 
   state-durability:
@@ -159,3 +188,334 @@ jobs:
           MINISKY_KIND_INTEGRATION: "1"
           MINISKY_KIND_CLUSTER: minisky-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: ./scripts/kind-integration.sh
+
+  event-delivery:
+    name: Critical Phase 9 event delivery
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install checksum-verified Pack v0.40.8
+        run: |
+          ./scripts/install-pack.sh
+          echo "${HOME}/.minisky/bin" >>"${GITHUB_PATH}"
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded event delivery lifecycle
+        run: |
+          set -o pipefail
+          make test-event-delivery 2>&1 | tee critical-phase9-event-delivery.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase9-event-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase9-event-delivery.log
+          if-no-files-found: error
+          retention-days: 7
+
+  artifact-registry:
+    name: Critical Phase 10 Artifact Registry
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded Artifact Registry lifecycle
+        run: |
+          set -o pipefail
+          make test-phase10-artifact 2>&1 | tee critical-phase10-artifact.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase10-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase10-artifact.log
+          if-no-files-found: error
+          retention-days: 7
+
+  workload-identity:
+    name: Critical Phase 13 workload identity
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded workload identity lifecycle
+        run: |
+          set -o pipefail
+          make test-phase13-wif 2>&1 | tee critical-phase13-wif.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase13-wif-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase13-wif.log
+          if-no-files-found: error
+          retention-days: 7
+
+  data-emulators:
+    name: Critical Phase 15 data emulators
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded emulator lifecycle
+        env:
+          MINISKY_PHASE15_INTEGRATION: "1"
+        run: |
+          set -o pipefail
+          ./scripts/phase15-emulator-integration.sh 2>&1 | tee critical-phase15-emulators.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase15-emulators-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase15-emulators.log
+          if-no-files-found: error
+          retention-days: 7
+
+  phase16-service-lifecycles:
+    name: Critical Phase 16 ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Monitoring
+            target: test-phase16-monitoring
+            log: critical-phase16-monitoring.log
+          - name: Logging
+            target: test-phase16-logging
+            log: critical-phase16-logging.log
+          - name: Cloud DNS
+            target: test-phase16-dns
+            log: critical-phase16-dns.log
+          - name: Vertex AI
+            target: test-phase16-vertex
+            log: critical-phase16-vertex.log
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run guarded service lifecycle
+        env:
+          MAKE_TARGET: ${{ matrix.target }}
+          LOG_FILE: ${{ matrix.log }}
+        run: |
+          set -o pipefail
+          make "${MAKE_TARGET}" 2>&1 | tee "${LOG_FILE}"
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ matrix.log }}
+          if-no-files-found: error
+          retention-days: 7
+
+  subnetwork-sdk:
+    name: Critical Phase 16 subnetwork SDK
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded subnetwork SDK lifecycle
+        run: |
+          set -o pipefail
+          make test-phase16-subnetwork 2>&1 | tee critical-phase16-subnetwork-sdk.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase16-subnetwork-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase16-subnetwork-sdk.log
+          if-no-files-found: error
+          retention-days: 7
+
+  subnetwork-terraform:
+    name: Critical Phase 16 subnetwork Terraform
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded subnetwork Terraform lifecycle
+        run: |
+          set -o pipefail
+          make test-phase16-subnetwork-terraform 2>&1 | tee critical-phase16-subnetwork-terraform.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase16-subnetwork-terraform-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase16-subnetwork-terraform.log
+          if-no-files-found: error
+          retention-days: 7
+
+  enterprise-controls:
+    name: Critical Phase 17 enterprise controls
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: critical-integration-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded enterprise controls lifecycle
+        run: |
+          set -o pipefail
+          make test-phase17-enterprise 2>&1 | tee critical-phase17-enterprise.log
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-phase17-enterprise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: critical-phase17-enterprise.log
+          if-no-files-found: error
+          retention-days: 7

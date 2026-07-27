@@ -32,13 +32,14 @@ type vpcIPAMBackend interface {
 }
 
 type computeMetadata struct {
-	Instances      map[string]*Instance              `json:"instances"`
-	Networks       map[string]*Network               `json:"networks"`
-	Subnetworks    map[string]*Subnetwork            `json:"subnetworks"`
-	NextSubnetID   uint64                            `json:"nextSubnetworkId"`
-	Firewalls      map[string]*FirewallRule          `json:"firewalls"`
-	InstanceGroups map[string]*InstanceGroup         `json:"instanceGroups"`
-	LoadBalancers  map[string]map[string]interface{} `json:"loadBalancers"`
+	Instances        map[string]*Instance              `json:"instances"`
+	Networks         map[string]*Network               `json:"networks"`
+	Subnetworks      map[string]*Subnetwork            `json:"subnetworks"`
+	NextSubnetID     uint64                            `json:"nextSubnetworkId"`
+	SecurityPolicies map[string]*SecurityPolicy        `json:"securityPolicies"`
+	Firewalls        map[string]*FirewallRule          `json:"firewalls"`
+	InstanceGroups   map[string]*InstanceGroup         `json:"instanceGroups"`
+	LoadBalancers    map[string]map[string]interface{} `json:"loadBalancers"`
 }
 
 // NewAPIWithStore constructs a Compute shim backed by the supplied profile store.
@@ -91,6 +92,9 @@ func newAPIWithMetadataStore(
 	if persisted.Firewalls != nil {
 		api.firewalls = persisted.Firewalls
 	}
+	if persisted.SecurityPolicies != nil {
+		api.securityPolicies = persisted.SecurityPolicies
+	}
 	if persisted.InstanceGroups != nil {
 		api.instanceGroups = persisted.InstanceGroups
 	}
@@ -99,6 +103,10 @@ func newAPIWithMetadataStore(
 	}
 	if err := validatePersistedSubnetworkGraph(api.networks, api.subnetworks, api.nextSubnetworkID); err != nil {
 		api.setInitializationError(fmt.Errorf("validate persisted Compute subnetworks: %w", err))
+		return api, nil
+	}
+	if err := validatePersistedSecurityPolicyGraph(api.securityPolicies, api.loadBalancers); err != nil {
+		api.setInitializationError(fmt.Errorf("validate persisted Compute security policies: %w", err))
 		return api, nil
 	}
 	if api.nextSubnetworkID == 0 {
@@ -359,6 +367,48 @@ func validatePersistedSubnetworkGraph(
 	return nil
 }
 
+func validatePersistedSecurityPolicyGraph(
+	policies map[string]*SecurityPolicy,
+	loadBalancers map[string]map[string]interface{},
+) error {
+	for key, policy := range policies {
+		if policy == nil {
+			return fmt.Errorf("security policy %q is nil", key)
+		}
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" ||
+			policy.Kind != "compute#securityPolicy" || policy.ID == "" ||
+			policy.Name != parts[1] ||
+			policy.SelfLink != securityPolicySelfLink(parts[0], parts[1]) {
+			return fmt.Errorf("security policy %q has invalid identity", key)
+		}
+		if _, err := time.Parse(time.RFC3339, policy.CreationTimestamp); err != nil {
+			return fmt.Errorf("security policy %q has invalid creation timestamp", key)
+		}
+		if err := validateSecurityPolicyRules(policy.Rules); err != nil {
+			return fmt.Errorf("security policy %q: %w", key, err)
+		}
+	}
+	for key, resource := range loadBalancers {
+		if resource == nil || !strings.Contains(key, ":backendServices:") {
+			continue
+		}
+		reference, _ := resource["securityPolicy"].(string)
+		if reference == "" {
+			continue
+		}
+		project := strings.SplitN(key, ":", 2)[0]
+		name, err := securityPolicyReferenceName(reference, project)
+		if err != nil {
+			return fmt.Errorf("backend service %q has invalid security policy: %w", key, err)
+		}
+		if policies[project+":"+name] == nil {
+			return fmt.Errorf("backend service %q references missing security policy %q", key, name)
+		}
+	}
+	return nil
+}
+
 func (api *API) setInitializationError(err error) {
 	api.initMu.Lock()
 	api.initializationErr = err
@@ -409,12 +459,13 @@ func (api *API) persistMetadata() error {
 
 func (api *API) marshalMetadataLocked() ([]byte, error) {
 	return json.Marshal(computeMetadata{
-		Instances:      api.instances,
-		Networks:       api.networks,
-		Subnetworks:    api.subnetworks,
-		NextSubnetID:   api.nextSubnetworkID,
-		Firewalls:      api.firewalls,
-		InstanceGroups: api.instanceGroups,
-		LoadBalancers:  api.loadBalancers,
+		Instances:        api.instances,
+		Networks:         api.networks,
+		Subnetworks:      api.subnetworks,
+		NextSubnetID:     api.nextSubnetworkID,
+		SecurityPolicies: api.securityPolicies,
+		Firewalls:        api.firewalls,
+		InstanceGroups:   api.instanceGroups,
+		LoadBalancers:    api.loadBalancers,
 	})
 }
