@@ -30,12 +30,12 @@ const phases = [
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
-  ["18", "Event workflows", "Experimental bounded slice", "Eventarc → Workflows delivery, replay, cancellation, SSRF, scoped LRO, and restart evidence pass; Batch container execution remains 501"],
-  ["19", "Pipelines and streaming", "Experimental truthful boundary", "Dataform hierarchy is durable; Dataflow, Composer, Kafka, and Pub/Sub Lite execution remain explicit 501 without owned backends"],
-  ["20", "Extended databases", "Experimental bounded slice", "Identity Platform, Filestore, and Storage Transfer have bounded workflows; AlloyDB and Valkey execution remain explicit 501"],
-  ["21–22", "Observability and API management", "Experimental bounded slice", "Durable ingestion, hierarchy, local gateway, directory, and rollout tests pass; external deployment parity remains unsupported"],
-  ["23", "AI and ML services", "Experimental deterministic slice", "Control-plane resources persist; unsupported inference and semantic outputs return 501 rather than fabricated confidence"],
-  ["24–25", "Security and networking", "Experimental policy slice", "CA, Binary Authorization, DLP, asset, org-policy, and perimeter evaluators are bounded; CDN/Armor data-plane parity remains unsupported"],
+  ["18", "Event workflows", "Experimental · local package gate passed", "Eventarc → Workflows and exact-owned Batch execution have failure, cancellation, scoped-LRO, cleanup, and restart coverage; guarded SDK lifecycle remains unverified"],
+  ["19", "Pipelines and streaming", "Experimental · local package gate passed", "Dataflow/Dataform plus owned Composer and Kafka backends are bounded; Pub/Sub Lite stays explicit 501 and the heavy Kafka/Airflow gate is optional-unverified"],
+  ["20", "Extended databases", "Experimental · local package gate passed", "AlloyDB, Valkey, Identity Platform, Filestore, and Storage Transfer have bounded lifecycle/cleanup coverage; guarded SDK and restart integration remains unverified"],
+  ["21–22", "Observability and API management", "Experimental · local package gate passed", "Durable ingestion, hierarchy, local gateway, directory, rollout, and policy tests pass; external deployment parity remains unsupported"],
+  ["23", "AI and ML services", "Experimental · local package gate passed", "Bounded deterministic and explicit-unsupported client contracts pass locally; real model-semantic inference is not claimed"],
+  ["24–25", "Security and networking", "Experimental · local package gate passed", "CA, Binary Authorization, DLP, asset, org-policy, perimeter, Armor, CDN, and service-routing boundaries have local enforcement evidence"],
 ];
 
 const waves = [
@@ -123,10 +123,10 @@ const waves = [
       "Keep every Phase 18–25 service domain default-off and experimental until its individual promotion gate passes.",
       "Reuse semantic import validation, transactional persistence, typed scoped LROs, opaque pagination, explicit routing, and strict IAM foundations.",
       "Promote only bounded package workflows with public-gateway, restart, generated-client, failure, and cleanup evidence.",
-      "Return canonical 501 for Batch, Dataflow, Composer, Kafka, AlloyDB, Valkey, model inference, CDN, and Armor behavior until exact-owned backends exist.",
+      "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "make test-phase18-25-evidence and the full race suite pass; each promoted service adds its own SDK/backend/Terraform evidence without changing default-off status for the others.",
+    gate: "Offline evidence, docs truth, and the full race suite pass. Six generated-client/restart/cleanup CI gates remain configured-unverified; no Phase 18–25 Terraform claim exists.",
   },
 ];
 
@@ -151,12 +151,11 @@ export default function MiniSkyRoadmapCompletionPlan() {
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
         delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL, Logging, DNS/UDP,
         Subnetwork/IPAM SDK and Terraform, and Vertex prediction restart gates, and Phase-17 federated
-        RBAC/quota/audit integration. Phase 18–25 services now share fail-closed state, scoped operation,
-        pagination, routing, IAM, and evidence foundations while remaining default-off experimental.
-        Fifteen guarded local gates have passed. Native amd64 and arm64 deb/rpm
-        build-install-smoke-uninstall jobs also pass in read-only CI; the opt-in Phase-9 event-delivery, Phase-16
-        subnetwork SDK and Terraform, and Phase-17 CI jobs are configured but have no CI pass evidence yet.
-        Production-grade semantics remain explicit external boundaries.
+        RBAC/quota/audit integration. Phase 18–25 services now share fail-closed state, scoped operations,
+        pagination, routing, strict IAM, exact-owned Docker cleanup, and machine-readable evidence while remaining
+        default-off experimental. All six package-unit and strict-IAM batch gates pass locally. Guarded
+        generated-client, restart, backend/cleanup CI, native Linux/Windows CGO, and Phase 18–25 Terraform evidence
+        remain unverified or absent. Production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -172,6 +171,30 @@ export default function MiniSkyRoadmapCompletionPlan() {
           <CardHeader>Promotion status</CardHeader>
           <CardBody><H2>Default-off</H2><Text tone="secondary">Experimental until per-service evidence passes</Text></CardBody>
         </Card>
+      </Grid>
+
+      <Grid columns="2fr 1fr" gap={20}>
+        <Stack gap={8}>
+          <H2>Promotion evidence state</H2>
+          <Text>
+            <Code>pkg/evidence/batch_gates.json</Code> records six batches across package, generated-client,
+            restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI dimensions. The complete Go race suite,
+            documentation truth gate, package references, strict-IAM routes, and isolated anonymous-volume cleanup
+            pass locally.
+          </Text>
+          <Text tone="secondary">
+            Configured-unverified is not a pass claim. The six guarded SDK/restart workflows, external GitHub jobs,
+            and native Linux/Windows CGO release-equivalent builds still need recorded runs. Phase 19&apos;s heavy
+            Kafka/Airflow backend path remains optional-unverified.
+          </Text>
+        </Stack>
+        <Stack gap={8}>
+          <H3>Terraform status</H3>
+          <Text tone="secondary">
+            Zero Phase 18–25 provider claims. Add one only after isolated apply, restart, no-drift, import where
+            relevant, destroy, and cleanup evidence passes.
+          </Text>
+        </Stack>
       </Grid>
 
       <Stack gap={10}>
@@ -352,10 +375,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: add an exact-owned, cleanup-safe Batch container runner and generated-client
-        create → execute → restart → observe → delete evidence. Composer, Managed Kafka, AlloyDB, and Valkey remain
-        explicit 501 boundaries until their backend ownership contracts are implemented. Refresh the committed
-        <Code>.codegraph/codegraph.db</Code> after those structural changes.
+        Run and record the six guarded generated-client create → restart → observe → delete workflows, including
+        exact-owned backend and terminal cleanup assertions. Then run the optional Phase 19 Kafka/Airflow path and
+        native Linux/Windows CGO release gates. Keep every domain experimental until its own matrix is complete;
+        add Terraform claims only after provider lifecycle evidence exists.
       </Callout>
     </Stack>
   );

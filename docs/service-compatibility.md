@@ -128,7 +128,7 @@ entire service API. Important boundaries:
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Generated-client evidence: not recorded. CI evidence: not recorded. Package tests are not promotion evidence; every inventoried service remains experimental until separate machine-readable promotion evidence exists.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client gates configured but unverified: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 The Phase 18–25 domains marked `experimental` in the machine-readable

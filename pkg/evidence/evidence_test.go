@@ -187,11 +187,7 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 				t.Errorf("%s %s references missing CI job %q", gate.ID, name, check.Job)
 			}
 		}
-		wantPackageStatus := EvidenceLocalPassed
-		if gate.ID == "phase18-25" {
-			wantPackageStatus = EvidenceConfiguredUnverified
-		}
-		if gate.PackageUnit.Status != wantPackageStatus ||
+		if gate.PackageUnit.Status != EvidenceLocalPassed ||
 			gate.GeneratedClientLifecycle.Status != EvidenceConfiguredUnverified ||
 			gate.DaemonRestart.Status != EvidenceConfiguredUnverified ||
 			gate.StrictIAM.Status != EvidenceLocalPassed ||

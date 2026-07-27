@@ -6,10 +6,12 @@
 
 MiniSky provides a local gateway for custom Go shims and selected Docker-backed
 emulators. Core services (Compute, Storage, BigQuery, Pub/Sub, Cloud SQL, IAM)
-have verified Terraform and SDK slices. Phase 18–25 services are package-local
-prototypes with bounded Go evidence but incomplete promotion evidence. Once
-dependencies and required images are available locally, verified workflows can
-run offline; first use may pull lazily loaded emulator images.
+have verified Terraform and SDK slices. Phase 18–25 services remain default-off
+experimental surfaces with locally passing package, race, strict-IAM, and
+machine-readable evidence gates; guarded generated-client, restart, backend,
+cleanup, and CI runs remain promotion prerequisites. Once dependencies and
+required images are available locally, verified workflows can run offline;
+first use may pull lazily loaded emulator images.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -40,7 +42,7 @@ run offline; first use may pull lazily loaded emulator images.
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Generated-client evidence: not recorded. CI evidence: not recorded. Package tests are not promotion evidence; every inventoried service remains experimental until separate machine-readable promotion evidence exists.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client gates configured but unverified: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -54,15 +56,18 @@ MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1 minisky start
 This switch enables all Phase 18–25 prototypes for that process. It does not
 promote their compatibility status or establish provider/backend evidence.
 
-Run the offline evidence gate with `make test-phase18-25-evidence`. Its
-machine-readable inventory is `pkg/evidence/phase18_25.json`.
+Run the offline evidence gate with `make test-phase18-25-evidence`. Per-service
+package evidence lives in `pkg/evidence/phase18_25.json`; the six batch matrices
+in `pkg/evidence/batch_gates.json` separately qualify package, generated-client,
+restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 
-The newly integrated Pub/Sub Lite, Service Management/Control, Speech-to-Text,
-Text-to-Speech, Natural Language, Dialogflow CX, Vector Search/Model Registry,
-Certificate Authority Service, and Binary Authorization packages remain
-experimental. Their unsupported execution boundaries return 501 rather than
-simulated success. Cloud CDN/Armor remains part of the existing Compute domain
-and has no separate registration; enforcement/data-plane parity is unsupported.
+The complete Go race suite, documentation truth checks, and package/strict-IAM
+evidence pass locally. Guarded generated-client and daemon-restart integrations,
+the optional heavy Phase 19 Kafka/Airflow backend gate, native Linux/Windows CGO
+release checks, and external CI results are not recorded as passes. No Phase
+18–25 Terraform compatibility is claimed. Unsupported methods return canonical
+501 responses rather than simulated success; Cloud CDN/Armor remains within the
+Compute domain and does not claim full GCP data-plane parity.
 
 ## 📋 Prerequisites
 Install the tools required by the slices you use:

@@ -90,9 +90,12 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"1 experimental",
 		"1 default-off",
 		"0 Terraform claims",
-		"Generated-client evidence: not recorded",
-		"CI evidence: not recorded",
-		"Package tests are not promotion evidence",
+		"6 batch gates",
+		"Package-unit gates passed locally: 6/6",
+		"strict-IAM gates passed locally: 6/6",
+		"Generated-client gates configured but unverified: 6/6",
+		"CI gates configured but unverified: 6/6",
+		"Package and IAM passes do not promote compatibility",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("summary does not contain %q:\n%s", want, got)

@@ -219,6 +219,10 @@ func renderPhaseSummary(
 	services []registry.Service,
 	inventory []evidence.PhaseService,
 ) (string, error) {
+	gates, err := evidence.BatchGates()
+	if err != nil {
+		return "", err
+	}
 	experimental := 0
 	for _, service := range services {
 		if service.Support == registry.SupportExperimental {
@@ -245,16 +249,45 @@ func renderPhaseSummary(
 	}
 	sort.Strings(categories)
 
+	packageLocal := 0
+	strictIAMLocal := 0
+	generatedConfigured := 0
+	ciConfigured := 0
+	for _, gate := range gates {
+		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
+			packageLocal++
+		}
+		if gate.StrictIAM.Status == evidence.EvidenceLocalPassed {
+			strictIAMLocal++
+		}
+		if gate.GeneratedClientLifecycle.Status == evidence.EvidenceConfiguredUnverified {
+			generatedConfigured++
+		}
+		if gate.CI.Status == evidence.EvidenceConfiguredUnverified {
+			ciConfigured++
+		}
+	}
+
 	return fmt.Sprintf(
 		"**Generated truth:** %d experimental; %d default-off; %d Terraform claims. "+
 			"Persistence inventory: %s.\n\n"+
-			"Generated-client evidence: not recorded. CI evidence: not recorded. "+
-			"Package tests are not promotion evidence; every inventoried service remains "+
-			"experimental until separate machine-readable promotion evidence exists.\n",
+			"Machine-readable promotion matrix: %d batch gates. Package-unit gates passed locally: %d/%d; "+
+			"strict-IAM gates passed locally: %d/%d. Generated-client gates configured but unverified: %d/%d; "+
+			"CI gates configured but unverified: %d/%d. Package and IAM passes do not promote compatibility; "+
+			"every inventoried service remains experimental until its required integration gates pass.\n",
 		experimental,
 		experimental,
 		terraformClaims,
 		strings.Join(categories, ", "),
+		len(gates),
+		packageLocal,
+		len(gates),
+		strictIAMLocal,
+		len(gates),
+		generatedConfigured,
+		len(gates),
+		ciConfigured,
+		len(gates),
 	), nil
 }
 
