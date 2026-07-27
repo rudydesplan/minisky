@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,83 @@ import (
 	"minisky/pkg/shims/serverless"
 	"minisky/pkg/state"
 )
+
+func gzipJSONBody(t *testing.T, body string) *bytes.Reader {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return bytes.NewReader(compressed.Bytes())
+}
+
+func TestRouterDecodesBoundedGzipJSONBeforeValidationAndDispatch(t *testing.T) {
+	const body = `{"name":"java-smoke"}`
+	var received []byte
+	var contentEncoding string
+	var contentLength int64
+
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var err error
+		received, err = io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contentEncoding = request.Header.Get("Content-Encoding")
+		contentLength = request.ContentLength
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/storage/storage/v1/b?project=demo",
+		gzipJSONBody(t, body),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Encoding", "gzip")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if string(received) != body {
+		t.Fatalf("downstream body=%q, want %q", received, body)
+	}
+	if contentEncoding != "" {
+		t.Fatalf("downstream Content-Encoding=%q, want removed after decoding", contentEncoding)
+	}
+	if contentLength != int64(len(body)) {
+		t.Fatalf("downstream Content-Length=%d, want %d", contentLength, len(body))
+	}
+}
+
+func TestRouterRejectsGzipJSONWhoseDecodedBodyExceedsRouteLimit(t *testing.T) {
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized decoded body reached shim")
+	}))
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://localhost/_minisky/storage/storage/v1/b?project=demo",
+		gzipJSONBody(t, `{"name":"`+strings.Repeat("x", (1<<20)+1)+`"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Encoding", "gzip")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(response.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
 
 type testAuthorizer struct {
 	issuer *localsecurity.Issuer

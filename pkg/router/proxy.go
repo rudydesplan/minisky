@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -342,7 +343,7 @@ func (p *ProxyRouter) enforceRequestBodyLimit(
 		return noCleanup, true
 	}
 
-	body, err := io.ReadAll(r.Body)
+	encodedBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
@@ -351,6 +352,32 @@ func (p *ProxyRouter) enforceRequestBodyLimit(
 		}
 		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Unable to read JSON request body")
 		return noCleanup, false
+	}
+	body := encodedBody
+	contentEncoding := strings.TrimSpace(r.Header.Get("Content-Encoding"))
+	if contentEncoding != "" {
+		if !strings.EqualFold(contentEncoding, "gzip") {
+			p.writeAuthError(w, http.StatusUnsupportedMediaType, "INVALID_ARGUMENT",
+				"Unsupported Content-Encoding; expected gzip")
+			return noCleanup, false
+		}
+		compressed, gzipErr := gzip.NewReader(bytes.NewReader(encodedBody))
+		if gzipErr != nil {
+			p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Unable to decode gzip JSON request body")
+			return noCleanup, false
+		}
+		body, err = io.ReadAll(io.LimitReader(compressed, limit+1))
+		closeErr := compressed.Close()
+		if err != nil || closeErr != nil {
+			p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Unable to decode gzip JSON request body")
+			return noCleanup, false
+		}
+		if int64(len(body)) > limit {
+			p.writeBodyLimitError(w, r, limit)
+			return noCleanup, false
+		}
+		r.Header.Del("Content-Encoding")
+		r.ContentLength = int64(len(body))
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	return noCleanup, true
