@@ -161,6 +161,22 @@ func TestServiceAccountImpersonationRolesAndResolution(t *testing.T) {
 	}
 }
 
+func TestServiceAccountViewerCanReadAccount(t *testing.T) {
+	api := newAPI(nil)
+	api.strict = true
+	const (
+		resource  = "projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com"
+		principal = "serviceAccount:worker@test-project.iam.gserviceaccount.com"
+	)
+	api.policies[resource] = &IamPolicy{Bindings: []Binding{{
+		Role:    "roles/iam.serviceAccountViewer",
+		Members: []string{principal},
+	}}}
+	if !api.Authorize(resource, principal, "iam.serviceAccounts.get") {
+		t.Fatal("service account viewer lacks iam.serviceAccounts.get")
+	}
+}
+
 func TestMiniSkyLocalRolesCoverDashboardAndGatewayPermissions(t *testing.T) {
 	t.Setenv("MINISKY_IAM_MODE", "strict")
 	api := newAPI(nil)
@@ -211,6 +227,7 @@ func TestFederatedPrincipalViewerRoleUsesExactMemberMatching(t *testing.T) {
 	for _, permission := range []string{
 		"minisky.dashboard.view",
 		"bigquery.datasets.get",
+		"bigquery.datasets.list",
 	} {
 		if !api.Authorize("projects/local-dev-project", principal, permission) {
 			t.Errorf("federated viewer lacks %q", permission)

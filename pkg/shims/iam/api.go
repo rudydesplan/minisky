@@ -829,6 +829,7 @@ var rolePermissions = map[string][]string{
 	"roles/minisky.viewer": {
 		"minisky.dashboard.view",
 		"bigquery.datasets.get",
+		"bigquery.datasets.list",
 		"compute.instances.get",
 		"compute.instances.list",
 		"pubsub.subscriptions.get",
@@ -842,6 +843,7 @@ var rolePermissions = map[string][]string{
 		"minisky.dashboard.view",
 		"minisky.dashboard.manage",
 		"bigquery.datasets.get",
+		"bigquery.datasets.list",
 		"bigquery.datasets.update",
 		"compute.instances.get",
 		"compute.instances.list",
@@ -872,6 +874,7 @@ var rolePermissions = map[string][]string{
 		"iam.serviceAccountKeys.disable",
 		"iam.serviceAccounts.setIamPolicy",
 		"bigquery.datasets.get",
+		"bigquery.datasets.list",
 		"bigquery.datasets.update",
 		"compute.disks.create",
 		"compute.disks.delete",
@@ -905,6 +908,9 @@ var rolePermissions = map[string][]string{
 	},
 	"roles/iam.serviceAccountTokenCreator": {
 		"iam.serviceAccounts.getAccessToken",
+	},
+	"roles/iam.serviceAccountViewer": {
+		"iam.serviceAccounts.get",
 	},
 	"roles/iam.workloadIdentityUser": {
 		"iam.serviceAccounts.getAccessToken",

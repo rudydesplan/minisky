@@ -1048,6 +1048,10 @@ exit 0
 	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(goCommand), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	terraformCommand := "#!/usr/bin/env bash\necho 'terraform must not run during preflight tests' >&2\nexit 98\n"
+	if err := os.WriteFile(filepath.Join(bin, "terraform"), []byte(terraformCommand), 0o700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPhase20AlloyDBTerraformGateStaticContract(t *testing.T) {

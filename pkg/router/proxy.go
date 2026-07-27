@@ -681,6 +681,9 @@ func routePermission(domain string, r *http.Request) (string, string) {
 			case matchIAMRouteTemplate(path, collectionTemplate+"/{resource}"):
 				switch r.Method {
 				case http.MethodGet, http.MethodHead:
+					if domain == "iam.googleapis.com" && spec.permissionRoot == "iam.serviceAccounts" {
+						return spec.permissionRoot + ".get", strings.TrimPrefix(path, "/v1/")
+					}
 					return spec.permissionRoot + ".get", resource
 				case http.MethodPut:
 					if spec.putCreates {

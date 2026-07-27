@@ -613,3 +613,11 @@ resource "google_service_account_iam_member" "phase13_delegation" {
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = google_service_account.phase13_delegate[each.value.source_key].member
 }
+
+resource "google_service_account_iam_member" "phase13_target_reader" {
+  count = local.phase13_wif_enabled ? 1 : 0
+
+  service_account_id = google_service_account.phase13_target[0].name
+  role               = "roles/iam.serviceAccountViewer"
+  member             = google_service_account.phase13_target[0].member
+}

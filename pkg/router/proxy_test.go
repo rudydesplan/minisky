@@ -192,6 +192,22 @@ type testProjects map[string]bool
 
 func (p testProjects) Exists(id string) bool { return p[id] }
 
+func TestIAMServiceAccountReadAuthorizesExactAccountResource(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/v1/projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com",
+		nil,
+	)
+	permission, resource := routePermission("iam.googleapis.com", request)
+	if permission != "iam.serviceAccounts.get" {
+		t.Fatalf("permission = %q", permission)
+	}
+	const want = "projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com"
+	if resource != want {
+		t.Fatalf("resource = %q, want %q", resource, want)
+	}
+}
+
 type countingReplayShim struct {
 	api       *bigquery.API
 	probes    int
