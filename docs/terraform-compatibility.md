@@ -37,8 +37,10 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `iam_credentials_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iamcredentials/v1/` | `iamcredentials.googleapis.com` |
 | `pubsub_custom_endpoint` | `http://127.0.0.1:8080/_minisky/pubsub/v1/` | `pubsub.googleapis.com` |
 | `redis_custom_endpoint` | `http://127.0.0.1:8080/_minisky/redis/v1/` | `redis.googleapis.com` |
+| `sql_custom_endpoint` | `http://127.0.0.1:8080/_minisky/sqladmin/sql/v1beta4/` | `sqladmin.googleapis.com` |
 | `spanner_custom_endpoint` | `http://127.0.0.1:8080/_minisky/spanner/v1/` | `spanner.googleapis.com` |
 | `storage_custom_endpoint` | `http://127.0.0.1:8080/_minisky/storage/storage/v1/` | `storage.googleapis.com` |
+| `container_custom_endpoint` | `http://127.0.0.1:8080/_minisky/container/v1/` | `container.googleapis.com` |
 
 The repeated `bigquery/bigquery` segments are intentional: the first is the
 MiniSky service selector and is removed by the router; the second is part of
@@ -59,9 +61,14 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_storage_bucket` | Docker passthrough to `fake-gcs-server` | Synchronous | Bucket name is read through the canonical endpoint |
 | `google_pubsub_topic` | Primary-project topic in the profile-owned Pub/Sub emulator | Synchronous | Canonical name is read and a unique Go SDK message is published |
 | `google_pubsub_subscription` | Secondary-project subscription referencing the primary topic | Synchronous | Exact topic reference is read, then the published message is pulled and acknowledged |
-| `google_artifact_registry_repository` (optional Phase 10) | In-memory repository metadata plus repository-scoped Registry v2 package/version views | Service LRO | Repository is created, read without drift, destroyed, and returns 404 |
+| `google_artifact_registry_repository` (optional Phase 10) | Profile-persisted repository metadata plus repository-scoped Registry v2 package/version views | Service LRO with bounded persisted terminal outcomes | Repository is created, read without drift, destroyed, and returns 404 |
+| `google_sql_database_instance` (guarded fidelity gate) | Profile metadata plus an owned PostgreSQL container; restored metadata is suspended until explicitly reconciled | Service LRO | Instance is `RUNNABLE` during the gate and returns 404 after destroy |
+| `google_sql_database` (guarded fidelity gate) | Profile-persisted database metadata; not a claim of SQL data durability | Synchronous | Named database is read through the provider endpoint |
+| `google_sql_user` (guarded fidelity gate) | Profile-persisted user metadata; not production authentication parity | Synchronous | Named user is listed through the provider endpoint |
+| `google_container_cluster` (guarded Unix fidelity gate) | Profile metadata plus an owned Kind cluster when explicitly enabled | Service LRO | Cluster reaches `RUNNING`, is read through the provider endpoint, and is removed on destroy |
 | `google_compute_network` (optional Phase 16) | Profile-persisted custom-mode network metadata | Global Compute LRO | Canonical import, immediate and post-restart no-drift plans, and ordered destroy pass |
 | `google_compute_subnetwork` (optional Phase 16) | Profile-persisted bounded regional IPv4 metadata plus one exact owned Docker bridge | Regional Compute LRO | Canonical import preserves bridge identity; destroy removes metadata and the exact bridge |
+| `google_compute_instance` (optional Phase 16) | One profile-owned container with one NIC on the bounded regional IPv4 subnetwork | Zonal Compute LRO | Canonical metadata and Docker-observed primary IPv4 address are exposed when enabled |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
@@ -74,8 +81,9 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Phase-13 WIF, Artifact Registry, Redis, Spanner, and Phase-16 networking
-resources are disabled by default and local-profile-only. Artifact Registry
+The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Spanner, and
+Phase-16 networking/instance resources are disabled by default and
+local-profile-only. Artifact Registry
 uses profile-owned Registry v2, and `emulator-config` is not a production
 Spanner configuration. Enable Artifact Registry with
 `enable_phase10_artifact_resources = true`, WIF with
@@ -86,11 +94,17 @@ subnetwork with `enable_phase16_network_resources = true`; their outputs are
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
-data-plane gate. Resources not listed above are not claimed as
-Terraform-compatible. In particular, the tracked stack excludes Cloud SQL,
-serverless, GKE/Kind, and the Compute resources beyond the explicitly listed
-bounded slices. See `docs/service-compatibility.md` for implementation status;
-API routes alone do not establish provider compatibility.
+data-plane gate. The runner also accepts `MINISKY_TERRAFORM_CLOUDSQL=1`,
+`MINISKY_TERRAFORM_GKE=1`, and `MINISKY_TERRAFORM_JAVA_SMOKE=1` for bounded
+Cloud SQL, Unix Kind/GKE, and Java Storage evidence. The critical-integration
+workflow enables all three. Native Windows GKE metadata compiles, but secure
+Kind kubeconfig ownership and publish operations fail safe as unsupported.
+
+Resources not listed above are not claimed as Terraform-compatible. In
+particular, serverless, broad Compute/VPC/load-balancer surfaces, and general
+Cloud SQL or GKE APIs remain outside the claim. See
+`docs/service-compatibility.md`; API routes alone do not establish provider
+compatibility.
 
 The separate guarded Phase-16 Terraform gate targets only
 `google_compute_network.phase16[0]` and
@@ -105,7 +119,7 @@ same-project relative network reference. Auto-mode networks, updates, multiple
 or secondary ranges, IPv6, workload connectivity, routes, NAT, peering, PSC,
 and general VPC parity remain unclaimed.
 
-## Go and Python SDK smoke suites
+## Go, Python, and Java SDK smoke suites
 
 Phase 7 includes self-contained smoke programs in `sdk-smoke/go` and
 `sdk-smoke/python`. Both use Google's official discovery-based REST clients,
@@ -126,6 +140,13 @@ Docker because the first request cold-starts `fake-gcs-server`. When
 verifies their exact cross-project reference, publishes a unique message,
 bounded-polls the secondary subscription, and acknowledges the matching
 delivery without deleting Terraform-owned resources.
+
+The Java smoke in `sdk-smoke/java` is a narrower guarded Storage lifecycle
+using the official Java client. `scripts/java-sdk-smoke.sh` runs it in a pinned,
+read-only Maven/Temurin container and accepts only a loopback MiniSky endpoint.
+Its compile-only mode checks the source without a daemon; the Terraform
+integration enables live mode with `MINISKY_TERRAFORM_JAVA_SMOKE=1`. This does
+not establish Java compatibility for other services.
 
 With MiniSky already running, execute the Go smoke:
 
@@ -203,8 +224,11 @@ arbitrary mappings, non-RS256 signatures, Google trust roots or credential
 portability/revocation, undelete/soft-delete recovery, more than four delegates,
 `generateIdToken`, `signJwt`, and `signBlob` remain unsupported.
 
-The Docker-backed `terraform-integration` job is opt-in because starting
-MiniSky requires a Docker network. It runs for:
+The general Docker-backed `terraform-integration` job is opt-in because
+starting MiniSky requires a Docker network. A separate critical-integration
+workflow runs the guarded provider lifecycle with Cloud SQL, GKE, and Java
+switches enabled on scheduled, main-branch, and relevant path-triggered events.
+The general opt-in job runs for:
 
 - a pull request carrying the `terraform-integration` label; or
 - a manual workflow dispatch with `run_terraform_integration` enabled.

@@ -1,0 +1,4 @@
+# Track the generated repository database; keep runtime files local.
+*
+!.gitignore
+!codegraph.db

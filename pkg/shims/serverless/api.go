@@ -1,6 +1,7 @@
 package serverless
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/shims/logging"
@@ -292,7 +294,18 @@ type eventTarget struct {
 }
 
 func deliverEvent(client *http.Client, targetURL, payload string) {
-	resp, err := client.Post(targetURL, "application/json", strings.NewReader(payload))
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		targetURL,
+		strings.NewReader(payload),
+	)
+	if err != nil {
+		log.Printf("[Serverless] ❌ Trigger request failed for %s: %v", targetURL, err)
+		return
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := observability.Do(client, request)
 	if err != nil {
 		log.Printf("[Serverless] ❌ Trigger failed for %s: %v", targetURL, err)
 		return
@@ -1238,17 +1251,20 @@ func (api *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string) {
 	opName := extractSegmentAfter(path, "operations")
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	project := extractSegmentAfter(path, "projects")
+	location := extractSegmentAfter(path, "locations")
+	targetPrefix := fmt.Sprintf("projects/%s/locations/%s/", project, location)
+	validKind := op != nil && (op.Kind == "cloudfunctions#operation" || op.Kind == "run#operation")
+	if !validKind || op.Region != location || !strings.HasPrefix(op.TargetLink, targetPrefix) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
 	}
-	project := extractSegmentAfter(path, "projects")
 	if project == "" {
 		project = "default-project"
 	}
 	res := map[string]interface{}{
-		"name":     fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, "us-central1", op.Name), // simplified for dashboard
+		"name":     fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name),
 		"done":     op.Done,
 		"metadata": map[string]string{"@type": "type.googleapis.com/google.cloud.functions.v2.OperationMetadata"},
 	}

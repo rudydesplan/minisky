@@ -135,6 +135,49 @@ func TestMutationCreatesPinnedProfileHierarchyFromFreshRoot(t *testing.T) {
 	}
 }
 
+func TestAcquireOwnershipCreatesSecureMissingStateRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fresh-state-root")
+	store, err := New(root, "fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := store.AcquireOwnership()
+	if err != nil {
+		t.Fatalf("AcquireOwnership on missing root: %v", err)
+	}
+	defer ownership.Close()
+
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("state root mode = %v, want directory 0700", info.Mode())
+	}
+}
+
+func TestImportRejectsOversizedSnapshotBeforeReplacement(t *testing.T) {
+	store, err := New(t.TempDir(), "import-limit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("existing/value", map[string]string{"status": "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"format":"minisky-state-snapshot","version":1,"entries":{}}` +
+		strings.Repeat(" ", int(maxImportSize))
+	if err := store.Import(strings.NewReader(payload)); err == nil {
+		t.Fatal("oversized snapshot was accepted")
+	}
+	var value map[string]string
+	if err := store.Load("existing/value", &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["status"] != "preserved" {
+		t.Fatalf("existing state was replaced: %#v", value)
+	}
+}
+
 func TestOptionalReadRefreshesHierarchyAfterTransactionLock(t *testing.T) {
 	if os.Getenv("MINISKY_OPTIONAL_READ_WRITER_HELPER") == "1" {
 		store, err := New(os.Getenv("MINISKY_STATE_ROOT"), "fresh")
@@ -257,6 +300,210 @@ func TestImportValidationDoesNotReplaceActiveState(t *testing.T) {
 	}
 	if got["value"] != "active" {
 		t.Fatalf("active state changed after failed import: %#v", got)
+	}
+}
+
+func TestImportEntryValidatorRejectsWrongSchemaBeforeReplacement(t *testing.T) {
+	const entry = "test-validator/metadata"
+	MustRegisterEntryValidator(entry, func(_ EntryValidationContext, payload json.RawMessage) error {
+		var value struct {
+			Items []string `json:"items"`
+		}
+		return json.Unmarshal(payload, &value)
+	})
+
+	store, err := New(t.TempDir(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("service/value", map[string]string{"value": "active"}); err != nil {
+		t.Fatal(err)
+	}
+
+	badSnapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"test-validator/metadata":{"items":"wrong"}}}`)
+	if err := store.Import(bytes.NewReader(badSnapshot)); err == nil ||
+		!strings.Contains(err.Error(), `state entry "test-validator/metadata"`) {
+		t.Fatalf("Import error = %v, want entry schema rejection", err)
+	}
+
+	var got map[string]string
+	if err := store.Load("service/value", &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["value"] != "active" {
+		t.Fatalf("active state changed after failed schema validation: %#v", got)
+	}
+}
+
+func TestImportEntryValidatorReceivesTargetStore(t *testing.T) {
+	const entry = "context-validator/metadata"
+	MustRegisterEntryValidator(entry, func(context EntryValidationContext, _ json.RawMessage) error {
+		if context.Store == nil || context.Profile != context.Store.Profile() {
+			return errors.New("validator did not receive target store context")
+		}
+		if context.Profile != "destination" {
+			return fmt.Errorf("validator profile = %q", context.Profile)
+		}
+		return nil
+	})
+	store, err := New(t.TempDir(), "destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"context-validator/metadata":{}}}`)
+	if err := store.Import(bytes.NewReader(snapshot)); err != nil {
+		t.Fatalf("Import error = %v", err)
+	}
+}
+
+func TestMustRegisterEntryValidatorIsRepeatSafe(t *testing.T) {
+	const entry = "repeat-validator/metadata"
+	validator := func(EntryValidationContext, json.RawMessage) error { return nil }
+
+	MustRegisterEntryValidator(entry, validator)
+	MustRegisterEntryValidator(entry, validator)
+}
+
+func TestRegisterEntryValidatorRejectsDifferentDuplicateWithTypedError(t *testing.T) {
+	const entry = "conflicting-validator/metadata"
+	first := func(EntryValidationContext, json.RawMessage) error { return nil }
+	second := func(EntryValidationContext, json.RawMessage) error { return errors.New("different") }
+
+	if err := RegisterEntryValidator(entry, first); err != nil {
+		t.Fatal(err)
+	}
+	err := RegisterEntryValidator(entry, second)
+	if !errors.Is(err, ErrEntryValidatorConflict) {
+		t.Fatalf("RegisterEntryValidator error = %v, want ErrEntryValidatorConflict", err)
+	}
+}
+
+func TestMustRegisterEntryValidatorPanicsForDifferentDuplicate(t *testing.T) {
+	const entry = "conflicting-must-validator/metadata"
+	MustRegisterEntryValidator(entry, func(EntryValidationContext, json.RawMessage) error { return nil })
+
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("MustRegisterEntryValidator did not panic")
+		}
+	}()
+	MustRegisterEntryValidator(entry, func(EntryValidationContext, json.RawMessage) error {
+		return errors.New("different")
+	})
+}
+
+type failingEntryStore struct {
+	loadErr   error
+	saveErr   error
+	saveCalls int
+}
+
+func (s *failingEntryStore) Load(string, any) error { return s.loadErr }
+
+func (s *failingEntryStore) Save(string, any) error {
+	s.saveCalls++
+	return s.saveErr
+}
+
+func TestGuardedEntryStoreKeepsFailuresSticky(t *testing.T) {
+	cause := errors.New("disk unavailable")
+	delegate := &failingEntryStore{saveErr: cause}
+	store := NewGuardedEntryStore(delegate, nil)
+
+	if err := store.Save("service/metadata", map[string]string{"value": "first"}); !errors.Is(err, cause) {
+		t.Fatalf("first Save error = %v, want %v", err, cause)
+	}
+	delegate.saveErr = nil
+	if err := store.Save("service/metadata", map[string]string{"value": "second"}); !errors.Is(err, cause) {
+		t.Fatalf("second Save error = %v, want sticky %v", err, cause)
+	}
+	if delegate.saveCalls != 1 {
+		t.Fatalf("delegate Save calls = %d, want 1", delegate.saveCalls)
+	}
+}
+
+func TestCorruptLoadPreservesBytesAndFailsClosedForMutations(t *testing.T) {
+	store, err := New(t.TempDir(), "corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const entry = "service/metadata"
+	if err := store.Save(entry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var metadata struct {
+		Items []string `json:"items"`
+	}
+	if err := store.Load(entry, &metadata); err == nil {
+		t.Fatal("corrupt state load succeeded")
+	}
+
+	var raw string
+	if err := store.Load(entry, &raw); err != nil {
+		t.Fatalf("non-mutating raw reload: %v", err)
+	}
+	if raw != "corrupt" {
+		t.Fatalf("raw state = %q, want corrupt", raw)
+	}
+	if err := store.Save("service/other", true); err == nil {
+		t.Fatal("save after corrupt load succeeded")
+	}
+	if err := store.Delete(entry); err == nil {
+		t.Fatal("delete after corrupt load succeeded")
+	}
+
+	after, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("state bytes changed after corrupt load:\nbefore: %s\nafter: %s", before, after)
+	}
+}
+
+func TestValidateResourceMapsRejectsMalformedMetadata(t *testing.T) {
+	type resource struct {
+		Name string `json:"name"`
+	}
+	type metadata struct {
+		Resources map[string]*resource `json:"resources"`
+	}
+
+	for name, value := range map[string]metadata{
+		"nil resource": {
+			Resources: map[string]*resource{"projects/p/resources/r": nil},
+		},
+		"key name mismatch": {
+			Resources: map[string]*resource{
+				"projects/p/resources/r": {Name: "projects/p/resources/other"},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateResourceMaps(&value); err == nil {
+				t.Fatal("ValidateResourceMaps accepted malformed metadata")
+			}
+		})
+	}
+}
+
+func TestValidateResourceMapsAllowsIndependentResourceIDs(t *testing.T) {
+	type resource struct {
+		ID string `json:"id"`
+	}
+	type metadata struct {
+		Networks map[string]*resource `json:"networks"`
+	}
+	value := metadata{
+		Networks: map[string]*resource{"test-project:network-a": {ID: "1"}},
+	}
+	if err := ValidateResourceMaps(&value); err != nil {
+		t.Fatalf("ValidateResourceMaps rejected valid independent ID: %v", err)
 	}
 }
 

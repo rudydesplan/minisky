@@ -155,6 +155,94 @@ func TestLoggingEntriesAndSinksSurviveRestartWithProjectIsolation(t *testing.T) 
 	assertLoggingError(t, missing, http.StatusNotFound, "NOT_FOUND")
 }
 
+func TestFailedSinkDeliveryReplaysOnceAfterRestart(t *testing.T) {
+	store, err := state.New(t.TempDir(), "sink-replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := &recordingSinkDeliverer{err: errors.New("temporary delivery failure")}
+	api, err := NewAPIWithStore(store, "", failing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+		`{"name":"errors","destination":"file://errors","filter":"severity>=ERROR"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create sink status=%d body=%s", create.Code, create.Body.String())
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+		`{"entries":[{"insertId":"stable","severity":"ERROR","textPayload":"retry me","logName":"projects/p/logs/app"}]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write status=%d body=%s", write.Code, write.Body.String())
+	}
+
+	replayed := &recordingSinkDeliverer{}
+	restarted, err := NewAPIWithStore(store, "", replayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReplayPendingDeliveries(); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed.deliveries) != 1 || replayed.deliveries[0] != "file://errors:retry me" {
+		t.Fatalf("replayed deliveries=%#v", replayed.deliveries)
+	}
+
+	again := &recordingSinkDeliverer{}
+	secondRestart, err := NewAPIWithStore(store, "", again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secondRestart.ReplayPendingDeliveries(); err != nil {
+		t.Fatal(err)
+	}
+	if len(again.deliveries) != 0 {
+		t.Fatalf("acknowledged delivery replayed again: %#v", again.deliveries)
+	}
+}
+
+func TestSinkDeletionDurablyCancelsPendingDelivery(t *testing.T) {
+	store, err := state.New(t.TempDir(), "sink-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store, "", &recordingSinkDeliverer{err: errors.New("offline")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+		`{"name":"errors","destination":"file://errors"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create=%d %s", create.Code, create.Body.String())
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+		`{"entries":[{"insertId":"stable","severity":"ERROR","textPayload":"never replay","logName":"projects/p/logs/app"}]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write=%d %s", write.Code, write.Body.String())
+	}
+	api.mu.RLock()
+	if len(api.pending) != 1 || api.pending[0].SinkKey != "p:errors" {
+		t.Fatalf("pending=%#v", api.pending)
+	}
+	api.mu.RUnlock()
+	deleted := loggingRequest(api, http.MethodDelete, "/v2/projects/p/sinks/errors", "")
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete=%d %s", deleted.Code, deleted.Body.String())
+	}
+
+	replayed := &recordingSinkDeliverer{}
+	restarted, err := NewAPIWithStore(store, "", replayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReplayPendingDeliveries(); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed.deliveries) != 0 || len(restarted.pending) != 0 {
+		t.Fatalf("deleted sink replayed: deliveries=%#v pending=%#v", replayed.deliveries, restarted.pending)
+	}
+}
+
 func TestLoggingListOrderingAndBounds(t *testing.T) {
 	api, err := NewAPIWithStore(nil, "", nil)
 	if err != nil {
@@ -369,6 +457,26 @@ func TestLoggingSaveFailureRollsBackAndRetryPublishesOnce(t *testing.T) {
 	}
 }
 
+func TestSinkDeleteSaveFailureRetainsSinkAndPendingDelivery(t *testing.T) {
+	store := &toggleLoggingStore{fail: true}
+	api := newAPI(store, &recordingSinkDeliverer{})
+	sink := LogSink{Name: "errors", Destination: "file://errors"}
+	api.sinks["p:errors"] = sink
+	api.pending = []sinkDelivery{{
+		ID: "stable", SinkKey: "p:errors", Sink: sink,
+		Entry: LogEntry{LogName: "projects/p/logs/app", TextPayload: "retry"},
+	}}
+
+	response := loggingRequest(api, http.MethodDelete, "/v2/projects/p/sinks/errors", "")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("delete=%d %s", response.Code, response.Body.String())
+	}
+	if api.sinks["p:errors"].Name != "errors" || len(api.pending) != 1 ||
+		api.pending[0].ID != "stable" {
+		t.Fatalf("failed delete did not roll back: sinks=%#v pending=%#v", api.sinks, api.pending)
+	}
+}
+
 func TestCorruptStateDisablesLoggingRuntime(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("MINISKY_STATE_DIR", root)
@@ -438,11 +546,12 @@ func TestLoggingFileAndPubSubSinksAvoidDeliveryLoops(t *testing.T) {
 
 type recordingSinkDeliverer struct {
 	deliveries []string
+	err        error
 }
 
 func (d *recordingSinkDeliverer) Deliver(sink LogSink, entry LogEntry) error {
 	d.deliveries = append(d.deliveries, sink.Destination+":"+entry.TextPayload)
-	return nil
+	return d.err
 }
 
 func loggingRequest(handler http.Handler, method, path, body string) *httptest.ResponseRecorder {

@@ -269,8 +269,8 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
                   sx={{ margin: 0 }}
                 />
               </Tooltip>
-              <IconButton onClick={() => loadCollections()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh" onClick={() => loadCollections()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 
@@ -279,7 +279,7 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
             <Box sx={{ width: 280, borderRight: '1px solid #dadce0', bgcolor: 'white', display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, borderBottom: '1px solid #dadce0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>Collections</Typography>
-                <IconButton size="small" onClick={() => setNewColOpen(true)}><AddIcon fontSize="small" /></IconButton>
+                <IconButton aria-label="Add" size="small" onClick={() => setNewColOpen(true)}><AddIcon fontSize="small" /></IconButton>
               </Box>
               <List sx={{ flex: 1, overflow: 'auto', p: 0 }}>
                 {collections.map(col => (
@@ -299,7 +299,7 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
             <Box sx={{ width: 320, borderRight: '1px solid #dadce0', bgcolor: '#fff', display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, borderBottom: '1px solid #dadce0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>Documents</Typography>
-                <IconButton size="small" onClick={handleCreateDocument} disabled={!activeCollection} color="primary">
+                <IconButton aria-label="Add" size="small" onClick={handleCreateDocument} disabled={!activeCollection} color="primary">
                   <AddIcon fontSize="small" />
                 </IconButton>
               </Box>
@@ -325,7 +325,7 @@ export default function FirestoreManagerDrawer({ open, onClose }: FirestoreManag
                         primary={<Typography sx={{ fontSize: '0.85rem', fontFamily: 'monospace', fontWeight: activeDocument?.name === doc.name ? 600 : 400 }}>{docId}</Typography>} 
                         secondary={<Typography sx={{ fontSize: '0.7rem' }}>Updated: {new Date(doc.updateTime).toLocaleString()}</Typography>}
                       />
-                      <IconButton size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteDocument(doc.name); }}>
+                      <IconButton aria-label={`Delete document ${docId}`} size="small" sx={{ opacity: 0.6, '&:hover': { opacity: 1, color: 'error.main' } }} onClick={(e) => { e.stopPropagation(); handleDeleteDocument(doc.name); }}>
                         <DeleteIcon fontSize="inherit" />
                       </IconButton>
                     </ListItemButton>

@@ -30,6 +30,12 @@ const phases = [
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
+  ["18", "Event workflows", "Experimental bounded slice", "Eventarc → Workflows delivery, replay, cancellation, SSRF, scoped LRO, and restart evidence pass; Batch container execution remains 501"],
+  ["19", "Pipelines and streaming", "Experimental truthful boundary", "Dataform hierarchy is durable; Dataflow, Composer, Kafka, and Pub/Sub Lite execution remain explicit 501 without owned backends"],
+  ["20", "Extended databases", "Experimental bounded slice", "Identity Platform, Filestore, and Storage Transfer have bounded workflows; AlloyDB and Valkey execution remain explicit 501"],
+  ["21–22", "Observability and API management", "Experimental bounded slice", "Durable ingestion, hierarchy, local gateway, directory, and rollout tests pass; external deployment parity remains unsupported"],
+  ["23", "AI and ML services", "Experimental deterministic slice", "Control-plane resources persist; unsupported inference and semantic outputs return 501 rather than fabricated confidence"],
+  ["24–25", "Security and networking", "Experimental policy slice", "CA, Binary Authorization, DLP, asset, org-policy, and perimeter evaluators are bounded; CDN/Armor data-plane parity remains unsupported"],
 ];
 
 const waves = [
@@ -110,6 +116,18 @@ const waves = [
     ],
     gate: "The bounded local slice is verified; CI pass evidence, external identity, distributed quotas, immutable audit storage, package publication, and runtime loading remain separate gates.",
   },
+  {
+    title: "Wave 8 — Promote Phase 18–25 services by evidence",
+    phases: "18–25",
+    deliverables: [
+      "Keep every Phase 18–25 service domain default-off and experimental until its individual promotion gate passes.",
+      "Reuse semantic import validation, transactional persistence, typed scoped LROs, opaque pagination, explicit routing, and strict IAM foundations.",
+      "Promote only bounded package workflows with public-gateway, restart, generated-client, failure, and cleanup evidence.",
+      "Return canonical 501 for Batch, Dataflow, Composer, Kafka, AlloyDB, Valkey, model inference, CDN, and Armor behavior until exact-owned backends exist.",
+      "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
+    ],
+    gate: "make test-phase18-25-evidence and the full race suite pass; each promoted service adds its own SDK/backend/Terraform evidence without changing default-off status for the others.",
+  },
 ];
 
 export default function MiniSkyRoadmapCompletionPlan() {
@@ -120,7 +138,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Stack gap={8}>
         <Row align="center" justify="space-between" wrap>
           <H1>MiniSky roadmap completion plan</H1>
-          <Pill active>Repository audit · 2026-07-26</Pill>
+          <Pill active>Repository audit · 2026-07-27</Pill>
         </Row>
         <Text tone="secondary">
           A dependency-ordered plan grounded in <Code>README.md</Code>, <Code>PRODUCT.md</Code>,
@@ -129,11 +147,13 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Stack>
 
       <Callout tone="info" title="Implementation status">
-        Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
+        The registry now verifies 71 domains. Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
         delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL, Logging, DNS/UDP,
         Subnetwork/IPAM SDK and Terraform, and Vertex prediction restart gates, and Phase-17 federated
-        RBAC/quota/audit integration. Fifteen guarded local gates have passed. Native amd64 and arm64 deb/rpm
+        RBAC/quota/audit integration. Phase 18–25 services now share fail-closed state, scoped operation,
+        pagination, routing, IAM, and evidence foundations while remaining default-off experimental.
+        Fifteen guarded local gates have passed. Native amd64 and arm64 deb/rpm
         build-install-smoke-uninstall jobs also pass in read-only CI; the opt-in Phase-9 event-delivery, Phase-16
         subnetwork SDK and Terraform, and Phase-17 CI jobs are configured but have no CI pass evidence yet.
         Production-grade semantics remain explicit external boundaries.
@@ -141,16 +161,16 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
-          <CardHeader>Guarded local gates</CardHeader>
-          <CardBody><H2>15 passed</H2><Text tone="secondary">Including Phase-16 provider import</Text></CardBody>
+          <CardHeader>Registry contract</CardHeader>
+          <CardBody><H2>71 domains</H2><Text tone="secondary">Manifest, docs, IAM, and routing checked</Text></CardBody>
         </Card>
         <Card>
-          <CardHeader>Native release smoke</CardHeader>
-          <CardBody><H2>Passed</H2><Text tone="secondary">macOS ARM64 snapshot and DuckDB doctor</Text></CardBody>
+          <CardHeader>Phase 18–25 gate</CardHeader>
+          <CardBody><H2>Passed</H2><Text tone="secondary">Offline evidence plus full Go race suite</Text></CardBody>
         </Card>
         <Card>
-          <CardHeader>Native package gates</CardHeader>
-          <CardBody><H2>Passed</H2><Text tone="secondary">amd64 and arm64 deb/rpm lifecycle</Text></CardBody>
+          <CardHeader>Promotion status</CardHeader>
+          <CardBody><H2>Default-off</H2><Text tone="secondary">Experimental until per-service evidence passes</Text></CardBody>
         </Card>
       </Grid>
 
@@ -332,11 +352,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Next internal executable milestone: prove one generated-client and provider-managed Compute instance can attach
-        to the bounded custom subnetwork and exchange traffic through the exact owned bridge before any NAT, peering,
-        or PSC expansion.
-        Homebrew, Scoop, deb, and rpm publication remains externally blocked until maintainer-owned repositories,
-        scoped credentials, protected approval environments, and native install-from-repository tests exist.
+        Next internal executable milestone: add an exact-owned, cleanup-safe Batch container runner and generated-client
+        create → execute → restart → observe → delete evidence. Composer, Managed Kafka, AlloyDB, and Valkey remain
+        explicit 501 boundaries until their backend ownership contracts are implemented. Refresh the committed
+        <Code>.codegraph/codegraph.db</Code> after those structural changes.
       </Callout>
     </Stack>
   );

@@ -5,11 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,6 +26,358 @@ func TestWaitUntilHTTPReadyAcceptsAnyHTTPResponse(t *testing.T) {
 
 	if err := waitUntilHTTPReady(server.URL, time.Second); err != nil {
 		t.Fatalf("wait for HTTP response: %v", err)
+	}
+}
+
+func TestServiceManagerUsesPerRequestDockerDeadlines(t *testing.T) {
+	manager, err := NewServiceManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.dockerClient == nil || manager.dockerClient.Timeout != 0 {
+		t.Fatalf("Docker client timeout = %v, want no global stream deadline", manager.dockerClient)
+	}
+	var remaining time.Duration
+	manager.dockerClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		if !ok {
+			t.Fatal("ordinary Docker request has no deadline")
+		}
+		remaining = time.Until(deadline)
+		return dockerResponse(http.StatusOK, `{}`), nil
+	})
+	request, err := http.NewRequest(http.MethodGet, "http://localhost/version", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := manager.doDocker(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if remaining <= 0 || remaining > dockerRequestTimeout {
+		t.Fatalf("ordinary Docker deadline remaining = %v", remaining)
+	}
+
+	remaining = 0
+	manager.dockerClient.Transport = deadlineRoundTripper{
+		timeout: dockerRequestTimeout,
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			deadline, ok := request.Context().Deadline()
+			if !ok {
+				t.Fatal("direct Docker client request has no deadline")
+			}
+			remaining = time.Until(deadline)
+			return dockerResponse(http.StatusOK, `{}`), nil
+		}),
+	}
+	response, err = manager.dockerClient.Get("http://localhost/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if remaining <= 0 || remaining > dockerRequestTimeout {
+		t.Fatalf("direct Docker deadline remaining = %v", remaining)
+	}
+}
+
+func TestImagePullUsesExplicitPullDeadline(t *testing.T) {
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	var remaining time.Duration
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		if !ok {
+			t.Fatal("image pull has no deadline")
+		}
+		remaining = time.Until(deadline)
+		return dockerResponse(http.StatusOK, ""), nil
+	})}
+	if err := manager.pullImageInternal(context.Background(), "example/image:latest"); err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= dockerRequestTimeout || remaining > dockerImagePullTimeout {
+		t.Fatalf("pull deadline remaining = %v, want explicit pull budget", remaining)
+	}
+}
+
+func TestCloudSQLAdminCommandUsesExecutableQuotedSQL(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  string
+		action   string
+		resource string
+		password string
+		want     []string
+	}{
+		{
+			name: "postgres database", version: "POSTGRES_18", action: "CREATE_DATABASE", resource: "app_db",
+			want: []string{"psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", `CREATE DATABASE "app_db"`},
+		},
+		{
+			name: "postgres user", version: "POSTGRES_18", action: "CREATE_USER", resource: "app_user", password: "pa'ss",
+			want: []string{"psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+				`CREATE USER "app_user" WITH PASSWORD 'pa''ss'`},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := cloudSQLAdminCommand(test.version, test.action, test.resource, test.password)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("command = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCleanupProfileSweepsOnlyExactOwnedDockerResources(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "cleanup")
+	var deleted []string
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/json":
+			return dockerResponse(http.StatusOK, `[
+				{"Id":"compute","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"compute-instance"}},
+				{"Id":"dataproc","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"compute-instance"}},
+				{"Id":"serverless","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"serverless"}},
+				{"Id":"cloudsql","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"cloudsql"}},
+				{"Id":"redis-container","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"memorystore-redis"}},
+				{"Id":"emulator","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"storage.googleapis.com"}},
+				{"Id":"foreign","Labels":{"managed-by":"minisky","minisky.profile":"other"}}
+			]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/networks":
+			return dockerResponse(http.StatusOK, `[
+				{"Id":"network","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"compute-network"}},
+				{"Id":"foreign-network","Labels":{"managed-by":"someone-else","minisky.profile":"cleanup"}}
+			]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/volumes":
+			return dockerResponse(http.StatusOK, `{"Volumes":[
+				{"Name":"redis","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"memorystore-redis"}},
+				{"Name":"sql","Labels":{"managed-by":"minisky","minisky.profile":"cleanup","minisky.service":"cloudsql"}},
+				{"Name":"foreign-volume","Labels":{"managed-by":"minisky","minisky.profile":"other"}}
+			]}`), nil
+		case request.Method == http.MethodGet &&
+			(request.URL.Path == "/volumes/redis" || request.URL.Path == "/volumes/sql"):
+			name := strings.TrimPrefix(request.URL.Path, "/volumes/")
+			return dockerResponse(http.StatusOK, fmt.Sprintf(
+				`{"Name":%q,"Labels":{"managed-by":"minisky","minisky.profile":"cleanup"}}`,
+				name,
+			)), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/volumes/prune":
+			if got := request.URL.Query().Get("filters"); !strings.Contains(got, "minisky.profile=cleanup") ||
+				!strings.Contains(got, "managed-by=minisky") || !strings.Contains(got, `"all":["true"]`) {
+				t.Fatalf("unsafe volume prune filters: %s", got)
+			}
+			return dockerResponse(http.StatusOK, `{"VolumesDeleted":["redis","sql"]}`), nil
+		case request.Method == http.MethodDelete:
+			deleted = append(deleted, request.URL.Path)
+			return dockerResponse(http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	if err := manager.CleanupProfile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(deleted)
+	want := []string{
+		"/containers/cloudsql", "/containers/compute", "/containers/dataproc",
+		"/containers/emulator", "/containers/redis-container", "/containers/serverless", "/networks/network",
+	}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("deleted = %#v, want %#v", deleted, want)
+	}
+}
+
+func TestCleanupProfilePropagatesDeletionFailure(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "cleanup")
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/json":
+			return dockerResponse(http.StatusOK, `[{"Id":"owned","Labels":{"managed-by":"minisky","minisky.profile":"cleanup"}}]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/networks":
+			return dockerResponse(http.StatusOK, `[]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/volumes":
+			return dockerResponse(http.StatusOK, `{"Volumes":[]}`), nil
+		case request.Method == http.MethodDelete:
+			return dockerResponse(http.StatusInternalServerError, `{"message":"busy"}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/volumes/prune":
+			return dockerResponse(http.StatusOK, `{"VolumesDeleted":[]}`), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	if err := manager.CleanupProfile(context.Background()); err == nil {
+		t.Fatal("cleanup deletion failure was hidden")
+	}
+}
+
+type trackedDockerBody struct {
+	io.Reader
+	closed *atomic.Int32
+	err    error
+}
+
+func (body *trackedDockerBody) Close() error {
+	body.closed.Add(1)
+	return body.err
+}
+
+func TestTeardownClosesBodiesAndJoinsDockerStatusFailures(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "teardown")
+	var responses atomic.Int32
+	var closed atomic.Int32
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		responses.Add(1)
+		status := http.StatusOK
+		body := `{"Id":"immutable-container-id","State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"teardown"}}}`
+		switch request.Method {
+		case http.MethodPost:
+			status = http.StatusInternalServerError
+			body = `{"message":"stop failed"}`
+		case http.MethodDelete:
+			status = http.StatusConflict
+			body = `{"message":"remove failed"}`
+		}
+		var closeErr error
+		if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/networks/") {
+			closeErr = errors.New("close failed")
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body: &trackedDockerBody{
+				Reader: strings.NewReader(body),
+				closed: &closed,
+				err:    closeErr,
+			},
+			Header:  make(http.Header),
+			Request: request,
+		}, nil
+	})}
+
+	err := manager.Teardown(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "stop") ||
+		!strings.Contains(err.Error(), "remove") || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("teardown error = %v, want joined stop/remove/close failures", err)
+	}
+	if got, want := closed.Load(), responses.Load(); got != want {
+		t.Fatalf("closed response bodies = %d, want %d", got, want)
+	}
+}
+
+func TestTeardownDeletesCapturedContainerAndNetworkIDs(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "teardown")
+	var mutations []string
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/containers/"):
+			return dockerResponse(http.StatusOK,
+				`{"Id":"container/id","State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"teardown"}}}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/networks/minisky-net":
+			return dockerResponse(http.StatusOK,
+				`{"Id":"network/id","Labels":{"managed-by":"minisky","minisky.profile":"teardown"}}`), nil
+		case request.Method == http.MethodPost || request.Method == http.MethodDelete:
+			mutations = append(mutations, request.Method+" "+request.URL.EscapedPath())
+			return dockerResponse(http.StatusNoContent, ""), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	if err := manager.Teardown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range mutations {
+		if strings.Contains(mutation, "minisky-") {
+			t.Fatalf("teardown mutated by replaceable name: %s", mutation)
+		}
+	}
+	if !slices.Contains(mutations, "POST /containers/container%2Fid/stop") ||
+		!slices.Contains(mutations, "DELETE /containers/container%2Fid") ||
+		!slices.Contains(mutations, "DELETE /networks/network%2Fid") {
+		t.Fatalf("immutable-ID mutations = %#v", mutations)
+	}
+}
+
+func TestCleanupProfilePrunesVolumesOnlyByServerSideLabels(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "cleanup")
+	pruned := false
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/json":
+			return dockerResponse(http.StatusOK, `[]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/networks":
+			return dockerResponse(http.StatusOK, `[]`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/volumes/prune":
+			pruned = true
+			filters := request.URL.Query().Get("filters")
+			if !strings.Contains(filters, "managed-by=minisky") ||
+				!strings.Contains(filters, "minisky.profile=cleanup") || !strings.Contains(filters, `"all":["true"]`) {
+				t.Fatalf("unsafe volume prune filters: %s", filters)
+			}
+			return dockerResponse(http.StatusOK, `{"VolumesDeleted":["replaceable"]}`), nil
+		case strings.HasPrefix(request.URL.Path, "/volumes/"):
+			t.Fatalf("volume cleanup used replaceable name: %s %s", request.Method, request.URL)
+			return nil, nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	if err := manager.CleanupProfile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !pruned {
+		t.Fatal("profile cleanup did not use atomic server-side prune")
+	}
+}
+
+func TestCleanupAllProfilesRequiresExactMiniSkyOwnershipLabels(t *testing.T) {
+	var deleted []string
+	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/json":
+			return dockerResponse(http.StatusOK, `[
+				{"Id":"one","Labels":{"managed-by":"minisky","minisky.profile":"one"}},
+				{"Id":"two","Labels":{"managed-by":"minisky","minisky.profile":"two"}},
+				{"Id":"missing-profile","Labels":{"managed-by":"minisky"}},
+				{"Id":"foreign","Labels":{"managed-by":"other","minisky.profile":"one"}}
+			]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/networks":
+			return dockerResponse(http.StatusOK, `[]`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/volumes":
+			return dockerResponse(http.StatusOK, `{"Volumes":[]}`), nil
+		case request.Method == http.MethodDelete:
+			deleted = append(deleted, request.URL.Path)
+			return dockerResponse(http.StatusNoContent, ""), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/volumes/prune":
+			filters := request.URL.Query().Get("filters")
+			if !strings.Contains(filters, "managed-by=minisky") ||
+				!strings.Contains(filters, `"minisky.profile"`) || !strings.Contains(filters, `"all":["true"]`) {
+				t.Fatalf("unsafe all-profile volume prune filters: %s", filters)
+			}
+			return dockerResponse(http.StatusOK, `{"VolumesDeleted":[]}`), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	if err := manager.CleanupAllProfiles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(deleted)
+	if !reflect.DeepEqual(deleted, []string{"/containers/one", "/containers/two"}) {
+		t.Fatalf("deleted = %#v", deleted)
 	}
 }
 
@@ -77,6 +435,33 @@ func TestTerminalExecTargetRequiresActiveProfileOwnership(t *testing.T) {
 
 	if err := manager.validateExecTarget("minisky-vm"); err == nil {
 		t.Fatal("terminal exec accepted a container owned by another profile")
+	}
+}
+
+func TestRunCommandRequiresExactOwnedComputeContainerAndRedactsArguments(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	mutated := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			mutated = true
+		}
+		return dockerResponse(http.StatusOK,
+			`{"State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"compute-instance","minisky.resource":"minisky-dataproc-cluster-m"}}}`), nil
+	})}}
+	_, err := manager.RunCommandInContainer("minisky-dataproc-cluster-m", []string{"spark-submit", "--password=secret"})
+	if err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("exec error = %v, want ownership refusal", err)
+	}
+	if mutated {
+		t.Fatal("unowned container reached Docker exec mutation")
+	}
+	if strings.Contains(logs.String(), "secret") {
+		t.Fatalf("command arguments leaked to logs: %s", logs.String())
 	}
 }
 

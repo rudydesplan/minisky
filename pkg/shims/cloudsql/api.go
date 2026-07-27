@@ -18,6 +18,7 @@ import (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(cloudSQLStateEntry, state.StrictEntryValidator[cloudSQLMetadata](nil))
 	registry.Register("sqladmin.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -54,6 +55,8 @@ type InstanceSettings struct {
 	StorageAutoResize   bool              `json:"storageAutoResize"`
 	DataDiskSizeGb      string            `json:"dataDiskSizeGb"`
 	DataDiskType        string            `json:"dataDiskType"` // PD_SSD, PD_HDD
+	AvailabilityType    string            `json:"availabilityType"`
+	PricingPlan         string            `json:"pricingPlan"`
 }
 
 type BackupConfig struct {
@@ -123,10 +126,12 @@ type SqlOperation struct {
 type API struct {
 	mu         sync.RWMutex
 	persistMu  sync.Mutex
+	adminMu    sync.Mutex
 	opMgr      *orchestrator.OperationManager
 	svcMgr     *orchestrator.ServiceManager
 	backend    cloudSQLBackend
 	stateStore cloudSQLStore
+	initErr    error
 	instances  map[string]*DatabaseInstance // key: project:instanceName
 	databases  map[string][]*Database       // key: project:instanceName
 	users      map[string][]*User           // key: project:instanceName
@@ -135,6 +140,7 @@ type API struct {
 type cloudSQLBackend interface {
 	Create(context.Context, string, string, string, string) (string, bool, error)
 	Delete(context.Context, string, string) error
+	ExecuteAdmin(context.Context, string, string, string, string, string, string) error
 }
 
 type serviceManagerBackend struct {
@@ -155,16 +161,29 @@ func (b serviceManagerBackend) Delete(ctx context.Context, project, name string)
 	return b.manager.DeleteCloudSQLVMContext(ctx, project, name)
 }
 
+func (b serviceManagerBackend) ExecuteAdmin(
+	ctx context.Context,
+	project, instance, version, action, name, password string,
+) error {
+	if b.manager == nil {
+		return fmt.Errorf("Cloud SQL backend is unavailable")
+	}
+	return b.manager.ExecuteCloudSQLAdmin(ctx, project, instance, version, action, name, password)
+}
+
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
 		log.Printf("[Shim: Cloud SQL] state disabled: %v", err)
-		return newAPI(opMgr, svcMgr, nil)
+		api := newAPI(opMgr, svcMgr, nil)
+		api.initErr = fmt.Errorf("open Cloud SQL state: %w", err)
+		return api
 	}
 	api, err := NewAPIWithStore(opMgr, svcMgr, store)
 	if err != nil {
 		log.Printf("[Shim: Cloud SQL] state rehydration failed: %v", err)
-		return newAPI(opMgr, svcMgr, store)
+		api = newAPI(opMgr, svcMgr, store)
+		api.initErr = err
 	}
 	return api
 }
@@ -210,6 +229,11 @@ func newAPIWithDependencies(
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud SQL] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.PersistenceError() != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Cloud SQL persistence is unavailable")
+		return
+	}
 
 	path := r.URL.Path
 	project := extractSegmentAfter(path, "projects")
@@ -229,6 +253,12 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Cloud SQL resource not found: "+path)
 	}
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.initErr
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +325,12 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	}
 	if settings.DataDiskType == "" {
 		settings.DataDiskType = "PD_SSD"
+	}
+	if settings.AvailabilityType == "" {
+		settings.AvailabilityType = "ZONAL"
+	}
+	if settings.PricingPlan == "" {
+		settings.PricingPlan = "PER_USE"
 	}
 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, body.Name)
@@ -443,18 +479,29 @@ func (api *API) listInstances(w http.ResponseWriter, project string) {
 
 func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, name string) {
 	key := instanceKey(project, name)
+	api.adminMu.Lock()
 	api.mu.Lock()
 	inst, ok := api.instances[key]
 	if !ok {
 		api.mu.Unlock()
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", fmt.Sprintf("Instance '%s' not found", name))
 		return
 	}
 
+	previousState := inst.State
+	previousBackendStatus := inst.BackendStatus
 	inst.State = "PENDING_DELETE"
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		if current := api.instances[key]; current == inst {
+			current.State = previousState
+			current.BackendStatus = previousBackendStatus
+		}
+		api.mu.Unlock()
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist deleting Cloud SQL instance: "+err.Error())
 		return
@@ -470,12 +517,14 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		if persistErr := api.persistMetadata(); persistErr != nil {
 			err = errors.Join(err, fmt.Errorf("persist degraded instance: %w", persistErr))
 		}
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
+		defer api.adminMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := api.backend.Delete(ctx, project, name); err != nil {
@@ -510,6 +559,13 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 			api.databases[key] = oldDatabases
 			api.users[key] = oldUsers
 			api.mu.Unlock()
+			degradedErr := api.persistMetadata()
+			if degradedErr != nil {
+				return errors.Join(
+					fmt.Errorf("persist deleted instance: %w", err),
+					fmt.Errorf("persist backend-deleted reconciliation tombstone: %w", degradedErr),
+				)
+			}
 			return fmt.Errorf("persist deleted instance: %w", err)
 		}
 		return nil
@@ -570,6 +626,35 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 			writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 			return
 		}
+		if !validCloudSQLPrincipal(body.Name) {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, 400, "INVALID_ARGUMENT", "database name must use letters, digits, hyphens, or underscores")
+			return
+		}
+		api.adminMu.Lock()
+		defer api.adminMu.Unlock()
+		iKey := instanceKey(project, instance)
+		inst, ok := api.runnableInstance(iKey)
+		if !ok {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "Cloud SQL instance backend is not runnable")
+			return
+		}
+		api.mu.RLock()
+		for _, existing := range api.databases[iKey] {
+			if existing.Name == body.Name {
+				api.mu.RUnlock()
+				w.WriteHeader(http.StatusConflict)
+				writeError(w, http.StatusConflict, "ALREADY_EXISTS", "Database "+body.Name+" already exists")
+				return
+			}
+		}
+		api.mu.RUnlock()
+		if err := api.executeAdmin(r.Context(), project, instance, inst.DatabaseVersion, "CREATE_DATABASE", body.Name, ""); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "create database in owned backend: "+err.Error())
+			return
+		}
 		charset := body.Charset
 		if charset == "" {
 			charset = "UTF8"
@@ -588,11 +673,23 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 			Collation: collation,
 			Etag:      newEtag(),
 		}
-		iKey := instanceKey(project, instance)
 		api.mu.Lock()
 		api.databases[iKey] = append(api.databases[iKey], db)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
+			compensationErr := api.executeAdmin(context.Background(), project, instance,
+				inst.DatabaseVersion, "DELETE_DATABASE", body.Name, "")
+			api.mu.Lock()
+			if compensationErr == nil {
+				api.databases[iKey] = removeDatabase(api.databases[iKey], body.Name)
+			} else {
+				api.markChildReconciliationLocked(iKey,
+					"database backend create committed but compensation failed: "+compensationErr.Error())
+			}
+			api.mu.Unlock()
+			if compensationErr != nil {
+				err = errors.Join(err, compensationErr, api.persistMetadata())
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			writeError(w, 500, "INTERNAL", "persist Cloud SQL database metadata: "+err.Error())
 			return
@@ -635,6 +732,60 @@ func (api *API) routeDatabases(w http.ResponseWriter, r *http.Request, project, 
 			"items": dbs,
 		})
 
+	case http.MethodDelete:
+		if dbName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "database name is required")
+			return
+		}
+		api.adminMu.Lock()
+		defer api.adminMu.Unlock()
+		iKey := instanceKey(project, instance)
+		inst, ok := api.runnableInstance(iKey)
+		if !ok {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "Cloud SQL instance backend is not runnable")
+			return
+		}
+		api.mu.RLock()
+		var existing *Database
+		for _, database := range api.databases[iKey] {
+			if database.Name == dbName {
+				clone := *database
+				existing = &clone
+				break
+			}
+		}
+		api.mu.RUnlock()
+		if existing == nil {
+			w.WriteHeader(http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Database "+dbName+" not found")
+			return
+		}
+		if err := api.executeAdmin(r.Context(), project, instance, inst.DatabaseVersion, "DELETE_DATABASE", dbName, ""); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "delete database from owned backend: "+err.Error())
+			return
+		}
+		api.mu.Lock()
+		api.databases[iKey] = removeDatabase(api.databases[iKey], dbName)
+		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			api.databases[iKey] = append(api.databases[iKey], existing)
+			api.markChildReconciliationLocked(iKey,
+				"database backend deleted but metadata removal persistence failed: "+err.Error())
+			api.mu.Unlock()
+			err = errors.Join(err, api.persistMetadata())
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "INTERNAL",
+				"database backend deleted but metadata persistence failed: "+err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"kind": "sql#operation", "status": "DONE", "operationType": "DELETE_DATABASE",
+		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
@@ -658,6 +809,40 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 			writeError(w, 400, "INVALID_ARGUMENT", "Parse error: "+err.Error())
 			return
 		}
+		if !validCloudSQLPrincipal(body.Name) {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "user name must use letters, digits, hyphens, or underscores")
+			return
+		}
+		if body.Host != "" && body.Host != "%" {
+			w.WriteHeader(http.StatusNotImplemented)
+			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "custom Cloud SQL user hosts are not supported")
+			return
+		}
+		api.adminMu.Lock()
+		defer api.adminMu.Unlock()
+		iKey := instanceKey(project, instance)
+		inst, ok := api.runnableInstance(iKey)
+		if !ok {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "Cloud SQL instance backend is not runnable")
+			return
+		}
+		api.mu.RLock()
+		for _, existing := range api.users[iKey] {
+			if existing.Name == body.Name {
+				api.mu.RUnlock()
+				w.WriteHeader(http.StatusConflict)
+				writeError(w, http.StatusConflict, "ALREADY_EXISTS", "User "+body.Name+" already exists")
+				return
+			}
+		}
+		api.mu.RUnlock()
+		if err := api.executeAdmin(r.Context(), project, instance, inst.DatabaseVersion, "CREATE_USER", body.Name, body.Password); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "create user in owned backend: "+err.Error())
+			return
+		}
 		user := &User{
 			Kind:     "sql#user",
 			Name:     body.Name,
@@ -665,11 +850,23 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 			Instance: instance,
 			Project:  project,
 		}
-		iKey := instanceKey(project, instance)
 		api.mu.Lock()
 		api.users[iKey] = append(api.users[iKey], user)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
+			compensationErr := api.executeAdmin(context.Background(), project, instance,
+				inst.DatabaseVersion, "DELETE_USER", body.Name, "")
+			api.mu.Lock()
+			if compensationErr == nil {
+				api.users[iKey] = removeUser(api.users[iKey], body.Name)
+			} else {
+				api.markChildReconciliationLocked(iKey,
+					"user backend create committed but compensation failed: "+compensationErr.Error())
+			}
+			api.mu.Unlock()
+			if compensationErr != nil {
+				err = errors.Join(err, compensationErr, api.persistMetadata())
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			writeError(w, 500, "INTERNAL", "persist Cloud SQL user metadata: "+err.Error())
 			return
@@ -698,6 +895,67 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 			"items": users,
 		})
 
+	case http.MethodDelete:
+		name := r.URL.Query().Get("name")
+		if !validCloudSQLPrincipal(name) {
+			w.WriteHeader(http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "user name query parameter is required")
+			return
+		}
+		host := r.URL.Query().Get("host")
+		if host != "" && host != "%" {
+			w.WriteHeader(http.StatusNotImplemented)
+			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "custom Cloud SQL user hosts are not supported")
+			return
+		}
+		api.adminMu.Lock()
+		defer api.adminMu.Unlock()
+		iKey := instanceKey(project, instance)
+		inst, ok := api.runnableInstance(iKey)
+		if !ok {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "Cloud SQL instance backend is not runnable")
+			return
+		}
+		api.mu.RLock()
+		var existing *User
+		for _, user := range api.users[iKey] {
+			if user.Name == name {
+				clone := *user
+				existing = &clone
+				break
+			}
+		}
+		api.mu.RUnlock()
+		if existing == nil {
+			w.WriteHeader(http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "User "+name+" not found")
+			return
+		}
+		if err := api.executeAdmin(r.Context(), project, instance, inst.DatabaseVersion, "DELETE_USER", name, ""); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "delete user from owned backend: "+err.Error())
+			return
+		}
+		api.mu.Lock()
+		api.users[iKey] = removeUser(api.users[iKey], name)
+		api.mu.Unlock()
+		if err := api.persistMetadata(); err != nil {
+			api.mu.Lock()
+			api.users[iKey] = append(api.users[iKey], existing)
+			api.markChildReconciliationLocked(iKey,
+				"user backend deleted but metadata removal persistence failed: "+err.Error())
+			api.mu.Unlock()
+			err = errors.Join(err, api.persistMetadata())
+			w.WriteHeader(http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "INTERNAL",
+				"user backend deleted but metadata persistence failed: "+err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"kind": "sql#operation", "status": "DONE", "operationType": "DELETE_USER",
+		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
@@ -709,9 +967,11 @@ func (api *API) routeUsers(w http.ResponseWriter, r *http.Request, project, inst
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string) {
+	project := extractSegmentAfter(path, "projects")
 	opName := extractSegmentAfter(path, "operations")
 	op := api.opMgr.Get(opName)
-	if op == nil {
+	targetPrefix := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/", project)
+	if op == nil || op.Kind != "sql#operation" || !strings.HasPrefix(op.TargetLink, targetPrefix) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
 		return
@@ -791,6 +1051,64 @@ func cloneUsers(users []*User) []*User {
 		result = append(result, &clone)
 	}
 	return result
+}
+
+func (api *API) runnableInstance(key string) (*DatabaseInstance, bool) {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	instance := cloneDatabaseInstance(api.instances[key])
+	return instance, instance != nil && instance.State == "RUNNABLE"
+}
+
+func (api *API) markChildReconciliationLocked(key, status string) {
+	if instance := api.instances[key]; instance != nil {
+		instance.State = "ERROR"
+		instance.BackendStatus = status
+		instance.IpAddresses = nil
+	}
+}
+
+func (api *API) executeAdmin(
+	parent context.Context,
+	project, instance, version, action, name, password string,
+) error {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	return api.backend.ExecuteAdmin(ctx, project, instance, version, action, name, password)
+}
+
+func removeDatabase(databases []*Database, name string) []*Database {
+	result := databases[:0]
+	for _, database := range databases {
+		if database.Name != name {
+			result = append(result, database)
+		}
+	}
+	return result
+}
+
+func removeUser(users []*User, name string) []*User {
+	result := users[:0]
+	for _, user := range users {
+		if user.Name != name {
+			result = append(result, user)
+		}
+	}
+	return result
+}
+
+func validCloudSQLPrincipal(value string) bool {
+	if value == "" || len(value) > 63 {
+		return false
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func instanceKey(project, name string) string {

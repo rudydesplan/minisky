@@ -16,6 +16,8 @@ builds:
     env: [CGO_ENABLED=1]
     goos: [linux]
     goarch: [amd64]
+    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X minisky/pkg/version.Version={{ .Version }}
@@ -27,6 +29,8 @@ builds:
     env: [CGO_ENABLED=1]
     goos: [linux]
     goarch: [arm64]
+    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X minisky/pkg/version.Version={{ .Version }}
@@ -40,6 +44,8 @@ builds:
       - CC=clang
     goos: [darwin]
     goarch: [arm64]
+    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X minisky/pkg/version.Version={{ .Version }}
@@ -53,6 +59,8 @@ builds:
       - CC=gcc
     goos: [windows]
     goarch: [amd64]
+    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X minisky/pkg/version.Version={{ .Version }}

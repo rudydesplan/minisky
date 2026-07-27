@@ -149,6 +149,25 @@ func NewAPIHandler(
 	return withDashboardRBAC(mux, authorizer, tokenAudience)
 }
 
+func NewUnavailableAPIHandler(
+	diagnostics http.Handler,
+	authorizer dashboardAuthorizer,
+	tokenAudience string,
+) http.Handler {
+	mux := http.NewServeMux()
+	if diagnostics != nil {
+		mux.Handle("/api/diagnostics/", diagnostics)
+	}
+	mux.Handle("/", unavailableAPIHandler())
+	return withDashboardRBAC(mux, authorizer, tokenAudience)
+}
+
+func unavailableAPIHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeDashboardAPIError(w, http.StatusServiceUnavailable, "Docker-backed dashboard services are unavailable")
+	})
+}
+
 // ServiceStatus matches the UI's expected schema
 type ServiceStatus struct {
 	ID          string               `json:"id"`
@@ -164,6 +183,10 @@ type ServiceStatus struct {
 func (api *API) handleServices(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if api.svcMgr == nil || api.bqBackend == nil || api.gkeBackend == nil || api.servBackend == nil {
+		writeDashboardAPIError(w, http.StatusServiceUnavailable, "Dashboard service status dependencies are unavailable")
 		return
 	}
 
@@ -902,6 +925,14 @@ func (api *API) handleManageGke() http.Handler {
 
 // handleLoggingEntries returns all centralized log entries.
 func (api *API) handleLoggingEntries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if api.logAPI == nil {
+		writeDashboardAPIError(w, http.StatusServiceUnavailable, "Centralized logging is unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	entries := api.logAPI.GetEntries()
@@ -913,6 +944,14 @@ func (api *API) handleLoggingEntries(w http.ResponseWriter, r *http.Request) {
 
 // handleContainerLogs returns the stdout/stderr of a named container.
 func (api *API) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if api.svcMgr == nil {
+		writeDashboardAPIError(w, http.StatusServiceUnavailable, "Docker container logs are unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	name := r.URL.Query().Get("name")
 	if name == "" {
@@ -926,13 +965,25 @@ func (api *API) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(name, "minisky-serverless-") {
 		containerName = "minisky-serverless-" + name
 	}
-	logs, _ := api.svcMgr.GetContainerLogs(containerName, 200)
+	logs, err := api.svcMgr.GetContainerLogs(containerName, 200)
+	if err != nil {
+		writeDashboardAPIError(w, http.StatusBadGateway, "Container logs could not be read")
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(logs))
 }
 
 // handleMonitoringStats returns CPU/Memory stats for all managed containers.
 func (api *API) handleMonitoringStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if api.svcMgr == nil {
+		writeDashboardAPIError(w, http.StatusServiceUnavailable, "Docker container metrics are unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
@@ -946,14 +997,30 @@ func (api *API) handleMonitoringStats(w http.ResponseWriter, r *http.Request) {
 	metrics := make([]ContainerMetrics, 0)
 	for _, c := range containers {
 		m := ContainerMetrics{Name: c.Name, Status: c.Status}
-		if stats, err := api.svcMgr.GetContainerStats(c.Name); err == nil {
-			m.CPU = stats.CPUPercentage
-			m.MemMB = stats.MemoryUsageMB
+		stats, err := api.svcMgr.GetContainerStats(c.Name)
+		if err != nil {
+			writeDashboardAPIError(w, http.StatusBadGateway, "Container metrics could not be read")
+			return
 		}
+		m.CPU = stats.CPUPercentage
+		m.MemMB = stats.MemoryUsageMB
 		metrics = append(metrics, m)
 	}
 	json.NewEncoder(w).Encode(metrics)
 }
+
+func writeDashboardAPIError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":    status,
+			"message": message,
+			"status":  http.StatusText(status),
+		},
+	})
+}
+
 func (api *API) handleResetLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)

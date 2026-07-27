@@ -231,7 +231,7 @@ export default function CloudTasksPageContent() {
                     <>
                       <TableRow key={q.name} sx={{ '&:hover': { backgroundColor: '#fcfcfc' } }}>
                         <TableCell>
-                          <IconButton size="small" onClick={() => toggleExpand(q.name)}>
+                          <IconButton aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queue ${id}`} size="small" onClick={() => toggleExpand(q.name)}>
                             {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                           </IconButton>
                         </TableCell>
@@ -254,7 +254,7 @@ export default function CloudTasksPageContent() {
                           >
                             Create Task
                           </Button>
-                          <IconButton onClick={() => handleDeleteQueue(q.name)} color="error"><DeleteIcon /></IconButton>
+                          <IconButton aria-label={`Delete queue ${id}`} onClick={() => handleDeleteQueue(q.name)} color="error"><DeleteIcon /></IconButton>
                         </TableCell>
                       </TableRow>
                       <TableRow>
@@ -284,7 +284,7 @@ export default function CloudTasksPageContent() {
                                             </Box>
                                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                                               <Chip size="small" label={t.status || 'PENDING'} color={t.status === 'COMPLETED' ? 'success' : 'primary'} />
-                                              <IconButton size="small" onClick={() => handleDeleteTask(q.name, t.name)} color="error">
+                                              <IconButton aria-label={`Delete task ${tId}`} size="small" onClick={() => handleDeleteTask(q.name, t.name)} color="error">
                                                 <DeleteIcon fontSize="small" />
                                               </IconButton>
                                             </Box>

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -218,6 +219,24 @@ func TestAuditStrictModeRejectsMutationBeforeDispatchOnWriteFailure(t *testing.T
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "http://localhost/resource", nil))
 	if response.Code != http.StatusInternalServerError || dispatched {
 		t.Fatalf("status=%d dispatched=%t", response.Code, dispatched)
+	}
+	if !errors.Is(audit.PersistenceError(), context.Canceled) {
+		t.Fatalf("persistence error = %v, want write failure", audit.PersistenceError())
+	}
+}
+
+func TestAuditNonStrictWriteFailureDegradesPersistenceHealth(t *testing.T) {
+	audit := &AuditLog{profile: "non-strict", writer: failingAuditWriter{}}
+	handler := audit.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://localhost/resource", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if !errors.Is(audit.PersistenceError(), context.Canceled) {
+		t.Fatalf("persistence error = %v, want write failure", audit.PersistenceError())
 	}
 }
 

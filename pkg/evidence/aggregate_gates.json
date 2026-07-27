@@ -1,0 +1,12 @@
+[
+  {"name":"public-gateway","package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"],"methodNote":"all experimental canonical selectors; default-off, opt-in, validation ordering, and scoped IAM"},
+  {"name":"scoped-lro","package":"pkg/orchestrator","tests":["TestScopedOperationPollingRejectsWrongServiceParentAndTarget"],"methodNote":"service, project, location, and target-bound operation polling"},
+  {"name":"service-scoped-lro","package":"pkg/shims/eventarc","tests":["TestGetOperationRejectsDifferentProjectScope"],"methodNote":"service route rejects cross-project operation polling"},
+  {"name":"pagination","package":"pkg/pagination","tests":["TestPageTokensAreOpaqueDeterministicAndScopeBound","TestPageRejectsMalformedAndStaleTokens"],"methodNote":"malformed, stale, service, parent, filter, and order-bound tokens"},
+  {"name":"event-delivery-restart","package":"pkg/shims/eventarc","tests":["TestPubSubAndStorageEventsDeliverToWorkflowAfterRestart"],"methodNote":"durable Pub/Sub and Storage event intents replay into Workflows"},
+  {"name":"workflow-cancellation","package":"pkg/shims/workflows","tests":["TestCancelExecution","TestCancelExecutionCancelsInflightHTTPCall"],"methodNote":"state transition and in-flight request cancellation"},
+  {"name":"workflow-ssrf","package":"pkg/shims/workflows","tests":["TestValidateCallURLEnforcesLoopbackOnlySSRFBoundary"],"methodNote":"rejects credentials, metadata, external hosts, ports, and schemes"},
+  {"name":"api-gateway-loopback","package":"pkg/shims/apigateway","tests":["TestApiConfigHierarchyAndLoopbackProxy","TestApiConfigRejectsSSRFAndUnsupportedMode"],"methodNote":"loopback proxy succeeds; metadata and unsupported transports fail closed"},
+  {"name":"unsupported-backends","package":"pkg/shims/pubsublite","tests":["TestDeferredHandlerNeverAcknowledgesMutations"],"methodNote":"no Docker success is claimed for explicit unsupported prototypes"},
+  {"name":"terraform-truth","package":"pkg/evidence","tests":["TestRegistryCountDocsAndTerraformClaimsStayAligned"],"methodNote":"experimental inventory declares no Terraform claim and tracked HCL has no experimental endpoints"}
+]

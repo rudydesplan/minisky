@@ -1,0 +1,1080 @@
+package eventarc
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"minisky/pkg/orchestrator"
+	"minisky/pkg/shims/workflows"
+	"minisky/pkg/state"
+)
+
+func TestCreateTrigger(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"google.cloud.storage.object.v1.finalized"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=my-trigger", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["done"] != false {
+		t.Fatal("expected LRO not done")
+	}
+	name, _ := resp["name"].(string)
+	if name == "" {
+		t.Fatal("expected operation name in response")
+	}
+	meta, _ := resp["metadata"].(map[string]any)
+	if meta == nil {
+		t.Fatal("expected metadata in response")
+	}
+	if meta["verb"] != "create" {
+		t.Fatalf("expected verb=create, got %v", meta["verb"])
+	}
+	if meta["target"] != "projects/test/locations/us-central1/triggers/my-trigger" {
+		t.Fatalf("unexpected target: %v", meta["target"])
+	}
+
+	// Verify trigger was stored
+	api.mu.RLock()
+	trigger := api.triggers["projects/test/locations/us-central1/triggers/my-trigger"]
+	api.mu.RUnlock()
+	if trigger == nil {
+		t.Fatal("trigger not stored")
+	}
+	if trigger.UID == "" {
+		t.Fatal("expected uid to be generated")
+	}
+	if trigger.CreateTime == "" {
+		t.Fatal("expected createTime to be set")
+	}
+	if trigger.Etag == "" {
+		t.Fatal("expected etag to be set")
+	}
+}
+
+func TestCreateTriggerMissingTriggerId(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateTriggerMissingEventFilters(t *testing.T) {
+	api := newTestAPI()
+	body := `{"destination":{"cloudRun":{"service":"svc"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=t1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateTriggerMissingDestination(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=t1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateTriggerUnsupportedDestinationReturns501WithoutMutation(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"httpEndpoint":{"uri":"http://127.0.0.1:8080"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=t1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(api.triggers) != 0 {
+		t.Fatal("unsupported destination must not create a trigger")
+	}
+}
+
+func TestCreateTriggerRejectsCrossProjectWorkflow(t *testing.T) {
+	api := newTestAPI()
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/other/locations/us-central1/workflows/w"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=t1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestWorkflowDeliveryOutcomeIsPersisted(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	api := &API{
+		opMgr:      newTestAPI().opMgr,
+		stateStore: store,
+		triggers: map[string]*Trigger{
+			"projects/p/locations/l/triggers/t": {
+				Name:         "projects/p/locations/l/triggers/t",
+				EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+				Destination:  &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+			},
+		},
+		deliveries: make(map[string]*Delivery),
+	}
+	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error { return nil }))
+	api.HandleEvent("test", "resource", `{"x":1}`)
+	waitForDeliveries(t, api, "SUCCEEDED", 1)
+
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	if len(api.deliveries) != 1 {
+		t.Fatalf("got %d deliveries, want 1", len(api.deliveries))
+	}
+	for _, delivery := range api.deliveries {
+		if delivery.State != "SUCCEEDED" || delivery.Attempts != 1 {
+			t.Fatalf("unexpected delivery: %#v", delivery)
+		}
+	}
+}
+
+func TestHandleEventRejectsOversizedPayloadAndFanout(t *testing.T) {
+	api := newTestAPI()
+	api.triggers = make(map[string]*Trigger)
+	for i := 0; i < maxMatchingTriggers+1; i++ {
+		name := fmt.Sprintf("projects/p/locations/l/triggers/t%d", i)
+		api.triggers[name] = &Trigger{
+			Name: name, EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+			Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+		}
+	}
+	if err := api.HandleEventWithAck("test", "resource", `{}`); !errors.Is(err, errTooManyMatchingTriggers) {
+		t.Fatalf("fanout error = %v", err)
+	}
+	if len(api.deliveries) != 0 {
+		t.Fatal("rejected fanout created delivery intents")
+	}
+
+	api.triggers = map[string]*Trigger{
+		"projects/p/locations/l/triggers/t": {
+			Name:        "projects/p/locations/l/triggers/t",
+			Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+		},
+	}
+	if err := api.HandleEventWithAck("test", "resource", strings.Repeat("x", maxEventPayload+1)); !errors.Is(err, errEventPayloadTooLarge) {
+		t.Fatalf("payload error = %v", err)
+	}
+}
+
+func TestHandleEventPersistsOneSharedPayloadAndPropagatesIntentSaveFailure(t *testing.T) {
+	store := &controllableStore{data: make(map[string][]byte)}
+	api := newTestAPI()
+	api.stateStore = store
+	api.triggers = map[string]*Trigger{}
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("projects/p/locations/l/triggers/t%d", i)
+		api.triggers[name] = &Trigger{
+			Name: name, Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+		}
+	}
+	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error { return nil }))
+	payload := strings.Repeat("p", 4096)
+	if err := api.HandleEventWithAck("test", "resource", payload); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeliveries(t, api, "SUCCEEDED", 2)
+	raw := waitForPersistedDeliveries(t, store, "SUCCEEDED", 2)
+	if got := bytes.Count(raw, []byte(payload)); got != 1 {
+		t.Fatalf("persisted payload copies = %d, want 1", got)
+	}
+
+	store.setFail(true)
+	before := len(api.deliveries)
+	if err := api.HandleEventWithAck("test", "resource", `{}`); err == nil {
+		t.Fatal("intent persistence failure was acknowledged")
+	}
+	if len(api.deliveries) != before {
+		t.Fatal("failed intent persistence changed in-memory deliveries")
+	}
+}
+
+func TestEventarcSemanticImportRejectsCraftedReplay(t *testing.T) {
+	cases := map[string]eventarcMetadata{
+		"missing trigger": {
+			Triggers: map[string]*Trigger{},
+			Payloads: map[string]string{"p": `{}`},
+			Deliveries: map[string]*Delivery{"d": {
+				ID: "d", Trigger: "projects/p/locations/l/triggers/missing",
+				Workflow: "projects/p/locations/l/workflows/w", PayloadRef: "p", State: "FAILED",
+			}},
+		},
+		"cross project workflow": {
+			Triggers: map[string]*Trigger{"projects/p/locations/l/triggers/t": {
+				Name:        "projects/p/locations/l/triggers/t",
+				Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+			}},
+			Payloads: map[string]string{"p": `{}`},
+			Deliveries: map[string]*Delivery{"d": {
+				ID: "d", Trigger: "projects/p/locations/l/triggers/t",
+				Workflow: "projects/other/locations/l/workflows/w", PayloadRef: "p", State: "FAILED",
+			}},
+		},
+		"oversized payload": {
+			Triggers: map[string]*Trigger{"projects/p/locations/l/triggers/t": {
+				Name:        "projects/p/locations/l/triggers/t",
+				Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+			}},
+			Payloads: map[string]string{"p": strings.Repeat("x", maxEventPayload+1)},
+		},
+	}
+	for name, metadata := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateEventarcMetadata(state.EntryValidationContext{}, &metadata); err == nil {
+				t.Fatal("crafted replay metadata accepted")
+			}
+			store, err := state.New(t.TempDir(), "import")
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := json.Marshal(state.Snapshot{
+				Format: state.SnapshotFormat, Version: state.Version,
+				Entries: map[string]json.RawMessage{eventarcStateEntry: raw},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Import(bytes.NewReader(snapshot)); err == nil {
+				t.Fatal("semantic state import accepted crafted replay")
+			}
+		})
+	}
+}
+
+func TestEventarcSemanticImportRejectsOtherwiseValidReplayableIntent(t *testing.T) {
+	triggerName := "projects/p/locations/l/triggers/t"
+	metadata := eventarcMetadata{
+		Triggers: map[string]*Trigger{triggerName: {
+			Name:        triggerName,
+			Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+		}},
+		Payloads: map[string]string{"payload": `{}`},
+		Deliveries: map[string]*Delivery{"delivery": {
+			ID: "delivery", Trigger: triggerName,
+			Workflow:   "projects/p/locations/l/workflows/w",
+			PayloadRef: "payload", State: "FAILED", Attempts: 1,
+		}},
+	}
+	store, err := state.New(t.TempDir(), "import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(state.Snapshot{
+		Format: state.SnapshotFormat, Version: state.Version,
+		Entries: map[string]json.RawMessage{eventarcStateEntry: raw},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Import(bytes.NewReader(snapshot)); err == nil {
+		t.Fatal("import accepted a replayable delivery intent")
+	}
+}
+
+func TestFailedWorkflowDeliveryReplaysAfterRestart(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	first := &API{
+		opMgr:      newTestAPI().opMgr,
+		stateStore: store,
+		triggers: map[string]*Trigger{
+			"projects/p/locations/l/triggers/t": {
+				Name:        "projects/p/locations/l/triggers/t",
+				Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+			},
+		},
+		deliveries: map[string]*Delivery{
+			"d1": {
+				ID: "d1", Trigger: "projects/p/locations/l/triggers/t",
+				Workflow: "projects/p/locations/l/workflows/w",
+				Payload:  `{}`, State: "FAILED", Attempts: 1,
+			},
+		},
+	}
+	if err := first.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := &API{
+		opMgr: newTestAPI().opMgr, stateStore: store,
+		triggers: make(map[string]*Trigger), deliveries: make(map[string]*Delivery),
+	}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	restarted.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error {
+		calls++
+		return nil
+	}))
+	restarted.replayDeliveries()
+	waitForDeliveries(t, restarted, "SUCCEEDED", 1)
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+	if got := restarted.deliveries["d1"]; got.State != "SUCCEEDED" || got.Attempts != 2 {
+		t.Fatalf("delivery = %#v", got)
+	}
+}
+
+func TestPubSubAndStorageEventsDeliverToWorkflowAfterRestart(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", stateRoot)
+	t.Setenv("MINISKY_PROFILE", "eventarc-workflow-restart")
+	opMgr := orchestrator.NewOperationManager()
+	workflowAPI := workflows.NewAPI(opMgr)
+	workflowName := "projects/p/locations/us-central1/workflows/events"
+	createWorkflow := httptest.NewRecorder()
+	workflowAPI.ServeHTTP(createWorkflow, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/p/locations/us-central1/workflows?workflowId=events",
+		bytes.NewBufferString(`{"sourceContents":"[{\"return\":\"delivered\"}]"}`),
+	))
+	if createWorkflow.Code != http.StatusOK {
+		t.Fatalf("create workflow status=%d body=%s", createWorkflow.Code, createWorkflow.Body.String())
+	}
+
+	store, err := state.New(t.TempDir(), "eventarc-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &API{
+		opMgr: opMgr, stateStore: store,
+		triggers: map[string]*Trigger{
+			"projects/p/locations/us-central1/triggers/pubsub": {
+				Name: "projects/p/locations/us-central1/triggers/pubsub",
+				EventFilters: []EventFilter{{
+					Attribute: "type", Value: "google.cloud.pubsub.topic.v1.messagePublished",
+				}},
+				Destination: &Destination{Workflow: workflowName},
+			},
+			"projects/p/locations/us-central1/triggers/storage": {
+				Name: "projects/p/locations/us-central1/triggers/storage",
+				EventFilters: []EventFilter{{
+					Attribute: "type", Value: "google.cloud.storage.object.v1.finalized",
+				}},
+				Destination: &Destination{Workflow: workflowName},
+			},
+		},
+		deliveries: make(map[string]*Delivery),
+	}
+	first.HandleEvent(
+		"google.cloud.pubsub.topic.v1.messagePublished",
+		"projects/p/topics/events",
+		`{"message":{"data":"cHViLXN1Yg=="}}`,
+	)
+	first.HandleEvent(
+		"google.cloud.storage.object.v1.finalized",
+		"bucket",
+		`{"bucket":"bucket","name":"object"}`,
+	)
+	waitForDeliveries(t, first, "FAILED", 2)
+	if len(first.deliveries) != 2 {
+		t.Fatalf("failed delivery intents = %d, want 2", len(first.deliveries))
+	}
+	for _, delivery := range first.deliveries {
+		if delivery.State != "FAILED" || delivery.Attempts != 1 {
+			t.Fatalf("pre-restart delivery = %#v", delivery)
+		}
+	}
+
+	restarted := &API{
+		opMgr: opMgr, stateStore: store,
+		triggers: make(map[string]*Trigger), deliveries: make(map[string]*Delivery),
+	}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetWorkflowsExecutor(workflowAPI)
+	restarted.replayDeliveries()
+	waitForDeliveries(t, restarted, "SUCCEEDED", 2)
+	for _, delivery := range restarted.deliveries {
+		if delivery.State != "SUCCEEDED" || delivery.Attempts != 2 {
+			t.Fatalf("post-restart delivery = %#v", delivery)
+		}
+	}
+
+	list := httptest.NewRecorder()
+	workflowAPI.ServeHTTP(list, httptest.NewRequest(
+		http.MethodGet,
+		"/v1/"+workflowName+"/executions",
+		nil,
+	))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list executions status=%d body=%s", list.Code, list.Body.String())
+	}
+	var response struct {
+		Executions []workflows.Execution `json:"executions"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Executions) != 2 {
+		t.Fatalf("workflow executions = %d, want Pub/Sub and Storage deliveries", len(response.Executions))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		allDone := true
+		for _, execution := range response.Executions {
+			if execution.State == "ACTIVE" {
+				allDone = false
+			}
+		}
+		if allDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("workflow executions did not finish")
+		}
+		time.Sleep(time.Millisecond)
+		list = httptest.NewRecorder()
+		workflowAPI.ServeHTTP(list, httptest.NewRequest(
+			http.MethodGet, "/v1/"+workflowName+"/executions", nil,
+		))
+		if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workflowsStore, err := state.New(stateRoot, "eventarc-workflow-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var persisted struct {
+			Executions map[string]*workflows.Execution `json:"executions"`
+		}
+		err := workflowsStore.Load("workflows/metadata", &persisted)
+		allPersisted := err == nil && len(persisted.Executions) == 2
+		for _, execution := range persisted.Executions {
+			if execution.State == "ACTIVE" {
+				allPersisted = false
+			}
+		}
+		if allPersisted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workflow outcomes were not persisted: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type workflowsExecutorFunc func(string, string) error
+
+func (f workflowsExecutorFunc) CreateExecutionFromEvent(workflow, payload string) error {
+	return f(workflow, payload)
+}
+
+func TestCreateTriggerDuplicate(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.triggers["projects/test/locations/us-central1/triggers/dup"] = &Trigger{
+		Name:       "projects/test/locations/us-central1/triggers/dup",
+		UID:        "existing-uid",
+		CreateTime: "2024-01-01T00:00:00Z",
+	}
+	api.mu.Unlock()
+
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=dup", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetTrigger(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.triggers["projects/test/locations/us-central1/triggers/t1"] = &Trigger{
+		Name:       "projects/test/locations/us-central1/triggers/t1",
+		UID:        "uid-123",
+		CreateTime: "2024-01-01T00:00:00Z",
+		UpdateTime: "2024-01-01T00:00:00Z",
+		EventFilters: []EventFilter{
+			{Attribute: "type", Value: "google.cloud.storage.object.v1.finalized"},
+		},
+		Destination: &Destination{
+			CloudRun: &CloudRunDest{Service: "my-svc", Region: "us-central1"},
+		},
+		ServiceAccount: "sa@project.iam.gserviceaccount.com",
+		Etag:           "abc123",
+	}
+	api.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers/t1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var trigger Trigger
+	_ = json.Unmarshal(w.Body.Bytes(), &trigger)
+	if trigger.Name != "projects/test/locations/us-central1/triggers/t1" {
+		t.Fatalf("unexpected name: %s", trigger.Name)
+	}
+	if trigger.UID != "uid-123" {
+		t.Fatalf("unexpected uid: %s", trigger.UID)
+	}
+	if trigger.ServiceAccount != "sa@project.iam.gserviceaccount.com" {
+		t.Fatalf("unexpected serviceAccount: %s", trigger.ServiceAccount)
+	}
+}
+
+func TestGetTriggerNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers/missing", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListTriggers(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.triggers["projects/test/locations/us-central1/triggers/alpha"] = &Trigger{Name: "projects/test/locations/us-central1/triggers/alpha", UID: "u1", CreateTime: "2024-01-01T00:00:00Z"}
+	api.triggers["projects/test/locations/us-central1/triggers/beta"] = &Trigger{Name: "projects/test/locations/us-central1/triggers/beta", UID: "u2", CreateTime: "2024-01-01T00:00:00Z"}
+	api.triggers["projects/test/locations/us-central1/triggers/gamma"] = &Trigger{Name: "projects/test/locations/us-central1/triggers/gamma", UID: "u3", CreateTime: "2024-01-01T00:00:00Z"}
+	api.mu.Unlock()
+
+	// First page: pageSize=2
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers?pageSize=2", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	triggers := resp["triggers"].([]any)
+	if len(triggers) != 2 {
+		t.Fatalf("expected 2 triggers, got %d", len(triggers))
+	}
+	// Verify sorted order
+	first := triggers[0].(map[string]any)["name"].(string)
+	second := triggers[1].(map[string]any)["name"].(string)
+	if first >= second {
+		t.Fatalf("expected sorted order, got %s >= %s", first, second)
+	}
+
+	nextToken := resp["nextPageToken"].(string)
+	if nextToken == "" {
+		t.Fatal("expected nextPageToken for pagination")
+	}
+
+	// Second page
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers?pageSize=2&pageToken="+nextToken, nil)
+	w = httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	triggers = resp["triggers"].([]any)
+	if len(triggers) != 1 {
+		t.Fatalf("expected 1 trigger on second page, got %d", len(triggers))
+	}
+}
+
+func TestListTriggersEmpty(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	triggers := resp["triggers"].([]any)
+	if len(triggers) != 0 {
+		t.Fatalf("expected 0 triggers, got %d", len(triggers))
+	}
+}
+
+func TestDeleteTrigger(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.triggers["projects/test/locations/us-central1/triggers/t1"] = &Trigger{
+		Name:       "projects/test/locations/us-central1/triggers/t1",
+		UID:        "uid-1",
+		CreateTime: "2024-01-01T00:00:00Z",
+	}
+	api.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/triggers/t1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["done"] != true {
+		t.Fatal("expected LRO done=true for delete")
+	}
+
+	// Verify trigger was removed
+	api.mu.RLock()
+	_, exists := api.triggers["projects/test/locations/us-central1/triggers/t1"]
+	api.mu.RUnlock()
+	if exists {
+		t.Fatal("trigger should have been deleted")
+	}
+}
+
+func TestDeleteTriggerNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/triggers/missing", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPatchTrigger(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.triggers["projects/test/locations/us-central1/triggers/t1"] = &Trigger{
+		Name:       "projects/test/locations/us-central1/triggers/t1",
+		UID:        "uid-1",
+		CreateTime: "2024-01-01T00:00:00Z",
+		UpdateTime: "2024-01-01T00:00:00Z",
+		EventFilters: []EventFilter{
+			{Attribute: "type", Value: "google.cloud.storage.object.v1.finalized"},
+		},
+		Destination: &Destination{
+			Workflow: "projects/test/locations/us-central1/workflows/w",
+		},
+		ServiceAccount: "old-sa@project.iam.gserviceaccount.com",
+	}
+	api.mu.Unlock()
+
+	body := `{"serviceAccount":"new-sa@project.iam.gserviceaccount.com"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/triggers/t1?updateMask=serviceAccount", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["done"] != true {
+		t.Fatal("expected LRO done=true for patch")
+	}
+
+	// Verify the trigger was updated
+	api.mu.RLock()
+	trigger := api.triggers["projects/test/locations/us-central1/triggers/t1"]
+	api.mu.RUnlock()
+	if trigger.ServiceAccount != "new-sa@project.iam.gserviceaccount.com" {
+		t.Fatalf("expected updated serviceAccount, got %s", trigger.ServiceAccount)
+	}
+	// Verify output-only fields preserved
+	if trigger.UID != "uid-1" {
+		t.Fatalf("uid should be preserved, got %s", trigger.UID)
+	}
+	if trigger.CreateTime != "2024-01-01T00:00:00Z" {
+		t.Fatalf("createTime should be preserved, got %s", trigger.CreateTime)
+	}
+	if trigger.UpdateTime == "2024-01-01T00:00:00Z" {
+		t.Fatal("updateTime should have been updated")
+	}
+	// Verify destination was NOT changed (not in updateMask)
+	if trigger.Destination == nil || trigger.Destination.Workflow != "projects/test/locations/us-central1/workflows/w" {
+		t.Fatal("destination should not have changed")
+	}
+}
+
+func TestPatchTriggerCompensatesPostCommitSaveAndOperation(t *testing.T) {
+	store := &postCommitEventarcStore{data: make(map[string][]byte)}
+	api := newTestAPI()
+	api.stateStore = store
+	name := "projects/test/locations/us-central1/triggers/t1"
+	api.triggers[name] = &Trigger{
+		Name: name, UID: "uid", EventFilters: []EventFilter{{Attribute: "type", Value: "test"}},
+		Destination:    &Destination{Workflow: "projects/test/locations/us-central1/workflows/w"},
+		ServiceAccount: "old",
+	}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.failNext = true
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v1/"+name+"?updateMask=serviceAccount", bytes.NewBufferString(`{"serviceAccount":"new"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if got := api.triggers[name].ServiceAccount; got != "old" {
+		t.Fatalf("visible service account = %q, want old", got)
+	}
+	var durable eventarcMetadata
+	if err := store.Load(eventarcStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if got := durable.Triggers[name].ServiceAccount; got != "old" {
+		t.Fatalf("durable service account = %q, want compensated old", got)
+	}
+	if operations := api.opMgr.List(); len(operations) != 0 {
+		t.Fatalf("compensated mutation retained operations: %#v", operations)
+	}
+	if api.opMgr.PersistenceError() == nil {
+		t.Fatal("ambiguous save error did not leave sticky degradation")
+	}
+}
+
+func TestPatchTriggerNotFound(t *testing.T) {
+	api := newTestAPI()
+	body := `{"serviceAccount":"new@test.iam.gserviceaccount.com"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/triggers/missing?updateMask=serviceAccount", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetOperation(t *testing.T) {
+	api := newTestAPI()
+	// Create a trigger to generate an operation
+	body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId=op-test", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create failed: %d: %s", w.Code, w.Body.String())
+	}
+
+	var createResp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &createResp)
+	opPath := createResp["name"].(string)
+
+	// Get the operation
+	req = httptest.NewRequest(http.MethodGet, "/v1/"+opPath, nil)
+	w = httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var opResp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &opResp)
+	meta := opResp["metadata"].(map[string]any)
+	if meta["verb"] != "create" {
+		t.Fatalf("expected verb=create, got %v", meta["verb"])
+	}
+	if meta["target"] != "projects/test/locations/us-central1/triggers/op-test" {
+		t.Fatalf("unexpected target: %v", meta["target"])
+	}
+}
+
+func TestGetOperationNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/operations/nonexistent", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetOperationRejectsDifferentProjectScope(t *testing.T) {
+	api := newTestAPI()
+	op, err := api.opMgr.RegisterScopedTargetDurable(
+		"eventarc#operation",
+		"create",
+		"projects/p1/locations/l/triggers/t",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/p2/locations/l/operations/"+extractAfter(op.Name, "operations"), nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPersistAndReload(t *testing.T) {
+	// Use a mock store to verify persist/load cycle
+	store := &mockStore{data: make(map[string][]byte)}
+	api := &API{
+		opMgr:      newTestAPI().opMgr,
+		stateStore: store,
+		triggers:   make(map[string]*Trigger),
+	}
+
+	// Create a trigger
+	api.mu.Lock()
+	api.triggers["projects/p/locations/l/triggers/t1"] = &Trigger{
+		Name:       "projects/p/locations/l/triggers/t1",
+		UID:        "uid-persist",
+		CreateTime: "2024-06-01T00:00:00Z",
+		UpdateTime: "2024-06-01T00:00:00Z",
+		EventFilters: []EventFilter{
+			{Attribute: "type", Value: "test.event"},
+		},
+		Destination: &Destination{
+			Workflow: "projects/p/locations/l/workflows/w",
+		},
+	}
+	api.mu.Unlock()
+
+	// Persist
+	if err := api.persistState(); err != nil {
+		t.Fatalf("persist failed: %v", err)
+	}
+
+	// Create a new API and reload
+	api2 := &API{
+		opMgr:      newTestAPI().opMgr,
+		stateStore: store,
+		triggers:   make(map[string]*Trigger),
+	}
+	if err := api2.loadState(); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	api2.mu.RLock()
+	trigger, ok := api2.triggers["projects/p/locations/l/triggers/t1"]
+	api2.mu.RUnlock()
+	if !ok {
+		t.Fatal("trigger not found after reload")
+	}
+	if trigger.UID != "uid-persist" {
+		t.Fatalf("expected uid-persist, got %s", trigger.UID)
+	}
+	if trigger.Destination == nil || trigger.Destination.Workflow == "" {
+		t.Fatal("destination lost after reload")
+	}
+}
+
+func TestConcurrentCreateAndGet(t *testing.T) {
+	api := newTestAPI()
+	const n = 50
+	var wg sync.WaitGroup
+
+	// Concurrent creates
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := `{"eventFilters":[{"attribute":"type","value":"test"}],"destination":{"workflow":"projects/test/locations/us-central1/workflows/w"}}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/triggers?triggerId="+string(rune('a'+idx%26))+"-"+itoa(idx), bytes.NewBufferString(body))
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+			// Either 200 (created) or 409 (duplicate from collision) is acceptable
+			if w.Code != http.StatusOK && w.Code != http.StatusConflict {
+				t.Errorf("unexpected status %d for create %d", w.Code, idx)
+			}
+		}(i)
+	}
+
+	// Concurrent gets
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/triggers", nil)
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("unexpected status %d for list", w.Code)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func itoa(i int) string {
+	return string(rune('0'+i/10)) + string(rune('0'+i%10))
+}
+
+func waitForDeliveries(t *testing.T, api *API, stateName string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		api.mu.RLock()
+		matches := 0
+		for _, delivery := range api.deliveries {
+			if delivery != nil && delivery.State == stateName {
+				matches++
+			}
+		}
+		api.mu.RUnlock()
+		if matches == count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d %s deliveries", count, stateName)
+}
+
+func waitForPersistedDeliveries(t *testing.T, store *controllableStore, stateName string, count int) []byte {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw := store.snapshot(eventarcStateEntry)
+		var metadata eventarcMetadata
+		if json.Unmarshal(raw, &metadata) == nil {
+			matches := 0
+			for _, delivery := range metadata.Deliveries {
+				if delivery != nil && delivery.State == stateName {
+					matches++
+				}
+			}
+			if matches == count {
+				return raw
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for persisted %s deliveries", stateName)
+	return nil
+}
+
+// mockStore is a simple in-memory state store for testing.
+type mockStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+type controllableStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+	fail bool
+}
+
+type postCommitEventarcStore struct {
+	mu       sync.Mutex
+	data     map[string][]byte
+	failNext bool
+}
+
+func (s *postCommitEventarcStore) Load(name string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw := s.data[name]
+	if len(raw) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (s *postCommitEventarcStore) Save(name string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	s.data[name] = raw
+	if s.failNext {
+		s.failNext = false
+		return errors.New("post-commit save error")
+	}
+	return nil
+}
+
+func (s *controllableStore) Load(name string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.data[name]
+	if !ok {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (s *controllableStore) Save(name string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errors.New("injected save failure")
+	}
+	raw, err := json.Marshal(value)
+	if err == nil {
+		s.data[name] = raw
+	}
+	return err
+}
+
+func (s *controllableStore) snapshot(name string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.data[name]...)
+}
+
+func (s *controllableStore) setFail(fail bool) {
+	s.mu.Lock()
+	s.fail = fail
+	s.mu.Unlock()
+}
+
+func (m *mockStore) Load(name string, target any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	raw, ok := m.data[name]
+	if !ok {
+		return fmt.Errorf("not found: %w", state.ErrNotFound)
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (m *mockStore) Save(name string, value any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	m.data[name] = raw
+	return nil
+}

@@ -197,8 +197,8 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
               <Typography variant="caption" sx={{ color: '#5f6368' }}>{activeProject} • Bigtable Emulator</Typography>
             </Box>
             <Box>
-              <IconButton onClick={() => loadInstances()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-              <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+              <IconButton aria-label="Refresh" onClick={() => loadInstances()} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+              <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
             </Box>
           </Box>
 
@@ -236,8 +236,8 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
                             </Box>
                           </Box>
                           <Box>
-                            <IconButton size="small" onClick={() => { setTargetInstance(instId); setNewTableOpen(true); }}><AddIcon fontSize="small" /></IconButton>
-                            <IconButton size="small" onClick={() => handleDeleteInstance(instId)} color="error"><DeleteIcon fontSize="small" /></IconButton>
+                            <IconButton aria-label={`Add table to ${instId}`} size="small" onClick={() => { setTargetInstance(instId); setNewTableOpen(true); }}><AddIcon fontSize="small" /></IconButton>
+                            <IconButton aria-label={`Delete instance ${instId}`} size="small" onClick={() => handleDeleteInstance(instId)} color="error"><DeleteIcon fontSize="small" /></IconButton>
                           </Box>
                         </Box>
                         <Divider />
@@ -260,7 +260,7 @@ export default function BigtableManagerDrawer({ open, onClose }: BigtableManager
                               >
                                 <TableChartIcon sx={{ fontSize: '1rem', mr: 1.5, color: '#e67c73' }} />
                                 <ListItemText primary={<Typography sx={{ fontSize: '0.8rem' }}>{tbId}</Typography>} />
-                                <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleDeleteTable(instId, tbId); }}><DeleteIcon fontSize="inherit" /></IconButton>
+                                <IconButton aria-label={`Delete table ${tbId}`} size="small" onClick={(e) => { e.stopPropagation(); handleDeleteTable(instId, tbId); }}><DeleteIcon fontSize="inherit" /></IconButton>
                               </ListItemButton>
                             );
                           })}

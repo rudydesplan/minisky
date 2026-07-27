@@ -20,8 +20,10 @@ type bigtableStore interface {
 }
 
 type bigtableMetadata struct {
-	Instances map[string]*Instance `json:"instances"`
-	Tables    map[string]*Table    `json:"tables"`
+	Instances  map[string]*Instance          `json:"instances"`
+	Clusters   map[string]*Cluster           `json:"clusters"`
+	Operations map[string]*BigtableOperation `json:"operations,omitempty"`
+	Tables     map[string]*Table             `json:"tables"`
 }
 
 func newAPIWithDependencies(
@@ -44,6 +46,12 @@ func newAPIWithDependencies(
 	if persisted.Instances != nil {
 		api.instances = persisted.Instances
 	}
+	if persisted.Clusters != nil {
+		api.clusters = persisted.Clusters
+	}
+	if persisted.Operations != nil {
+		api.operations = persisted.Operations
+	}
 	if persisted.Tables != nil {
 		api.tables = persisted.Tables
 	}
@@ -60,6 +68,13 @@ func newAPIWithDependencies(
 			delete(api.tables, key)
 		}
 	}
+	for key, cluster := range api.clusters {
+		if cluster == nil {
+			delete(api.clusters, key)
+			continue
+		}
+		cluster.State = metadataOnlyInstanceState
+	}
 	return api, nil
 }
 
@@ -71,8 +86,10 @@ func (api *API) persistMetadata() error {
 	defer api.persistMu.Unlock()
 	api.mu.RLock()
 	payload, err := json.Marshal(bigtableMetadata{
-		Instances: api.instances,
-		Tables:    api.tables,
+		Instances:  api.instances,
+		Clusters:   api.clusters,
+		Operations: api.operations,
+		Tables:     api.tables,
 	})
 	api.mu.RUnlock()
 	if err != nil {

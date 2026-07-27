@@ -16,8 +16,10 @@ provider "google" {
   iam_credentials_custom_endpoint   = local.use_minisky ? "${local.minisky_base_url}/_minisky/iamcredentials/v1/" : null
   pubsub_custom_endpoint            = local.use_minisky ? "${local.minisky_base_url}/_minisky/pubsub/v1/" : null
   redis_custom_endpoint             = local.use_minisky ? "${local.minisky_base_url}/_minisky/redis/v1/" : null
+  sql_custom_endpoint               = local.use_minisky ? "${local.minisky_base_url}/_minisky/sqladmin/sql/v1beta4/" : null
   spanner_custom_endpoint           = local.use_minisky ? "${local.minisky_base_url}/_minisky/spanner/v1/" : null
   storage_custom_endpoint           = local.use_minisky ? "${local.minisky_base_url}/_minisky/storage/storage/v1/" : null
+  container_custom_endpoint         = local.use_minisky ? "${local.minisky_base_url}/_minisky/container/v1/" : null
 }
 
 provider "google" {

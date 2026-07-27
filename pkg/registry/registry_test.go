@@ -41,3 +41,12 @@ func TestSharedHandlerCreatesOneOwnerConcurrently(t *testing.T) {
 		t.Fatalf("owner creations = %d, want 1", creates.Load())
 	}
 }
+
+func TestRequireDockerRejectsHybridRegistration(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("hybrid Compute registration was accepted as pure Docker passthrough")
+		}
+	}()
+	RequireDocker("compute.googleapis.com")
+}

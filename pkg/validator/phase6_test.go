@@ -227,6 +227,39 @@ func TestPhase6CreateContracts(t *testing.T) {
 			invalidBody: `{}`,
 			wantMessage: "instances",
 		},
+		{
+			name:        "vertex index create",
+			domain:      "aiplatform.googleapis.com",
+			path:        "/v1/projects/test-project/locations/us-central1/indexes",
+			validBody:   `{"displayName":"demo"}`,
+			invalidBody: `{}`,
+			wantMessage: "displayName",
+		},
+		{
+			name:        "dialogflow agent create",
+			domain:      "dialogflow.googleapis.com",
+			path:        "/v3/projects/test-project/locations/us-central1/agents",
+			validBody:   `{"displayName":"demo","defaultLanguageCode":"en","timeZone":"UTC"}`,
+			invalidBody: `{"displayName":"demo"}`,
+			wantMessage: "defaultLanguageCode",
+		},
+		{
+			name:        "private ca certificate create",
+			domain:      "privateca.googleapis.com",
+			path:        "/v1/projects/test-project/locations/us-central1/caPools/pool/certificates",
+			validBody:   `{"certificateId":"cert","pemCsr":"pem","lifetime":"1h"}`,
+			invalidBody: `{"certificateId":"cert"}`,
+			wantMessage: "pemCsr",
+		},
+		{
+			name:        "binary authorization policy update",
+			domain:      "binaryauthorization.googleapis.com",
+			method:      http.MethodPut,
+			path:        "/v1/projects/test-project/policy",
+			validBody:   `{"name":"projects/test-project/policy","defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW"}}`,
+			invalidBody: `{"name":"projects/test-project/policy"}`,
+			wantMessage: "defaultAdmissionRule",
+		},
 	}
 
 	validator := NewValidator()

@@ -20,9 +20,12 @@ type fakeCloudSQLBackend struct {
 	mu          sync.Mutex
 	createErr   error
 	deleteErr   error
+	adminErr    error
+	adminErrors map[string]error
 	deleteCalls int
 	created     bool
 	deleted     []string
+	admin       []string
 }
 
 type failingCloudSQLStore struct {
@@ -32,6 +35,13 @@ type failingCloudSQLStore struct {
 }
 
 type failingOperationStore struct{}
+
+type flakyCloudSQLStore struct {
+	mu     sync.Mutex
+	saves  int
+	failOn map[int]bool
+	data   []byte
+}
 
 func (failingOperationStore) Load(string, any) error { return state.ErrNotFound }
 func (failingOperationStore) Save(string, any) error { return errors.New("operation save failed") }
@@ -47,6 +57,29 @@ func (s *failingCloudSQLStore) Save(string, any) error {
 	return nil
 }
 
+func (s *flakyCloudSQLStore) Load(_ string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(s.data, target)
+}
+
+func (s *flakyCloudSQLStore) Save(_ string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saves++
+	if s.failOn[s.saves] {
+		return errors.New("injected transient save failure")
+	}
+	data, err := json.Marshal(value)
+	if err == nil {
+		s.data = data
+	}
+	return err
+}
+
 func (b *fakeCloudSQLBackend) Create(context.Context, string, string, string, string) (string, bool, error) {
 	return "", b.created, b.createErr
 }
@@ -59,10 +92,49 @@ func (b *fakeCloudSQLBackend) Delete(_ context.Context, project, name string) er
 	return b.deleteErr
 }
 
+func (b *fakeCloudSQLBackend) ExecuteAdmin(
+	_ context.Context,
+	project, instance, version, action, name, password string,
+) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.admin = append(b.admin, strings.Join([]string{project, instance, version, action, name, password}, ":"))
+	if b.adminErrors[action] != nil {
+		return b.adminErrors[action]
+	}
+	return b.adminErr
+}
+
 func (b *fakeCloudSQLBackend) deletes() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.deleteCalls
+}
+
+func TestCreateInstanceReturnsProviderDefaultSettings(t *testing.T) {
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), &fakeCloudSQLBackend{}, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/demo/instances",
+		bytes.NewBufferString(`{"name":"db","databaseVersion":"POSTGRES_18","settings":{"tier":"db-f1-micro"}}`))
+	api.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var operation SqlOperation
+	if err := json.Unmarshal(rec.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	waitCloudSQLOperation(t, api.opMgr, operation.Name)
+
+	rec = httptest.NewRecorder()
+	api.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/projects/demo/instances/db", nil))
+	var instance DatabaseInstance
+	if err := json.Unmarshal(rec.Body.Bytes(), &instance); err != nil {
+		t.Fatal(err)
+	}
+	if instance.Settings.AvailabilityType != "ZONAL" || instance.Settings.PricingPlan != "PER_USE" {
+		t.Fatalf("provider defaults = %#v", instance.Settings)
+	}
 }
 
 func TestCreateBackendFailureFailsOperationAndRollsBack(t *testing.T) {
@@ -178,6 +250,108 @@ func TestPostDeleteSaveFailureKeepsTombstone(t *testing.T) {
 	}
 }
 
+func TestDeletePrecommitSaveFailureDoesNotTouchBackend(t *testing.T) {
+	store := &flakyCloudSQLStore{failOn: map[int]bool{1: true}}
+	backend := &fakeCloudSQLBackend{}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, store)
+	key := instanceKey("demo", "db")
+	api.instances[key] = &DatabaseInstance{Name: "db", Project: "demo", State: "RUNNABLE"}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/projects/demo/instances/db", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if backend.deletes() != 0 {
+		t.Fatalf("backend delete calls=%d", backend.deletes())
+	}
+	if api.instances[key].State != "RUNNABLE" {
+		t.Fatalf("precommit state=%q", api.instances[key].State)
+	}
+}
+
+func TestInstanceDeleteSerializesWithAdminMutations(t *testing.T) {
+	backend := &fakeCloudSQLBackend{}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, nil)
+	key := instanceKey("demo", "db")
+	api.instances[key] = &DatabaseInstance{Name: "db", Project: "demo", State: "RUNNABLE"}
+	api.adminMu.Lock()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/projects/demo/instances/db", nil))
+		done <- response
+	}()
+	select {
+	case <-done:
+		t.Fatal("instance deletion bypassed the admin mutation lock")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if backend.deletes() != 0 {
+		t.Fatal("backend deletion started while an admin mutation held the lock")
+	}
+	api.adminMu.Unlock()
+	response := <-done
+	var operation SqlOperation
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	waitCloudSQLOperation(t, api.opMgr, operation.Name)
+}
+
+func TestPostDeleteSaveFailurePersistsReconciliationTombstoneAcrossRestart(t *testing.T) {
+	store := &flakyCloudSQLStore{failOn: map[int]bool{3: true}}
+	backend := &fakeCloudSQLBackend{}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, store)
+	key := instanceKey("demo", "db")
+	api.instances[key] = &DatabaseInstance{Name: "db", Project: "demo", State: "RUNNABLE"}
+	if err := api.persistMetadata(); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/projects/demo/instances/db", nil))
+	var initial SqlOperation
+	if err := json.Unmarshal(response.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	waitCloudSQLOperation(t, api.opMgr, initial.Name)
+
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := restarted.instances[key]
+	if instance == nil || instance.State != "ERROR" ||
+		!strings.Contains(instance.BackendStatus, "backend deleted") {
+		t.Fatalf("restarted tombstone=%#v", instance)
+	}
+}
+
+func TestCreateCompensationFailurePersistsDivergenceAcrossRestart(t *testing.T) {
+	store := &flakyCloudSQLStore{failOn: map[int]bool{2: true}}
+	backend := &fakeCloudSQLBackend{created: true, deleteErr: errors.New("compensation failed")}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, store)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/projects/demo/instances",
+		bytes.NewBufferString(`{"name":"db"}`)))
+	var initial SqlOperation
+	if err := json.Unmarshal(response.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	waitCloudSQLOperation(t, api.opMgr, initial.Name)
+
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := restarted.instances[instanceKey("demo", "db")]
+	if instance == nil || instance.State != "ERROR" ||
+		!strings.Contains(instance.BackendStatus, "compensation failed") {
+		t.Fatalf("restarted divergence=%#v", instance)
+	}
+}
+
 func TestMethodNotAllowedUsesJSONEnvelope(t *testing.T) {
 	api := newAPIWithBackend(orchestrator.NewOperationManager(), &fakeCloudSQLBackend{}, nil)
 	rec := httptest.NewRecorder()
@@ -248,6 +422,184 @@ func TestCreateFailureWithoutOwnershipDoesNotCompensate(t *testing.T) {
 	waitCloudSQLOperation(t, api.opMgr, initial.Name)
 	if backend.deletes() != 0 {
 		t.Fatalf("unowned backend compensation calls = %d", backend.deletes())
+	}
+}
+
+func TestDatabaseAndUserMutationsExecuteAgainstBackendBeforeMetadata(t *testing.T) {
+	backend := &fakeCloudSQLBackend{}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, nil)
+	key := instanceKey("demo", "db")
+	api.instances[key] = &DatabaseInstance{
+		Name: "db", Project: "demo", DatabaseVersion: "POSTGRES_15", State: "RUNNABLE",
+	}
+
+	for _, request := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/v1/projects/demo/instances/db/databases", `{"name":"app"}`},
+		{http.MethodPost, "/v1/projects/demo/instances/db/users", `{"name":"app_user","password":"secret"}`},
+		{http.MethodDelete, "/v1/projects/demo/instances/db/databases/app", ""},
+		{http.MethodDelete, "/v1/projects/demo/instances/db/users?name=app_user", ""},
+	} {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(request.method, request.path, strings.NewReader(request.body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s %s status=%d body=%s", request.method, request.path, response.Code, response.Body.String())
+		}
+	}
+
+	backend.mu.Lock()
+	got := append([]string(nil), backend.admin...)
+	backend.mu.Unlock()
+	want := []string{
+		"demo:db:POSTGRES_15:CREATE_DATABASE:app:",
+		"demo:db:POSTGRES_15:CREATE_USER:app_user:secret",
+		"demo:db:POSTGRES_15:DELETE_DATABASE:app:",
+		"demo:db:POSTGRES_15:DELETE_USER:app_user:",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("backend admin calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestChildCreateCompensationFailurePersistsParentReconciliationAcrossRestart(t *testing.T) {
+	tests := []struct {
+		name               string
+		path               string
+		body               string
+		compensationAction string
+		assertChild        func(*testing.T, *API, string)
+	}{
+		{
+			name: "database", path: "/v1/projects/demo/instances/db/databases",
+			body: `{"name":"app"}`, compensationAction: "DELETE_DATABASE",
+			assertChild: func(t *testing.T, api *API, key string) {
+				if got := api.databases[key]; len(got) != 1 || got[0].Name != "app" {
+					t.Fatalf("database reconciliation metadata=%#v", got)
+				}
+			},
+		},
+		{
+			name: "user", path: "/v1/projects/demo/instances/db/users",
+			body: `{"name":"app_user"}`, compensationAction: "DELETE_USER",
+			assertChild: func(t *testing.T, api *API, key string) {
+				if got := api.users[key]; len(got) != 1 || got[0].Name != "app_user" {
+					t.Fatalf("user reconciliation metadata=%#v", got)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &flakyCloudSQLStore{failOn: map[int]bool{2: true}}
+			backend := &fakeCloudSQLBackend{adminErrors: map[string]error{
+				test.compensationAction: errors.New("compensation failed"),
+			}}
+			api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, store)
+			key := instanceKey("demo", "db")
+			api.instances[key] = &DatabaseInstance{
+				Name: "db", Project: "demo", DatabaseVersion: "POSTGRES_15", State: "RUNNABLE",
+			}
+			if err := api.persistMetadata(); err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body)))
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance := restarted.instances[key]
+			if instance == nil || instance.State != "ERROR" ||
+				!strings.Contains(instance.BackendStatus, "compensation failed") {
+				t.Fatalf("parent reconciliation=%#v", instance)
+			}
+			test.assertChild(t, restarted, key)
+		})
+	}
+}
+
+func TestChildPostDeleteSaveFailurePersistsParentReconciliationAcrossRestart(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		seed        func(*API, string)
+		assertChild func(*testing.T, *API, string)
+	}{
+		{
+			name: "database", path: "/v1/projects/demo/instances/db/databases/app",
+			seed: func(api *API, key string) {
+				api.databases[key] = []*Database{{Name: "app", Project: "demo", Instance: "db"}}
+			},
+			assertChild: func(t *testing.T, api *API, key string) {
+				if got := api.databases[key]; len(got) != 1 || got[0].Name != "app" {
+					t.Fatalf("database phantom evidence=%#v", got)
+				}
+			},
+		},
+		{
+			name: "user", path: "/v1/projects/demo/instances/db/users?name=app_user",
+			seed: func(api *API, key string) {
+				api.users[key] = []*User{{Name: "app_user", Project: "demo", Instance: "db"}}
+			},
+			assertChild: func(t *testing.T, api *API, key string) {
+				if got := api.users[key]; len(got) != 1 || got[0].Name != "app_user" {
+					t.Fatalf("user phantom evidence=%#v", got)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &flakyCloudSQLStore{failOn: map[int]bool{2: true}}
+			api := newAPIWithBackend(orchestrator.NewOperationManager(), &fakeCloudSQLBackend{}, store)
+			key := instanceKey("demo", "db")
+			api.instances[key] = &DatabaseInstance{
+				Name: "db", Project: "demo", DatabaseVersion: "POSTGRES_15", State: "RUNNABLE",
+			}
+			test.seed(api, key)
+			if err := api.persistMetadata(); err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, test.path, nil))
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance := restarted.instances[key]
+			if instance == nil || instance.State != "ERROR" ||
+				!strings.Contains(instance.BackendStatus, "backend deleted") {
+				t.Fatalf("parent reconciliation=%#v", instance)
+			}
+			test.assertChild(t, restarted, key)
+		})
+	}
+}
+
+func TestDatabaseMutationFailsClosedWhenBackendUnavailable(t *testing.T) {
+	backend := &fakeCloudSQLBackend{adminErr: errors.New("database backend unavailable")}
+	api := newAPIWithBackend(orchestrator.NewOperationManager(), backend, nil)
+	api.instances[instanceKey("demo", "db")] = &DatabaseInstance{
+		Name: "db", Project: "demo", DatabaseVersion: "POSTGRES_15", State: "RUNNABLE",
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/demo/instances/db/databases", strings.NewReader(`{"name":"app"}`)))
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(api.databases[instanceKey("demo", "db")]) != 0 {
+		t.Fatal("backend failure created database metadata")
 	}
 }
 

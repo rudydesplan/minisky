@@ -2,7 +2,9 @@
 
 **Website:** [minisky.bmics.com.ng](https://minisky.bmics.com.ng)
 
-MiniSky is a high-fidelity GCP emulator designed for local development, testing, and CI/CD. It allows you to run a full GCP cloud environment locally using Docker and a custom API Gateway.
+MiniSky is a local emulator for bounded Google Cloud development and CI
+workflows. One gateway exposes custom Go shims and selected Docker-backed
+emulators; it is not a full local GCP environment.
 
 TLS, mTLS, local credentials, strict IAM, and their non-production boundaries
 are documented in [Security simulation](security-simulation.md).
@@ -84,6 +86,12 @@ tools and images are present, the corresponding checks can run offline.
 Use `make dev`, `make test`, `make test-phase17`, `make benchmark`, or the explicitly guarded
 `MINISKY_INTEGRATION=1 make test-integration`.
 
+If Docker is unavailable at startup, MiniSky keeps the public gateway,
+dashboard, diagnostics, and in-process shims available. Docker-backed services
+then fail explicitly instead of preventing the daemon from starting.
+Configuration or ownership conflicts still fail closed because continuing could
+adopt or modify the wrong resources.
+
 ---
 
 ## Cloud Storage
@@ -105,7 +113,9 @@ blob.upload_from_string("Hello MiniSky!")
 
 ## Pub/Sub
 
-Full support for Topics, Subscriptions (Push & Pull).
+The Docker passthrough supports the bounded topic/subscription publish, pull,
+and acknowledge workflows used by the acceptance gates. Push subscriptions and
+general Pub/Sub parity are not claimed.
 
 ### Node.js Example (Publisher)
 ```javascript
@@ -132,8 +142,14 @@ doc_ref.set({"name": "Alice", "active": True})
 ```
 
 ### Cloud SQL
-MiniSky spins up high-performance Docker containers for MySQL/PostgreSQL.
-- **Access**: Via the local port shown in the **Database Topology** dashboard.
+MiniSky supports a bounded MySQL/PostgreSQL instance lifecycle plus persisted
+instance, database, and user control-plane metadata. The guarded Terraform gate
+proves create/read/no-drift/destroy for one PostgreSQL instance, database, and
+user. Restored instances are `SUSPENDED`/`METADATA_ONLY` with stale endpoints
+removed until explicitly reconciled; container database files are not included
+in state export.
+- **Access**: While the owned backend is running, use the loopback port shown in
+  the **Database Topology** dashboard.
 
 ---
 
@@ -184,19 +200,28 @@ See [ADR 0012](adr/0012-local-observability-and-request-replay.md) for the
 redaction, cardinality, binding, and replay-safety decisions.
 
 ### Cloud Logging
-All container logs (Serverless, Compute, etc.) are automatically harvested into the **Cloud Logging** dashboard.
-- **Search**: Filter by resource name or text content.
-- **Live Stream**: Real-time log tailing.
+The bounded Logging API persists entries, sinks, and unacknowledged sink
+deliveries. Pending file/Pub/Sub deliveries are retried after restart and are
+cancelled when their sink is deleted. Delivery is at-least-once across the
+external-acceptance/persisted-acknowledgement window, so duplicates remain
+possible.
+- **Search**: Filter persisted entries by the supported project/resource/text
+  fields in the dark operational Log Explorer.
+- The container harvester polls logs from currently managed containers; it is
+  not a guaranteed lossless live stream.
 
 ### Cloud Monitoring
-Real-time CPU and Memory metrics are collected from all managed containers.
-- View charts in the **Cloud Monitoring** tab.
+The dark operational Monitoring view displays bounded managed-container
+CPU/memory samples and persisted custom metric data. The supported PromQL API
+is an exact instant selector, not full Cloud Monitoring or PromQL parity.
 
 ---
 
 ## BigQuery
 
-Powered by **DuckDB** for lightning-fast local analytical queries without the heavy overhead of the official BQ emulator.
+On CGO builds, the `full` profile or `MINISKY_BQ_BACKEND=duckdb` enables local
+DuckDB query execution. The default `simulation` profile keeps dataset/table
+metadata behavior and simulated queries; it does not silently enable DuckDB.
 
 ```python
 from google.cloud import bigquery
@@ -211,6 +236,15 @@ results = client.query(query)
 
 ### Lazy Loading
 MiniSky is "Lazy" by default. If you run a command like `gcloud pubsub topics create ...`, MiniSky will detect that Pub/Sub is not running, pull the image (if missing), start the container, and then execute your command. Docker image pulls honor request cancellation and are bounded to two minutes; timeout and registry failures are returned to the caller instead of leaving the request pending indefinitely.
+
+### Delivery lifecycle boundaries
+Cloud Tasks persists stable task IDs, attempts, schedules, and outcomes.
+Nonterminal tasks are resumed once per API lifetime after restart with their
+remaining retry budget. This is at-least-once delivery: a crash after target
+acceptance but before the terminal result is saved can cause a duplicate.
+Cloud Scheduler manual and cron deliveries run under the Scheduler API lifetime,
+not the incoming request lifetime; shutdown cancels and bounded-waits for active
+deliveries. Missed schedules are not replayed.
 
 ### State lifecycle
 Adopted Go shims persist metadata under

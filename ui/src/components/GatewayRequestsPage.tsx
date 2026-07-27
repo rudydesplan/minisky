@@ -5,8 +5,16 @@ import {
   Button,
   Chip,
   CircularProgress,
+  FormControl,
+  InputLabel,
   MenuItem,
   Select,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
   TextField,
   Typography,
 } from '@mui/material';
@@ -34,14 +42,21 @@ function isGatewayRequest(value: unknown): value is GatewayRequest {
     && typeof record.method === 'string'
     && typeof record.route === 'string'
     && typeof record.service === 'string'
-    && typeof record.status === 'number'
+    && (record.traceId === undefined || typeof record.traceId === 'string')
+    && Number.isInteger(record.status)
+    && Number.isFinite(record.status)
+    && (record.status as number) >= 100
+    && (record.status as number) <= 599
     && typeof record.latencyMs === 'number'
+    && Number.isFinite(record.latencyMs)
+    && record.latencyMs >= 0
     && typeof record.replayable === 'boolean';
 }
 
 export default function GatewayRequestsPage() {
   const [requests, setRequests] = useState<GatewayRequest[]>([]);
   const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [error, setError] = useState('');
   const [service, setService] = useState('ALL');
   const [method, setMethod] = useState('ALL');
@@ -60,6 +75,7 @@ export default function GatewayRequestsPage() {
       const parsed = (data as { requests: unknown[] }).requests;
       if (!parsed.every(isGatewayRequest)) throw new Error('Malformed request record');
       setRequests(parsed);
+      setHasLoaded(true);
       setError('');
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -107,7 +123,7 @@ export default function GatewayRequestsPage() {
   };
 
   return (
-    <Box sx={{ p: 4, minHeight: '100%', background: '#f8f9fa' }}>
+    <Box sx={{ p: { xs: 2, sm: 3, md: 4 }, minHeight: '100%', background: '#f8f9fa' }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 3, flexWrap: 'wrap' }}>
         <Box>
           <Typography variant="h5" sx={{ fontWeight: 600 }}>Gateway Requests</Typography>
@@ -119,7 +135,11 @@ export default function GatewayRequestsPage() {
         <Button startIcon={<RefreshIcon />} onClick={() => load()} disabled={loading}>Refresh</Button>
       </Box>
 
-      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      {error && (
+        <Alert severity={hasLoaded ? 'warning' : 'error'} sx={{ mb: 2 }}>
+          {hasLoaded ? `Showing stale gateway records. ${error}` : error}
+        </Alert>
+      )}
 
       <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
         <TextField
@@ -127,61 +147,89 @@ export default function GatewayRequestsPage() {
           label="Route, request ID, or trace ID"
           value={search}
           onChange={event => setSearch(event.target.value)}
-          sx={{ minWidth: 280 }}
+          sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 280 } }}
         />
-        <Select size="small" value={service} onChange={event => setService(event.target.value)}>
-          {services.map(value => <MenuItem key={value} value={value}>{value === 'ALL' ? 'All services' : value}</MenuItem>)}
-        </Select>
-        <Select size="small" value={method} onChange={event => setMethod(event.target.value)}>
-          {['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map(value => (
-            <MenuItem key={value} value={value}>{value === 'ALL' ? 'All methods' : value}</MenuItem>
-          ))}
-        </Select>
+        <FormControl size="small" sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 180 } }}>
+          <InputLabel id="gateway-service-label">Service</InputLabel>
+          <Select
+            labelId="gateway-service-label"
+            label="Service"
+            value={service}
+            onChange={event => setService(event.target.value)}
+          >
+            {services.map(value => <MenuItem key={value} value={value}>{value === 'ALL' ? 'All services' : value}</MenuItem>)}
+          </Select>
+        </FormControl>
+        <FormControl size="small" sx={{ width: { xs: '100%', sm: 'auto' }, minWidth: { sm: 140 } }}>
+          <InputLabel id="gateway-method-label">Method</InputLabel>
+          <Select
+            labelId="gateway-method-label"
+            label="Method"
+            value={method}
+            onChange={event => setMethod(event.target.value)}
+          >
+            {['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map(value => (
+              <MenuItem key={value} value={value}>{value === 'ALL' ? 'All methods' : value}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
         <Chip label={`${filtered.length} requests`} />
       </Box>
 
       {loading && requests.length === 0 ? (
         <Box sx={{ display: 'grid', placeItems: 'center', py: 10 }}><CircularProgress /></Box>
-      ) : filtered.length === 0 ? (
+      ) : hasLoaded && filtered.length === 0 ? (
         <Typography color="text.secondary" sx={{ py: 8, textAlign: 'center' }}>No matching requests.</Typography>
       ) : (
-        <Box sx={{ border: '1px solid #dadce0', borderRadius: 2, overflow: 'auto', background: '#fff' }}>
-          {filtered.map(request => (
-            <Box
-              key={request.requestId}
-              sx={{
-                display: 'grid',
-                gridTemplateColumns: '90px minmax(280px, 1fr) 90px 100px 130px',
-                gap: 2,
-                alignItems: 'center',
-                px: 2,
-                py: 1.5,
-                borderBottom: '1px solid #eee',
-                minWidth: 850,
-              }}
-            >
-              <Chip label={request.method} size="small" />
-              <Box sx={{ minWidth: 0 }}>
-                <Typography sx={{ fontFamily: 'monospace', fontSize: 13 }} noWrap>{request.route}</Typography>
-                <Typography variant="caption" color="text.secondary" noWrap>{request.service} · {request.requestId}</Typography>
-              </Box>
-              <Chip
-                label={request.status}
-                size="small"
-                color={request.status >= 500 ? 'error' : request.status >= 400 ? 'warning' : 'success'}
-              />
-              <Typography variant="body2">{request.latencyMs.toFixed(2)} ms</Typography>
-              <Button
-                size="small"
-                startIcon={<ReplayIcon />}
-                disabled={!request.replayable || replaying === request.requestId}
-                onClick={() => replay(request)}
-              >
-                Replay
-              </Button>
-            </Box>
-          ))}
-        </Box>
+        <TableContainer sx={{ border: '1px solid #dadce0', borderRadius: 2, background: '#fff' }}>
+          <Table size="small" sx={{ minWidth: 900 }}>
+            <TableHead>
+              <TableRow>
+                <TableCell>Method</TableCell>
+                <TableCell>Route and service</TableCell>
+                <TableCell>Trace ID</TableCell>
+                <TableCell>Status</TableCell>
+                <TableCell>Latency</TableCell>
+                <TableCell>Actions</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {filtered.map(request => (
+                <TableRow key={request.requestId}>
+                  <TableCell><Chip label={request.method} size="small" /></TableCell>
+                  <TableCell>
+                    <Typography sx={{ fontFamily: 'monospace', fontSize: 13 }} noWrap>{request.route}</Typography>
+                    <Typography variant="caption" color="text.secondary" noWrap>
+                      {request.service} · {request.requestId}
+                    </Typography>
+                  </TableCell>
+                  <TableCell sx={{ fontFamily: 'monospace', fontSize: 12 }}>
+                    {request.traceId ?? '—'}
+                  </TableCell>
+                  <TableCell>
+                    <Chip
+                      label={request.status}
+                      size="small"
+                      color={request.status >= 500 ? 'error' : request.status >= 400 ? 'warning' : 'success'}
+                    />
+                  </TableCell>
+                  <TableCell>{request.latencyMs.toFixed(2)} ms</TableCell>
+                  <TableCell>
+                    <Button
+                      size="small"
+                      startIcon={<ReplayIcon />}
+                      aria-label={`Replay ${request.method} ${request.requestId}`}
+                      disabled={!request.replayable || replaying === request.requestId}
+                      onClick={() => replay(request)}
+                    >
+                      Replay
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
       )}
     </Box>
   );

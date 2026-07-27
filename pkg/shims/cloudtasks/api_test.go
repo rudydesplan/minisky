@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -171,6 +172,7 @@ func TestTaskStateSurvivesRestartWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create API: %v", err)
 	}
+	api.allowLocalTargets = true
 	queueName := createTestQueue(t, api, RetryConfig{MaxAttempts: 1})
 	taskName := createTestTask(t, api, queueName, &HTTPRequest{URL: target.URL})
 	waitForTaskStatus(t, api, queueName, taskName, "COMPLETED")
@@ -180,6 +182,7 @@ func TestTaskStateSurvivesRestartWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart API: %v", err)
 	}
+	restarted.allowLocalTargets = true
 	defer restarted.Close()
 	task := waitForTaskStatus(t, restarted, queueName, taskName, "COMPLETED")
 	if task.AttemptCount != 1 {
@@ -191,20 +194,28 @@ func TestTaskStateSurvivesRestartWithoutReplay(t *testing.T) {
 	}
 }
 
-func TestRestartMarksInterruptedTasksTerminal(t *testing.T) {
+func TestRestartReplaysOnlyPendingAndRetryingTasks(t *testing.T) {
 	store := &memoryStateStore{}
+	var deliveries atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deliveries.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	queueName := "projects/test/locations/us-central1/queues/q"
 	if err := store.Save(cloudTasksStateEntry, cloudTasksMetadata{
 		Queues: map[string]*Queue{
-			"projects/test/locations/us-central1/queues/q": {
-				Name:  "projects/test/locations/us-central1/queues/q",
-				State: "RUNNING",
+			queueName: {
+				Name: queueName, State: "RUNNING",
+				RetryConfig: RetryConfig{MaxAttempts: 3, MinBackoff: "1ms"},
 			},
 		},
 		Tasks: map[string][]*Task{
-			"projects/test/locations/us-central1/queues/q": {
-				{Name: "pending", Status: "PENDING"},
-				{Name: "retrying", Status: "RETRYING", AttemptCount: 2},
-				{Name: "done", Status: "FAILED", AttemptCount: 3},
+			queueName: {
+				{Name: queueName + "/tasks/pending", Status: "PENDING", HTTPRequest: &HTTPRequest{URL: target.URL}},
+				{Name: queueName + "/tasks/retrying", Status: "RETRYING", AttemptCount: 1, HTTPRequest: &HTTPRequest{URL: target.URL}},
+				{Name: queueName + "/tasks/done", Status: "COMPLETED", AttemptCount: 1, HTTPRequest: &HTTPRequest{URL: target.URL}},
+				{Name: queueName + "/tasks/failed", Status: "FAILED", AttemptCount: 3, HTTPRequest: &HTTPRequest{URL: target.URL}},
 			},
 		},
 	}); err != nil {
@@ -215,19 +226,266 @@ func TestRestartMarksInterruptedTasksTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart API: %v", err)
 	}
+	api.allowLocalTargets = true
 	defer api.Close()
 
+	api.ResumePendingDeliveries()
+	pending := waitForTaskStatus(t, api, queueName, queueName+"/tasks/pending", "COMPLETED")
+	retrying := waitForTaskStatus(t, api, queueName, queueName+"/tasks/retrying", "COMPLETED")
+	if pending.AttemptCount != 1 || retrying.AttemptCount != 2 {
+		t.Fatalf("replayed attempts: pending=%+v retrying=%+v", pending, retrying)
+	}
+	api.ResumePendingDeliveries()
+	time.Sleep(20 * time.Millisecond)
+	if got := deliveries.Load(); got != 2 {
+		t.Fatalf("deliveries = %d, want exactly two nonterminal replays", got)
+	}
 	api.mu.RLock()
 	defer api.mu.RUnlock()
-	tasks := api.tasks["projects/test/locations/us-central1/queues/q"]
-	if tasks[0].Status != "FAILED" || !strings.Contains(tasks[0].LastError, "interrupted") {
-		t.Fatalf("pending task restart state = %+v", tasks[0])
+	if api.tasks[queueName][2].Status != "COMPLETED" || api.tasks[queueName][3].Status != "FAILED" {
+		t.Fatalf("terminal tasks changed: %+v", api.tasks[queueName])
 	}
-	if tasks[1].Status != "FAILED" || tasks[1].AttemptCount != 2 {
-		t.Fatalf("retrying task restart state = %+v", tasks[1])
+}
+
+func TestAttemptIsPersistedBeforeOutboundDelivery(t *testing.T) {
+	store := &memoryStateStore{}
+	const queueName = "projects/test/locations/us-central1/queues/q"
+	persistedBeforeDelivery := make(chan bool, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var metadata cloudTasksMetadata
+		err := store.Load(cloudTasksStateEntry, &metadata)
+		task := metadata.Tasks[queueName][0]
+		persistedBeforeDelivery <- err == nil && task.Status == "RETRYING" && task.AttemptCount == 1
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	if err := store.Save(cloudTasksStateEntry, cloudTasksMetadata{
+		Queues: map[string]*Queue{queueName: {Name: queueName, State: "RUNNING"}},
+		Tasks: map[string][]*Task{queueName: {
+			{Name: queueName + "/tasks/t", Status: "PENDING", HTTPRequest: &HTTPRequest{URL: target.URL}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if tasks[2].Status != "FAILED" || tasks[2].LastError != "" {
-		t.Fatalf("terminal task changed on restart = %+v", tasks[2])
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.allowLocalTargets = true
+	defer api.Close()
+	api.ResumePendingDeliveries()
+	if persisted := <-persistedBeforeDelivery; !persisted {
+		t.Fatal("attempt was not durably reserved before outbound delivery")
+	}
+	waitForTaskStatus(t, api, queueName, queueName+"/tasks/t", "COMPLETED")
+}
+
+func TestShutdownKeepsInterruptedBackoffReplayable(t *testing.T) {
+	store := &memoryStateStore{}
+	var attempts atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "retry", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.allowLocalTargets = true
+	queueName := createTestQueue(t, api, RetryConfig{
+		MaxAttempts: 3, MinBackoff: "500ms", MaxBackoff: "500ms",
+	})
+	taskName := createTestTask(t, api, queueName, &HTTPRequest{URL: target.URL})
+	waitForTaskRetryOutcome(t, api, queueName, taskName)
+	if err := api.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.allowLocalTargets = true
+	defer restarted.Close()
+	restarted.ResumePendingDeliveries()
+	task := waitForTaskStatus(t, restarted, queueName, taskName, "COMPLETED")
+	if task.AttemptCount != 2 || attempts.Load() != 2 {
+		t.Fatalf("resumed task=%+v outbound attempts=%d", task, attempts.Load())
+	}
+}
+
+func TestReplayHonorsScheduleAndRetryBudget(t *testing.T) {
+	const queueName = "projects/test/locations/us-central1/queues/q"
+	store := &memoryStateStore{}
+	delivered := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		delivered <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	if err := store.Save(cloudTasksStateEntry, cloudTasksMetadata{
+		Queues: map[string]*Queue{queueName: {
+			Name: queueName, State: "RUNNING", RetryConfig: RetryConfig{MaxAttempts: 3},
+		}},
+		Tasks: map[string][]*Task{queueName: {
+			{
+				Name: queueName + "/tasks/future", Status: "PENDING",
+				ScheduleTime: time.Now().Add(50 * time.Millisecond).Format(time.RFC3339Nano),
+				HTTPRequest:  &HTTPRequest{URL: target.URL},
+			},
+			{
+				Name: queueName + "/tasks/exhausted", Status: "RETRYING", AttemptCount: 3,
+				HTTPRequest: &HTTPRequest{URL: target.URL},
+			},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.allowLocalTargets = true
+	defer api.Close()
+	api.ResumePendingDeliveries()
+	select {
+	case <-delivered:
+		t.Fatal("future task delivered before its schedule time")
+	case <-time.After(10 * time.Millisecond):
+	}
+	select {
+	case <-delivered:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled replay was not delivered")
+	}
+	waitForTaskStatus(t, api, queueName, queueName+"/tasks/future", "COMPLETED")
+	exhausted := waitForTaskStatus(t, api, queueName, queueName+"/tasks/exhausted", "FAILED")
+	if exhausted.AttemptCount != 3 || !strings.Contains(exhausted.LastError, "budget exhausted") {
+		t.Fatalf("exhausted replay = %+v", exhausted)
+	}
+	select {
+	case <-delivered:
+		t.Fatal("retry-budget-exhausted task was delivered")
+	case <-time.After(10 * time.Millisecond):
+	}
+}
+
+func TestReplayRejectsUnsafeOrOversizedRequestsWithoutOutboundIO(t *testing.T) {
+	const queueName = "projects/test/locations/us-central1/queues/q"
+	tooManyHeaders := make(map[string]string, 101)
+	for index := range 101 {
+		tooManyHeaders[fmt.Sprintf("X-Test-%d", index)] = "value"
+	}
+	tests := []struct {
+		name    string
+		request *HTTPRequest
+	}{
+		{name: "metadata", request: &HTTPRequest{URL: "http://169.254.169.254/computeMetadata/v1/"}},
+		{name: "private", request: &HTTPRequest{URL: "http://10.0.0.1/task"}},
+		{name: "credentials", request: &HTTPRequest{URL: "http://user:pass@example.com/task"}},
+		{name: "headers", request: &HTTPRequest{URL: "https://example.com/task", Headers: tooManyHeaders}},
+		{name: "body", request: &HTTPRequest{
+			URL:  "https://example.com/task",
+			Body: base64.StdEncoding.EncodeToString(make([]byte, (1<<20)+1)),
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryStateStore{}
+			taskName := queueName + "/tasks/" + test.name
+			if err := store.Save(cloudTasksStateEntry, cloudTasksMetadata{
+				Queues: map[string]*Queue{queueName: {Name: queueName, State: "RUNNING"}},
+				Tasks: map[string][]*Task{queueName: {
+					{Name: taskName, Status: "PENDING", HTTPRequest: test.request},
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			api, err := NewAPIWithStore(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer api.Close()
+			var calls atomic.Int32
+			api.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return nil, errors.New("outbound I/O must not occur")
+			})}
+			api.ResumePendingDeliveries()
+			task := waitForTaskStatus(t, api, queueName, taskName, "FAILED")
+			if calls.Load() != 0 || task.AttemptCount != 1 {
+				t.Fatalf("task=%+v outbound calls=%d", task, calls.Load())
+			}
+		})
+	}
+}
+
+func TestTaskTargetResolutionPinsValidatedAddressAgainstRebinding(t *testing.T) {
+	api := newAPI(nil)
+	defer api.Close()
+	var resolutions atomic.Int32
+	api.lookupIP = func(context.Context, string) ([]net.IP, error) {
+		if resolutions.Add(1) == 1 {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		}
+		return []net.IP{net.ParseIP("169.254.169.254")}, nil
+	}
+	var dialed string
+	dialFailure := errors.New("deterministic dial stop")
+	api.dial = func(_ context.Context, _, address string) (net.Conn, error) {
+		dialed = address
+		return nil, dialFailure
+	}
+
+	ctx, err := api.pinTaskTarget(context.Background(), "https://task.example.test/deliver")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.dialTaskTarget(ctx, "tcp", "task.example.test:443")
+	if !errors.Is(err, dialFailure) {
+		t.Fatalf("dial error = %v", err)
+	}
+	if resolutions.Load() != 1 {
+		t.Fatalf("resolver calls = %d, want one pinned resolution", resolutions.Load())
+	}
+	if dialed != "203.0.113.10:443" {
+		t.Fatalf("dialed address = %q", dialed)
+	}
+}
+
+func TestTaskTargetResolutionRejectsUnsafeAnswersAndScopesLocalException(t *testing.T) {
+	tests := []struct {
+		name       string
+		address    string
+		scheme     string
+		allowLocal bool
+		wantError  bool
+	}{
+		{name: "private", address: "10.0.0.1", scheme: "https", wantError: true},
+		{name: "link-local-metadata", address: "169.254.169.254", scheme: "http", wantError: true},
+		{name: "loopback-default", address: "127.0.0.1", scheme: "http", wantError: true},
+		{name: "loopback-explicit-http", address: "127.0.0.1", scheme: "http", allowLocal: true},
+		{name: "loopback-explicit-https", address: "127.0.0.1", scheme: "https", allowLocal: true, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newAPI(nil)
+			defer api.Close()
+			api.allowLocalTargets = test.allowLocal
+			api.lookupIP = func(context.Context, string) ([]net.IP, error) {
+				return []net.IP{net.ParseIP(test.address)}, nil
+			}
+			_, err := api.pinTaskTarget(
+				context.Background(), test.scheme+"://target.example.test/deliver",
+			)
+			if (err != nil) != test.wantError {
+				t.Fatalf("pin error = %v, wantError=%v", err, test.wantError)
+			}
+		})
 	}
 }
 
@@ -345,6 +603,12 @@ type deleteOrderStore struct {
 	saved atomic.Bool
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 func (s *deleteOrderStore) Load(string, any) error { return state.ErrNotFound }
 
 func (s *deleteOrderStore) Save(string, any) error {
@@ -395,6 +659,7 @@ func newMemoryAPI(t *testing.T) *API {
 	if err != nil {
 		t.Fatalf("create in-memory API: %v", err)
 	}
+	api.allowLocalTargets = true
 	return api
 }
 
@@ -429,6 +694,25 @@ func waitForTaskStatus(t *testing.T, api *API, queueName, taskName, status strin
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for task %s to reach %s", taskName, status)
+	return Task{}
+}
+
+func waitForTaskRetryOutcome(t *testing.T, api *API, queueName, taskName string) Task {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		api.mu.RLock()
+		for _, task := range api.tasks[queueName] {
+			if task.Name == taskName && task.Status == "RETRYING" && task.LastError != "" {
+				result := *task
+				api.mu.RUnlock()
+				return result
+			}
+		}
+		api.mu.RUnlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for task %s retry outcome", taskName)
 	return Task{}
 }
 

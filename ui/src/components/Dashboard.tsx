@@ -26,7 +26,8 @@ import CloudBuildDrawer from './CloudBuildDrawer';
 
 export default function Dashboard() {
   const { 
-    services, settings, error, handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency
+    services, settings, error, hasLoaded, stale,
+    handleStartContainer, handleStopContainer, toggleSetting, handleInstallDependency
   } = useServices();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [iamDrawerOpen, setIamDrawerOpen] = useState(false);
@@ -64,7 +65,11 @@ export default function Dashboard() {
           </Typography>
         </Box>
       </Box>
-      {error && <Alert severity="error" role="alert" sx={{ mb: 3 }}>{error}</Alert>}
+      {error && (
+        <Alert severity={stale ? 'warning' : 'error'} role="alert" sx={{ mb: 3 }}>
+          {stale ? `Showing stale service status. ${error}` : error}
+        </Alert>
+      )}
       <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 3 }}>
         <Typography variant="body2" sx={{ color: 'text.secondary' }}>Runtime profile</Typography>
         <Chip size="small" label={settings.runtime_profile?.name ?? 'unknown'} />
@@ -75,11 +80,11 @@ export default function Dashboard() {
 
       <Typography variant="h6" sx={{ mb: 3, color: 'var(--text-primary)' }}>Service Runtime Status</Typography>
       
-      {services.length === 0 ? (
+      {hasLoaded && services.length === 0 ? (
         <Box sx={{ p: 4, background: '#f8f9fa', borderRadius: '10px', border: '1px dashed #dadce0', textAlign: 'center' }}>
           <Typography variant="body1" sx={{ color: '#80868b' }}>No active endpoints. Services will spin up automatically when invoked, or you can manually enable them in their specific tabs.</Typography>
         </Box>
-      ) : (
+      ) : services.length > 0 ? (
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 4 }}>
           {services.map((s, idx) => (
             <ServiceCard 
@@ -117,7 +122,7 @@ export default function Dashboard() {
             />
           ))}
         </Box>
-      )}
+      ) : null}
 
       <StorageManagerDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />
       <IamManagerDrawer open={iamDrawerOpen} onClose={() => setIamDrawerOpen(false)} />

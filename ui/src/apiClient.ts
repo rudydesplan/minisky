@@ -81,10 +81,17 @@ export function installDashboardFetch(): void {
 
     // Canonical path/body targets take precedence. This header supplies the
     // selected project only for dashboard operations without such a target.
+    const selectedProject = localStorage.getItem(PROJECT_KEY) ?? 'local-dev-project';
     if (!/\/projects\/[^/]+/.test(url.pathname) && !(url.pathname === '/api/projects' && init?.method === 'POST')) {
-      headers.set('X-MiniSky-Project', localStorage.getItem(PROJECT_KEY) ?? 'local-dev-project');
+      headers.set('X-MiniSky-Project', selectedProject);
     }
-    return nativeFetch(input, { ...init, headers }).then(response => {
+    const projectScopedDiagnostics = url.pathname.startsWith('/api/diagnostics/')
+      && url.pathname !== '/api/diagnostics/metrics';
+    if (projectScopedDiagnostics) url.searchParams.set('project', selectedProject);
+    const scopedInput = projectScopedDiagnostics
+      ? (request ? new Request(url, request) : url)
+      : input;
+    return nativeFetch(scopedInput, { ...init, headers }).then(response => {
       if (response.status === 401 || response.status === 403) {
         void responseErrorMessage(response, 'Dashboard request was rejected').then(message => {
           window.dispatchEvent(new CustomEvent(DASHBOARD_AUTH_EVENT, { detail: message }));

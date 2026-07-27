@@ -310,9 +310,9 @@ func TestDataprocPartialProvisionCompensatesInReverseOrder(t *testing.T) {
 		t.Fatalf("create = %d, body = %s", response.Code, response.Body.String())
 	}
 	want := []string{
-		"minisky-dataproc-cluster-w-1",
-		"minisky-dataproc-cluster-w-0",
-		"minisky-dataproc-cluster-m",
+		dataprocDockerName("test", "us", "cluster", "w", 1),
+		dataprocDockerName("test", "us", "cluster", "w", 0),
+		dataprocDockerName("test", "us", "cluster", "m", 0),
 	}
 	if len(backend.deleteNames) != len(want) {
 		t.Fatalf("compensation deletes = %#v", backend.deleteNames)
@@ -338,22 +338,28 @@ func TestDataprocProvisionErrorCompensatesAttemptedOwnedIdentity(t *testing.T) {
 		{
 			name: "master create succeeded start failed", failure: "start container failed",
 			failAt: 1, workers: 0,
-			wantDelete: []string{"minisky-dataproc-cluster-m"},
+			wantDelete: []string{dataprocDockerName("test", "us", "cluster", "m", 0)},
 		},
 		{
 			name: "master port registry update failed", failure: "update port registry failed",
 			failAt: 1, workers: 0,
-			wantDelete: []string{"minisky-dataproc-cluster-m"},
+			wantDelete: []string{dataprocDockerName("test", "us", "cluster", "m", 0)},
 		},
 		{
 			name: "worker create succeeded start failed", failure: "start container failed",
 			failAt: 2, workers: 1,
-			wantDelete: []string{"minisky-dataproc-cluster-w-0", "minisky-dataproc-cluster-m"},
+			wantDelete: []string{
+				dataprocDockerName("test", "us", "cluster", "w", 0),
+				dataprocDockerName("test", "us", "cluster", "m", 0),
+			},
 		},
 		{
 			name: "worker port registry update failed", failure: "update port registry failed",
 			failAt: 2, workers: 1,
-			wantDelete: []string{"minisky-dataproc-cluster-w-0", "minisky-dataproc-cluster-m"},
+			wantDelete: []string{
+				dataprocDockerName("test", "us", "cluster", "w", 0),
+				dataprocDockerName("test", "us", "cluster", "m", 0),
+			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -389,11 +395,14 @@ func TestDataprocProvisionErrorRefusesUnownedCollisionAndDegrades(t *testing.T) 
 		"/v1/projects/test/regions/us/clusters",
 		`{"clusterName":"cluster","config":{"workerConfig":{"numInstances":1}}}`)
 
-	wantAttempts := []string{"minisky-dataproc-cluster-w-0", "minisky-dataproc-cluster-m"}
+	wantAttempts := []string{
+		dataprocDockerName("test", "us", "cluster", "w", 0),
+		dataprocDockerName("test", "us", "cluster", "m", 0),
+	}
 	if strings.Join(backend.attemptedDeletes, ",") != strings.Join(wantAttempts, ",") {
 		t.Fatalf("cleanup attempts = %#v, want %#v", backend.attemptedDeletes, wantAttempts)
 	}
-	if got := strings.Join(backend.deleted, ","); got != "minisky-dataproc-cluster-m" {
+	if got := strings.Join(backend.deleted, ","); got != dataprocDockerName("test", "us", "cluster", "m", 0) {
 		t.Fatalf("deleted resources = %q; unowned worker must remain", got)
 	}
 	if api.PersistenceError() == nil {
@@ -454,14 +463,27 @@ func TestDataprocDuplicateDoesNotRegisterOperation(t *testing.T) {
 
 func TestDataprocJobTransitionSaveFailureIsSticky(t *testing.T) {
 	store := newDataprocFailingStore()
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			clusterKey("test", "us", "cluster"): {
+				ProjectId: "test", ClusterName: "cluster",
+				Status: ClusterStatus{State: "RUNNING"},
+			},
+		},
+	})
 	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), &dataprocBackendSpy{}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	api.mu.Lock()
+	api.clusters[clusterKey("test", "us", "cluster")].Status.State = "RUNNING"
+	api.mu.Unlock()
+	store.saves = 0
 	api.jobRunner = func(work func()) { work() }
 	store.failAt = 2
 	response := dataprocRequest(api, http.MethodPost,
-		"/v1/projects/test/regions/us/jobs:submit", `{"job":{"placement":{"clusterName":"cluster"}}}`)
+		"/v1/projects/test/regions/us/jobs:submit",
+		`{"job":{"placement":{"clusterName":"cluster"},"pysparkJob":{"mainPythonFileUri":"gs://test/job.py"}}}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("submit = %d, body = %s", response.Code, response.Body.String())
 	}
@@ -470,6 +492,91 @@ func TestDataprocJobTransitionSaveFailureIsSticky(t *testing.T) {
 	}
 	blocked := dataprocRequest(api, http.MethodGet, "/v1/projects/test/regions/us/jobs", "")
 	assertDataprocError(t, blocked, http.StatusServiceUnavailable, "UNAVAILABLE")
+}
+
+func TestDataprocRejectsUnsupportedJobsWithoutPersisting(t *testing.T) {
+	store := newDataprocFailingStore()
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			clusterKey("test", "us", "cluster"): {
+				ProjectId: "test", ClusterName: "cluster",
+				Status: ClusterStatus{State: "RUNNING"},
+			},
+		},
+	})
+	backend := &dataprocBackendSpy{}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := dataprocRequest(api, http.MethodPost,
+		"/v1/projects/test/regions/us/jobs:submit",
+		`{"job":{"placement":{"clusterName":"cluster"},"hiveJob":{"queryList":{"queries":["select 1"]}}}}`)
+	assertDataprocError(t, response, http.StatusNotImplemented, "UNIMPLEMENTED")
+	if len(api.jobs) != 0 || backend.commands != 0 {
+		t.Fatalf("unsupported job mutated state or executed: jobs=%d commands=%d", len(api.jobs), backend.commands)
+	}
+}
+
+func TestDataprocJobRequiresExactPersistedClusterIdentity(t *testing.T) {
+	store := newDataprocFailingStore()
+	store.entries[dataprocStateEntry] = mustDataprocJSON(t, dataprocMetadata{
+		Clusters: map[string]*Cluster{
+			clusterKey("project-a", "us", "cluster"): {
+				ProjectId: "project-a", ClusterName: "cluster",
+				Status: ClusterStatus{State: "RUNNING"},
+			},
+		},
+	})
+	backend := &dataprocBackendSpy{}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := dataprocRequest(api, http.MethodPost,
+		"/v1/projects/project-b/regions/us/jobs:submit",
+		`{"job":{"placement":{"clusterName":"cluster"},"pysparkJob":{"mainPythonFileUri":"gs://code/job.py"}}}`)
+	assertDataprocError(t, response, http.StatusNotFound, "NOT_FOUND")
+	if len(api.jobs) != 0 || backend.commands != 0 {
+		t.Fatalf("foreign cluster job mutated state or executed: jobs=%d commands=%d", len(api.jobs), backend.commands)
+	}
+}
+
+func TestDataprocDockerIdentitySeparatesProfileProjectRegionAndCluster(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "profile-a")
+	first := dataprocDockerName("project-a", "us", "cluster", "m", 0)
+	for _, other := range []string{
+		dataprocDockerName("project-b", "us", "cluster", "m", 0),
+		dataprocDockerName("project-a", "eu", "cluster", "m", 0),
+		dataprocDockerName("project-a", "us", "other", "m", 0),
+		dataprocDockerName("project-a", "us", "cluster", "w", 0),
+	} {
+		if other == first {
+			t.Fatalf("Dataproc Docker identity collision: %q", first)
+		}
+	}
+	t.Setenv("MINISKY_PROFILE", "profile-b")
+	if other := dataprocDockerName("project-a", "us", "cluster", "m", 0); other == first {
+		t.Fatalf("Dataproc Docker identity collided across profiles: %q", first)
+	}
+}
+
+func TestDataprocOperationPollingIsFullyScoped(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api := newAPI(manager, nil, nil)
+	operations := []*orchestrator.Operation{
+		manager.Register("dataproc#operation", "CREATE",
+			"https://dataproc.googleapis.com/v1/projects/other/regions/us/clusters/c", "", "us"),
+		manager.Register("dataproc#operation", "CREATE",
+			"https://dataproc.googleapis.com/v1/projects/test/regions/eu/clusters/c", "", "eu"),
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/test/zones/us/instances/c", "us", ""),
+	}
+	for _, operation := range operations {
+		response := dataprocRequest(api, http.MethodGet,
+			"/v1/projects/test/regions/us/operations/"+operation.Name, "")
+		assertDataprocError(t, response, http.StatusNotFound, "NOT_FOUND")
+	}
 }
 
 func TestDataprocRunningSaveFailureCompensatesAndDegrades(t *testing.T) {
@@ -493,9 +600,9 @@ func TestDataprocRunningSaveFailureCompensatesAndDegrades(t *testing.T) {
 		t.Fatalf("create = %d, body = %s", response.Code, response.Body.String())
 	}
 	want := []string{
-		"minisky-dataproc-cluster-w-1",
-		"minisky-dataproc-cluster-w-0",
-		"minisky-dataproc-cluster-m",
+		dataprocDockerName("test", "us", "cluster", "w", 1),
+		dataprocDockerName("test", "us", "cluster", "w", 0),
+		dataprocDockerName("test", "us", "cluster", "m", 0),
 	}
 	if strings.Join(backend.deleteNames, ",") != strings.Join(want, ",") {
 		t.Fatalf("RUNNING-save compensation = %#v, want %#v", backend.deleteNames, want)
@@ -527,7 +634,10 @@ func TestDataprocRunningPostCommitSaveFailureStillCompensates(t *testing.T) {
 	_ = dataprocRequest(api, http.MethodPost,
 		"/v1/projects/test/regions/us/clusters",
 		`{"clusterName":"cluster","config":{"workerConfig":{"numInstances":1}}}`)
-	want := []string{"minisky-dataproc-cluster-w-0", "minisky-dataproc-cluster-m"}
+	want := []string{
+		dataprocDockerName("test", "us", "cluster", "w", 0),
+		dataprocDockerName("test", "us", "cluster", "m", 0),
+	}
 	if strings.Join(backend.deleteNames, ",") != strings.Join(want, ",") {
 		t.Fatalf("post-commit compensation = %#v, want %#v", backend.deleteNames, want)
 	}

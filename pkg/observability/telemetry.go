@@ -3,7 +3,6 @@ package observability
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"sync"
 	"time"
@@ -24,40 +23,18 @@ type TelemetryConfig struct {
 }
 
 func SetupTelemetry(ctx context.Context, config TelemetryConfig) (func(context.Context) error, error) {
-	if !config.Enabled {
-		return func(context.Context) error { return nil }, nil
-	}
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
-		return nil, fmt.Errorf("invalid OTLP HTTP endpoint %q", config.Endpoint)
-	}
-	timeout := config.ExportTimeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	exporter, err := otlptracehttp.New(
-		ctx,
-		otlptracehttp.WithEndpointURL(endpoint.String()),
-		otlptracehttp.WithTimeout(timeout),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create OTLP trace exporter: %w", err)
-	}
-	res, err := resource.New(
+	options := make([]sdktrace.TracerProviderOption, 0, 1)
+	res, resourceErr := resource.New(
 		ctx,
 		resource.WithAttributes(
 			semconv.ServiceName("minisky"),
 			semconv.ServiceVersion(config.ServiceVersion),
 		),
 	)
-	if err != nil {
-		_ = exporter.Shutdown(ctx)
-		return nil, fmt.Errorf("create telemetry resource: %w", err)
+	if resourceErr == nil {
+		options = append(options, sdktrace.WithResource(res))
 	}
-	provider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
-	)
+	provider := sdktrace.NewTracerProvider(options...)
 	otel.SetTracerProvider(provider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
@@ -66,10 +43,31 @@ func SetupTelemetry(ctx context.Context, config TelemetryConfig) (func(context.C
 
 	var once sync.Once
 	var shutdownErr error
-	return func(shutdownCtx context.Context) error {
+	shutdown := func(shutdownCtx context.Context) error {
 		once.Do(func() {
 			shutdownErr = errors.Join(provider.ForceFlush(shutdownCtx), provider.Shutdown(shutdownCtx))
 		})
 		return shutdownErr
-	}, nil
+	}
+
+	if config.Enabled {
+		endpoint, parseErr := url.Parse(config.Endpoint)
+		if parseErr != nil || endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+			return shutdown, nil
+		}
+		timeout := config.ExportTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		exporter, exportErr := otlptracehttp.New(
+			ctx,
+			otlptracehttp.WithEndpointURL(endpoint.String()),
+			otlptracehttp.WithTimeout(timeout),
+		)
+		if exportErr != nil {
+			return shutdown, nil
+		}
+		provider.RegisterSpanProcessor(sdktrace.NewBatchSpanProcessor(exporter))
+	}
+	return shutdown, nil
 }

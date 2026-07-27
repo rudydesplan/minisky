@@ -4,6 +4,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -11,13 +12,23 @@ import (
 	"github.com/Microsoft/go-winio"
 )
 
+func validateDockerHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil
+	}
+	const prefix = "npipe:////./pipe/"
+	name, ok := strings.CutPrefix(host, prefix)
+	if !ok || name == "" || strings.ContainsAny(name, `/\?#`) || name == "." || name == ".." {
+		return fmt.Errorf("%w: unsupported Windows DOCKER_HOST %q", ErrDockerConfiguration, host)
+	}
+	return nil
+}
+
 func resolveDockerSocket() string {
 	// 1. Explicit DOCKER_HOST env var
 	if host := os.Getenv("DOCKER_HOST"); host != "" {
-		if strings.HasPrefix(host, "npipe://") {
-			return host
-		}
-		return strings.TrimPrefix(host, "unix://")
+		return strings.TrimPrefix(host, "npipe://")
 	}
 
 	// 2. Default Windows named pipe
@@ -26,11 +37,5 @@ func resolveDockerSocket() string {
 }
 
 func (sm *ServiceManager) dialDocker(ctx context.Context, _, _ string) (net.Conn, error) {
-	if strings.HasPrefix(sm.sockPath, "//./pipe/") {
-		// Windows Named Pipe
-		return winio.DialPipeContext(ctx, sm.sockPath)
-	}
-	// Fallback to TCP if it looks like an IP (though usually handled by default transport)
-	var d net.Dialer
-	return d.DialContext(ctx, "tcp", sm.sockPath)
+	return winio.DialPipeContext(ctx, sm.sockPath)
 }

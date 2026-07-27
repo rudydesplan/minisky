@@ -2,12 +2,14 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -36,10 +38,12 @@ var (
 	ErrSafeOwnershipUnsupported = errors.New("safe profile ownership is unsupported")
 	ErrStateRootReplaced        = errors.New("state root directory was replaced")
 	ErrUnsupportedVersion       = errors.New("unsupported state version")
+	ErrEntryValidatorConflict   = errors.New("state entry validator conflict")
 
-	profilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	entryPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	pathLocks      sync.Map
+	profilePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	entryPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	pathLocks       sync.Map
+	entryValidators sync.Map
 )
 
 type document struct {
@@ -56,6 +60,70 @@ type Snapshot struct {
 	Entries map[string]json.RawMessage `json:"entries"`
 }
 
+// EntryValidationContext identifies the explicit import destination.
+type EntryValidationContext struct {
+	Store   *Store
+	Profile string
+}
+
+// EntryValidator validates one durable state entry before snapshot replacement.
+type EntryValidator func(EntryValidationContext, json.RawMessage) error
+
+type entryValidatorRegistration struct {
+	validator EntryValidator
+	pointer   uintptr
+}
+
+// RegisterEntryValidator registers the schema validator for an exact state entry.
+func RegisterEntryValidator(name string, validator EntryValidator) error {
+	if err := validateEntryName(name); err != nil {
+		return err
+	}
+	if validator == nil {
+		return fmt.Errorf("state entry validator %q is nil", name)
+	}
+	registration := entryValidatorRegistration{
+		validator: validator,
+		pointer:   reflect.ValueOf(validator).Pointer(),
+	}
+	if existing, loaded := entryValidators.LoadOrStore(name, registration); loaded {
+		if existing.(entryValidatorRegistration).pointer == registration.pointer {
+			return nil
+		}
+		return fmt.Errorf("%w: %q", ErrEntryValidatorConflict, name)
+	}
+	return nil
+}
+
+// MustRegisterEntryValidator registers a validator or panics during package init.
+func MustRegisterEntryValidator(name string, validator EntryValidator) {
+	if err := RegisterEntryValidator(name, validator); err != nil {
+		panic(err)
+	}
+}
+
+// StrictEntryValidator decodes one entry with unknown-field rejection and then
+// applies optional schema-specific semantic validation.
+func StrictEntryValidator[T any](validate func(EntryValidationContext, *T) error) EntryValidator {
+	return func(context EntryValidationContext, payload json.RawMessage) error {
+		var value T
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+		if err := requireEOF(decoder); err != nil {
+			return err
+		}
+		if validate != nil {
+			if err := validate(context, &value); err != nil {
+				return err
+			}
+		}
+		return ValidateResourceMaps(&value)
+	}
+}
+
 // Store persists named JSON entries for one profile.
 type Store struct {
 	root        string
@@ -68,6 +136,8 @@ type Store struct {
 	stateAnchor string
 	ownerAnchor string
 	lock        *sync.RWMutex
+	healthMu    sync.RWMutex
+	degradedErr error
 
 	beforeStateReplace    func()
 	beforeReadOnlyRecheck func()
@@ -122,6 +192,9 @@ func (s *Store) AcquireOwnership() (*Ownership, error) {
 }
 
 func (s *Store) acquireOwnership(registerLocal bool) (*Ownership, error) {
+	if err := s.prepareStateRoot(); err != nil {
+		return nil, err
+	}
 	if err := s.prepareProfileDirectory(); err != nil {
 		return nil, err
 	}
@@ -173,9 +246,36 @@ func (s *Store) acquireOwnership(registerLocal bool) (*Ownership, error) {
 	}}, nil
 }
 
+func (s *Store) prepareStateRoot() error {
+	created := false
+	if err := os.Mkdir(s.root, 0o700); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create state root: %w", err)
+		}
+	} else {
+		created = true
+	}
+	root, err := openPinnedDirectory(s.root)
+	if err != nil {
+		return fmt.Errorf("pin state root after creation: %w", err)
+	}
+	defer root.close()
+	info, err := os.Stat(s.root)
+	if err != nil {
+		return fmt.Errorf("inspect state root: %w", err)
+	}
+	if created && info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("state root permissions %04o are too broad; want 0700", info.Mode().Perm())
+	}
+	return root.samePath()
+}
+
 // Save atomically replaces one named JSON entry.
 func (s *Store) Save(name string, value any) error {
 	if err := validateEntryName(name); err != nil {
+		return err
+	}
+	if err := s.persistenceError(); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(value)
@@ -183,7 +283,7 @@ func (s *Store) Save(name string, value any) error {
 		return fmt.Errorf("marshal state entry %q: %w", name, err)
 	}
 
-	return s.withMutationLock(func(profileDir *pinnedDirectory) error {
+	err = s.withMutationLock(func(profileDir *pinnedDirectory) error {
 		doc, err := s.readLocked(profileDir)
 		if err != nil {
 			return err
@@ -191,6 +291,10 @@ func (s *Store) Save(name string, value any) error {
 		doc.Entries[name] = payload
 		return s.writeLocked(profileDir, doc)
 	})
+	if err != nil {
+		s.markPersistenceDegraded(err)
+	}
+	return err
 }
 
 // Load decodes one named entry into target.
@@ -198,7 +302,7 @@ func (s *Store) Load(name string, target any) error {
 	if err := validateEntryName(name); err != nil {
 		return err
 	}
-	return s.withStateLock(false, func(profileDir *pinnedDirectory) error {
+	err := s.withStateLock(false, func(profileDir *pinnedDirectory) error {
 		doc, err := s.readLocked(profileDir)
 		if err != nil {
 			return err
@@ -212,6 +316,32 @@ func (s *Store) Load(name string, target any) error {
 		}
 		return nil
 	})
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.markPersistenceDegraded(err)
+	}
+	return err
+}
+
+func (s *Store) markPersistenceDegraded(err error) {
+	if err == nil {
+		return
+	}
+	s.healthMu.Lock()
+	if s.degradedErr == nil {
+		s.degradedErr = err
+	}
+	s.healthMu.Unlock()
+}
+
+func (s *Store) persistenceError() error {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+	return s.degradedErr
+}
+
+// PersistenceError reports the first load or save failure observed by the store.
+func (s *Store) PersistenceError() error {
+	return s.persistenceError()
 }
 
 // Delete atomically removes one named entry. Missing entries are not an error.
@@ -219,7 +349,10 @@ func (s *Store) Delete(name string) error {
 	if err := validateEntryName(name); err != nil {
 		return err
 	}
-	return s.withMutationLock(func(profileDir *pinnedDirectory) error {
+	if err := s.persistenceError(); err != nil {
+		return err
+	}
+	err := s.withMutationLock(func(profileDir *pinnedDirectory) error {
 		doc, err := s.readLocked(profileDir)
 		if err != nil {
 			return err
@@ -230,6 +363,10 @@ func (s *Store) Delete(name string) error {
 		delete(doc.Entries, name)
 		return s.writeLocked(profileDir, doc)
 	})
+	if err != nil {
+		s.markPersistenceDegraded(err)
+	}
+	return err
 }
 
 // Export writes a portable metadata snapshot. It never copies arbitrary files.
@@ -280,6 +417,12 @@ func (s *Store) Import(r io.Reader) error {
 		}
 		if !json.Valid(payload) {
 			return fmt.Errorf("invalid JSON in state entry %q", name)
+		}
+		if registered, ok := entryValidators.Load(name); ok {
+			context := EntryValidationContext{Store: s, Profile: s.profile}
+			if err := registered.(entryValidatorRegistration).validator(context, payload); err != nil {
+				return fmt.Errorf("invalid schema for state entry %q: %w", name, err)
+			}
 		}
 	}
 

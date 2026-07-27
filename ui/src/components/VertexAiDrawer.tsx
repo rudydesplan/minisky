@@ -141,7 +141,7 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
               <Typography variant="caption" sx={{ color: '#5f6368' }}>Local & Remote LLM Orchestration • {activeProject}</Typography>
             </Box>
           </Box>
-          <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+          <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
         </Box>
 
         <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ bgcolor: 'white', borderBottom: '1px solid #dadce0' }}>
@@ -217,7 +217,7 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
                     }}
                     sx={{ bgcolor: 'white', borderRadius: 2 }}
                   />
-                  <IconButton 
+                  <IconButton aria-label="Send"
                     color="primary" 
                     onClick={handleSend} 
                     disabled={!input || loading}
@@ -267,7 +267,7 @@ export default function VertexAiDrawer({ open, onClose }: VertexAiDrawerProps) {
                       )}
                     </Select>
                   </FormControl>
-                  <IconButton onClick={fetchModels} disabled={isFetchingModels}>
+                  <IconButton aria-label="Refresh" onClick={fetchModels} disabled={isFetchingModels}>
                     <RefreshIcon className={isFetchingModels ? 'spin' : ''} />
                   </IconButton>
                 </Box>

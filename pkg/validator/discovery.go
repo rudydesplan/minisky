@@ -631,6 +631,172 @@ var embeddedRules = []ServiceSchema{
 					Message: "field 'instances' is required for endpoints.predict",
 				}},
 			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/indexes",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "displayName", Type: "string",
+					Message: "field 'displayName' is required for indexes.create",
+				}},
+			},
+			{
+				HTTPMethod:  "POST",
+				PathGlob:    "/v1/projects/*/locations/*/models:upload",
+				ContentType: "application/json",
+				RequiredBody: []BodyField{{
+					Path: "model.displayName", Type: "string",
+					Message: "field 'model.displayName' is required for models.upload",
+				}},
+			},
 		},
 	},
+
+	// Phase 18
+	{Domain: "eventarc.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/triggers", ContentType: "application/json",
+			RequiredBody:  []BodyField{{Path: "eventFilters", Type: "array", Message: "field 'eventFilters' is required for triggers.create"}},
+			RequiredQuery: []string{"triggerId"}},
+	}},
+	{Domain: "workflows.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/workflows", ContentType: "application/json",
+			RequiredBody:  []BodyField{{Path: "sourceContents", Type: "string", Message: "field 'sourceContents' is required for workflows.create"}},
+			RequiredQuery: []string{"workflowId"}},
+	}},
+	{Domain: "batch.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/jobs", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "taskGroups", Type: "array", Message: "field 'taskGroups' is required for jobs.create"}}},
+	}},
+	// Phase 19
+	{Domain: "dataflow.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1b3/projects/*/locations/*/jobs", ContentType: "application/json"},
+	}},
+	{Domain: "composer.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/environments", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "name", Type: "string", Message: "field 'name' is required for environments.create"}}},
+	}},
+	{Domain: "managedkafka.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/clusters", ContentType: "application/json",
+			RequiredQuery: []string{"clusterId"}},
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/clusters/*/topics", ContentType: "application/json",
+			RequiredQuery: []string{"topicId"}},
+	}},
+	{Domain: "dataform.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1beta1/projects/*/locations/*/repositories", ContentType: "application/json",
+			RequiredQuery: []string{"repositoryId"}},
+	}},
+	// Phase 20
+	{Domain: "alloydb.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/clusters", ContentType: "application/json",
+			RequiredQuery: []string{"clusterId"},
+			RequiredBody:  []BodyField{{Path: "network", Type: "string", Message: "field 'network' is required for clusters.create"}}},
+	}},
+	{Domain: "identityplatform.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/tenants", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "displayName", Type: "string", Message: "field 'displayName' is required for tenants.create"}}},
+	}},
+	{Domain: "file.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/instances", ContentType: "application/json",
+			RequiredQuery: []string{"instanceId"},
+			RequiredBody: []BodyField{
+				{Path: "tier", Type: "string", Message: "field 'tier' is required for instances.create"},
+				{Path: "fileShares", Type: "array", Message: "field 'fileShares' is required for instances.create"},
+				{Path: "networks", Type: "array", Message: "field 'networks' is required for instances.create"},
+			}},
+	}},
+	{Domain: "storagetransfer.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/transferJobs", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "projectId", Type: "string", Message: "field 'projectId' is required for transferJobs.create"},
+				{Path: "transferSpec", Type: "object", Message: "field 'transferSpec' is required for transferJobs.create"},
+			}},
+	}},
+	// Phase 21
+	{Domain: "cloudtrace.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/traces:batchWrite", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "spans", Type: "array", Message: "field 'spans' is required for traces.batchWrite"}}},
+	}},
+	{Domain: "clouderrorreporting.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1beta1/projects/*/events:report", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "message", Type: "string", Message: "field 'message' is required for events.report"}}},
+	}},
+	{Domain: "cloudprofiler.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/profiles", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "profileType", Type: "array", Message: "field 'profileType' is required for profiles.create"}}},
+	}},
+	// Phase 22
+	{Domain: "apigateway.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/apis", ContentType: "application/json",
+			RequiredQuery: []string{"apiId"}},
+	}},
+	{Domain: "servicedirectory.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/namespaces/*/services/*/endpoints", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "address", Type: "string", Message: "field 'address' is required for endpoints.create"}}},
+	}},
+	{Domain: "clouddeploy.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/deliveryPipelines", ContentType: "application/json",
+			RequiredQuery: []string{"deliveryPipelineId"}},
+	}},
+	// Phase 23
+	{Domain: "vision.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/images:annotate", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "requests", Type: "array", Message: "field 'requests' is required for images.annotate"}}},
+	}},
+	{Domain: "translate.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v3/projects/*/locations/*:translateText", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "contents", Type: "array", Message: "field 'contents' is required for translateText"},
+				{Path: "targetLanguageCode", Type: "string", Message: "field 'targetLanguageCode' is required for translateText"},
+			}},
+	}},
+	{Domain: "documentai.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/processors", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "type", Type: "string", Message: "field 'type' is required for processors.create"}}},
+	}},
+	// Phase 24
+	{Domain: "dlp.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/inspectTemplates", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "inspectTemplate", Type: "object", Message: "field 'inspectTemplate' is required for inspectTemplates.create"}}},
+	}},
+	{Domain: "orgpolicy.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/policies", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "spec", Type: "object", Message: "field 'spec' is required for policies.create"}}},
+	}},
+	// Phase 25
+	{Domain: "networksecurity.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/authorizationPolicies", ContentType: "application/json",
+			RequiredQuery: []string{"authorizationPolicyId"},
+			RequiredBody:  []BodyField{{Path: "name", Type: "string", Message: "field 'name' is required for authorizationPolicies.create"}}},
+	}},
+	{Domain: "accesscontextmanager.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/accessPolicies", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "title", Type: "string", Message: "field 'title' is required for accessPolicies.create"}}},
+	}},
+	{Domain: "networkservices.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/meshes", ContentType: "application/json",
+			RequiredQuery: []string{"meshId"},
+			RequiredBody:  []BodyField{{Path: "name", Type: "string", Message: "field 'name' is required for meshes.create"}}},
+	}},
+	{Domain: "dialogflow.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v3/projects/*/locations/*/agents", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "displayName", Type: "string", Message: "field 'displayName' is required for agents.create"},
+				{Path: "defaultLanguageCode", Type: "string", Message: "field 'defaultLanguageCode' is required for agents.create"},
+				{Path: "timeZone", Type: "string", Message: "field 'timeZone' is required for agents.create"},
+			}},
+	}},
+	{Domain: "privateca.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/caPools/*/certificates", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "pemCsr", Type: "string", Message: "field 'pemCsr' is required for certificates.create"},
+				{Path: "lifetime", Type: "string", Message: "field 'lifetime' is required for certificates.create"},
+			}},
+	}},
+	{Domain: "binaryauthorization.googleapis.com", Methods: []MethodSchema{
+		{HTTPMethod: "PUT", PathGlob: "/v1/projects/*/policy", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "name", Type: "string", Message: "field 'name' is required for policy.update"},
+				{Path: "defaultAdmissionRule", Type: "object", Message: "field 'defaultAdmissionRule' is required for policy.update"},
+			}},
+	}},
 }

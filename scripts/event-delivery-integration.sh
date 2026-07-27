@@ -2,6 +2,78 @@
 
 set -Eeuo pipefail
 
+assert_local_target_harness() {
+  local target=$1
+  local candidate_profile=$2
+  local candidate_work_dir=$3
+  local candidate_state_dir=$4
+  local network_manager=$5
+  local network_profile=$6
+  local owned=$7
+
+  python3 - "${target}" <<'PY' || return 1
+import sys
+import urllib.parse
+
+target = urllib.parse.urlsplit(sys.argv[1])
+if (
+    target.scheme != "http"
+    or target.hostname != "127.0.0.1"
+    or target.port is None
+    or target.username is not None
+    or target.password is not None
+    or target.path not in ("", "/")
+    or target.query
+    or target.fragment
+):
+    raise SystemExit("Cloud Tasks local-target exception requires an explicit loopback HTTP origin")
+PY
+  [[ "${candidate_profile}" == event-integration-* ]] || return 1
+  [[ "${candidate_state_dir}" == "${candidate_work_dir}/state" ]] || return 1
+  [[ -d "${candidate_work_dir}" && -d "${candidate_state_dir}" ]] || return 1
+  [[ "${network_manager}" == "minisky" ]] || return 1
+  [[ "${network_profile}" == "${candidate_profile}" ]] || return 1
+  [[ -z "${owned}" ]] || return 1
+}
+
+run_guard_self_test() (
+  local root
+  root="$(mktemp -d)"
+  trap 'rm -rf "${root}"' EXIT
+  mkdir "${root}/state"
+  assert_local_target_harness \
+    "http://127.0.0.1:18080" "event-integration-self-test" \
+    "${root}" "${root}/state" "minisky" "event-integration-self-test" ""
+  if assert_local_target_harness \
+    "http://10.0.0.1:18080" "event-integration-self-test" \
+    "${root}" "${root}/state" "minisky" "event-integration-self-test" "" 2>/dev/null; then
+    echo "Local-target guard accepted a non-loopback target." >&2
+    return 1
+  fi
+  if assert_local_target_harness \
+    "http://127.0.0.1:18080" "event-integration-self-test" \
+    "${root}" "${root}/state" "minisky" "wrong-profile" "" 2>/dev/null; then
+    echo "Local-target guard accepted foreign network ownership." >&2
+    return 1
+  fi
+  if assert_local_target_harness \
+    "http://127.0.0.1:18080" "event-integration-self-test" \
+    "${root}" "${root}/state" "minisky" "event-integration-self-test" "existing" 2>/dev/null; then
+    echo "Local-target guard accepted pre-existing owned resources." >&2
+    return 1
+  fi
+  echo "Event delivery local-target guard self-test passed."
+)
+
+if [[ "${MINISKY_EVENT_INTEGRATION_SELF_TEST:-}" == "1" ]]; then
+  command -v python3 >/dev/null 2>&1 || {
+    echo "Required command not found: python3" >&2
+    exit 1
+  }
+  run_guard_self_test
+  exit 0
+fi
+
 if [[ "${MINISKY_EVENT_INTEGRATION:-}" != "1" ]]; then
   echo "Refusing to start Docker-backed event integration without MINISKY_EVENT_INTEGRATION=1." >&2
   exit 2
@@ -43,12 +115,11 @@ owned_container_names() {
 }
 
 cleanup() {
-  local status
+  local status="$?"
   local cleanup_failed=0
   local container
   local network_manager
   local network_profile
-  status=$?
   trap - EXIT INT TERM
 
   if (( status != 0 )); then
@@ -148,10 +219,12 @@ api_port="$(free_port)"
 ui_port="$(free_port)"
 handler_port="$(free_port)"
 gateway="http://127.0.0.1:${api_port}"
+handler_target="http://127.0.0.1:${handler_port}"
 project="local-dev-project"
 location="us-central1"
 deliveries="${work_dir}/deliveries.jsonl"
-mkdir -p "${work_dir}/home" "${work_dir}/state"
+state_dir="${work_dir}/state"
+mkdir -p "${work_dir}/home" "${state_dir}"
 
 cat >"${work_dir}/handler.py" <<'PY'
 import http.server
@@ -260,6 +333,21 @@ assert body["status"] == sys.argv[2]
 ' "${task_name}" "${expected_status}" <<<"${response}" 2>/dev/null
 }
 
+scheduler_succeeded() {
+  local job_name=$1
+  local response
+  response="$(curl -fsS -H "Host: cloudscheduler.googleapis.com" \
+    "${gateway}/v1/${job_name}" 2>/dev/null)" || return 1
+  python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+assert body["name"] == sys.argv[1]
+assert body["lastAttemptStatus"] == 204
+assert body.get("lastAttemptError", "") == ""
+assert body["status"]["code"] == 0
+' "${job_name}" <<<"${response}" 2>/dev/null
+}
+
 serverless_container() {
   local resource_type=$1
   local resource_name=$2
@@ -300,8 +388,17 @@ resource_missing() {
 }
 
 go build -trimpath -o "${work_dir}/minisky" ./cmd/minisky
-HOME="${work_dir}/home" MINISKY_STATE_DIR="${work_dir}/state" MINISKY_PROFILE="${profile}" \
+network_manager="$(docker network inspect --format '{{index .Labels "managed-by"}}' minisky-net)"
+network_profile="$(docker network inspect --format '{{index .Labels "minisky.profile"}}' minisky-net)"
+preexisting_owned_containers="$(docker ps -aq \
+  --filter "label=managed-by=minisky" \
+  --filter "label=minisky.profile=${profile}")"
+assert_local_target_harness \
+  "${handler_target}" "${profile}" "${work_dir}" "${state_dir}" \
+  "${network_manager}" "${network_profile}" "${preexisting_owned_containers}"
+HOME="${work_dir}/home" MINISKY_STATE_DIR="${state_dir}" MINISKY_PROFILE="${profile}" \
   MINISKY_RUNTIME_PROFILE=full MINISKY_SERVERLESS_BACKEND=buildpacks \
+  MINISKY_CLOUDTASKS_ALLOW_LOCAL_TARGETS=1 \
   MINISKY_PORT="${api_port}" MINISKY_UI_PORT="${ui_port}" \
   "${work_dir}/minisky" start >"${work_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -309,14 +406,14 @@ daemon_pid=$!
 poll 120 "gateway readiness" gateway_ready
 
 scheduler_job="projects/${project}/locations/${location}/jobs/event-gate"
-python3 - "${scheduler_job}" "${handler_port}" <<'PY' >"${work_dir}/scheduler.json"
+python3 - "${scheduler_job}" "${handler_target}" <<'PY' >"${work_dir}/scheduler.json"
 import json, sys
-name, port = sys.argv[1:]
+name, target = sys.argv[1:]
 print(json.dumps({
     "name": name,
     "schedule": "0 0 1 1 *",
     "httpTarget": {
-        "uri": f"http://127.0.0.1:{port}/scheduler",
+        "uri": f"{target}/scheduler",
         "httpMethod": "POST",
         "body": "scheduler-body",
     },
@@ -327,6 +424,7 @@ curl -fsS -X POST -H "Content-Type: application/json" -H "Host: cloudscheduler.g
   "${gateway}/v1/projects/${project}/locations/${location}/jobs" >/dev/null
 curl -fsS -X POST -H "Host: cloudscheduler.googleapis.com" \
   "${gateway}/v1/${scheduler_job}:run" >/dev/null
+poll 30 "successful Scheduler delivery outcome" scheduler_succeeded "${scheduler_job}"
 
 queue="projects/${project}/locations/${location}/queues/event-gate"
 curl -fsS -X POST -H "Content-Type: application/json" -H "Host: cloudtasks.googleapis.com" \
@@ -345,13 +443,13 @@ create_task() {
   local path=$2
   local body=$3
   local task_name="${queue}/tasks/${task_id}"
-  python3 - "${task_name}" "${handler_port}" "${path}" "${body}" <<'PY' >"${work_dir}/${task_id}.json"
+  python3 - "${task_name}" "${handler_target}" "${path}" "${body}" <<'PY' >"${work_dir}/${task_id}.json"
 import base64, json, sys
-name, port, path, body = sys.argv[1:]
+name, target, path, body = sys.argv[1:]
 print(json.dumps({"task": {
     "name": name,
     "httpRequest": {
-        "url": f"http://127.0.0.1:{port}{path}",
+        "url": f"{target}{path}",
         "httpMethod": "POST",
         "body": base64.b64encode(body.encode()).decode(),
     },

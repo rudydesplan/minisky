@@ -134,7 +134,7 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
         <Box sx={{ width: '700px', p: 4 }}>
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
             <Typography variant="h5" sx={{ fontWeight: 500 }}>IAM Manager</Typography>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
           <Typography variant="body2" sx={{ color: '#5f6368', mb: 3 }}>
             Current Project Context: <Chip label={activeProject} size="small" sx={{ ml: 1, backgroundColor: '#e8f0fe', color: '#1a73e8', fontWeight: 600 }} />
@@ -202,7 +202,7 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
                                 {sa.email}
                               </Link>
                               <Tooltip title="Copy Email">
-                                <IconButton size="small" onClick={() => copyToClipboard(sa.email)}>
+                                <IconButton aria-label={`Copy service account email ${sa.email}`} size="small" onClick={() => copyToClipboard(sa.email)}>
                                   <ContentCopyIcon sx={{ fontSize: 14 }} />
                                 </IconButton>
                               </Tooltip>
@@ -211,7 +211,7 @@ export default function IamManagerDrawer({ open, onClose }: IamManagerDrawerProp
                         </Box>
                       </TableCell>
                       <TableCell align="right">
-                        <IconButton size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteSA(sa.email); }}><DeleteIcon fontSize="small"/></IconButton>
+                        <IconButton aria-label={`Delete service account ${sa.email}`} size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteSA(sa.email); }}><DeleteIcon fontSize="small"/></IconButton>
                       </TableCell>
                     </TableRow>
                   ))}

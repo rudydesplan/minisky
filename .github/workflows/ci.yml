@@ -86,12 +86,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate project agent skills
         run: python3 .claude/skills/validate.py
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
@@ -105,6 +105,10 @@ jobs:
         working-directory: ui
         run: npm run lint
 
+      - name: Test UI
+        working-directory: ui
+        run: npm test
+
       - name: Audit UI dependencies
         working-directory: ui
         run: npm audit --audit-level=high
@@ -114,13 +118,13 @@ jobs:
         run: npm run build
 
       - name: Share UI assets with native platform jobs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ui-dist
           path: ui/dist
           if-no-files-found: error
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -163,15 +167,40 @@ jobs:
           ruby -e "require 'yaml'; YAML.safe_load(File.read('.gitlab/ci/minisky.yml'), aliases: true)"
           docker compose -f deployments/docker-compose.yml config >/dev/null
 
+  dependency-scan:
+    name: Scan Go dependencies
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Scan reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./cmd/... ./pkg/... ./ui
+
   terraform-validate:
     name: Validate Terraform example
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: "1.15.8"
 
@@ -188,7 +217,9 @@ jobs:
 
       - name: Validate integration script syntax
         run: |
-          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          MINISKY_KIND_SELF_TEST=1 ./scripts/kind-integration.sh
+          MINISKY_RELEASE_TAG_POLICY_SELF_TEST=1 ./scripts/release-tag-policy.sh
           MINISKY_PHASE16_SUBNETWORK_SELF_TEST=1 ./scripts/phase16-subnetwork-integration.sh
           MINISKY_PHASE16_SUBNETWORK_TERRAFORM_SELF_TEST=1 ./scripts/phase16-subnetwork-terraform-integration.sh
 
@@ -229,15 +260,15 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: pip
@@ -252,6 +283,9 @@ jobs:
       - name: Compile Python SDK smoke
         run: python -m compileall -q sdk-smoke/python
 
+      - name: Compile Java SDK smoke in pinned container
+        run: make test-java-sdk-compile
+
   terraform-integration:
     name: Terraform apply, no-drift, and destroy
     if: >-
@@ -265,20 +299,20 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ui-dist
           path: ui/dist
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: pip
@@ -287,13 +321,16 @@ jobs:
       - name: Install pinned Python SDK dependency
         run: python -m pip install --requirement sdk-smoke/python/requirements.txt
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: "1.15.8"
 
       - name: Run Terraform integration
         env:
           MINISKY_TERRAFORM_INTEGRATION: "1"
+          MINISKY_TERRAFORM_CLOUDSQL: "1"
+          MINISKY_TERRAFORM_GKE: "1"
+          MINISKY_TERRAFORM_JAVA_SMOKE: "1"
         run: ./scripts/terraform-integration.sh
 
   state-durability-integration:
@@ -664,9 +701,9 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
@@ -676,7 +713,7 @@ jobs:
         working-directory: ui
         run: npm ci
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -686,14 +723,14 @@ jobs:
         name: Validate GoReleaser configuration
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: v2.17.0
           args: check
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         name: Build Linux amd64 release snapshot
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: v2.17.0
           args: build --snapshot --clean --id linux-amd64
 
   linux-packages:
@@ -741,7 +778,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: v2.17.0
           install-only: true
 
       - name: Build, install, smoke-test, and remove deb/rpm
@@ -768,14 +805,14 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ui-dist
           path: ui/dist
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -806,20 +843,20 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ui-dist
           path: ui/dist
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: true
@@ -860,7 +897,7 @@ jobs:
 
       - name: Upload feasibility evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-cgo-evidence
           path: |

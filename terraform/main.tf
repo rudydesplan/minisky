@@ -98,6 +98,47 @@ resource "google_spanner_database" "compatibility" {
   ]
 }
 
+# These resources are off by default because they exercise real profile-owned
+# Docker/Kind backends. The guarded integration runner enables them explicitly.
+resource "google_sql_database_instance" "fidelity" {
+  count = local.use_minisky && var.enable_fidelity_cloudsql_resources ? 1 : 0
+
+  name             = "minisky-fidelity"
+  database_version = "POSTGRES_15"
+  region           = var.region
+
+  settings {
+    tier = "db-f1-micro"
+  }
+
+  deletion_protection = false
+}
+
+resource "google_sql_database" "fidelity" {
+  count = local.use_minisky && var.enable_fidelity_cloudsql_resources ? 1 : 0
+
+  name     = "app"
+  instance = google_sql_database_instance.fidelity[0].name
+}
+
+resource "google_sql_user" "fidelity" {
+  count = local.use_minisky && var.enable_fidelity_cloudsql_resources ? 1 : 0
+
+  name     = "app_user"
+  instance = google_sql_database_instance.fidelity[0].name
+  password = "minisky-local-only"
+}
+
+resource "google_container_cluster" "fidelity" {
+  count = local.use_minisky && var.enable_fidelity_gke_resources ? 1 : 0
+
+  name               = "minisky-fidelity"
+  location           = "us-central1-c"
+  initial_node_count = 1
+
+  deletion_protection = false
+}
+
 # This opt-in local slice exercises one custom-mode VPC and its single bounded
 # regional IPv4 subnetwork. NAT, peering, PSC, IPv6, and secondary ranges remain
 # explicit non-goals for this compatibility fixture.

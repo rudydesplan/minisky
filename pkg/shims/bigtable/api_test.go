@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"minisky/pkg/state"
@@ -112,12 +113,79 @@ func TestUnsupportedAndMethodErrorsUseCanonicalEnvelopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertBigtableError(t, api, http.MethodGet,
-		"/v2/projects/demo/instances/primary/clusters", "",
-		http.StatusNotImplemented, "UNIMPLEMENTED")
+	assertBigtableError(t, api, http.MethodPatch,
+		"/v2/projects/demo/instances/primary/clusters/primary-c1", `{}`,
+		http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
 	assertBigtableError(t, api, http.MethodPatch,
 		"/v2/projects/demo/instances/primary", `{}`,
 		http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
+}
+
+func TestClusterAdminLifecyclePersistsAcrossRestart(t *testing.T) {
+	store, err := state.New(t.TempDir(), "clusters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(nil, fakeBigtableBackend{endpoint: "127.0.0.1:9000"}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.instances["projects/demo/instances/primary"] = &Instance{
+		Name: "projects/demo/instances/primary", State: "READY",
+	}
+	response := assertBigtableRequest(t, api, http.MethodPost,
+		"/v2/projects/demo/instances/primary/clusters?clusterId=primary-c1",
+		`{"location":"projects/demo/locations/us-central1-b","serveNodes":1}`,
+		http.StatusOK)
+	if response["done"] != true {
+		t.Fatalf("create operation = %#v", response)
+	}
+	operationName, _ := response["name"].(string)
+	metadata := response["metadata"].(map[string]interface{})
+	if metadata["@type"] != "type.googleapis.com/google.bigtable.admin.v2.CreateClusterMetadata" {
+		t.Fatalf("operation metadata = %#v", metadata)
+	}
+	originalRequest := metadata["originalRequest"].(map[string]interface{})
+	if originalRequest["parent"] != "projects/demo/instances/primary" ||
+		originalRequest["clusterId"] != "primary-c1" {
+		t.Fatalf("operation target metadata = %#v", originalRequest)
+	}
+	polled := assertBigtableRequest(t, api, http.MethodGet, "/v2/"+operationName, "", http.StatusOK)
+	cluster := polled["response"].(map[string]interface{})
+	if cluster["name"] != "projects/demo/instances/primary/clusters/primary-c1" ||
+		cluster["state"] != metadataOnlyInstanceState ||
+		cluster["@type"] != "type.googleapis.com/google.bigtable.admin.v2.Cluster" {
+		t.Fatalf("created cluster response = %#v", cluster)
+	}
+	foreignName := strings.Replace(operationName, "projects/demo/", "projects/foreign/", 1)
+	api.operations[foreignName] = cloneBigtableOperation(api.operations[operationName])
+	api.operations[foreignName].Name = foreignName
+	assertBigtableError(t, api, http.MethodGet, "/v2/"+foreignName, "",
+		http.StatusNotFound, "NOT_FOUND")
+
+	restarted, err := NewAPIWithStore(nil, fakeBigtableBackend{endpoint: "127.0.0.1:9000"}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBigtableRequest(t, restarted, http.MethodGet,
+		"/v2/projects/demo/instances/primary/clusters/primary-c1", "", http.StatusOK)
+	assertBigtableRequest(t, restarted, http.MethodGet, "/v2/"+operationName, "", http.StatusOK)
+	deleted := assertBigtableRequest(t, restarted, http.MethodDelete,
+		"/v2/projects/demo/instances/primary/clusters/primary-c1", "", http.StatusOK)
+	if deleted["done"] != true {
+		t.Fatalf("delete operation = %#v", deleted)
+	}
+	deleteMetadata := deleted["metadata"].(map[string]interface{})
+	if deleteMetadata["@type"] != "type.googleapis.com/google.bigtable.admin.v2.DeleteClusterMetadata" {
+		t.Fatalf("delete metadata = %#v", deleteMetadata)
+	}
+	deleteRequest := deleteMetadata["originalRequest"].(map[string]interface{})
+	if deleteRequest["name"] != "projects/demo/instances/primary/clusters/primary-c1" {
+		t.Fatalf("delete target metadata = %#v", deleteRequest)
+	}
+	assertBigtableError(t, restarted, http.MethodGet,
+		"/v2/projects/demo/instances/primary/clusters/primary-c1", "",
+		http.StatusNotFound, "NOT_FOUND")
 }
 
 func assertBigtableRequest(

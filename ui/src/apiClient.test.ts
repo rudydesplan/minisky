@@ -1,5 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
-import { checkedMutation, requireOk, responseErrorMessage, safeRequestError } from './apiClient';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  checkedMutation,
+  installDashboardFetch,
+  requireOk,
+  responseErrorMessage,
+  safeRequestError,
+} from './apiClient';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('responseErrorMessage', () => {
   it('provides shared actionable authorization errors', async () => {
@@ -71,5 +81,35 @@ describe('responseErrorMessage', () => {
     expect(refreshed).toBe(false);
     expect(safeRequestError(error, 'Network fallback.')).toBe('Delete failed. Detach dependencies and retry.');
     expect(text).not.toHaveBeenCalled();
+  });
+
+  it('uses the active project for diagnostics authorization and selection', async () => {
+    const local = new Map([['minisky-active-project', 'project-alpha']]);
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => local.get(key) ?? null,
+      setItem: (key: string, value: string) => local.set(key, value),
+      removeItem: (key: string) => local.delete(key),
+      clear: () => local.clear(),
+    });
+    vi.stubGlobal('sessionStorage', {
+      getItem: () => null,
+      setItem: () => undefined,
+      removeItem: () => undefined,
+      clear: () => undefined,
+    });
+    const nativeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void input;
+      void init;
+      return new Response('{}', { status: 200 });
+    });
+    vi.stubGlobal('fetch', nativeFetch);
+    installDashboardFetch();
+
+    await window.fetch('/api/diagnostics/requests');
+
+    const [input, init] = nativeFetch.mock.calls[0];
+    const url = new URL(input.toString(), window.location.href);
+    expect(url.searchParams.get('project')).toBe('project-alpha');
+    expect(new Headers(init?.headers).get('X-MiniSky-Project')).toBe('project-alpha');
   });
 });

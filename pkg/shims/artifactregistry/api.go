@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
@@ -33,6 +34,7 @@ const (
 )
 
 func init() {
+	state.MustRegisterEntryValidator(artifactRegistryStateEntry, state.StrictEntryValidator[artifactRegistryMetadata](nil))
 	registry.Register("artifactregistry.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -122,7 +124,7 @@ func (index *dockerRegistryIndex) get(ctx context.Context, path string, target a
 	if err != nil {
 		return fmt.Errorf("build registry request: %w", err)
 	}
-	response, err := index.client.Do(request)
+	response, err := observability.Do(index.client, request)
 	if err != nil {
 		return fmt.Errorf("registry request %s: %w", path, err)
 	}

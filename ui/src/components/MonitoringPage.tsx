@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import {
   Box, Typography, Chip, IconButton, Tooltip, CircularProgress,
   Alert, Paper, LinearProgress
@@ -40,6 +40,17 @@ function statusColor(status: string) {
   if (status.startsWith('Up')) return '#81c995';
   if (status.startsWith('Exited')) return '#f28b82';
   return '#fbbc04';
+}
+
+function isContainerMetrics(value: unknown): value is ContainerMetrics {
+  if (typeof value !== 'object' || value === null) return false;
+  const metric = value as Record<string, unknown>;
+  return typeof metric.name === 'string'
+    && typeof metric.status === 'string'
+    && typeof metric.cpu === 'number'
+    && Number.isFinite(metric.cpu)
+    && typeof metric.memMB === 'number'
+    && Number.isFinite(metric.memMB);
 }
 
 function MiniSparkline({ points, color }: { points: number[]; color: string }) {
@@ -105,20 +116,24 @@ export default function MonitoringPage() {
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
-  const fetchMetrics = async () => {
+  const fetchMetrics = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/manage/monitoring/stats');
+      const res = await fetch('/api/manage/monitoring/stats', { signal });
       await requireOk(res, 'Unable to load container metrics. Verify that Docker is available.');
-      const data: ContainerMetrics[] = await res.json();
-      setMetrics(data ?? []);
+      const data: unknown = await res.json();
+      if (!Array.isArray(data) || !data.every(isContainerMetrics)) {
+        throw new Error('Container metrics returned an invalid response.');
+      }
+      setMetrics(data);
+      setHasLoaded(true);
       setError(null);
       const now = new Date().toLocaleTimeString();
       setHistory(prev => {
         const next = { ...prev };
-        (data ?? []).forEach(m => {
+        data.forEach(m => {
           const pts = prev[m.name] ?? [];
           next[m.name] = [
             ...pts,
@@ -128,22 +143,36 @@ export default function MonitoringPage() {
         return next;
       });
     } catch (cause: unknown) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') return;
       setError(cause instanceof Error ? cause.message : 'Unable to load container metrics');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { fetchMetrics(); }, []);
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      controller = new AbortController();
+      await fetchMetrics(controller.signal);
+      if (!stopped && streaming) timer = setTimeout(poll, 1000);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [fetchMetrics, streaming]);
 
   const startStream = () => {
     setStreaming(true);
-    timerRef.current = setInterval(fetchMetrics, 1000);
   };
 
   const stopStream = () => {
     setStreaming(false);
-    if (timerRef.current) clearInterval(timerRef.current);
   };
 
   const handlePrune = async () => {
@@ -154,15 +183,13 @@ export default function MonitoringPage() {
         await fetch('/api/manage/system/prune-containers', { method: 'POST' }),
         'Container cleanup failed. Check Docker availability and retry.',
       );
-      fetchMetrics();
+      await fetchMetrics();
     } catch (cause: unknown) {
       setError(cause instanceof Error ? cause.message : 'Container cleanup failed');
     } finally {
       setLoading(false);
     }
   };
-
-  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
 
   const running = metrics.filter(m => m.status.startsWith('Up'));
   const stopped = metrics.filter(m => !m.status.startsWith('Up'));
@@ -224,17 +251,21 @@ export default function MonitoringPage() {
           </IconButton>
         </Tooltip>
         <Tooltip title="Refresh now">
-          <IconButton size="small" onClick={fetchMetrics} disabled={loading}
+          <IconButton size="small" onClick={() => void fetchMetrics()} disabled={loading}
             aria-label="Refresh container metrics"
             sx={{ color: '#8b949e' }}>
             {loading ? <CircularProgress size={16} sx={{ color: '#8b949e' }} /> : <RefreshIcon fontSize="small" />}
           </IconButton>
         </Tooltip>
       </Box>
-      {error && <Alert severity="error" role="alert" sx={{ m: 2 }}>{error}</Alert>}
+      {error && (
+        <Alert severity={hasLoaded ? 'warning' : 'error'} role="alert" sx={{ m: 2 }}>
+          {hasLoaded ? `Showing stale container metrics. ${error}` : error}
+        </Alert>
+      )}
 
       {/* Content */}
-      {metrics.length === 0 ? (
+      {hasLoaded && !error && metrics.length === 0 ? (
         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: 2 }}>
           <MonitorHeartIcon sx={{ fontSize: 56, color: '#21262d' }} />
           <Typography sx={{ color: '#8b949e' }}>No running containers detected.</Typography>
@@ -242,9 +273,9 @@ export default function MonitoringPage() {
             Start a Cloud Function or Compute instance to see metrics here.
           </Typography>
         </Box>
-      ) : (
-        <Box sx={{ p: 3 }}>
-          <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 2 }}>
+      ) : metrics.length > 0 ? (
+        <Box sx={{ p: { xs: 1.5, sm: 3 } }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))', gap: 2, minWidth: 0 }}>
             {metrics.map(m => {
               const hist = history[m.name] ?? [];
               const cpuHist = hist.map(p => p.cpu);
@@ -252,7 +283,7 @@ export default function MonitoringPage() {
               const isUp = m.status.startsWith('Up');
 
               return (
-                <Box key={m.name}>
+                <Box key={m.name} sx={{ minWidth: 0 }}>
                   <Paper sx={{
                     background: '#161b27', border: '1px solid #21262d', borderRadius: '12px',
                     p: 2, position: 'relative', overflow: 'hidden',
@@ -293,7 +324,7 @@ export default function MonitoringPage() {
 
                     {/* Sparklines */}
                     {hist.length > 1 && (
-                      <Box sx={{ mt: 1.5, display: 'flex', gap: 2 }}>
+                      <Box sx={{ mt: 1.5, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                         <Box>
                           <Typography sx={{ fontSize: '0.62rem', color: '#6e7681', mb: 0.25 }}>CPU trend</Typography>
                           <MiniSparkline points={cpuHist} color="#1e88e5" />
@@ -306,7 +337,7 @@ export default function MonitoringPage() {
                     )}
 
                     {/* Current values */}
-                    <Box sx={{ mt: 1.5, display: 'flex', gap: 2 }}>
+                    <Box sx={{ mt: 1.5, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                         <SpeedIcon sx={{ fontSize: 13, color: '#1e88e5' }} />
                         <Typography sx={{ fontSize: '0.72rem', color: '#8b949e' }}>
@@ -326,7 +357,7 @@ export default function MonitoringPage() {
             })}
           </Box>
         </Box>
-      )}
+      ) : null}
     </Box>
   );
 }

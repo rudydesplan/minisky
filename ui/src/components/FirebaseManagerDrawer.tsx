@@ -153,7 +153,7 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
               </Typography>
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>Project: {activeProject}</Typography>
             </Box>
-            <IconButton onClick={onClose}><CloseIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
           </Box>
 
           <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ bgcolor: 'white', borderBottom: '1px solid #e0e0e0' }}>
@@ -167,7 +167,7 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
                   <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Users</Typography>
                   <Stack direction="row" spacing={1}>
-                    <IconButton onClick={loadUsers} size="small"><RefreshIcon /></IconButton>
+                    <IconButton aria-label="Refresh" onClick={loadUsers} size="small"><RefreshIcon /></IconButton>
                     <Button variant="contained" color="warning" size="small" startIcon={<PersonAddIcon />} onClick={() => setShowAddUser(true)}>
                       Add User
                     </Button>
@@ -184,7 +184,7 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
                           primary={u.email} 
                           secondary={`UID: ${u.localId} • Created: ${new Date(parseInt(u.createdAt)).toLocaleString()}`} 
                         />
-                        <IconButton size="small" color="error" onClick={() => handleDeleteUser(u.localId)}><DeleteIcon fontSize="small" /></IconButton>
+                        <IconButton aria-label={`Delete user ${u.email}`} size="small" color="error" onClick={() => handleDeleteUser(u.localId)}><DeleteIcon fontSize="small" /></IconButton>
                       </ListItem>
                     ))}
                   </List>
@@ -203,7 +203,7 @@ export default function FirebaseManagerDrawer({ open, onClose }: FirebaseManager
                     placeholder="/users/123"
                     sx={{ flex: 1 }}
                   />
-                  <IconButton onClick={() => loadRtdb(dbPath)} size="small"><RefreshIcon /></IconButton>
+                  <IconButton aria-label="Refresh" onClick={() => loadRtdb(dbPath)} size="small"><RefreshIcon /></IconButton>
                   <Button variant="contained" color="warning" startIcon={<SaveIcon />} onClick={handleSaveRtdb}>
                     Save
                   </Button>

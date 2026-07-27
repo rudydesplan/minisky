@@ -118,10 +118,10 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
             <Typography variant="h5" sx={{ fontWeight: 500 }}>GKE Cluster Console</Typography>
           </Box>
           <Box>
-            <IconButton onClick={() => fetchClusters()} disabled={loading} size="small" sx={{ mr: 1 }}>
+            <IconButton aria-label="Refresh" onClick={() => fetchClusters()} disabled={loading} size="small" sx={{ mr: 1 }}>
               <RefreshIcon fontSize="small" />
             </IconButton>
-            <IconButton onClick={onClose}>
+            <IconButton aria-label="Close" onClick={onClose}>
               <CloseIcon />
             </IconButton>
           </Box>
@@ -218,13 +218,13 @@ export default function GKEManagerDrawer({ open, onClose }: Props) {
                     </TableCell>
                     <TableCell align="right">
                       <Tooltip title="Get Credentials (Kubeconfig)">
-                        <IconButton size="small" color="primary" onClick={() => handleDownloadConfig(c.name)} disabled={c.status === 'PROVISIONING'} sx={{ mr: 1 }}>
+                        <IconButton aria-label={`Download kubeconfig for ${c.name}`} size="small" color="primary" onClick={() => handleDownloadConfig(c.name)} disabled={c.status === 'PROVISIONING'} sx={{ mr: 1 }}>
                           <DownloadIcon fontSize="small" />
                         </IconButton>
                       </Tooltip>
                       <Tooltip title={c.status === 'PROVISIONING' ? 'Provisioning in progress...' : 'Deprovision Cluster'}>
                         <span>
-                          <IconButton size="small" color="error" onClick={() => handleDelete(c.name)} disabled={c.status === 'PROVISIONING'}>
+                          <IconButton aria-label={`Delete cluster ${c.name}`} size="small" color="error" onClick={() => handleDelete(c.name)} disabled={c.status === 'PROVISIONING'}>
                             <DeleteIcon fontSize="small" />
                           </IconButton>
                         </span>

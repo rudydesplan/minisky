@@ -20,14 +20,15 @@ func TestCloudSQLMetadataRehydratesWithoutContainerRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	opMgr := orchestrator.NewOperationManager()
-	svcMgr := &orchestrator.ServiceManager{}
-	api, err := NewAPIWithStore(opMgr, svcMgr, store)
+	backend := &fakeCloudSQLBackend{}
+	api, err := NewAPIWithStore(opMgr, nil, store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	api.backend = backend
 	key := instanceKey("project", "sql")
 	api.instances[key] = &DatabaseInstance{
-		Name: "sql", Project: "project", State: "RUNNABLE",
+		Name: "sql", Project: "project", State: "RUNNABLE", DatabaseVersion: "POSTGRES_15",
 		IpAddresses: []IpMapping{{Type: "PRIMARY", IpAddress: "127.0.0.1:5432"}},
 	}
 	for _, request := range []struct {
@@ -44,11 +45,12 @@ func TestCloudSQLMetadataRehydratesWithoutContainerRecreation(t *testing.T) {
 		}
 	}
 
-	restarted, err := NewAPIWithStore(opMgr, svcMgr, store)
+	restarted, err := NewAPIWithStore(opMgr, nil, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restarted.opMgr != opMgr || restarted.svcMgr != svcMgr {
+	restarted.backend = backend
+	if restarted.opMgr != opMgr {
 		t.Fatal("rehydration replaced orchestrator dependencies")
 	}
 	instance := restarted.instances[key]
@@ -92,5 +94,59 @@ func TestCloudSQLStateMissingAndCorrupt(t *testing.T) {
 	if _, err := NewAPIWithStore(nil, nil, corrupt); err == nil ||
 		!strings.Contains(err.Error(), "load Cloud SQL metadata") {
 		t.Fatalf("corrupt state error = %v", err)
+	}
+}
+
+func TestCloudSQLPublicConstructionFailsClosedWithoutOverwritingCorruptState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt")
+	store, err := state.New(root, "corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.ProfileDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(store.ProfileDir(), "state.json")
+	corrupt := []byte("{broken")
+	if err := os.WriteFile(statePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	api := NewAPI(orchestrator.NewOperationManager(), nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/project/instances",
+		bytes.NewBufferString(`{"name":"must-not-exist"}`),
+	))
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, corrupt) {
+		t.Fatalf("corrupt state was overwritten: %q", after)
+	}
+}
+
+func TestCloudSQLOperationPollingIsProjectAndServiceScoped(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api := newAPI(manager, nil, nil)
+	foreignProject := manager.Register("sql#operation", "CREATE",
+		"https://sqladmin.googleapis.com/v1/projects/other/instances/db", "", "us-central1")
+	foreignService := manager.Register("compute#operation", "insert",
+		"https://www.googleapis.com/compute/v1/projects/project/instances/vm", "", "")
+	for _, operation := range []*orchestrator.Operation{foreignProject, foreignService} {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"/v1/projects/project/operations/"+operation.Name, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("foreign operation %s status=%d body=%s", operation.Kind, response.Code, response.Body.String())
+		}
 	}
 }

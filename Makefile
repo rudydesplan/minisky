@@ -1,12 +1,18 @@
-.PHONY: dev test ui-build test-integration test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
+.PHONY: dev test ui-install ui-build ui-test test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence benchmark
 
-ui-build:
-	cd ui && npm ci && npm run build
+ui-install:
+	cd ui && npm ci
+
+ui-test: ui-install
+	cd ui && npm test
+
+ui-build: ui-test
+	cd ui && npm run build
 
 dev: ui-build
 	go run ./cmd/minisky start
 
-test: ui-build
+test: ui-test ui-build
 	go test -race ./cmd/... ./pkg/... ./ui
 
 test-integration:
@@ -15,6 +21,15 @@ test-integration:
 	MINISKY_STATE_DURABILITY_INTEGRATION=1 ./scripts/state-durability-integration.sh
 	MINISKY_TERRAFORM_INTEGRATION=1 ./scripts/terraform-integration.sh
 	MINISKY_PHASE10_INTEGRATION=1 ./scripts/phase10-artifact-integration.sh
+
+test-kind:
+	MINISKY_KIND_INTEGRATION=1 ./scripts/kind-integration.sh
+
+test-java-sdk-compile:
+	MINISKY_JAVA_SDK_SMOKE=1 MINISKY_JAVA_CONTAINER=1 MINISKY_JAVA_COMPILE_ONLY=1 ./scripts/java-sdk-smoke.sh
+
+test-java-sdk-smoke:
+	MINISKY_JAVA_SDK_SMOKE=1 MINISKY_JAVA_CONTAINER=1 ./scripts/java-sdk-smoke.sh
 
 test-event-delivery:
 	MINISKY_EVENT_INTEGRATION=1 ./scripts/event-delivery-integration.sh
@@ -53,6 +68,9 @@ test-phase17:
 
 test-phase17-enterprise:
 	MINISKY_PHASE17_ENTERPRISE_INTEGRATION=1 ./scripts/phase17-enterprise-wif-integration.sh
+
+test-phase18-25-evidence:
+	go test -count=1 ./pkg/evidence ./pkg/orchestrator ./pkg/pagination ./pkg/registry ./pkg/router ./pkg/shims/...
 
 benchmark:
 	go test -run='^$$' -bench=BenchmarkGatewayRouting -benchmem -count=5 ./pkg/router

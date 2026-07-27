@@ -34,6 +34,9 @@ func TestLoadBalancerResourceLifecycle(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.collection, func(t *testing.T) {
 			api, opMgr := newComputeTestAPI()
+			if tc.collection == "urlMaps" {
+				createLoadBalancerResourceForTest(t, api, "backendServices", `{"name":"backend-link"}`)
+			}
 			collectionPath := fmt.Sprintf("/compute/v1/projects/test-project/global/%s", tc.collection)
 			canonicalSelfLink := fmt.Sprintf(
 				"https://www.googleapis.com/compute/v1/projects/test-project/global/%s/test-resource",
@@ -122,6 +125,7 @@ func TestLoadBalancerResourceLifecycle(t *testing.T) {
 func TestLoadBalancerResourceUnsupportedRoutes(t *testing.T) {
 	api, _ := newComputeTestAPI()
 	base := "/compute/v1/projects/test-project/global/backendServices"
+	createLoadBalancerResourceForTest(t, api, "backendServices", `{"name":"backend"}`)
 
 	assertComputeError(t, performComputeRequest(api, http.MethodPatch, base+"/missing", `{}`), http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
 	assertComputeError(t, performComputeRequest(api, http.MethodPut, base+"/missing", `{}`), http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
@@ -132,14 +136,92 @@ func TestLoadBalancerResourceUnsupportedRoutes(t *testing.T) {
 	assertComputeError(
 		t,
 		performComputeRequest(api, http.MethodPost, "/compute/v1/projects/test-project/global/urlMaps",
-			`{"name":"routes","defaultService":"backend","hostRules":[{"hosts":["*"],"pathMatcher":"paths"}]}`),
-		http.StatusNotImplemented,
-		"UNIMPLEMENTED",
+			`{"name":"routes","defaultService":"backend","hostRules":[{"hosts":["*"],"pathMatcher":"missing"}]}`),
+		http.StatusBadRequest,
+		"INVALID_ARGUMENT",
 	)
+}
+
+func TestURLMapCreateValidatesAllBackendReferencesAndUnreachableRules(t *testing.T) {
+	api, _ := newComputeTestAPI()
+	createLoadBalancerResourceForTest(t, api, "backendServices", `{"name":"backend"}`)
+	for _, body := range []string{
+		`{"name":"foreign","defaultService":"https://www.googleapis.com/compute/v1/projects/other/global/backendServices/backend"}`,
+		`{"name":"wrong-collection","defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/healthChecks/backend"}`,
+		`{"name":"unreachable","defaultService":"backend","pathMatchers":[{"name":"unused","defaultService":"backend","pathRules":[{"paths":["bad"],"service":"backend"}]}]}`,
+		`{"name":"missing","defaultService":"backend","pathMatchers":[{"name":"unused","defaultService":"backend","pathRules":[{"paths":["/ok/*"],"service":"absent"}]}]}`,
+	} {
+		response := performComputeRequest(api, http.MethodPost,
+			"/compute/v1/projects/test-project/global/urlMaps", body)
+		assertComputeError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+	}
+}
+
+func TestLoadBalancerURLMapRoutesByHostAndLongestPath(t *testing.T) {
+	defaultBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "default:%s", r.URL.Path)
+	}))
+	defer defaultBackend.Close()
+	apiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "api:%s", r.URL.Path)
+	}))
+	defer apiBackend.Close()
+	versionBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "version:%s", r.URL.Path)
+	}))
+	defer versionBackend.Close()
+
+	api, _ := newComputeTestAPI()
+	for name, target := range map[string]string{
+		"default-backend": defaultBackend.URL,
+		"api-backend":     apiBackend.URL,
+		"version-backend": versionBackend.URL,
+	} {
+		createLoadBalancerResourceForTest(t, api, "backendServices",
+			fmt.Sprintf(`{"name":%q,"backends":[{"url":%q}]}`, name, target))
+	}
+	createLoadBalancerResourceForTest(t, api, "urlMaps", `{
+		"name":"routes",
+		"defaultService":"default-backend",
+		"hostRules":[{"hosts":["api.example.test"],"pathMatcher":"api-paths"}],
+		"pathMatchers":[{
+			"name":"api-paths",
+			"defaultService":"api-backend",
+			"pathRules":[
+				{"paths":["/v1/*"],"service":"api-backend"},
+				{"paths":["/v1/special/*"],"service":"version-backend"}
+			]
+		}]
+	}`)
+	createLoadBalancerResourceForTest(t, api, "targetHttpProxies", `{"name":"proxy","urlMap":"routes"}`)
+	createLoadBalancerResourceForTest(t, api, "forwardingRules", `{"name":"frontend","target":"proxy"}`)
+
+	tests := []struct {
+		host string
+		path string
+		want string
+	}{
+		{host: "other.example.test", path: "/v1/special/item", want: "default:/v1/special/item"},
+		{host: "api.example.test:8080", path: "/other", want: "api:/other"},
+		{host: "api.example.test", path: "/v1/item", want: "api:/v1/item"},
+		{host: "api.example.test", path: "/v1/special/item", want: "version:/v1/special/item"},
+	}
+	for _, test := range tests {
+		request := httptest.NewRequest(http.MethodGet,
+			"/compute/v1/projects/test-project/global/forwardingRules/frontend/proxy"+test.path, nil)
+		request.Host = test.host
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.String() != test.want {
+			t.Fatalf("host=%q path=%q: status=%d body=%q, want %q",
+				test.host, test.path, response.Code, response.Body.String(), test.want)
+		}
+	}
 }
 
 func TestLoadBalancerMetadataConcurrentAccess(t *testing.T) {
 	api, _ := newComputeTestAPI()
+	createLoadBalancerResourceForTest(t, api, "backendServices", `{"name":"backend-link"}`)
 	base := "/compute/v1/projects/test-project/global/urlMaps"
 	create := performComputeRequest(api, http.MethodPost, base, `{"name":"concurrent","defaultService":"backend-link"}`)
 	if create.Code != http.StatusOK {
@@ -372,6 +454,24 @@ func TestComputeGlobalOperationsExposePollingSelfLink(t *testing.T) {
 	decodeComputeResponse(t, poll, &polled)
 	if polled["selfLink"] != wantSelfLink {
 		t.Fatalf("polled operation = %#v", polled)
+	}
+}
+
+func TestComputeGlobalOperationPollingIsProjectKindAndScopeBound(t *testing.T) {
+	manager := orchestrator.NewOperationManager()
+	api := NewAPI(manager, nil)
+	operations := []*orchestrator.Operation{
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/other/global/networks/n", "", ""),
+		manager.Register("compute#operation", "insert",
+			"https://www.googleapis.com/compute/v1/projects/test-project/zones/us/instances/vm", "us", ""),
+		manager.Register("sql#operation", "CREATE",
+			"https://sqladmin.googleapis.com/v1/projects/test-project/instances/db", "", ""),
+	}
+	for _, operation := range operations {
+		response := performComputeRequest(api, http.MethodGet,
+			"/compute/v1/projects/test-project/global/operations/"+operation.Name, "")
+		assertComputeError(t, response, http.StatusNotFound, "NOT_FOUND")
 	}
 }
 

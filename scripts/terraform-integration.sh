@@ -7,12 +7,28 @@ if [[ "${MINISKY_TERRAFORM_INTEGRATION:-}" != "1" ]]; then
   exit 2
 fi
 
-for command in curl docker go python3 terraform; do
+for command in curl docker go grep python3 terraform; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
     exit 1
   fi
 done
+
+enable_fidelity_cloudsql="${MINISKY_TERRAFORM_CLOUDSQL:-0}"
+enable_fidelity_gke="${MINISKY_TERRAFORM_GKE:-0}"
+enable_java_smoke="${MINISKY_TERRAFORM_JAVA_SMOKE:-0}"
+for value in "${enable_fidelity_cloudsql}" "${enable_fidelity_gke}" "${enable_java_smoke}"; do
+  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+    echo "MINISKY_TERRAFORM_CLOUDSQL, MINISKY_TERRAFORM_GKE, and MINISKY_TERRAFORM_JAVA_SMOKE must be 0 or 1." >&2
+    exit 2
+  fi
+done
+if [[ "${enable_fidelity_gke}" == "1" ]]; then
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "Required GKE lifecycle command not found: kubectl" >&2
+    exit 1
+  fi
+fi
 
 docker info >/dev/null
 
@@ -42,10 +58,65 @@ fi
 work_dir="$(mktemp -d)"
 minisky_pid=""
 profile="terraform-integration-$$"
+kind_bin=""
+
+owned_kind_backend() {
+  python3 - "${work_dir}/home/.minisky/state/profiles/${profile}" "${profile}" <<'PY'
+import glob
+import json
+import pathlib
+import re
+import sys
+
+profile_dir = pathlib.Path(sys.argv[1])
+profile = sys.argv[2]
+expected = (profile, "local-dev-project", "us-central1-c", "minisky-fidelity")
+names = set()
+
+def consider(ownership):
+    if not isinstance(ownership, dict):
+        return
+    identity = (
+        ownership.get("profile"), ownership.get("project"),
+        ownership.get("zone"), ownership.get("cluster"),
+    )
+    name = ownership.get("backendName", "")
+    if identity == expected and re.fullmatch(r"minisky-owned-[0-9a-f]{32}", name):
+        names.add(name)
+
+state_path = profile_dir / "state.json"
+if state_path.exists():
+    document = json.loads(state_path.read_text())
+    metadata = document.get("entries", {}).get("gke/metadata", {})
+    for ownership in metadata.get("kubeconfigOwnerships", {}).values():
+        consider(ownership)
+
+for path in glob.glob(str(profile_dir / "runtime/gke/.intent-*")):
+    envelope = json.loads(pathlib.Path(path).read_text())
+    consider(envelope.get("intent", {}).get("ownership"))
+
+if len(names) > 1:
+    raise SystemExit("multiple nonce-owned Kind backends found for the integration identity")
+if names:
+    print(next(iter(names)))
+PY
+}
 
 cleanup() {
   exit_code=$?
+  cleanup_failed=0
   trap - EXIT INT TERM
+
+  if [[ "${exit_code}" -ne 0 && -f "${work_dir}/minisky.log" ]]; then
+    echo "MiniSky integration log (last 200 lines):" >&2
+    python3 - "${work_dir}/minisky.log" <<'PY' >&2
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+print("\n".join(lines[-200:]))
+PY
+  fi
 
   if [[ -n "${minisky_pid}" ]] && kill -0 "${minisky_pid}" 2>/dev/null; then
     kill -TERM "${minisky_pid}" 2>/dev/null || true
@@ -57,14 +128,43 @@ cleanup() {
   done < <(docker ps -aq \
     --filter "label=managed-by=minisky" \
     --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
+  if [[ "${enable_fidelity_gke}" == "1" && -x "${kind_bin}" ]]; then
+    if ! owned_cluster="$(owned_kind_backend)"; then
+      echo "Failed to resolve exact nonce-owned Kind backend during cleanup." >&2
+      cleanup_failed=1
+    elif ! kind_clusters="$("${kind_bin}" get clusters)"; then
+      echo "Failed to list Kind clusters during cleanup." >&2
+      cleanup_failed=1
+    elif [[ -n "${owned_cluster}" ]]; then
+      if grep -Fqx -- "${owned_cluster}" <<<"${kind_clusters}"; then
+        if ! "${kind_bin}" delete cluster --name "${owned_cluster}"; then
+          echo "Failed to delete exact owned Kind backend ${owned_cluster}." >&2
+          cleanup_failed=1
+        elif ! post_delete_clusters="$("${kind_bin}" get clusters)"; then
+          echo "Failed to verify exact owned Kind backend deletion." >&2
+          cleanup_failed=1
+        elif grep -Fqx -- "${owned_cluster}" <<<"${post_delete_clusters}"; then
+          echo "Exact owned Kind backend still exists after deletion: ${owned_cluster}." >&2
+          cleanup_failed=1
+        fi
+      fi
+    elif grep -Eq '^minisky-owned-[0-9a-f]{32}$' <<<"${kind_clusters}"; then
+      echo "Refusing ambiguous Kind cleanup without durable ownership identity." >&2
+      cleanup_failed=1
+    fi
+  fi
   network_manager="$(docker network inspect --format '{{index .Labels "managed-by"}}' minisky-net 2>/dev/null || true)"
   network_profile="$(docker network inspect --format '{{index .Labels "minisky.profile"}}' minisky-net 2>/dev/null || true)"
   if [[ "${network_manager}" == "minisky" && "${network_profile}" == "${profile}" ]]; then
     docker network rm minisky-net >/dev/null 2>&1 || true
   fi
 
-  rm -rf "${work_dir}"
+  chmod -R u+w "${work_dir}" 2>/dev/null || true
+  rm -rf "${work_dir}" || true
   rmdir "${lock_dir}" 2>/dev/null || true
+  if [[ "${cleanup_failed}" -ne 0 ]]; then
+    exit_code=1
+  fi
   exit "${exit_code}"
 }
 trap cleanup EXIT INT TERM
@@ -117,6 +217,8 @@ if [[ "${enable_phase10_artifact_resources}" == "1" ]]; then
   tf_phase10_artifact_enabled=true
 fi
 tf_vars=(
+  -var="enable_fidelity_cloudsql_resources=$([[ "${enable_fidelity_cloudsql}" == "1" ]] && echo true || echo false)"
+  -var="enable_fidelity_gke_resources=$([[ "${enable_fidelity_gke}" == "1" ]] && echo true || echo false)"
   -var="enable_phase10_artifact_resources=${tf_phase10_artifact_enabled}"
   -var="enable_phase10_lb_resources=${tf_phase10_enabled}"
   -var="enable_phase15_resources=${tf_phase15_enabled}"
@@ -126,8 +228,40 @@ tf_vars=(
 )
 
 mkdir -p "${work_dir}/home"
+if [[ "${enable_fidelity_gke}" == "1" ]]; then
+  installer="${work_dir}/install-kind.go"
+  cat >"${installer}" <<'EOF'
+package main
+
+import (
+	"context"
+	"log"
+
+	"minisky/pkg/orchestrator"
+)
+
+func main() {
+	if err := orchestrator.InstallToolDependency(context.Background(), "kind"); err != nil {
+		log.Fatal(err)
+	}
+}
+EOF
+  (
+    cd "${repository_root}"
+    HOME="${work_dir}/home" GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
+      go run "${installer}"
+  )
+  kind_bin="${work_dir}/home/.minisky/bin/kind"
+  test -x "${kind_bin}"
+  "${kind_bin}" version | grep -F 'kind v0.22.0' >/dev/null
+  PATH="$(dirname "${kind_bin}"):${PATH}"
+  export PATH
+fi
 go build -trimpath -o "${work_dir}/minisky" ./cmd/minisky
 
+if [[ "${enable_fidelity_gke}" == "1" ]]; then
+  export MINISKY_GKE_BACKEND=kind
+fi
 HOME="${work_dir}/home" MINISKY_PROFILE="${profile}" "${work_dir}/minisky" start \
   --port "${api_port}" \
   --ui-port "${ui_port}" >"${work_dir}/minisky.log" 2>&1 &
@@ -183,7 +317,7 @@ import sys
 path, expression, expected = sys.argv[1:]
 value = json.loads(open(path, encoding="utf-8").read())
 for component in expression.split("."):
-    value = value[component]
+    value = value[int(component)] if component.isdigit() else value[component]
 if str(value) != expected:
     raise SystemExit(f"{expression} was {value!r}, expected {expected!r}")
 PY
@@ -212,6 +346,10 @@ phase10_proxy_url="${compute_base_url}/global/targetHttpProxies/minisky-phase10-
 phase10_forwarding_url="${compute_base_url}/global/forwardingRules/minisky-phase10-http"
 phase10_traffic_url="${phase10_forwarding_url}/proxy/"
 phase10_artifact_url="${gateway}/_minisky/artifactregistry/v1/projects/${project_id}/locations/us-central1/repositories/minisky-phase10"
+cloudsql_instance_url="${gateway}/_minisky/sqladmin/v1/projects/${project_id}/instances/minisky-fidelity"
+cloudsql_database_url="${cloudsql_instance_url}/databases/app"
+cloudsql_users_url="${cloudsql_instance_url}/users"
+gke_cluster_url="${gateway}/_minisky/container/v1/projects/${project_id}/locations/us-central1-c/clusters/minisky-fidelity"
 
 assert_json_value "${dataset_url}" "datasetReference.datasetId" "${dataset_id}"
 assert_json_value "${secondary_dataset_url}" "datasetReference.projectId" "${secondary_project_id}"
@@ -246,6 +384,14 @@ if [[ "${enable_phase10_resources}" == "1" ]]; then
     exit 1
   fi
 fi
+if [[ "${enable_fidelity_cloudsql}" == "1" ]]; then
+  assert_json_value "${cloudsql_instance_url}" "state" "RUNNABLE"
+  assert_json_value "${cloudsql_database_url}" "name" "app"
+  assert_json_value "${cloudsql_users_url}" "items.0.name" "app_user"
+fi
+if [[ "${enable_fidelity_gke}" == "1" ]]; then
+  assert_json_value "${gke_cluster_url}" "status" "RUNNING"
+fi
 
 export MINISKY_ENDPOINT="${gateway}"
 export MINISKY_PROJECT_ID="${project_id}"
@@ -259,6 +405,14 @@ python3 -m venv "${work_dir}/python-venv"
   --quiet \
   -r "${repository_root}/sdk-smoke/python/requirements.txt"
 "${work_dir}/python-venv/bin/python" "${repository_root}/sdk-smoke/python/smoke.py"
+if [[ "${enable_java_smoke}" == "1" ]]; then
+  MINISKY_JAVA_SDK_SMOKE=1 \
+    MINISKY_JAVA_CONTAINER=1 \
+    MINISKY_ENDPOINT="${gateway}" \
+    MINISKY_PROJECT_ID="${project_id}" \
+    MINISKY_JAVA_BUCKET="minisky-java-${profile}" \
+    "${repository_root}/scripts/java-sdk-smoke.sh"
+fi
 
 set +e
 terraform -chdir="${terraform_dir}" plan \
@@ -303,6 +457,12 @@ if [[ "${enable_phase10_resources}" == "1" ]]; then
 fi
 if [[ "${enable_phase10_artifact_resources}" == "1" ]]; then
   destroyed_urls+=("${phase10_artifact_url}")
+fi
+if [[ "${enable_fidelity_cloudsql}" == "1" ]]; then
+  destroyed_urls+=("${cloudsql_database_url}" "${cloudsql_instance_url}")
+fi
+if [[ "${enable_fidelity_gke}" == "1" ]]; then
+  destroyed_urls+=("${gke_cluster_url}")
 fi
 for url in "${destroyed_urls[@]}"; do
   status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' "${url}")"

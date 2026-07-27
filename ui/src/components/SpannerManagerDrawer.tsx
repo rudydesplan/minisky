@@ -277,8 +277,8 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
             <Typography variant="caption" sx={{ color: '#5f6368' }}>{activeProject} • Spanner Emulator</Typography>
           </Box>
           <Box>
-            <IconButton onClick={loadInstances} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
-            <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
+            <IconButton aria-label="Refresh" onClick={loadInstances} size="small" sx={{ mr: 1 }}><RefreshIcon /></IconButton>
+            <IconButton aria-label="Close" onClick={onClose} size="small"><CloseIcon /></IconButton>
           </Box>
         </Box>
 
@@ -343,13 +343,13 @@ export default function SpannerManagerDrawer({ open, onClose }: Props) {
                                 </ListItemIcon>
                                 <ListItemText primary={<Typography variant="body2">{dbId}</Typography>} />
                                 <Box>
-                                  <IconButton size="small" onClick={(e) => {
+                                  <IconButton aria-label={`Refresh schema for database ${dbId}`} size="small" onClick={(e) => {
                                     e.stopPropagation();
                                     loadTables(instId, dbId);
                                   }} title="Refresh Schema">
                                     <RefreshIcon sx={{ fontSize: 14 }} />
                                   </IconButton>
-                                  <IconButton size="small" onClick={(e) => {
+                                  <IconButton aria-label={`Open SQL workspace for database ${dbId}`} size="small" onClick={(e) => {
                                     e.stopPropagation();
                                     setSelectedDb(dbPath);
                                     setTabValue(1);

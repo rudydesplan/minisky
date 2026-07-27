@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -17,6 +18,7 @@ import (
 const defaultMiniSkyEndpoint = "http://localhost:8080"
 
 var miniskyEndpoint string
+var cliHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 var rootCmd = &cobra.Command{
 	Use:   "minisky",
@@ -92,7 +94,7 @@ func requestJSON(method, endpoint string, body any, target any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := cliHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}

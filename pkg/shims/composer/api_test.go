@@ -1,0 +1,418 @@
+package composer
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"minisky/pkg/state"
+)
+
+func TestCreateEnvironment(t *testing.T) {
+	api := newTestAPI()
+	body := `{"name":"projects/test/locations/us-central1/environments/my-env","config":{"nodeCount":3,"softwareConfig":{"imageVersion":"composer-2.0.0-airflow-2.2.3"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), `"status":"UNIMPLEMENTED"`) {
+		t.Fatalf("expected canonical 501, got %d: %s", w.Code, w.Body.String())
+	}
+	api.mu.RLock()
+	env := api.environments["projects/test/locations/us-central1/environments/my-env"]
+	api.mu.RUnlock()
+	if env != nil {
+		t.Fatal("unsupported create mutated environment state")
+	}
+}
+
+func TestCreateEnvironmentMissingName(t *testing.T) {
+	api := newTestAPI()
+	body := `{"config":{"nodeCount":3}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateEnvironmentInvalidName(t *testing.T) {
+	api := newTestAPI()
+	body := `{"name":"projects/other/locations/us-central1/environments/my-env"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateEnvironmentDuplicate(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.environments["projects/test/locations/us-central1/environments/dup"] = &Environment{
+		Name: "projects/test/locations/us-central1/environments/dup",
+		UUID: "existing-uuid",
+	}
+	api.mu.Unlock()
+
+	body := `{"name":"projects/test/locations/us-central1/environments/dup"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetEnvironment(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.environments["projects/test/locations/us-central1/environments/e1"] = &Environment{
+		Name:       "projects/test/locations/us-central1/environments/e1",
+		UUID:       "uuid-123",
+		CreateTime: "2024-01-01T00:00:00Z",
+		UpdateTime: "2024-01-01T00:00:00Z",
+		State:      "RUNNING",
+		Config: &EnvironmentConfig{
+			NodeCount: 3,
+			SoftwareConfig: &SoftwareConfig{
+				ImageVersion: "composer-2.0.0-airflow-2.2.3",
+			},
+		},
+	}
+	api.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments/e1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var env Environment
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Name != "projects/test/locations/us-central1/environments/e1" {
+		t.Fatalf("unexpected name: %s", env.Name)
+	}
+	if env.State != "RUNNING" {
+		t.Fatalf("unexpected state: %s", env.State)
+	}
+	if env.Config == nil || env.Config.NodeCount != 3 {
+		t.Fatal("expected config in response")
+	}
+}
+
+func TestGetEnvironmentNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments/missing", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListEnvironments(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.environments["projects/test/locations/us-central1/environments/alpha"] = &Environment{Name: "projects/test/locations/us-central1/environments/alpha", UUID: "u1"}
+	api.environments["projects/test/locations/us-central1/environments/beta"] = &Environment{Name: "projects/test/locations/us-central1/environments/beta", UUID: "u2"}
+	api.environments["projects/test/locations/us-central1/environments/gamma"] = &Environment{Name: "projects/test/locations/us-central1/environments/gamma", UUID: "u3"}
+	api.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments?pageSize=2", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	envs := resp["environments"].([]any)
+	if len(envs) != 2 {
+		t.Fatalf("expected 2 environments, got %d", len(envs))
+	}
+	first := envs[0].(map[string]any)["name"].(string)
+	second := envs[1].(map[string]any)["name"].(string)
+	if first >= second {
+		t.Fatalf("expected sorted order, got %s >= %s", first, second)
+	}
+
+	nextToken := resp["nextPageToken"].(string)
+	if nextToken == "" {
+		t.Fatal("expected nextPageToken for pagination")
+	}
+
+	// Second page
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments?pageSize=2&pageToken="+nextToken, nil)
+	w = httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	envs = resp["environments"].([]any)
+	if len(envs) != 1 {
+		t.Fatalf("expected 1 environment on second page, got %d", len(envs))
+	}
+}
+
+func TestListEnvironmentsEmpty(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	envs := resp["environments"].([]any)
+	if len(envs) != 0 {
+		t.Fatalf("expected 0 environments, got %d", len(envs))
+	}
+}
+
+func TestDeleteEnvironment(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.environments["projects/test/locations/us-central1/environments/e1"] = &Environment{
+		Name: "projects/test/locations/us-central1/environments/e1",
+		UUID: "uuid-1",
+	}
+	api.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/environments/e1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+
+	api.mu.RLock()
+	_, exists := api.environments["projects/test/locations/us-central1/environments/e1"]
+	api.mu.RUnlock()
+	if !exists {
+		t.Fatal("unsupported delete mutated environment state")
+	}
+}
+
+func TestDeleteEnvironmentNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/environments/missing", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPatchEnvironment(t *testing.T) {
+	api := newTestAPI()
+	api.mu.Lock()
+	api.environments["projects/test/locations/us-central1/environments/e1"] = &Environment{
+		Name:       "projects/test/locations/us-central1/environments/e1",
+		UUID:       "uuid-1",
+		CreateTime: "2024-01-01T00:00:00Z",
+		UpdateTime: "2024-01-01T00:00:00Z",
+		State:      "RUNNING",
+		Config: &EnvironmentConfig{
+			NodeCount: 3,
+			SoftwareConfig: &SoftwareConfig{
+				ImageVersion: "composer-2.0.0-airflow-2.2.3",
+			},
+		},
+		Labels: map[string]string{"env": "dev"},
+	}
+	api.mu.Unlock()
+
+	body := `{"labels":{"env":"prod"}}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/environments/e1?updateMask=labels", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+
+	api.mu.RLock()
+	env := api.environments["projects/test/locations/us-central1/environments/e1"]
+	api.mu.RUnlock()
+	if env.Labels["env"] != "dev" {
+		t.Fatalf("unsupported patch mutated labels: %v", env.Labels)
+	}
+	if env.UUID != "uuid-1" {
+		t.Fatalf("uuid should be preserved, got %s", env.UUID)
+	}
+	if env.CreateTime != "2024-01-01T00:00:00Z" {
+		t.Fatalf("createTime should be preserved, got %s", env.CreateTime)
+	}
+	if env.UpdateTime != "2024-01-01T00:00:00Z" {
+		t.Fatal("unsupported patch mutated updateTime")
+	}
+}
+
+func TestPatchEnvironmentNotFound(t *testing.T) {
+	api := newTestAPI()
+	body := `{"labels":{"x":"y"}}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/environments/missing?updateMask=labels", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetOperation(t *testing.T) {
+	api := newTestAPI()
+	op, err := api.opMgr.RegisterScopedTargetDurable("composer#operation", "update",
+		"projects/test/locations/us-central1/environments/op-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/"+op.Name, nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var opResp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &opResp)
+	meta := opResp["metadata"].(map[string]any)
+	if meta["verb"] != "update" {
+		t.Fatalf("expected verb=update, got %v", meta["verb"])
+	}
+}
+
+func TestGetOperationNotFound(t *testing.T) {
+	api := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/operations/nonexistent", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPersistAndReload(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	api := &API{
+		opMgr:        newTestAPI().opMgr,
+		stateStore:   store,
+		environments: make(map[string]*Environment),
+	}
+
+	api.mu.Lock()
+	api.environments["projects/p/locations/l/environments/e1"] = &Environment{
+		Name:       "projects/p/locations/l/environments/e1",
+		UUID:       "uuid-persist",
+		CreateTime: "2024-06-01T00:00:00Z",
+		UpdateTime: "2024-06-01T00:00:00Z",
+		State:      "RUNNING",
+		Config: &EnvironmentConfig{
+			NodeCount: 5,
+		},
+	}
+	api.mu.Unlock()
+
+	if err := api.persistState(); err != nil {
+		t.Fatalf("persist failed: %v", err)
+	}
+
+	api2 := &API{
+		opMgr:        newTestAPI().opMgr,
+		stateStore:   store,
+		environments: make(map[string]*Environment),
+	}
+	if err := api2.loadState(); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	api2.mu.RLock()
+	env, ok := api2.environments["projects/p/locations/l/environments/e1"]
+	api2.mu.RUnlock()
+	if !ok {
+		t.Fatal("environment not found after reload")
+	}
+	if env.UUID != "uuid-persist" {
+		t.Fatalf("expected uuid-persist, got %s", env.UUID)
+	}
+	if env.Config == nil || env.Config.NodeCount != 5 {
+		t.Fatal("config lost after reload")
+	}
+	if env.State != "ERROR" {
+		t.Fatalf("rehydrated environment must not claim a running backend, got %q", env.State)
+	}
+}
+
+func TestConcurrentCreateAndGet(t *testing.T) {
+	api := newTestAPI()
+	const n = 50
+	var wg sync.WaitGroup
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"name":"projects/test/locations/us-central1/environments/e-%d"}`, idx)
+			req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+			if w.Code != http.StatusNotImplemented {
+				t.Errorf("unexpected status %d for create %d", w.Code, idx)
+			}
+		}(i)
+	}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments", nil)
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("unexpected status %d for list", w.Code)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+type mockStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (m *mockStore) Load(name string, target any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	raw, ok := m.data[name]
+	if !ok {
+		return fmt.Errorf("not found: %w", state.ErrNotFound)
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (m *mockStore) Save(name string, value any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	m.data[name] = raw
+	return nil
+}

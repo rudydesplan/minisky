@@ -130,7 +130,7 @@ export default function StorageManagerDrawer({ open, onClose }: StorageManagerDr
       <Box sx={{ width: '600px', p: 3 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
         <Typography variant="h5" sx={{ fontWeight: 500 }}>Cloud Storage Manager</Typography>
-        <IconButton onClick={onClose}><CloseIcon /></IconButton>
+        <IconButton aria-label="Close" onClick={onClose}><CloseIcon /></IconButton>
       </Box>
       {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
 
@@ -155,7 +155,7 @@ export default function StorageManagerDrawer({ open, onClose }: StorageManagerDr
                   <TableCell><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><InsertDriveFileIcon fontSize="small"/> {o.name}</Box></TableCell>
                   <TableCell>{Math.round(parseInt(o.size || '0') / 1024)} KB</TableCell>
                   <TableCell>
-                    <IconButton size="small" color="error" onClick={() => handleDeleteObject(o.name)}><DeleteIcon fontSize="small"/></IconButton>
+                    <IconButton aria-label={`Delete object ${o.name}`} size="small" color="error" onClick={() => handleDeleteObject(o.name)}><DeleteIcon fontSize="small"/></IconButton>
                   </TableCell>
                 </TableRow>
               ))}
@@ -177,7 +177,7 @@ export default function StorageManagerDrawer({ open, onClose }: StorageManagerDr
                 <TableRow key={b.name} hover sx={{ cursor: 'pointer' }} onClick={() => setCurrentBucket(b.name)}>
                   <TableCell><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><CreateNewFolderIcon fontSize="small"/> {b.name}</Box></TableCell>
                   <TableCell align="right">
-                    <IconButton size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteBucket(b.name); }}><DeleteIcon fontSize="small"/></IconButton>
+                    <IconButton aria-label={`Delete bucket ${b.name}`} size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteBucket(b.name); }}><DeleteIcon fontSize="small"/></IconButton>
                   </TableCell>
                 </TableRow>
               ))}

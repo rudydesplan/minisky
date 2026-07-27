@@ -26,6 +26,10 @@ type EventObserver interface {
 	HandleEvent(eventType, resource, payload string)
 }
 
+type acknowledgedEventObserver interface {
+	HandleEventWithAck(eventType, resource, payload string) error
+}
+
 type API struct {
 	svcMgr    *orchestrator.ServiceManager
 	mu        sync.RWMutex
@@ -35,6 +39,11 @@ type API struct {
 func (api *API) OnPostBoot(ctx *registry.Context) {
 	if slsShim, ok := ctx.GetShim("cloudfunctions.googleapis.com").(*serverless.API); ok {
 		api.SetObserver(slsShim)
+	}
+	if eventarcShim := ctx.GetShim("eventarc.googleapis.com"); eventarcShim != nil {
+		if observer, ok := eventarcShim.(EventObserver); ok {
+			api.AddObserver(observer)
+		}
 	}
 }
 
@@ -76,7 +85,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Intercept the response to trigger events
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			api.handlePotentialEvent(r, resp)
+			return api.handlePotentialEvent(r, resp)
 		}
 		return nil
 	}
@@ -84,10 +93,10 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
+func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) error {
 	observers := api.eventObservers()
 	if len(observers) == 0 {
-		return
+		return nil
 	}
 
 	path := req.URL.Path
@@ -98,7 +107,9 @@ func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
 
 		if object != "" {
 			log.Printf("[Storage Event] File finalized: gs://%s/%s", bucket, object)
-			api.notify(observers, bucket, object, "google.storage.object.finalize")
+			if err := api.notify(observers, bucket, object, "google.cloud.storage.object.v1.finalized"); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -107,21 +118,31 @@ func (api *API) handlePotentialEvent(req *http.Request, resp *http.Response) {
 		bucket := extractSegmentAfter(path, "b")
 		object := extractSegmentAfter(path, "o")
 		log.Printf("[Storage Event] File deleted: gs://%s/%s", bucket, object)
-		api.notify(observers, bucket, object, "google.storage.object.delete")
+		if err := api.notify(observers, bucket, object, "google.cloud.storage.object.v1.deleted"); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (api *API) notify(observers []EventObserver, bucket, object, eventType string) {
+func (api *API) notify(observers []EventObserver, bucket, object, eventType string) error {
 	payload, err := json.Marshal(map[string]string{
 		"bucket": bucket,
 		"name":   object,
 	})
 	if err != nil {
-		return
+		return err
 	}
 	for _, observer := range observers {
-		observer.HandleEvent(eventType, bucket, string(payload))
+		if acknowledged, ok := observer.(acknowledgedEventObserver); ok {
+			if err := acknowledged.HandleEventWithAck(eventType, bucket, string(payload)); err != nil {
+				return err
+			}
+		} else {
+			observer.HandleEvent(eventType, bucket, string(payload))
+		}
 	}
+	return nil
 }
 
 func (api *API) eventObservers() []EventObserver {

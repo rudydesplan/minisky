@@ -58,6 +58,10 @@ func NewAPIWithStore(
 			delete(api.instances, key)
 			continue
 		}
+		if instance.State == "ERROR" && instance.BackendStatus != "" {
+			instance.IpAddresses = nil
+			continue
+		}
 		instance.State = "SUSPENDED"
 		instance.BackendStatus = metadataOnlyBackendState
 		instance.IpAddresses = nil
