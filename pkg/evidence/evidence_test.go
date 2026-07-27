@@ -187,12 +187,28 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 				t.Errorf("%s %s references missing CI job %q", gate.ID, name, check.Job)
 			}
 		}
+		generatedStatus := EvidenceConfiguredUnverified
+		restartStatus := EvidenceConfiguredUnverified
+		backendStatus := gate.RealBackendDocker.Status
+		cleanupStatus := EvidenceConfiguredUnverified
+		if gate.ID == "phase18-25" || gate.ID == "phase19" ||
+			gate.ID == "phase20" || gate.ID == "phase21-22" ||
+			gate.ID == "phase23" || gate.ID == "phase24-25" {
+			generatedStatus = EvidenceLocalPassed
+			restartStatus = EvidenceLocalPassed
+			cleanupStatus = EvidenceLocalPassed
+		}
+		if gate.ID == "phase18-25" || gate.ID == "phase19" ||
+			gate.ID == "phase20" || gate.ID == "phase24-25" {
+			backendStatus = EvidenceLocalPassed
+		}
 		if gate.PackageUnit.Status != EvidenceLocalPassed ||
-			gate.GeneratedClientLifecycle.Status != EvidenceConfiguredUnverified ||
-			gate.DaemonRestart.Status != EvidenceConfiguredUnverified ||
+			gate.GeneratedClientLifecycle.Status != generatedStatus ||
+			gate.DaemonRestart.Status != restartStatus ||
+			gate.RealBackendDocker.Status != backendStatus ||
 			gate.StrictIAM.Status != EvidenceLocalPassed ||
 			gate.Terraform.Status != EvidenceAbsent ||
-			gate.Cleanup.Status != EvidenceConfiguredUnverified ||
+			gate.Cleanup.Status != cleanupStatus ||
 			gate.CI.Status != EvidenceConfiguredUnverified {
 			t.Errorf("%s overstates or conflates batch evidence: %+v", gate.ID, gate)
 		}
@@ -276,6 +292,38 @@ func TestPhase18AggregateEvidenceNamesAreStableAndReferenceable(t *testing.T) {
 		if strings.Join(gate.Tests, "\x00") != strings.Join(want.tests, "\x00") {
 			t.Errorf("%s tests = %v, want %v", name, gate.Tests, want.tests)
 		}
+	}
+}
+
+func TestPhase19IntegrationUsesCanonicalDockerOwnershipLabels(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join(repositoryRoot(t), "scripts", "phase19-sdk-integration.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	for _, label := range []string{"minisky.profile", "minisky.resource"} {
+		if !strings.Contains(source, `label=`+label+`=`) {
+			t.Errorf("Phase 19 integration does not query canonical Docker label %q", label)
+		}
+	}
+	if strings.Contains(source, "com.minisky.") {
+		t.Fatal("Phase 19 integration queries obsolete com.minisky Docker labels")
+	}
+}
+
+func TestPhase20IntegrationSeedsStorageBeforeTransferBoundary(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join(repositoryRoot(t), "scripts", "phase20-sdk-integration.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	create := strings.Index(source, "MINISKY_PHASE20_MODE=create go run ./sdk-smoke/phase20")
+	boundary := strings.Index(source, "MINISKY_PHASE20_MODE=boundary go run ./sdk-smoke/phase20")
+	if create < 0 || boundary < 0 {
+		t.Fatal("Phase 20 integration is missing create or boundary mode")
+	}
+	if create > boundary {
+		t.Fatal("Phase 20 integration runs Storage Transfer boundary before seeding its source and sink buckets")
 	}
 }
 

@@ -126,8 +126,8 @@ func proveStorageTransferBoundary(ctx context.Context, clients *generatedClients
 	job, err := clients.transfer.TransferJobs.Create(&storagetransfer.TransferJob{
 		ProjectId: cfg.project, Status: "ENABLED", Description: "Phase 20 generated-client boundary",
 		TransferSpec: &storagetransfer.TransferSpec{
-			GcsDataSource: &storagetransfer.GcsData{BucketName: cfg.sourceBucket},
-			GcsDataSink:   &storagetransfer.GcsData{BucketName: cfg.sinkBucket},
+			GcsDataSource: &storagetransfer.GcsData{BucketName: cfg.sourceBucket, Path: "phase20/"},
+			GcsDataSink:   &storagetransfer.GcsData{BucketName: cfg.sinkBucket, Path: "copied/"},
 		},
 	}).Context(ctx).Do()
 	if err != nil {

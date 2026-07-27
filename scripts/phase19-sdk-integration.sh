@@ -41,7 +41,7 @@ cleanup() {
   if command -v docker >/dev/null 2>&1; then
     while IFS= read -r container; do
       [[ -n "${container}" ]] && docker rm -f -v "${container}" >/dev/null 2>&1 || true
-    done < <(docker ps -aq --filter "label=com.minisky.profile=${profile}" 2>/dev/null || true)
+    done < <(docker ps -aq --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
     while IFS= read -r volume; do
       [[ -n "${volume}" ]] && docker volume rm "${volume}" >/dev/null 2>&1 || true
     done <"${owned_volumes_file}"
@@ -116,7 +116,7 @@ stop_daemon() {
 
 assert_no_owned_resources() {
   local containers
-  containers="$(docker ps -aq --filter "label=com.minisky.profile=${profile}")"
+  containers="$(docker ps -aq --filter "label=minisky.profile=${profile}")"
   if [[ -n "${containers}" ]]; then
     echo "Exact-owned Phase 19 container cleanup is incomplete: ${containers}" >&2
     return 1
@@ -135,7 +135,7 @@ capture_owned_volumes() {
     while IFS= read -r volume; do
       [[ -n "${volume}" ]] && printf '%s\n' "${volume}" >>"${owned_volumes_file}"
     done < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' "${container}")
-  done < <(docker ps -aq --filter "label=com.minisky.profile=${profile}")
+  done < <(docker ps -aq --filter "label=minisky.profile=${profile}")
   return 0
 }
 
@@ -180,11 +180,11 @@ MINISKY_PHASE19_MODE=docker-create MINISKY_PHASE19_EXPERIMENTAL_OPT_IN=1 go run 
 capture_owned_volumes
 
 kafka_container="$(docker ps -q \
-  --filter "label=com.minisky.profile=${profile}" \
-  --filter "label=com.minisky.resource=projects/${project}/locations/us-central1/clusters/phase19-kafka")"
+  --filter "label=minisky.profile=${profile}" \
+  --filter "label=minisky.resource=projects/${project}/locations/us-central1/clusters/phase19-kafka")"
 airflow_container="$(docker ps -q \
-  --filter "label=com.minisky.profile=${profile}" \
-  --filter "label=com.minisky.resource=projects/${project}/locations/us-central1/environments/phase19-airflow")"
+  --filter "label=minisky.profile=${profile}" \
+  --filter "label=minisky.resource=projects/${project}/locations/us-central1/environments/phase19-airflow")"
 [[ -n "${kafka_container}" && -n "${airflow_container}" ]] || {
   echo "Expected exact-owned Kafka and Airflow containers were not found." >&2
   exit 1

@@ -238,6 +238,7 @@ func TestResponseRecorderCapsWhileWriting(t *testing.T) {
 
 func TestHandlerObjectCopierStreamsObjectWithinBound(t *testing.T) {
 	var sink bytes.Buffer
+	var sinkContentLength int64
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -245,6 +246,7 @@ func TestHandlerObjectCopierStreamsObjectWithinBound(t *testing.T) {
 			_, _ = w.Write([]byte("abcd"))
 			_, _ = w.Write([]byte("efgh"))
 		case http.MethodPost:
+			sinkContentLength = r.ContentLength
 			data, err := io.ReadAll(r.Body)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -260,6 +262,9 @@ func TestHandlerObjectCopierStreamsObjectWithinBound(t *testing.T) {
 	}
 	if sink.String() != "abcdefgh" {
 		t.Fatalf("streamed sink = %q", sink.String())
+	}
+	if sinkContentLength != 8 {
+		t.Fatalf("sink Content-Length = %d, want 8", sinkContentLength)
 	}
 }
 

@@ -128,7 +128,7 @@ entire service API. Important boundaries:
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client gates configured but unverified: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 The Phase 18–25 domains marked `experimental` in the machine-readable
@@ -136,9 +136,31 @@ manifest below are package-registered prototypes. The offline
 `make test-phase18-25-evidence` gate covers their canonical public selector,
 default-off/opt-in behavior, validation ordering, scoped IAM where applicable,
 and the package-local evidence referenced by
-`pkg/evidence/phase18_25.json`. It does not establish Terraform provider,
-Docker/backend, or generated-client lifecycle compatibility, so these domains
-remain default-off and do not claim Standard fidelity.
+`pkg/evidence/phase18_25.json`. All six generated-client gates passed
+locally. Phase 18–25 covered Workflows, Workflow Executions, Eventarc, and
+exact-owned Docker-backed Batch execution. Phase 19 covered terminal/cancelled
+Dataflow, the Dataform hierarchy, explicit Pub/Sub Lite 501 behavior, Kafka
+protocol round-trip, and Airflow DAG triggering. Both gates passed restart and
+cleanup, including exact-owned containers and anonymous volumes where relevant.
+Phase 20 covered AlloyDB, Filestore, Identity Platform, Redis-domain Valkey,
+Storage Transfer, canonical Storage upload and transfer custom actions, restart
+truth, deletion, and exact-owned digest-pinned PostgreSQL, Valkey, and Storage
+backend cleanup. Phase 21–22 covered telemetry, API Gateway, Service Directory,
+Service Management/Control, Binary Authorization, Cloud Deploy, strict errors,
+restart truth, generated deletion, executable loopback routing, and exact-owned
+isolated network cleanup; its real-backend dimension remains not applicable.
+Phase 23 covered deterministic bounded translation, Vision, and Language
+behavior; explicit Speech/TTS and semantic/inference boundaries; GCP-shaped
+errors; Document AI, Dialogflow, and Vertex control-plane lifecycles; restart
+truth; project isolation; sensitive-data absence; and exact-owned network
+cleanup. Its real-backend dimension also remains not applicable. The final
+Phase 24–25 gate covered security/network resource lifecycles, perimeter and
+proxy policy deny/allow enforcement, strict IAM and GCP-shaped errors, canonical
+Compute/network routing, restart truth, generated deletion, and exact cleanup.
+Its backend gate exercised two isolated loopback HTTP backends without claiming
+a Docker service backend. Terraform provider evidence remains absent and all CI
+gates remain configured-unverified, so every experimental domain remains default-off and does not claim
+Standard fidelity.
 
 aiplatform.googleapis.com remains implemented for the existing Vertex
 prediction/configuration slice. Its newly integrated Index and Model Registry

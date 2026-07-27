@@ -232,13 +232,13 @@ export MINISKY_PHASE20_EVIDENCE="${evidence_file}"
 export MINISKY_PHASE20_OPT_IN=1
 
 start_daemon "${work}/minisky-create.log"
-if ! MINISKY_PHASE20_MODE=boundary go run ./sdk-smoke/phase20; then
+if ! MINISKY_PHASE20_MODE=create go run ./sdk-smoke/phase20; then
   python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[-8192:])' \
     "${work}/minisky-create.log" >&2
   print_owned_diagnostics
   exit 1
 fi
-if ! MINISKY_PHASE20_MODE=create go run ./sdk-smoke/phase20; then
+if ! MINISKY_PHASE20_MODE=boundary go run ./sdk-smoke/phase20; then
   python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[-8192:])' \
     "${work}/minisky-create.log" >&2
   print_owned_diagnostics

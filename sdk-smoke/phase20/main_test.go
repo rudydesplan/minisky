@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -157,6 +158,16 @@ func TestBoundaryRequiresSuccessfulStorageTransferRun(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPost &&
 			r.URL.Path == "/_minisky/storagetransfer.googleapis.com/v1/transferJobs":
+			var job storagetransfer.TransferJob
+			if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if job.TransferSpec.GcsDataSource.Path != "phase20/" ||
+				job.TransferSpec.GcsDataSink.Path != "copied/" {
+				http.Error(w, "boundary must reuse the lifecycle object paths", http.StatusBadRequest)
+				return
+			}
 			fmt.Fprint(w, `{"name":"transferJobs/1","projectId":"demo","status":"ENABLED"}`)
 		case r.Method == http.MethodPost &&
 			r.URL.Path == "/_minisky/storagetransfer.googleapis.com/v1/transferJobs/1:run":

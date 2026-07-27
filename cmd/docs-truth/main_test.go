@@ -93,7 +93,10 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"6 batch gates",
 		"Package-unit gates passed locally: 6/6",
 		"strict-IAM gates passed locally: 6/6",
-		"Generated-client gates configured but unverified: 6/6",
+		"Generated-client lifecycle gates passed locally: 6/6",
+		"configured but unverified: 0/6",
+		"Restart gates passed locally: 6/6",
+		"cleanup gates passed locally: 6/6",
 		"CI gates configured but unverified: 6/6",
 		"Package and IAM passes do not promote compatibility",
 	} {

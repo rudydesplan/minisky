@@ -8,10 +8,13 @@ MiniSky provides a local gateway for custom Go shims and selected Docker-backed
 emulators. Core services (Compute, Storage, BigQuery, Pub/Sub, Cloud SQL, IAM)
 have verified Terraform and SDK slices. Phase 18–25 services remain default-off
 experimental surfaces with locally passing package, race, strict-IAM, and
-machine-readable evidence gates; guarded generated-client, restart, backend,
-cleanup, and CI runs remain promotion prerequisites. Once dependencies and
-required images are available locally, verified workflows can run offline;
-first use may pull lazily loaded emulator images.
+machine-readable evidence gates. All six Phase 18–25 guarded
+generated-client, restart, and cleanup workflows now pass locally, including
+Kafka/Airflow, the Phase 20 pinned PostgreSQL, Valkey, and Storage backends, and
+the later isolated local gateway/backend boundaries; external CI and native
+platform runs remain promotion prerequisites. Once
+dependencies and required images are available locally, verified workflows can
+run offline; first use may pull lazily loaded emulator images.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -42,7 +45,7 @@ first use may pull lazily loaded emulator images.
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client gates configured but unverified: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -62,12 +65,25 @@ in `pkg/evidence/batch_gates.json` separately qualify package, generated-client,
 restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 
 The complete Go race suite, documentation truth checks, and package/strict-IAM
-evidence pass locally. Guarded generated-client and daemon-restart integrations,
-the optional heavy Phase 19 Kafka/Airflow backend gate, native Linux/Windows CGO
-release checks, and external CI results are not recorded as passes. No Phase
-18–25 Terraform compatibility is claimed. Unsupported methods return canonical
-501 responses rather than simulated success; Cloud CDN/Armor remains within the
-Compute domain and does not claim full GCP data-plane parity.
+evidence pass locally. All six Phase 18–25 generated-client
+workflows passed create, restart, terminal observation, delete, and cleanup locally.
+Phase 19 additionally passed exact-owned Kafka protocol and Airflow DAG
+execution with container and anonymous-volume cleanup. Phase 20 passed AlloyDB,
+Filestore, Identity Platform, Redis-domain Valkey, Storage Transfer, canonical
+Storage upload and transfer custom actions, and exact-owned pinned backend
+cleanup. Phase 21–22 passed telemetry, API Gateway, Service Directory,
+Service Management/Control, Binary Authorization, Cloud Deploy, strict-error,
+loopback routing, and exact-owned network cleanup. Phase 23 passed bounded
+translation, Vision, and Language behavior; explicit Speech/TTS and semantic
+boundaries; GCP-shaped errors; project isolation; sensitive-data absence; and
+control-plane/network cleanup. Phase 24–25 passed security/network resource
+lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
+GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
+restart truth, and cleanup. Native Linux/Windows CGO release checks and
+external CI results are not recorded as passes. No Phase 18–25 Terraform
+compatibility is claimed. Unsupported methods return canonical 501 responses
+rather than simulated success; Cloud CDN/Armor remains within the Compute
+domain and does not claim full GCP data-plane parity.
 
 ## 📋 Prerequisites
 Install the tools required by the slices you use:

@@ -251,7 +251,10 @@ func renderPhaseSummary(
 
 	packageLocal := 0
 	strictIAMLocal := 0
+	generatedLocal := 0
 	generatedConfigured := 0
+	restartLocal := 0
+	cleanupLocal := 0
 	ciConfigured := 0
 	for _, gate := range gates {
 		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
@@ -260,8 +263,17 @@ func renderPhaseSummary(
 		if gate.StrictIAM.Status == evidence.EvidenceLocalPassed {
 			strictIAMLocal++
 		}
+		if gate.GeneratedClientLifecycle.Status == evidence.EvidenceLocalPassed {
+			generatedLocal++
+		}
 		if gate.GeneratedClientLifecycle.Status == evidence.EvidenceConfiguredUnverified {
 			generatedConfigured++
+		}
+		if gate.DaemonRestart.Status == evidence.EvidenceLocalPassed {
+			restartLocal++
+		}
+		if gate.Cleanup.Status == evidence.EvidenceLocalPassed {
+			cleanupLocal++
 		}
 		if gate.CI.Status == evidence.EvidenceConfiguredUnverified {
 			ciConfigured++
@@ -272,7 +284,8 @@ func renderPhaseSummary(
 		"**Generated truth:** %d experimental; %d default-off; %d Terraform claims. "+
 			"Persistence inventory: %s.\n\n"+
 			"Machine-readable promotion matrix: %d batch gates. Package-unit gates passed locally: %d/%d; "+
-			"strict-IAM gates passed locally: %d/%d. Generated-client gates configured but unverified: %d/%d; "+
+			"strict-IAM gates passed locally: %d/%d. Generated-client lifecycle gates passed locally: %d/%d; "+
+			"configured but unverified: %d/%d. Restart gates passed locally: %d/%d; cleanup gates passed locally: %d/%d; "+
 			"CI gates configured but unverified: %d/%d. Package and IAM passes do not promote compatibility; "+
 			"every inventoried service remains experimental until its required integration gates pass.\n",
 		experimental,
@@ -284,7 +297,13 @@ func renderPhaseSummary(
 		len(gates),
 		strictIAMLocal,
 		len(gates),
+		generatedLocal,
+		len(gates),
 		generatedConfigured,
+		len(gates),
+		restartLocal,
+		len(gates),
+		cleanupLocal,
 		len(gates),
 		ciConfigured,
 		len(gates),

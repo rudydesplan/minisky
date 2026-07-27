@@ -289,7 +289,7 @@ func (c handlerObjectCopier) Copy(ctx context.Context, source, sink GcsData) (in
 	if source.Path != "" {
 		listPath += "&prefix=" + url.QueryEscape(source.Path)
 	}
-	list, err := c.request(ctx, http.MethodGet, listPath, nil, maxListResponse)
+	list, err := c.request(ctx, http.MethodGet, listPath, nil, 0, maxListResponse)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -354,7 +354,7 @@ func (c handlerObjectCopier) copyObject(ctx context.Context, sourcePath, sinkPat
 		<-sourceDone
 		return fmt.Errorf("Storage request failed with status %d", status)
 	}
-	_, sinkErr := c.request(ctx, http.MethodPost, sinkPath, reader, maxListResponse)
+	_, sinkErr := c.request(ctx, http.MethodPost, sinkPath, reader, size, maxListResponse)
 	_ = reader.CloseWithError(sinkErr)
 	<-sourceDone
 	if sourceRecorder.err != nil {
@@ -366,11 +366,17 @@ func (c handlerObjectCopier) copyObject(ctx context.Context, sourcePath, sinkPat
 	return sinkErr
 }
 
-func (c handlerObjectCopier) request(ctx context.Context, method, path string, body io.Reader, limit int64) ([]byte, error) {
+func (c handlerObjectCopier) request(
+	ctx context.Context,
+	method, path string,
+	body io.Reader,
+	contentLength, limit int64,
+) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, method, path, body)
 	if err != nil {
 		return nil, err
 	}
+	request.ContentLength = contentLength
 	request.Host = "storage.googleapis.com"
 	recorder := newResponseRecorder(limit)
 	c.handler.ServeHTTP(recorder, request)
