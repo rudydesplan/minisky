@@ -11,8 +11,10 @@ experimental surfaces with locally passing package, race, strict-IAM, and
 machine-readable evidence gates. All six Phase 18–25 guarded
 generated-client, restart, and cleanup workflows now pass locally, including
 Kafka/Airflow, the Phase 20 pinned PostgreSQL, Valkey, and Storage backends, and
-the later isolated local gateway/backend boundaries; external CI and native
-platform runs remain promotion prerequisites. Once
+the later isolated local gateway/backend boundaries. All six corresponding
+GitHub Actions jobs passed on commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`
+in [run 30285572232](https://github.com/rudydesplan/minisky/actions/runs/30285572232);
+the complete native release-equivalent gate remains a promotion prerequisite. Once
 dependencies and required images are available locally, verified workflows can
 run offline; first use may pull lazily loaded emulator images.
 
@@ -45,7 +47,7 @@ run offline; first use may pull lazily loaded emulator images.
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -79,8 +81,12 @@ boundaries; GCP-shaped errors; project isolation; sensitive-data absence; and
 control-plane/network cleanup. Phase 24–25 passed security/network resource
 lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
 GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
-restart truth, and cleanup. Native Linux/Windows CGO release checks and
-external CI results are not recorded as passes. No Phase 18–25 Terraform
+restart truth, and cleanup. All six external generated-client jobs passed on
+commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its
+Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. The overall run
+failed before the Linux AMD64 release snapshot because GoReleaser was not on
+the release-validation step's `PATH`; the local workflow fix is not CI-verified.
+No Phase 18–25 Terraform
 compatibility is claimed. Unsupported methods return canonical 501 responses
 rather than simulated success; Cloud CDN/Armor remains within the Compute
 domain and does not claim full GCP data-plane parity.

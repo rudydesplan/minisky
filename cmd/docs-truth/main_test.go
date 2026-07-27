@@ -97,7 +97,8 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"configured but unverified: 0/6",
 		"Restart gates passed locally: 6/6",
 		"cleanup gates passed locally: 6/6",
-		"CI gates configured but unverified: 6/6",
+		"CI gates passed: 6/6; configured but unverified: 0/6",
+		"Heavy backend CI gates passed: 0/1; configured but unverified: 1/1",
 		"Package and IAM passes do not promote compatibility",
 	} {
 		if !strings.Contains(got, want) {

@@ -1,4 +1,4 @@
-.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase19-sdk test-phase20-sdk test-phase21-22-sdk test-phase23-sdk test-phase24-25-sdk benchmark
+.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase19-sdk test-phase19-heavy-backend test-phase20-sdk test-phase21-22-sdk test-phase23-sdk test-phase24-25-sdk benchmark
 
 ui-install:
 	cd ui && npm ci
@@ -87,6 +87,9 @@ test-phase18-25-sdk:
 
 test-phase19-sdk:
 	MINISKY_PHASE19_SDK_INTEGRATION=1 ./scripts/phase19-sdk-integration.sh
+
+test-phase19-heavy-backend:
+	MINISKY_PHASE19_SDK_INTEGRATION=1 MINISKY_PHASE19_DOCKER_INTEGRATION=1 ./scripts/phase19-sdk-integration.sh
 
 test-phase20-sdk:
 	MINISKY_PHASE20_SDK_INTEGRATION=1 ./scripts/phase20-sdk-integration.sh

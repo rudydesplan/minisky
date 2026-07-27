@@ -255,7 +255,11 @@ func renderPhaseSummary(
 	generatedConfigured := 0
 	restartLocal := 0
 	cleanupLocal := 0
+	ciPassed := 0
 	ciConfigured := 0
+	backendCITotal := 0
+	backendCIPassed := 0
+	backendCIConfigured := 0
 	for _, gate := range gates {
 		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
 			packageLocal++
@@ -275,8 +279,20 @@ func renderPhaseSummary(
 		if gate.Cleanup.Status == evidence.EvidenceLocalPassed {
 			cleanupLocal++
 		}
+		if gate.CI.Status == evidence.EvidenceCIPassed {
+			ciPassed++
+		}
 		if gate.CI.Status == evidence.EvidenceConfiguredUnverified {
 			ciConfigured++
+		}
+		if gate.BackendCI.Status != "" {
+			backendCITotal++
+		}
+		if gate.BackendCI.Status == evidence.EvidenceCIPassed {
+			backendCIPassed++
+		}
+		if gate.BackendCI.Status == evidence.EvidenceConfiguredUnverified {
+			backendCIConfigured++
 		}
 	}
 
@@ -286,7 +302,9 @@ func renderPhaseSummary(
 			"Machine-readable promotion matrix: %d batch gates. Package-unit gates passed locally: %d/%d; "+
 			"strict-IAM gates passed locally: %d/%d. Generated-client lifecycle gates passed locally: %d/%d; "+
 			"configured but unverified: %d/%d. Restart gates passed locally: %d/%d; cleanup gates passed locally: %d/%d; "+
-			"CI gates configured but unverified: %d/%d. Package and IAM passes do not promote compatibility; "+
+			"CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Heavy backend CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Package and IAM passes do not promote compatibility; "+
 			"every inventoried service remains experimental until its required integration gates pass.\n",
 		experimental,
 		experimental,
@@ -305,8 +323,14 @@ func renderPhaseSummary(
 		len(gates),
 		cleanupLocal,
 		len(gates),
+		ciPassed,
+		len(gates),
 		ciConfigured,
 		len(gates),
+		backendCIPassed,
+		backendCITotal,
+		backendCIConfigured,
+		backendCITotal,
 	), nil
 }
 

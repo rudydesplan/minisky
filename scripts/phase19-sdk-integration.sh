@@ -14,6 +14,12 @@ for command in curl go python3; do
   }
 done
 
+profile="${MINISKY_PHASE19_PROFILE:-phase19-sdk-$$}"
+if [[ ! "${profile}" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+  echo "MINISKY_PHASE19_PROFILE must be a lowercase resource identifier." >&2
+  exit 2
+fi
+
 lock="${TMPDIR:-/tmp}/minisky-phase19-sdk-integration.lock"
 if ! mkdir "${lock}" 2>/dev/null; then
   echo "Another Phase 19 SDK integration is running (${lock})." >&2
@@ -23,17 +29,37 @@ fi
 work="$(mktemp -d)"
 state_root="${work}/state"
 home="${work}/home"
-profile="phase19-sdk-$$"
 project="phase19-project-$$"
 evidence_file="${work}/generated-client-evidence.json"
 pid=""
 owned_volumes_file="${work}/owned-volumes"
+diagnostics_dir="${MINISKY_PHASE19_DIAGNOSTICS_DIR:-}"
 mkdir -p "${state_root}" "${home}"
 : >"${owned_volumes_file}"
+
+capture_failure_diagnostics() {
+  [[ -n "${diagnostics_dir}" ]] || return 0
+  mkdir -p "${diagnostics_dir}"
+  for diagnostic in "${work}"/*.log; do
+    [[ -f "${diagnostic}" ]] && cp "${diagnostic}" "${diagnostics_dir}/"
+  done
+  if command -v docker >/dev/null 2>&1; then
+    docker ps -a --no-trunc --filter "label=minisky.profile=${profile}" \
+      >"${diagnostics_dir}/docker-ps.txt" 2>&1 || true
+    while IFS= read -r container; do
+      [[ -n "${container}" ]] || continue
+      docker inspect "${container}" >"${diagnostics_dir}/docker-${container}-inspect.json" 2>&1 || true
+      docker logs "${container}" >"${diagnostics_dir}/docker-${container}.log" 2>&1 || true
+    done < <(docker ps -aq --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
+  fi
+}
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM
+  if [[ "${status}" -ne 0 ]]; then
+    capture_failure_diagnostics
+  fi
   if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
     kill -TERM "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true

@@ -86,6 +86,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_phase19_heavy_backend_integration:
+        description: Run Phase 19 Kafka and Airflow backend acceptance
+        required: false
+        type: boolean
+        default: false
       run_phase20_sdk_integration:
         description: Run Phase 20 Docker-backed generated Go client acceptance
         required: false
@@ -446,6 +451,66 @@ jobs:
           path: phase19-sdk-integration.log
           if-no-files-found: error
           retention-days: 7
+
+  phase19-heavy-backend-integration:
+    name: Phase 19 Kafka and Airflow backend acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_phase19_heavy_backend_integration
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PHASE19_HEAVY_PROFILE: phase19-heavy-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 19 heavy backend integration
+        env:
+          MINISKY_PHASE19_PROFILE: ${{ env.PHASE19_HEAVY_PROFILE }}
+          MINISKY_PHASE19_DIAGNOSTICS_DIR: ${{ runner.temp }}/phase19-heavy-diagnostics
+        run: |
+          set -o pipefail
+          make test-phase19-heavy-backend 2>&1 | tee phase19-heavy-backend-integration.log
+
+      - name: Retain heavy backend failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase19-heavy-backend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase19-heavy-backend-integration.log
+            ${{ runner.temp }}/phase19-heavy-diagnostics
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove exact-owned Phase 19 resources
+        if: always()
+        env:
+          MINISKY_PHASE19_PROFILE: ${{ env.PHASE19_HEAVY_PROFILE }}
+        run: |
+          while IFS= read -r container; do
+            test -z "${container}" || docker rm -f -v "${container}"
+          done < <(docker ps -aq --filter "label=minisky.profile=${MINISKY_PHASE19_PROFILE}")
+          test -z "$(docker ps -aq --filter "label=minisky.profile=${MINISKY_PHASE19_PROFILE}")"
 
   phase20-sdk-integration:
     name: Phase 20 Docker-backed generated Go client acceptance
@@ -1076,11 +1141,11 @@ jobs:
           cache-dependency-path: go.sum
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
-        name: Validate GoReleaser configuration
+        name: Install pinned GoReleaser
         with:
           distribution: goreleaser
           version: v2.17.0
-          args: check
+          install-only: true
 
       - name: Validate non-publishing Phase 11 distribution contracts
         env:

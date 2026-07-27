@@ -50,6 +50,7 @@ type EvidenceStatus string
 
 const (
 	EvidenceLocalPassed          EvidenceStatus = "local-passed"
+	EvidenceCIPassed             EvidenceStatus = "ci-passed"
 	EvidenceConfiguredUnverified EvidenceStatus = "configured-unverified"
 	EvidenceOptionalUnverified   EvidenceStatus = "optional-unverified"
 	EvidenceNotApplicable        EvidenceStatus = "not-applicable"
@@ -63,7 +64,7 @@ type TestReference struct {
 
 // EvidenceCheck records one independently qualified batch-gate dimension.
 // Configured checks are not pass claims until an actual local or GitHub run is
-// recorded.
+// recorded. CI passes identify the immutable source commit and durable run URL.
 type EvidenceCheck struct {
 	Status     EvidenceStatus  `json:"status"`
 	References []TestReference `json:"references,omitempty"`
@@ -71,6 +72,8 @@ type EvidenceCheck struct {
 	MakeTarget string          `json:"makeTarget,omitempty"`
 	Workflow   string          `json:"workflow,omitempty"`
 	Job        string          `json:"job,omitempty"`
+	RunURL     string          `json:"runUrl,omitempty"`
+	Commit     string          `json:"commit,omitempty"`
 	Note       string          `json:"note"`
 }
 
@@ -89,6 +92,7 @@ type BatchGate struct {
 	Terraform                   EvidenceCheck `json:"terraform"`
 	Cleanup                     EvidenceCheck `json:"cleanup"`
 	CI                          EvidenceCheck `json:"ci"`
+	BackendCI                   EvidenceCheck `json:"backendCI,omitempty"`
 }
 
 //go:embed batch_gates.json

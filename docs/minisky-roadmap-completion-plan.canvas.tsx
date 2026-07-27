@@ -30,12 +30,12 @@ const phases = [
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
-  ["18", "Event workflows", "Experimental · guarded lifecycle passed locally", "Generated clients proved default-off behavior plus Eventarc, Workflows, Workflow Executions, and exact-owned Batch create → restart → observe → delete; CI remains unverified"],
-  ["19", "Pipelines and streaming", "Experimental · guarded lifecycle passed locally", "Dataflow/Dataform lifecycle plus exact-owned Kafka protocol and Airflow DAG execution pass locally; Pub/Sub Lite stays explicit 501"],
-  ["20", "Extended databases", "Experimental · guarded lifecycle passed locally", "AlloyDB, Valkey, Identity Platform, Filestore, Storage Transfer, pinned backends, restart, and exact cleanup pass locally"],
-  ["21–22", "Observability and API management", "Experimental · guarded lifecycle passed locally", "Durable ingestion, hierarchy, local gateway, directory, rollout, policy, restart, and cleanup gates pass; external deployment parity remains unsupported"],
-  ["23", "AI and ML services", "Experimental · guarded lifecycle passed locally", "Bounded deterministic and explicit-unsupported client contracts, restart, sensitive-data absence, and cleanup pass; real model-semantic inference is not claimed"],
-  ["24–25", "Security and networking", "Experimental · guarded lifecycle passed locally", "CA, Binary Authorization, DLP, asset, org-policy, perimeter, routing, two isolated backends, restart, and cleanup pass locally"],
+  ["18", "Event workflows", "Experimental · local + CI lifecycle passed", "Generated clients proved default-off behavior plus Eventarc, Workflows, Workflow Executions, and exact-owned Batch create → restart → observe → delete"],
+  ["19", "Pipelines and streaming", "Experimental · core CI passed; heavy CI configured", "Dataflow/Dataform lifecycle passes in CI; exact-owned Kafka protocol and Airflow DAG execution pass locally with a separate workflow-dispatch job awaiting its first pushed run; Pub/Sub Lite stays explicit 501"],
+  ["20", "Extended databases", "Experimental · local + CI lifecycle passed", "AlloyDB, Valkey, Identity Platform, Filestore, Storage Transfer, pinned backends, restart, and exact cleanup pass locally and in CI"],
+  ["21–22", "Observability and API management", "Experimental · local + CI lifecycle passed", "Durable ingestion, hierarchy, local gateway, directory, rollout, policy, restart, and cleanup gates pass; external deployment parity remains unsupported"],
+  ["23", "AI and ML services", "Experimental · local + CI lifecycle passed", "Bounded deterministic and explicit-unsupported client contracts, restart, sensitive-data absence, and cleanup pass; real model-semantic inference is not claimed"],
+  ["24–25", "Security and networking", "Experimental · local + CI lifecycle passed", "CA, Binary Authorization, DLP, asset, org-policy, perimeter, routing, two isolated backends, restart, and cleanup pass locally and in CI"],
 ];
 
 const waves = [
@@ -126,7 +126,7 @@ const waves = [
       "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally. Applicable backend boundaries pass locally; all six CI gates remain unverified and no Phase 18–25 Terraform claim exists.",
+    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI on commit 62d6fa2. Applicable backend boundaries pass locally; Phase 19 heavy backend CI is configured-unverified and no Phase 18–25 Terraform claim exists.",
   },
 ];
 
@@ -154,9 +154,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
         RBAC/quota/audit integration. Phase 18–25 services now share fail-closed state, scoped operations,
         pagination, routing, strict IAM, exact-owned Docker cleanup, and machine-readable evidence while remaining
         default-off experimental. All six package-unit, strict-IAM, generated-client, restart, and cleanup batch gates
-        pass locally, including the applicable Docker and loopback backend boundaries. All external CI gates,
-        native Linux/Windows CGO, and Phase 18–25 Terraform evidence remain unverified or
-        absent. Production-grade semantics remain explicit external boundaries.
+        pass locally, including the applicable Docker and loopback backend boundaries. All six external CI gates
+        passed on commit 62d6fa2. Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs also passed in that
+        run, while its release snapshot was blocked by a GoReleaser PATH defect now fixed only locally. Phase 18–25
+        Terraform evidence remains absent. Production-grade semantics remain explicit external boundaries.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -170,7 +171,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Card>
         <Card>
           <CardHeader>Promotion status</CardHeader>
-          <CardBody><H2>Default-off</H2><Text tone="secondary">External and native promotion evidence pending</Text></CardBody>
+          <CardBody><H2>Default-off</H2><Text tone="secondary">CI passed; release-equivalent and Terraform evidence pending</Text></CardBody>
         </Card>
       </Grid>
 
@@ -184,10 +185,12 @@ export default function MiniSkyRoadmapCompletionPlan() {
             pass locally.
           </Text>
           <Text tone="secondary">
-            Configured-unverified is not a pass claim. All six Phase 18–25 SDK/restart/cleanup workflows passed
+            All six Phase 18–25 SDK/restart/cleanup workflows passed
             locally on 2026-07-27, including terminal exact-owned Batch cleanup, Phase 19&apos;s heavy Kafka/Airflow
-            path, pinned Phase 20 backends, and isolated Phase 24–25 routing backends. All external GitHub jobs and
-            native Linux/Windows CGO release-equivalent builds still need recorded runs.
+            path, pinned Phase 20 backends, and isolated Phase 24–25 routing backends. The six GitHub jobs passed in
+            run 30285572232 on commit 62d6fa2. That run also passed Linux ARM64, macOS ARM64, and Windows AMD64 CGO
+            jobs, but the Linux AMD64 release snapshot was skipped after an earlier release-validation PATH failure.
+            A separate explicit Phase 19 Kafka/Airflow workflow-dispatch job is now configured but unverified.
           </Text>
         </Stack>
         <Stack gap={8}>
@@ -377,9 +380,9 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next evidence milestone">
-        Run and record all six external CI jobs plus native Linux/Windows CGO release gates. Keep every domain
-        experimental until its external promotion evidence is complete; add Terraform claims only after provider
-        lifecycle evidence exists.
+        After commit and push, CI-verify the Phase 19 Kafka/Airflow job and the GoReleaser PATH fix, then complete
+        the release-equivalent snapshot gate. Keep every domain experimental while Terraform evidence remains
+        absent; add provider claims only after isolated lifecycle evidence exists.
       </Callout>
     </Stack>
   );

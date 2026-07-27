@@ -162,6 +162,9 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			"cleanup":                  gate.Cleanup,
 			"ci":                       gate.CI,
 		}
+		if gate.BackendCI.Status != "" {
+			checks["backendCI"] = gate.BackendCI
+		}
 		for name, check := range checks {
 			if check.Status == "" || check.Note == "" {
 				t.Errorf("%s %s has incomplete status metadata: %+v", gate.ID, name, check)
@@ -209,8 +212,12 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			gate.StrictIAM.Status != EvidenceLocalPassed ||
 			gate.Terraform.Status != EvidenceAbsent ||
 			gate.Cleanup.Status != cleanupStatus ||
-			gate.CI.Status != EvidenceConfiguredUnverified {
+			gate.CI.Status != EvidenceCIPassed {
 			t.Errorf("%s overstates or conflates batch evidence: %+v", gate.ID, gate)
+		}
+		if gate.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30285572232" ||
+			gate.CI.Commit != "62d6fa245774f3ff3bdd9b82e19d1c617650d448" {
+			t.Errorf("%s CI evidence does not identify the passing run and commit: %+v", gate.ID, gate.CI)
 		}
 		if len(gate.Terraform.References) != 0 || gate.Terraform.Script != "" ||
 			gate.Terraform.MakeTarget != "" {
@@ -308,6 +315,99 @@ func TestPhase19IntegrationUsesCanonicalDockerOwnershipLabels(t *testing.T) {
 	}
 	if strings.Contains(source, "com.minisky.") {
 		t.Fatal("Phase 19 integration queries obsolete com.minisky Docker labels")
+	}
+}
+
+func TestPhase19HeavyBackendCIIsExplicitAndIsolated(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var phase19 BatchGate
+	for _, gate := range gates {
+		if gate.ID == "phase19" {
+			phase19 = gate
+			break
+		}
+	}
+	if phase19.BackendCI.Status != EvidenceConfiguredUnverified ||
+		phase19.BackendCI.Workflow != ".github/workflows/ci.yml" ||
+		phase19.BackendCI.Job != "phase19-heavy-backend-integration" ||
+		phase19.BackendCI.MakeTarget != "test-phase19-heavy-backend" {
+		t.Fatalf("Phase 19 heavy backend CI evidence is not configured-unverified: %+v", phase19.BackendCI)
+	}
+	if phase19.BackendCI.RunURL != "" || phase19.BackendCI.Commit != "" {
+		t.Fatalf("unverified Phase 19 heavy backend CI must not claim a run: %+v", phase19.BackendCI)
+	}
+
+	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(workflow)
+	inputStart := strings.Index(source, "      run_phase19_heavy_backend_integration:")
+	inputEnd := strings.Index(source[inputStart+1:], "\n      run_phase20_sdk_integration:")
+	if inputStart < 0 || inputEnd < 0 {
+		t.Fatal("Phase 19 heavy backend workflow_dispatch input is missing or misplaced")
+	}
+	input := source[inputStart : inputStart+1+inputEnd]
+	for _, want := range []string{"type: boolean", "default: false"} {
+		if !strings.Contains(input, want) {
+			t.Errorf("Phase 19 heavy backend input is missing %q", want)
+		}
+	}
+
+	jobStart := strings.Index(source, "\n  phase19-heavy-backend-integration:")
+	jobEnd := strings.Index(source[jobStart+1:], "\n  phase20-sdk-integration:")
+	if jobStart < 0 || jobEnd < 0 {
+		t.Fatal("Phase 19 heavy backend job is missing or misplaced")
+	}
+	job := source[jobStart : jobStart+1+jobEnd]
+	for _, want := range []string{
+		"github.event_name == 'workflow_dispatch' && inputs.run_phase19_heavy_backend_integration",
+		"permissions:\n      contents: read",
+		"timeout-minutes: 30",
+		"docker info >/dev/null",
+		"MINISKY_PHASE19_PROFILE:",
+		"make test-phase19-heavy-backend",
+		"if: failure()",
+		"phase19-heavy-backend-integration.log",
+		"if: always()",
+		`docker rm -f -v`,
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("Phase 19 heavy backend job is missing %q", want)
+		}
+	}
+
+	makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"\ntest-phase19-heavy-backend:",
+		"MINISKY_PHASE19_SDK_INTEGRATION=1 MINISKY_PHASE19_DOCKER_INTEGRATION=1",
+	} {
+		if !strings.Contains(string(makefile), want) {
+			t.Errorf("Phase 19 heavy backend Make contract is missing %q", want)
+		}
+	}
+
+	script, err := os.ReadFile(filepath.Join(root, "scripts", "phase19-sdk-integration.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`profile="${MINISKY_PHASE19_PROFILE:-phase19-sdk-$$}"`,
+		`diagnostics_dir="${MINISKY_PHASE19_DIAGNOSTICS_DIR:-}"`,
+		`docker ps -aq --filter "label=minisky.profile=${profile}"`,
+		`docker volume rm "${volume}"`,
+		"assert_no_owned_resources",
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Errorf("Phase 19 heavy backend script is missing %q", want)
+		}
 	}
 }
 

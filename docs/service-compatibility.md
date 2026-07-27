@@ -128,7 +128,7 @@ entire service API. Important boundaries:
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 0 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates configured but unverified: 6/6. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 The Phase 18–25 domains marked `experimental` in the machine-readable
@@ -158,9 +158,13 @@ Phase 24–25 gate covered security/network resource lifecycles, perimeter and
 proxy policy deny/allow enforcement, strict IAM and GCP-shaped errors, canonical
 Compute/network routing, restart truth, generated deletion, and exact cleanup.
 Its backend gate exercised two isolated loopback HTTP backends without claiming
-a Docker service backend. Terraform provider evidence remains absent and all CI
-gates remain configured-unverified, so every experimental domain remains default-off and does not claim
-Standard fidelity.
+a Docker service backend. All six generated-client CI jobs passed on commit
+`62d6fa245774f3ff3bdd9b82e19d1c617650d448` in
+[run 30285572232](https://github.com/rudydesplan/minisky/actions/runs/30285572232).
+The separate Phase 19 Kafka/Airflow backend job is workflow-dispatch-only and
+configured-unverified until its first pushed run succeeds. Terraform provider
+evidence remains absent, so every experimental domain remains default-off and
+does not claim Standard fidelity.
 
 aiplatform.googleapis.com remains implemented for the existing Vertex
 prediction/configuration slice. Its newly integrated Index and Model Registry

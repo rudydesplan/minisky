@@ -10,7 +10,7 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase18-25-sdk-integration.sh","makeTarget":"test-phase18-25-sdk","note":"The successful 2026-07-27 local gate proved no exact profile-owned Batch container remained after terminal execution or deletion, and verified trigger, job, workflow, and cascaded execution 404 cleanup."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase18-25-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase18-25-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The generated-client restart acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27."}
   },
   {
     "id": "phase19",
@@ -23,7 +23,8 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-sdk","note":"The successful 2026-07-27 gates verified Dataform descendant 404s, Kafka/Composer generated-client 404s, and complete exact profile-owned Kafka/Airflow container and anonymous-volume cleanup."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase19-sdk-integration","note":"The workflow-dispatch job is configured for the core gate, but no actual GitHub run result is recorded; the heavy backend passed locally only."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase19-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The generated-client restart acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27; the optional heavy Kafka/Airflow backend remains separately qualified."},
+    "backendCI": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase19-heavy-backend-integration","script":"scripts/phase19-sdk-integration.sh","makeTarget":"test-phase19-heavy-backend","note":"An explicit workflow-dispatch job is configured for the digest-pinned Kafka/Airflow backend, exact-owned cleanup, and retained failure diagnostics; no pushed GitHub run has tested this wiring."}
   },
   {
     "id": "phase20",
@@ -36,7 +37,7 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase20-sdk-integration.sh","makeTarget":"test-phase20-sdk","note":"Local guarded run verified generated resource deletion plus zero exact-owned containers, volumes, and networks at terminal cleanup."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase20-sdk-integration","note":"The workflow-dispatch Docker job is configured; no actual GitHub run result is recorded."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase20-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The Docker-backed generated-client acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27."}
   },
   {
     "id": "phase21-22",
@@ -48,7 +49,7 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase21-22-sdk-integration.sh","makeTarget":"test-phase21-22-sdk","note":"Local guarded run verified generated deletes, child cleanup, canonical 404s, and removal of the exact-owned isolated minisky-net network."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase21-22-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase21-22-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The Docker-isolated generated-client acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27."}
   },
   {
     "id": "phase23",
@@ -62,7 +63,7 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase23-sdk-integration.sh","makeTarget":"test-phase23-sdk","note":"Local guarded run verified control-plane deletes and canonical 404s, sensitive sentinel absence from state/evidence/logs, and removal of the exact-owned isolated minisky-net network."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase23-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase23-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The Docker-isolated generated-client acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27."}
   },
   {
     "id": "phase24-25",
@@ -75,6 +76,6 @@
     "strictIAM": {"status":"local-passed","references":[{"package":"pkg/router","tests":["TestEveryExperimentalDomainPublicGatewayEvidence"]}],"note":"The shared offline gateway test passed for every experimental domain."},
     "terraform": {"status":"absent","note":"No Google provider lifecycle gate exists for this batch, so no Terraform compatibility is claimed."},
     "cleanup": {"status":"local-passed","script":"scripts/phase24-25-sdk-integration.sh","makeTarget":"test-phase24-25-sdk","note":"Local guarded run verified generated resource delete/404 cleanup, neutralized the non-deletable isolated policy, stopped both daemon generations and loopback backends, and observed MiniSky network cleanup."},
-    "ci": {"status":"configured-unverified","workflow":".github/workflows/ci.yml","job":"phase24-25-sdk-integration","note":"The workflow-dispatch job is configured; no actual GitHub run result is recorded."}
+    "ci": {"status":"ci-passed","workflow":".github/workflows/ci.yml","job":"phase24-25-sdk-integration","runUrl":"https://github.com/rudydesplan/minisky/actions/runs/30285572232","commit":"62d6fa245774f3ff3bdd9b82e19d1c617650d448","note":"The generated-client restart acceptance job passed on GitHub Actions for the recorded commit on 2026-07-27."}
   }
 ]

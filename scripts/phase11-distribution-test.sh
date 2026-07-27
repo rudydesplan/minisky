@@ -58,6 +58,18 @@ for artifact in (
     require(".github/workflows/release.yml", release, artifact)
 require(".github/workflows/release.yml", release, "goreleaser release --clean --skip=announce,publish,before,nfpm,homebrew,scoop")
 
+ci = read(".github/workflows/ci.yml")
+release_job_start = ci.find("  release-snapshot:")
+release_job_end = ci.find("\n  linux-packages:", release_job_start)
+if release_job_start < 0 or release_job_end < 0:
+    raise SystemExit(".github/workflows/ci.yml is missing the release-snapshot job boundary")
+release_job = ci[release_job_start:release_job_end]
+require(".github/workflows/ci.yml release-snapshot", release_job, "install-only: true")
+install_index = release_job.find("install-only: true")
+validation_index = release_job.find("run: make test-phase11-distribution")
+if validation_index < 0 or install_index > validation_index:
+    raise SystemExit(".github/workflows/ci.yml must install pinned GoReleaser before Phase 11 validation")
+
 action = read(".github/actions/setup-minisky/index.mjs")
 for target in (
     '"linux-x64": ["linux", "amd64", "tar.gz", "minisky"]',
@@ -140,6 +152,7 @@ run_self_test() {
     "${temp}/scripts"
   cp .goreleaser.yaml "${temp}/.goreleaser.yaml"
   cp .github/actions/setup-minisky/index.mjs "${temp}/.github/actions/setup-minisky/index.mjs"
+  cp .github/workflows/ci.yml "${temp}/.github/workflows/ci.yml"
   cp .github/workflows/release.yml "${temp}/.github/workflows/release.yml"
   cp deployments/docker-compose.yml "${temp}/deployments/docker-compose.yml"
   cp scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh \
@@ -155,6 +168,18 @@ path.write_text(path.read_text(encoding="utf-8").replace("version: 2", "version:
 PY
   if validate_distribution_contract "${temp}" >/dev/null 2>&1; then
     echo "Self-test accepted an invalid GoReleaser major version." >&2
+    return 1
+  fi
+  cp .goreleaser.yaml "${temp}/.goreleaser.yaml"
+  python3 - "${temp}/.github/workflows/ci.yml" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text(encoding="utf-8").replace("install-only: true", "install-only: false", 1), encoding="utf-8")
+PY
+  if validate_distribution_contract "${temp}" >/dev/null 2>&1; then
+    echo "Self-test accepted a release-validation job without an installed GoReleaser CLI." >&2
     return 1
   fi
   MINISKY_PHASE11_DISTRIBUTION_BUILD=0 native_package_mode && {
