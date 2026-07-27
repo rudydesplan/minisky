@@ -30,6 +30,8 @@ run offline; first use may pull lazily loaded emulator images.
 - **🔌 Dynamic Registry**: Modular Go shim registry for community-led service contributions.
 - **📦 Single Binary**: Go shims and the built dashboard are packaged together;
   selected services require Docker, emulator images, Kind, Pack, or DuckDB/CGO.
+- **🧭 CodeGraph Index**: The repository includes a generated CodeGraph database
+  for immediate dependency, reference, and dynamic-dispatch exploration.
 
 ### Phase 18–25 Services (Experimental)
 
@@ -651,6 +653,19 @@ bounded slice is not production federation or a production-ready Phase 17.
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details on how to build and register new service shims.
+
+### CodeGraph
+
+The committed `.codegraph/codegraph.db` indexes the current repository. Refresh
+it after structural code changes:
+
+```bash
+codegraph init
+```
+
+Commit the regenerated database together with the source changes that made the
+index stale. Runtime files such as daemon state, sockets, and logs remain
+ignored.
 
 ## 📄 License
 
