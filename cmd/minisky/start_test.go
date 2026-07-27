@@ -223,6 +223,9 @@ func TestDaemonServersHaveTimeoutsAndShutDownGracefully(t *testing.T) {
 		server.WriteTimeout <= 0 || server.IdleTimeout <= 0 {
 		t.Fatalf("daemon server timeouts are not bounded: %#v", server)
 	}
+	if server.WriteTimeout < 2*time.Minute {
+		t.Fatalf("daemon write timeout %s cannot cover a bounded lazy backend cold start", server.WriteTimeout)
+	}
 	first := &shutdownServerStub{}
 	second := &shutdownServerStub{}
 	if err := shutdownHTTPServers(context.Background(), first, second); err != nil {
