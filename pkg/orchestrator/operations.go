@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,12 @@ type Operation struct {
 	// Zone or Region scoping (optional, service-specific)
 	Zone   string `json:"zone,omitempty"`
 	Region string `json:"region,omitempty"`
+	// ServiceKind, Project, Location, and Response are the durable scope and
+	// terminal result used by service-specific google.longrunning polling.
+	ServiceKind string          `json:"serviceKind,omitempty"`
+	Project     string          `json:"project,omitempty"`
+	Location    string          `json:"location,omitempty"`
+	Response    json.RawMessage `json:"response,omitempty"`
 }
 
 // OperationError provides GCP-shaped error details on failure.
@@ -55,6 +62,19 @@ type OperationError struct {
 type operationStore interface {
 	Load(string, any) error
 	Save(string, any) error
+}
+
+// ErrOperationNotFound deliberately covers unknown operations and scope
+// mismatches so callers cannot discover operations owned by another service or
+// parent.
+var ErrOperationNotFound = errors.New("operation not found")
+
+// OperationScope is the durable identity of one service-specific operation.
+type OperationScope struct {
+	ServiceKind string
+	Project     string
+	Location    string
+	Target      string
 }
 
 // OperationManager is a thread-safe LRO registry with optional profile state.
@@ -138,38 +158,89 @@ func (om *OperationManager) RegisterDurable(kind, operationType, targetLink, zon
 	return om.register(kind, operationType, targetLink, zone, region, true)
 }
 
-func (om *OperationManager) register(kind, operationType, targetLink, zone, region string, rollbackOnFailure bool) (*Operation, error) {
-	id := fmt.Sprintf("%d", rand.Int63())
-	name := fmt.Sprintf("operation-%d-%s", time.Now().Unix(), randomSuffix(8))
-
-	op := &Operation{
-		ID:            id,
-		Name:          name,
-		Kind:          kind,
-		OperationType: operationType,
-		Status:        StatusPending,
-		TargetLink:    targetLink,
-		Progress:      0,
-		Done:          false,
-		InsertTime:    time.Now().UTC().Format(time.RFC3339),
-		Zone:          zone,
-		Region:        region,
+// RegisterScopedDurable creates a durable service-scoped operation with its
+// canonical polling name.
+func (om *OperationManager) RegisterScopedDurable(scope OperationScope, operationType string) (*Operation, error) {
+	if scope.ServiceKind == "" || scope.Target == "" {
+		return nil, errors.New("operation service kind and target are required")
 	}
+	name := canonicalOperationName(scope.Project, scope.Location)
+	op := newOperation(name, scope.ServiceKind, operationType, scope.Target, "", scope.Location)
+	op.ServiceKind = scope.ServiceKind
+	op.Project = scope.Project
+	op.Location = scope.Location
+	return om.insertDurable(op, true)
+}
 
+// RegisterScopedTargetDurable derives the canonical project and location scope
+// from a resource target.
+func (om *OperationManager) RegisterScopedTargetDurable(serviceKind, operationType, target string) (*Operation, error) {
+	project, location := resourceParentScope(target)
+	return om.RegisterScopedDurable(OperationScope{
+		ServiceKind: serviceKind,
+		Project:     project,
+		Location:    location,
+		Target:      target,
+	}, operationType)
+}
+
+func (om *OperationManager) register(kind, operationType, targetLink, zone, region string, rollbackOnFailure bool) (*Operation, error) {
+	name := fmt.Sprintf("operation-%d-%s", time.Now().Unix(), randomSuffix(8))
+	op := newOperation(name, kind, operationType, targetLink, zone, region)
+	op.ServiceKind = kind
+	op.Project, op.Location = resourceParentScope(targetLink)
+	if op.Location == "" {
+		op.Location = region
+		if op.Location == "" {
+			op.Location = zone
+		}
+	}
+	return om.insertDurable(op, rollbackOnFailure)
+}
+
+func (om *OperationManager) insertDurable(op *Operation, rollbackOnFailure bool) (*Operation, error) {
 	om.persistMu.Lock()
 	defer om.persistMu.Unlock()
 
 	om.mu.Lock()
-	om.ops[name] = op
+	om.ops[op.Name] = op
 	om.mu.Unlock()
 
 	if err := om.persistLocked(); err != nil {
 		if rollbackOnFailure {
 			om.mu.Lock()
-			delete(om.ops, name)
+			delete(om.ops, op.Name)
 			om.mu.Unlock()
+			if compensationErr := om.persistLocked(); compensationErr != nil {
+				var durable map[string]*Operation
+				loadErr := error(nil)
+				if om.store != nil {
+					loadErr = om.store.Load(operationStateEntry, &durable)
+				}
+				if errors.Is(loadErr, state.ErrNotFound) {
+					loadErr = nil
+					durable = nil
+				}
+				om.mu.Lock()
+				if loadErr == nil {
+					if durableOperation := durable[op.Name]; durableOperation != nil {
+						om.ops[op.Name] = cloneOperation(durableOperation)
+					} else {
+						delete(om.ops, op.Name)
+					}
+				} else {
+					om.ops[op.Name] = op
+				}
+				om.mu.Unlock()
+				if loadErr != nil {
+					err = fmt.Errorf("%w; compensate registration: %v; read back operations: %v",
+						err, compensationErr, loadErr)
+				} else {
+					err = fmt.Errorf("%w; compensate registration: %v", err, compensationErr)
+				}
+			}
 		}
-		om.recordPersistenceFailure(name, false, err)
+		om.recordPersistenceFailure(op.Name, false, err)
 		if rollbackOnFailure {
 			return nil, err
 		}
@@ -178,11 +249,93 @@ func (om *OperationManager) register(kind, operationType, targetLink, zone, regi
 	return cloneOperation(op), nil
 }
 
+func newOperation(name, kind, operationType, targetLink, zone, region string) *Operation {
+	return &Operation{
+		ID:            fmt.Sprintf("%d", rand.Int63()),
+		Name:          name,
+		Kind:          kind,
+		OperationType: operationType,
+		Status:        StatusPending,
+		TargetLink:    targetLink,
+		InsertTime:    time.Now().UTC().Format(time.RFC3339),
+		Zone:          zone,
+		Region:        region,
+	}
+}
+
 // Get retrieves an operation by name. Returns nil if not found.
 func (om *OperationManager) Get(name string) *Operation {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
 	return cloneOperation(om.ops[name])
+}
+
+// GetScoped returns an operation only when every supplied scope component
+// matches its durable registration.
+func (om *OperationManager) GetScoped(name string, scope OperationScope) (*Operation, error) {
+	op := om.Get(name)
+	if op == nil ||
+		scope.ServiceKind != "" && op.ServiceKind != scope.ServiceKind ||
+		scope.Project != "" && op.Project != scope.Project ||
+		scope.Location != "" && op.Location != scope.Location ||
+		scope.Target != "" && op.TargetLink != scope.Target {
+		return nil, ErrOperationNotFound
+	}
+	return op, nil
+}
+
+// PollScoped resolves the canonical operation name in path and validates it
+// against the service and parent encoded by that path.
+func (om *OperationManager) PollScoped(path, serviceKind string) (*Operation, error) {
+	name, project, location := operationPathScope(path)
+	if name == "" {
+		return nil, ErrOperationNotFound
+	}
+	scope := OperationScope{
+		ServiceKind: serviceKind,
+		Project:     project,
+		Location:    location,
+	}
+	op, err := om.GetScoped(name, scope)
+	if err != nil {
+		_, id := splitOperationName(name)
+		op, err = om.GetScoped(id, scope)
+	}
+	if err != nil {
+		return nil, err
+	}
+	op.Name = name
+	return op, nil
+}
+
+// ScopedOperationResponse serializes the durable google.longrunning operation
+// fields shared by experimental services.
+func ScopedOperationResponse(op *Operation) map[string]any {
+	metadata := map[string]any{
+		"serviceKind": op.ServiceKind,
+		"project":     op.Project,
+		"location":    op.Location,
+		"target":      op.TargetLink,
+		"verb":        op.OperationType,
+	}
+	if typeURL := operationMetadataType(op.ServiceKind); typeURL != "" {
+		metadata["@type"] = typeURL
+	}
+	response := map[string]any{
+		"name":     op.Name,
+		"done":     op.Done,
+		"metadata": metadata,
+	}
+	if op.Done && op.Error != nil {
+		response["error"] = op.Error
+	}
+	if op.Done && op.Error == nil && len(op.Response) != 0 {
+		var value any
+		if json.Unmarshal(op.Response, &value) == nil {
+			response["response"] = value
+		}
+	}
+	return response
 }
 
 // Advance moves the operation through the PENDING → RUNNING → DONE state machine.
@@ -217,6 +370,7 @@ func (om *OperationManager) AdvanceDurable(name string, progress int, status Ope
 		op.Done = true
 		op.Progress = 100
 		op.EndTime = time.Now().UTC().Format(time.RFC3339)
+		ensureScopedTerminalResponse(op)
 	}
 	om.mu.Unlock()
 	if err := om.persistLocked(); err != nil {
@@ -280,7 +434,11 @@ func (om *OperationManager) FailDurable(name string, code int, message string) e
 	op.Done = true
 	op.Progress = 100
 	op.EndTime = time.Now().UTC().Format(time.RFC3339)
+	if isScopedOperation(op) {
+		code = canonicalRPCCode(code)
+	}
 	op.Error = &OperationError{Code: code, Message: message}
+	op.Response = nil
 	om.mu.Unlock()
 	if err := om.persistLocked(); err != nil {
 		om.recordPersistenceFailure(name, true, err)
@@ -298,6 +456,15 @@ func (om *OperationManager) FailDurable(name string, code int, message string) e
 // preserved even when readback confirms the terminal state, allowing callers
 // to enter a degraded mode for uncertain filesystem durability.
 func (om *OperationManager) FinalizeDurable(name string, code int, message string) error {
+	return om.finalizeDurable(name, nil, code, message)
+}
+
+// FinalizeScopedDurable records the durable terminal response or error.
+func (om *OperationManager) FinalizeScopedDurable(name string, response json.RawMessage, code int, message string) error {
+	return om.finalizeDurable(name, response, code, message)
+}
+
+func (om *OperationManager) finalizeDurable(name string, response json.RawMessage, code int, message string) error {
 	om.persistMu.Lock()
 
 	om.mu.Lock()
@@ -312,9 +479,15 @@ func (om *OperationManager) FinalizeDurable(name string, code int, message strin
 	op.Progress = 100
 	op.EndTime = time.Now().UTC().Format(time.RFC3339)
 	if code != 0 {
+		if isScopedOperation(op) {
+			code = canonicalRPCCode(code)
+		}
 		op.Error = &OperationError{Code: code, Message: message}
+		op.Response = nil
 	} else {
 		op.Error = nil
+		op.Response = append(json.RawMessage(nil), response...)
+		ensureScopedTerminalResponse(op)
 	}
 	om.mu.Unlock()
 
@@ -323,6 +496,10 @@ func (om *OperationManager) FinalizeDurable(name string, code int, message strin
 		loadErr := error(nil)
 		if om.store != nil {
 			loadErr = om.store.Load(operationStateEntry, &durable)
+		}
+		if errors.Is(loadErr, state.ErrNotFound) {
+			loadErr = nil
+			durable = nil
 		}
 		wrapped := fmt.Errorf("terminal operation persistence degraded: %w", err)
 		om.mu.Lock()
@@ -345,6 +522,45 @@ func (om *OperationManager) FinalizeDurable(name string, code int, message strin
 	completed := om.Get(name)
 	om.persistMu.Unlock()
 	om.notifyTerminal(completed)
+	return nil
+}
+
+// RollbackScopedRegistration removes an operation created as part of a resource
+// mutation that could not be committed.
+func (om *OperationManager) RollbackScopedRegistration(name string) error {
+	om.persistMu.Lock()
+	defer om.persistMu.Unlock()
+
+	om.mu.Lock()
+	previous := cloneOperation(om.ops[name])
+	delete(om.ops, name)
+	om.mu.Unlock()
+	if previous == nil {
+		return nil
+	}
+	if err := om.persistLocked(); err != nil {
+		var durable map[string]*Operation
+		loadErr := error(nil)
+		if om.store != nil {
+			loadErr = om.store.Load(operationStateEntry, &durable)
+		}
+		wrapped := fmt.Errorf("operation rollback persistence degraded: %w", err)
+		om.mu.Lock()
+		switch {
+		case loadErr != nil:
+			om.ops[name] = previous
+		case durable[name] != nil:
+			om.ops[name] = cloneOperation(durable[name])
+		default:
+			delete(om.ops, name)
+		}
+		om.persistenceErr = wrapped
+		om.mu.Unlock()
+		if loadErr != nil {
+			return fmt.Errorf("rollback operation %q: %w; read back operations: %v", name, wrapped, loadErr)
+		}
+		return fmt.Errorf("rollback operation %q: %w", name, wrapped)
+	}
 	return nil
 }
 
@@ -550,6 +766,14 @@ func (om *OperationManager) PersistenceError() error {
 	return om.persistenceErr
 }
 
+// MarkPersistenceFailure records a durable state failure discovered while
+// compensating a resource mutation associated with this operation manager.
+func (om *OperationManager) MarkPersistenceFailure(err error) {
+	if err != nil {
+		om.recordPersistenceFailure("", false, err)
+	}
+}
+
 func (om *OperationManager) notifyTerminal(operation *Operation) {
 	if operation == nil {
 		return
@@ -625,7 +849,68 @@ func cloneOperation(op *Operation) *Operation {
 		operationError := *op.Error
 		clone.Error = &operationError
 	}
+	clone.Response = append(json.RawMessage(nil), op.Response...)
 	return &clone
+}
+
+func canonicalOperationName(project, location string) string {
+	id := fmt.Sprintf("operation-%d-%s", time.Now().Unix(), randomSuffix(8))
+	switch {
+	case project != "" && location != "":
+		return fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, id)
+	case project != "":
+		return fmt.Sprintf("projects/%s/operations/%s", project, id)
+	default:
+		return "operations/" + id
+	}
+}
+
+func splitOperationName(name string) (parent, id string) {
+	index := strings.LastIndex(name, "/")
+	if index < 0 {
+		return "", name
+	}
+	return name[:index], name[index+1:]
+}
+
+func resourceParentScope(resource string) (project, location string) {
+	parts := strings.Split(strings.Trim(resource, "/"), "/")
+	for index, part := range parts {
+		if index+1 >= len(parts) {
+			break
+		}
+		switch part {
+		case "projects":
+			project = parts[index+1]
+		case "locations", "regions", "zones":
+			location = parts[index+1]
+		}
+	}
+	return project, location
+}
+
+func operationPathScope(path string) (name, project, location string) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	projectIndex := -1
+	for index, part := range parts {
+		if index+1 >= len(parts) {
+			break
+		}
+		switch part {
+		case "projects":
+			project = parts[index+1]
+			projectIndex = index
+		case "locations", "regions", "zones":
+			location = parts[index+1]
+		case "operations":
+			start := index
+			if projectIndex >= 0 {
+				start = projectIndex
+			}
+			name = strings.Join(parts[start:index+2], "/")
+		}
+	}
+	return name, project, location
 }
 
 func interruptOperation(op *Operation) {
@@ -633,9 +918,133 @@ func interruptOperation(op *Operation) {
 	op.Done = true
 	op.Progress = 100
 	op.EndTime = time.Now().UTC().Format(time.RFC3339)
+	code := 500
+	if isScopedOperation(op) {
+		code = canonicalRPCCode(code)
+	}
 	op.Error = &OperationError{
-		Code:    500,
+		Code:    code,
 		Message: "operation interrupted by MiniSky restart; side effects were not replayed",
+	}
+}
+
+func isScopedOperation(op *Operation) bool {
+	return op != nil && strings.Contains(op.Name, "/operations/") && op.ServiceKind != ""
+}
+
+func ensureScopedTerminalResponse(op *Operation) {
+	if !isScopedOperation(op) || op.Error != nil {
+		return
+	}
+	typeURL := operationResponseType(op)
+	if typeURL == "" {
+		return
+	}
+	response := make(map[string]any)
+	if len(op.Response) != 0 {
+		_ = json.Unmarshal(op.Response, &response)
+	}
+	response["@type"] = typeURL
+	if typeURL != "type.googleapis.com/google.protobuf.Empty" && op.TargetLink != "" {
+		if _, exists := response["name"]; !exists {
+			response["name"] = op.TargetLink
+		}
+	}
+	op.Response, _ = json.Marshal(response)
+}
+
+func operationMetadataType(serviceKind string) string {
+	types := map[string]string{
+		"accesscontextmanager#operation": "type.googleapis.com/google.identity.accesscontextmanager.v1.OperationMetadata",
+		"alloydb#operation":              "type.googleapis.com/google.cloud.alloydb.v1.OperationMetadata",
+		"apigateway#operation":           "type.googleapis.com/google.cloud.apigateway.v1.OperationMetadata",
+		"batch#operation":                "type.googleapis.com/google.cloud.batch.v1.OperationMetadata",
+		"clouddeploy#operation":          "type.googleapis.com/google.cloud.deploy.v1.OperationMetadata",
+		"composer#operation":             "type.googleapis.com/google.cloud.orchestration.airflow.service.v1.OperationMetadata",
+		"documentai#operation":           "type.googleapis.com/google.cloud.documentai.v1.CommonOperationMetadata",
+		"eventarc#operation":             "type.googleapis.com/google.cloud.eventarc.v1.OperationMetadata",
+		"file#operation":                 "type.googleapis.com/google.cloud.common.OperationMetadata",
+		"filestore#operation":            "type.googleapis.com/google.cloud.common.OperationMetadata",
+		"managedkafka#operation":         "type.googleapis.com/google.cloud.managedkafka.v1.OperationMetadata",
+		"networksecurity#operation":      "type.googleapis.com/google.cloud.networksecurity.v1.OperationMetadata",
+		"servicemesh#operation":          "type.googleapis.com/google.cloud.servicemesh.v1.OperationMetadata",
+		"workflows#operation":            "type.googleapis.com/google.cloud.workflows.v1.OperationMetadata",
+	}
+	return types[serviceKind]
+}
+
+func operationResponseType(op *Operation) string {
+	if strings.EqualFold(op.OperationType, "delete") {
+		return "type.googleapis.com/google.protobuf.Empty"
+	}
+	collections := []struct {
+		serviceKind string
+		segment     string
+		typeURL     string
+	}{
+		{"accesscontextmanager#operation", "/accessPolicies/", "type.googleapis.com/google.identity.accesscontextmanager.v1.AccessPolicy"},
+		{"accesscontextmanager#operation", "/servicePerimeters/", "type.googleapis.com/google.identity.accesscontextmanager.v1.ServicePerimeter"},
+		{"accesscontextmanager#operation", "/accessLevels/", "type.googleapis.com/google.identity.accesscontextmanager.v1.AccessLevel"},
+		{"apigateway#operation", "/gateways/", "type.googleapis.com/google.cloud.apigateway.v1.Gateway"},
+		{"apigateway#operation", "/configs/", "type.googleapis.com/google.cloud.apigateway.v1.ApiConfig"},
+		{"apigateway#operation", "/apis/", "type.googleapis.com/google.cloud.apigateway.v1.Api"},
+		{"clouddeploy#operation", "/deliveryPipelines/", "type.googleapis.com/google.cloud.deploy.v1.DeliveryPipeline"},
+		{"clouddeploy#operation", "/releases/", "type.googleapis.com/google.cloud.deploy.v1.Release"},
+		{"clouddeploy#operation", "/rollouts/", "type.googleapis.com/google.cloud.deploy.v1.Rollout"},
+		{"workflows#operation", "/workflows/", "type.googleapis.com/google.cloud.workflows.v1.Workflow"},
+		{"eventarc#operation", "/triggers/", "type.googleapis.com/google.cloud.eventarc.v1.Trigger"},
+		{"eventarc#operation", "/channels/", "type.googleapis.com/google.cloud.eventarc.v1.Channel"},
+		{"file#operation", "/instances/", "type.googleapis.com/google.cloud.filestore.v1.Instance"},
+		{"filestore#operation", "/instances/", "type.googleapis.com/google.cloud.filestore.v1.Instance"},
+		{"composer#operation", "/environments/", "type.googleapis.com/google.cloud.orchestration.airflow.service.v1.Environment"},
+		{"alloydb#operation", "/instances/", "type.googleapis.com/google.cloud.alloydb.v1.Instance"},
+		{"alloydb#operation", "/clusters/", "type.googleapis.com/google.cloud.alloydb.v1.Cluster"},
+		{"documentai#operation", "/processors/", "type.googleapis.com/google.cloud.documentai.v1.Processor"},
+		{"managedkafka#operation", "/topics/", "type.googleapis.com/google.cloud.managedkafka.v1.Topic"},
+		{"managedkafka#operation", "/clusters/", "type.googleapis.com/google.cloud.managedkafka.v1.Cluster"},
+		{"networksecurity#operation", "/authorizationPolicies/", "type.googleapis.com/google.cloud.networksecurity.v1.AuthorizationPolicy"},
+		{"networksecurity#operation", "/serverTlsPolicies/", "type.googleapis.com/google.cloud.networksecurity.v1.ServerTlsPolicy"},
+		{"servicemesh#operation", "/meshes/", "type.googleapis.com/google.cloud.servicemesh.v1.Mesh"},
+		{"batch#operation", "/jobs/", "type.googleapis.com/google.cloud.batch.v1.Job"},
+	}
+	target := "/" + strings.Trim(op.TargetLink, "/") + "/"
+	for _, collection := range collections {
+		if collection.serviceKind == op.ServiceKind && strings.Contains(target, collection.segment) {
+			return collection.typeURL
+		}
+	}
+	return ""
+}
+
+func canonicalRPCCode(code int) int {
+	if code >= 0 && code <= 16 {
+		return code
+	}
+	switch code {
+	case 400:
+		return 3
+	case 401:
+		return 16
+	case 403:
+		return 7
+	case 404:
+		return 5
+	case 409:
+		return 6
+	case 412:
+		return 9
+	case 429:
+		return 8
+	case 499:
+		return 1
+	case 501:
+		return 12
+	case 503:
+		return 14
+	case 504:
+		return 4
+	default:
+		return 13
 	}
 }
 

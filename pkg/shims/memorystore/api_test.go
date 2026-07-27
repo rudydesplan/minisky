@@ -77,6 +77,31 @@ func TestRedisLifecycleValidationPersistenceAndOwnedReconciliation(t *testing.T)
 	}
 }
 
+func TestValkeyCreateIsCanonicalUnsupportedBeforeMutation(t *testing.T) {
+	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/instances?instanceId=cache",
+		bytes.NewBufferString(`{"engineVersion":"VALKEY_8_1","nodeType":"SHARED_CORE_NANO"}`))
+	request.Host = "memorystore.googleapis.com"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	assertRedisError(t, response, http.StatusNotImplemented, "UNIMPLEMENTED")
+	if backend.provisionCalls != 0 {
+		t.Fatalf("provision calls = %d, want 0", backend.provisionCalls)
+	}
+	api.mu.RLock()
+	count := len(api.instances)
+	api.mu.RUnlock()
+	if count != 0 {
+		t.Fatalf("instances = %d, want 0", count)
+	}
+}
+
 func TestRedisReconciliationRejectsUnownedBackend(t *testing.T) {
 	store, err := state.New(t.TempDir(), "redis")
 	if err != nil {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,6 +12,13 @@ import (
 type recordingObserver struct {
 	mu     sync.Mutex
 	events []recordedEvent
+}
+
+type failingAcknowledgedObserver struct{}
+
+func (failingAcknowledgedObserver) HandleEvent(string, string, string) {}
+func (failingAcknowledgedObserver) HandleEventWithAck(string, string, string) error {
+	return errors.New("intent save failed")
 }
 
 type recordedEvent struct {
@@ -44,7 +52,7 @@ func TestStorageEventsNotifyAllObserversOnceWithPayload(t *testing.T) {
 			t.Fatalf("%s observer got %d events, want 1", name, len(events))
 		}
 		got := events[0]
-		if got.eventType != "google.storage.object.finalize" || got.resource != "photos" {
+		if got.eventType != "google.cloud.storage.object.v1.finalized" || got.resource != "photos" {
 			t.Fatalf("%s observer event = %#v", name, got)
 		}
 		var data map[string]string
@@ -69,5 +77,14 @@ func TestStorageNonEventRequestDoesNotNotify(t *testing.T) {
 	defer observer.mu.Unlock()
 	if len(observer.events) != 0 {
 		t.Fatalf("got %d events, want none", len(observer.events))
+	}
+}
+
+func TestStorageEventPropagatesObserverPersistenceFailure(t *testing.T) {
+	api := NewAPI(nil)
+	api.AddObserver(failingAcknowledgedObserver{})
+	req := httptest.NewRequest(http.MethodPost, "/upload/storage/v1/b/photos/o?name=summer.jpg", nil)
+	if err := api.handlePotentialEvent(req, &http.Response{StatusCode: http.StatusOK}); err == nil {
+		t.Fatal("observer persistence failure was ignored")
 	}
 }

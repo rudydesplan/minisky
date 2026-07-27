@@ -27,6 +27,10 @@ type EventObserver interface {
 	HandleEvent(eventType, resource, payload string)
 }
 
+type acknowledgedEventObserver interface {
+	HandleEventWithAck(eventType, resource, payload string) error
+}
+
 type API struct {
 	svcMgr    *orchestrator.ServiceManager
 	proxy     *httputil.ReverseProxy
@@ -37,6 +41,11 @@ type API struct {
 func (api *API) OnPostBoot(ctx *registry.Context) {
 	if slsShim, ok := ctx.GetShim("cloudfunctions.googleapis.com").(*serverless.API); ok {
 		api.SetObserver(slsShim)
+	}
+	if eventarcShim := ctx.GetShim("eventarc.googleapis.com"); eventarcShim != nil {
+		if observer, ok := eventarcShim.(EventObserver); ok {
+			api.AddObserver(observer)
+		}
 	}
 }
 
@@ -116,17 +125,35 @@ func (api *API) handlePublish(w http.ResponseWriter, r *http.Request, targetURL 
 	// Proxy the request
 	target, _ := url.Parse(targetURL)
 	proxy := observability.NewReverseProxy(target)
-
-	observers := api.eventObservers()
-	if len(observers) > 0 && topic != "" {
-		log.Printf("[PubSub Shim] 📢 Intercepted publish to topic: %s", topic)
-		for _, observer := range observers {
-			observer.HandleEvent("google.cloud.pubsub.topic.v1.messagePublished", topic, string(body))
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode >= 200 && response.StatusCode < 300 && topic != "" {
+			resource := "projects/" + extractProject(r.URL.Path) + "/topics/" + topic
+			log.Printf("[PubSub Shim] 📢 Intercepted publish to topic: %s", resource)
+			for _, observer := range api.eventObservers() {
+				if acknowledged, ok := observer.(acknowledgedEventObserver); ok {
+					if err := acknowledged.HandleEventWithAck("google.cloud.pubsub.topic.v1.messagePublished", resource, string(body)); err != nil {
+						return err
+					}
+				} else {
+					observer.HandleEvent("google.cloud.pubsub.topic.v1.messagePublished", resource, string(body))
+				}
+			}
 		}
+		return nil
 	}
 
 	log.Printf("[PubSub Shim] %s %s", r.Method, r.URL.Path)
 	proxy.ServeHTTP(w, r)
+}
+
+func extractProject(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		if part == "projects" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 func (api *API) eventObservers() []EventObserver {

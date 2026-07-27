@@ -7,6 +7,7 @@ import (
 	"minisky/pkg/registry"
 
 	// Blank imports to trigger init() in all shim packages
+	_ "minisky/pkg/shims/aiplatform"
 	_ "minisky/pkg/shims/appengine"
 	_ "minisky/pkg/shims/artifactregistry"
 	_ "minisky/pkg/shims/bigquery"
@@ -35,7 +36,43 @@ import (
 	_ "minisky/pkg/shims/serverless"
 	_ "minisky/pkg/shims/storage"
 	_ "minisky/pkg/shims/sts"
-	_ "minisky/pkg/shims/vertexai"
+	// Phase 18-25 packages remain registered as experimental prototypes.
+	// registry.BootAll and registry.ContractHandlers expose their handlers only
+	// when MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1; default requests receive 501.
+	_ "minisky/pkg/shims/accesscontextmanager"
+	_ "minisky/pkg/shims/alloydb"
+	_ "minisky/pkg/shims/apigateway"
+	_ "minisky/pkg/shims/batch"
+	_ "minisky/pkg/shims/binaryauthorization"
+	_ "minisky/pkg/shims/cloudasset"
+	_ "minisky/pkg/shims/clouddeploy"
+	_ "minisky/pkg/shims/cloudendpoints"
+	_ "minisky/pkg/shims/cloudprofiler"
+	_ "minisky/pkg/shims/cloudtrace"
+	_ "minisky/pkg/shims/composer"
+	_ "minisky/pkg/shims/dataflow"
+	_ "minisky/pkg/shims/dataform"
+	_ "minisky/pkg/shims/dialogflowcx"
+	_ "minisky/pkg/shims/dlp"
+	_ "minisky/pkg/shims/documentai"
+	_ "minisky/pkg/shims/errorreporting"
+	_ "minisky/pkg/shims/eventarc"
+	_ "minisky/pkg/shims/filestore"
+	_ "minisky/pkg/shims/identityplatform"
+	_ "minisky/pkg/shims/language"
+	_ "minisky/pkg/shims/managedkafka"
+	_ "minisky/pkg/shims/networksecurity"
+	_ "minisky/pkg/shims/orgpolicy"
+	_ "minisky/pkg/shims/privateca"
+	_ "minisky/pkg/shims/pubsublite"
+	_ "minisky/pkg/shims/servicedirectory"
+	_ "minisky/pkg/shims/servicemesh"
+	_ "minisky/pkg/shims/speech"
+	_ "minisky/pkg/shims/storagetransfer"
+	_ "minisky/pkg/shims/texttospeech"
+	_ "minisky/pkg/shims/translate"
+	_ "minisky/pkg/shims/vision"
+	_ "minisky/pkg/shims/workflows"
 )
 
 func init() {

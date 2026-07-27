@@ -54,6 +54,9 @@ var (
 func Register(domain string, factory Factory) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	if _, exists := factories[domain]; exists || lazyDocker[domain] {
+		panic("duplicate registry domain: " + domain)
+	}
 	factories[domain] = factory
 	log.Printf("[Registry] Registered Shim Factory for %s", domain)
 }
@@ -62,6 +65,9 @@ func Register(domain string, factory Factory) {
 func RegisterLazyDocker(domain string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	if _, exists := factories[domain]; exists || lazyDocker[domain] {
+		panic("duplicate registry domain: " + domain)
+	}
 	lazyDocker[domain] = true
 	log.Printf("[Registry] Registered Lazy Docker Factory for %s", domain)
 }
@@ -143,10 +149,15 @@ func BootAll(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceM
 		shims:  make(map[string]http.Handler),
 		shared: make(map[string]http.Handler),
 	}
+	experimentalEnabled := experimentalServicesEnabled()
 
 	// First pass: Instantiate all shims
 	registryMu.Lock()
 	for domain, factory := range factories {
+		if experimentalServiceContracts[domain] && !experimentalEnabled {
+			ctx.shims[domain] = experimentalDisabledHandler(domain)
+			continue
+		}
 		if svcMgr == nil && requiresDocker[domain] {
 			ctx.shims[domain] = dockerUnavailableHandler()
 			continue

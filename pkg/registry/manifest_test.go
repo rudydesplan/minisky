@@ -22,13 +22,16 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(services) == 0 {
-		t.Fatal("service manifest is empty")
+	if len(services) != 71 {
+		t.Fatalf("registered service count = %d, want exactly 71", len(services))
 	}
 
 	documentation, err := os.ReadFile("../../docs/service-compatibility.md")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if rows := strings.Count(string(documentation), "| `"); rows != len(services) {
+		t.Fatalf("machine-readable documentation rows = %d, want %d", rows, len(services))
 	}
 	for _, service := range services {
 		service := service
@@ -47,8 +50,15 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 				if service.Fidelity != "" {
 					t.Errorf("deferred service claims fidelity tier %q", service.Fidelity)
 				}
-				if service.DeferredReason == "" {
+				if service.SupportReason == "" {
 					t.Error("deferred service has no reason")
+				}
+			case registry.SupportExperimental:
+				if service.Fidelity != "" {
+					t.Errorf("experimental service claims fidelity tier %q", service.Fidelity)
+				}
+				if service.SupportReason == "" {
+					t.Error("experimental service has no opt-in/evidence reason")
 				}
 			default:
 				t.Errorf("unknown support status %q", service.Support)
@@ -70,10 +80,11 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 				t.Errorf("docs/service-compatibility.md lists %q %d times, want exactly once", service.Domain, count)
 			}
 			expectedRow := ""
-			if service.Support == registry.SupportDeferred {
+			if service.Support != registry.SupportImplemented {
 				expectedRow = fmt.Sprintf(
-					"| `%s` | deferred | %s |",
+					"| `%s` | %s | %s |",
 					service.Domain,
+					service.Support,
 					service.Persistence,
 				)
 			} else {
@@ -94,6 +105,264 @@ func TestRegisteredServicesHaveManifestAndDocumentation(t *testing.T) {
 				t.Error("Docker-gated service has no backend contract rationale")
 			}
 		})
+	}
+}
+
+func TestPhase18To25DomainsAreExperimental(t *testing.T) {
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	experimental := make(map[string]registry.Service)
+	for _, service := range services {
+		if service.Support == registry.SupportExperimental {
+			experimental[service.Domain] = service
+		}
+	}
+	expected := []string{
+		"accesscontextmanager.googleapis.com",
+		"binaryauthorization.googleapis.com",
+		"alloydb.googleapis.com",
+		"apigateway.googleapis.com",
+		"batch.googleapis.com",
+		"cloudasset.googleapis.com",
+		"clouddeploy.googleapis.com",
+		"dialogflow.googleapis.com",
+		"clouderrorreporting.googleapis.com",
+		"cloudprofiler.googleapis.com",
+		"cloudtrace.googleapis.com",
+		"composer.googleapis.com",
+		"dataflow.googleapis.com",
+		"dataform.googleapis.com",
+		"dlp.googleapis.com",
+		"documentai.googleapis.com",
+		"eventarc.googleapis.com",
+		"file.googleapis.com",
+		"identityplatform.googleapis.com",
+		"language.googleapis.com",
+		"managedkafka.googleapis.com",
+		"networksecurity.googleapis.com",
+		"networkservices.googleapis.com",
+		"orgpolicy.googleapis.com",
+		"privateca.googleapis.com",
+		"pubsublite.googleapis.com",
+		"servicecontrol.googleapis.com",
+		"servicemanagement.googleapis.com",
+		"servicedirectory.googleapis.com",
+		"speech.googleapis.com",
+		"storagetransfer.googleapis.com",
+		"texttospeech.googleapis.com",
+		"translate.googleapis.com",
+		"vision.googleapis.com",
+		"workflows.googleapis.com",
+		"workflowexecutions.googleapis.com",
+	}
+	if len(experimental) != len(expected) {
+		t.Fatalf("experimental domain count = %d, want %d: %#v", len(experimental), len(expected), experimental)
+	}
+	for _, domain := range expected {
+		service, ok := experimental[domain]
+		if !ok {
+			t.Errorf("%s is not experimental", domain)
+			continue
+		}
+		if service.Fidelity != "" {
+			t.Errorf("%s fidelity = %q, want no promoted fidelity", domain, service.Fidelity)
+		}
+	}
+}
+
+func TestExperimentalHandlersRequireExplicitRuntimeOptIn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "experimental-runtime-gate")
+	t.Setenv(registry.ExperimentalServicesEnv, "")
+
+	const domain = "batch.googleapis.com"
+	const path = "/v1/projects/demo/locations/us-central1/jobs"
+	wantMessage := "MiniSky: " + domain + " is experimental and disabled; set " +
+		registry.ExperimentalServicesEnv +
+		"=1 to opt in; promotion evidence is incomplete"
+
+	assertBlocked := func(t *testing.T, handler http.Handler) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotImplemented {
+			t.Fatalf("status = %d, want 501; body: %s", response.Code, response.Body.String())
+		}
+		var envelope struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Status  string `json:"status"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		if envelope.Error.Code != http.StatusNotImplemented ||
+			envelope.Error.Status != "UNIMPLEMENTED" ||
+			envelope.Error.Message != wantMessage {
+			t.Fatalf("unexpected experimental gate response: %+v", envelope.Error)
+		}
+	}
+
+	booted, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	assertBlocked(t, booted[domain])
+	coreResponse := httptest.NewRecorder()
+	booted["bigquery.googleapis.com"].ServeHTTP(
+		coreResponse,
+		httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/demo/datasets", nil),
+	)
+	if coreResponse.Code != http.StatusOK {
+		t.Fatalf("default experimental gate changed core BigQuery status = %d; body: %s",
+			coreResponse.Code, coreResponse.Body.String())
+	}
+	contracts, err := registry.ContractHandlers(orchestrator.NewOperationManager(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBlocked(t, contracts[domain])
+
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	booted, _ = registry.BootAll(orchestrator.NewOperationManager(), nil)
+	response := httptest.NewRecorder()
+	booted[domain].ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("opted-in Batch status = %d, want 200; body: %s", response.Code, response.Body.String())
+	}
+	contracts, err = registry.ContractHandlers(orchestrator.NewOperationManager(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	contracts[domain].ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("opted-in Batch contract status = %d, want 200; body: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestEveryExperimentalDomainUsesDefaultOffRuntimeGate(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "all-experimental-runtime-gates")
+	t.Setenv(registry.ExperimentalServicesEnv, "")
+
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	enabled, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+
+	for _, service := range services {
+		if service.Support != registry.SupportExperimental {
+			continue
+		}
+		if !registry.IsExperimentalDisabled(disabled[service.Domain]) {
+			t.Errorf("%s is not default-gated", service.Domain)
+		}
+		if registry.IsExperimentalDisabled(enabled[service.Domain]) {
+			t.Errorf("%s remains gated after explicit opt-in", service.Domain)
+		}
+	}
+}
+
+func TestRelatedAliasesShareOneHandlerInstance(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "shared-alias-handlers")
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+
+	handlers, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	for _, domains := range [][]string{
+		{
+			"pubsublite.googleapis.com",
+		},
+		{
+			"servicemanagement.googleapis.com",
+			"servicecontrol.googleapis.com",
+		},
+	} {
+		first := handlers[domains[0]]
+		if first == nil {
+			t.Fatalf("missing handler for %s", domains[0])
+		}
+		for _, domain := range domains[1:] {
+			if handlers[domain] != first {
+				t.Errorf("%s and %s do not share one handler instance", domains[0], domain)
+			}
+		}
+	}
+}
+
+func TestAIPlatformFactoryPreservesPredictionAndControlPlane(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "merged-aiplatform")
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+
+	handlers, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	handler := handlers["aiplatform.googleapis.com"]
+	if handler == nil {
+		t.Fatal("missing aiplatform handler")
+	}
+
+	predict := httptest.NewRecorder()
+	handler.ServeHTTP(predict, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/demo/locations/us/endpoints/endpoint-1:predict",
+		strings.NewReader(`{"instances":[{"value":1}]}`),
+	))
+	if predict.Code != http.StatusOK || !strings.Contains(predict.Body.String(), `"predictions"`) {
+		t.Fatalf("prediction status=%d body=%s", predict.Code, predict.Body.String())
+	}
+
+	index := httptest.NewRecorder()
+	handler.ServeHTTP(index, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/demo/locations/us/indexes",
+		strings.NewReader(`{"displayName":"demo-index"}`),
+	))
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), `"done":true`) {
+		t.Fatalf("control-plane status=%d body=%s", index.Code, index.Body.String())
+	}
+}
+
+func TestDuplicateDomainRegistrationPanicsWithoutReplacingFactory(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("duplicate registration did not panic")
+		}
+	}()
+	registry.Register("aiplatform.googleapis.com", func(*registry.Context) http.Handler {
+		t.Fatal("duplicate factory must never be installed")
+		return nil
+	})
+}
+
+func TestBootAllContainsEveryNonLazyManifestDomain(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "boot-manifest-coherence")
+	t.Setenv(registry.ExperimentalServicesEnv, "")
+	services, err := registry.Services()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers, lazy := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	lazySet := make(map[string]bool, len(lazy))
+	for _, domain := range lazy {
+		lazySet[domain] = true
+	}
+	for _, service := range services {
+		_, handlerExists := handlers[service.Domain]
+		if handlerExists == lazySet[service.Domain] {
+			t.Errorf("%s handlerExists=%v lazy=%v, want exactly one runtime registration",
+				service.Domain, handlerExists, lazySet[service.Domain])
+		}
+	}
+	if len(handlers)+len(lazy) != 71 {
+		t.Fatalf("BootAll domains = %d handlers + %d lazy = %d, want 71",
+			len(handlers), len(lazy), len(handlers)+len(lazy))
 	}
 }
 

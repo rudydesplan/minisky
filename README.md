@@ -1,35 +1,64 @@
 # 🛰️ MiniSky
 
-**Bounded local emulator for tested Google Cloud workflows.**
+**Local emulator for Google Cloud Platform workflows.**
 
 **Official Website:** [minisky.bmics.com.ng](https://minisky.bmics.com.ng)
 
-MiniSky provides one local gateway for custom Go shims and selected
-Docker-backed emulators. It supports explicitly documented Terraform, SDK,
-serverless, data, and observability slices; it does not claim broad GCP parity.
-Once dependencies and required images are available locally, many workflows can
+MiniSky provides a local gateway for custom Go shims and selected Docker-backed
+emulators. Core services (Compute, Storage, BigQuery, Pub/Sub, Cloud SQL, IAM)
+have verified Terraform and SDK slices. Phase 18–25 services are package-local
+prototypes with bounded Go evidence but incomplete promotion evidence. Once
+dependencies and required images are available locally, verified workflows can
 run offline; first use may pull lazily loaded emulator images.
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Mini Movement](https://img.shields.io/badge/Mini-Family-blue.svg)](https://github.com/topics/mini-cloud)
-[![High Fidelity](https://img.shields.io/badge/Fidelity-High-green.svg)](#)
 
 ---
 
 ## ✨ Features
 
-- **🚀 Registered service domains**: Compatibility ranges from bounded executable
-  slices to metadata-only control planes, Docker passthroughs, and explicit
-  deferred behavior. See the service matrix before selecting a workflow.
-- **🖥️ Embedded Dashboard**: A light management shell with intentionally dark
-  Logging, Monitoring, terminal, and log-output operational views.
-- **🛠️ Bounded Terraform gates**: The pinned Google provider is tested only for
-  the resources listed in `docs/terraform-compatibility.md`.
+- **🚀 71 Registry-Verified Domains**: The exact catalog count and machine-readable
+  compatibility rows are checked by registry tests. Core services have verified
+  Terraform/SDK slices; experimental services remain default-off.
+  See [Service Compatibility](docs/service-compatibility.md).
+- **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
+  and operational views.
+- **🛠️ Terraform Gates**: The pinned Google provider is tested only for resources
+  listed in `docs/terraform-compatibility.md`.
 - **🔌 Dynamic Registry**: Modular Go shim registry for community-led service contributions.
-- **📦 Single binary**: Go shims and the built dashboard are packaged together;
-  selected services still require Docker, emulator images, Kind, Pack, or
-  DuckDB/CGO.
+- **📦 Single Binary**: Go shims and the built dashboard are packaged together;
+  selected services require Docker, emulator images, Kind, Pack, or DuckDB/CGO.
+
+### Phase 18–25 Services (Experimental)
+
+Phase 18–25 services remain registered for manifest and package-level
+development, but are classified as **experimental**, not Standard or
+implemented. Their data-driven Go gate covers public routing, restart evidence,
+scoped operations, pagination, event delivery, cancellation, and loopback
+safety. It does not prove Terraform/provider or external-backend lifecycles.
+
+Their runtime handlers are disabled by default. Requests return canonical JSON
+`501 UNIMPLEMENTED` with the opt-in and evidence status. To inspect the existing
+prototype handlers explicitly:
+
+```bash
+MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1 minisky start
+```
+
+This switch enables all Phase 18–25 prototypes for that process. It does not
+promote their compatibility status or establish provider/backend evidence.
+
+Run the offline evidence gate with `make test-phase18-25-evidence`. Its
+machine-readable inventory is `pkg/evidence/phase18_25.json`.
+
+The newly integrated Pub/Sub Lite, Service Management/Control, Speech-to-Text,
+Text-to-Speech, Natural Language, Dialogflow CX, Vector Search/Model Registry,
+Certificate Authority Service, and Binary Authorization packages remain
+experimental. Their unsupported execution boundaries return 501 rather than
+simulated success. Cloud CDN/Armor remains part of the existing Compute domain
+and has no separate registration; enforcement/data-plane parity is unsupported.
 
 ## 📋 Prerequisites
 Install the tools required by the slices you use:
@@ -279,9 +308,10 @@ require network access; the command does not prune global Docker resources.
 ### Phase 6 — Fidelity baseline
 
 - Maintain `docs/service-compatibility.md` with the manifest vocabulary:
-  **implemented** or **deferred** support status. Implemented domains additionally
-  declare **high**, **standard**, or **passthrough** fidelity; every domain
-  declares **memory**, **file**, **docker**, **hybrid**, or **static**
+  **implemented**, **experimental**, or **deferred** support status. Implemented
+  domains additionally declare **high**, **standard**, or **passthrough**
+  fidelity; experimental and deferred domains claim no fidelity tier. Every
+  domain declares **memory**, **file**, **docker**, **hybrid**, or **static**
   persistence.
 - Add `docs/state-model.md` describing file, Docker volume, and in-memory state
   per service.

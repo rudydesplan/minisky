@@ -224,6 +224,11 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION", "Memorystore state is unavailable")
 		return
 	}
+	if strings.EqualFold(strings.Split(r.Host, ":")[0], "memorystore.googleapis.com") {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"Memorystore for Valkey requires a dedicated owned Valkey backend; the Redis backend is not reused")
+		return
+	}
 	switch {
 	case strings.Contains(r.URL.Path, "/operations/") && r.Method == http.MethodGet:
 		api.getOperation(w, r)

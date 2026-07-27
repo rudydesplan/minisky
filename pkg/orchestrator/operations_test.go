@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -121,6 +122,189 @@ func TestRegisterDurableRollsBackWhenInitialSaveFails(t *testing.T) {
 	}
 	if manager.PersistenceError() == nil {
 		t.Fatal("failed registration did not mark persistence degraded")
+	}
+}
+
+func TestRegisterDurableCompensatesPostCommitFailure(t *testing.T) {
+	store := &postCommitOperationStore{failOnSave: map[int]error{
+		1: errors.New("post-commit registration failure"),
+	}}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := manager.RegisterScopedTargetDurable(
+		"filestore#operation", "update",
+		"projects/demo/locations/us/instances/i",
+	)
+	if err == nil || op != nil {
+		t.Fatalf("registration = (%+v, %v), want compensated failure", op, err)
+	}
+	if len(manager.List()) != 0 {
+		t.Fatalf("failed registration remained visible: %#v", manager.List())
+	}
+	restarted, restartErr := NewOperationManagerWithStore(store)
+	if restartErr != nil {
+		t.Fatal(restartErr)
+	}
+	if len(restarted.List()) != 0 {
+		t.Fatalf("failed registration remained durable: %#v", restarted.List())
+	}
+	if manager.PersistenceError() == nil {
+		t.Fatal("ambiguous registration failure did not remain degraded")
+	}
+}
+
+func TestScopedOperationPollingRejectsWrongServiceParentAndTarget(t *testing.T) {
+	t.Parallel()
+
+	manager := NewOperationManager()
+	scope := OperationScope{
+		ServiceKind: "workflows#operation",
+		Project:     "project-a",
+		Location:    "us-central1",
+		Target:      "projects/project-a/locations/us-central1/workflows/flow",
+	}
+	op, err := manager.RegisterScopedDurable(scope, "create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Name == "" || !strings.HasPrefix(op.Name, "projects/project-a/locations/us-central1/operations/") {
+		t.Fatalf("scoped operation name = %q", op.Name)
+	}
+
+	for name, wrong := range map[string]OperationScope{
+		"service":  {ServiceKind: "batch#operation", Project: scope.Project, Location: scope.Location},
+		"project":  {ServiceKind: scope.ServiceKind, Project: "project-b", Location: scope.Location},
+		"location": {ServiceKind: scope.ServiceKind, Project: scope.Project, Location: "europe-west1"},
+		"target": {
+			ServiceKind: scope.ServiceKind,
+			Project:     scope.Project,
+			Location:    scope.Location,
+			Target:      "projects/project-a/locations/us-central1/workflows/other",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := manager.GetScoped(op.Name, wrong); !errors.Is(err, ErrOperationNotFound) || got != nil {
+				t.Fatalf("GetScoped() = (%+v, %v), want nil NOT_FOUND", got, err)
+			}
+		})
+	}
+	if got, err := manager.GetScoped(op.Name, scope); err != nil || got == nil {
+		t.Fatalf("GetScoped(correct) = (%+v, %v)", got, err)
+	}
+}
+
+func TestScopedOperationPersistsTerminalResponseAndError(t *testing.T) {
+	store := &injectedOperationStore{}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := OperationScope{
+		ServiceKind: "documentai#operation",
+		Project:     "demo",
+		Location:    "us",
+		Target:      "projects/demo/locations/us/processors/p",
+	}
+	success, err := manager.RegisterScopedDurable(scope, "create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := json.RawMessage(`{"name":"projects/demo/locations/us/processors/p"}`)
+	if err := manager.FinalizeScopedDurable(success.Name, response, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	failure, err := manager.RegisterScopedDurable(scope, "delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeScopedDurable(failure.Name, nil, 501, "backend unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	succeeded, err := restarted.GetScoped(success.Name, scope)
+	var persistedResponse map[string]any
+	if decodeErr := json.Unmarshal(succeeded.Response, &persistedResponse); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if err != nil ||
+		persistedResponse["@type"] != "type.googleapis.com/google.cloud.documentai.v1.Processor" ||
+		persistedResponse["name"] != "projects/demo/locations/us/processors/p" ||
+		succeeded.Error != nil {
+		t.Fatalf("persisted success = (%+v, %v)", succeeded, err)
+	}
+	failed, err := restarted.GetScoped(failure.Name, scope)
+	if err != nil || failed.Error == nil || failed.Error.Code != 12 {
+		t.Fatalf("persisted failure = (%+v, %v)", failed, err)
+	}
+}
+
+func TestRollbackScopedRegistrationCompensatesDurableStore(t *testing.T) {
+	store := &injectedOperationStore{}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := OperationScope{
+		ServiceKind: "eventarc#operation",
+		Project:     "demo",
+		Location:    "us",
+		Target:      "projects/demo/locations/us/triggers/t",
+	}
+	op, err := manager.RegisterScopedDurable(scope, "create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RollbackScopedRegistration(op.Name); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Get(op.Name) != nil {
+		t.Fatal("rolled-back operation remained in memory")
+	}
+	restarted, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Get(op.Name) != nil {
+		t.Fatal("rolled-back operation remained durable")
+	}
+}
+
+func TestRollbackScopedRegistrationReconcilesPostCommitFailure(t *testing.T) {
+	store := &postCommitOperationStore{failOnSave: map[int]error{
+		2: errors.New("post-commit rollback failure"),
+	}}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := manager.RegisterScopedTargetDurable(
+		"eventarc#operation", "update",
+		"projects/demo/locations/us/triggers/t",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RollbackScopedRegistration(op.Name); err == nil {
+		t.Fatal("ambiguous rollback failure was not reported")
+	}
+	if manager.Get(op.Name) != nil {
+		t.Fatalf("readback-confirmed deletion was restored in memory: %#v", manager.Get(op.Name))
+	}
+	restarted, restartErr := NewOperationManagerWithStore(store)
+	if restartErr != nil {
+		t.Fatal(restartErr)
+	}
+	if restarted.Get(op.Name) != nil {
+		t.Fatalf("readback-confirmed deletion remained durable: %#v", restarted.Get(op.Name))
+	}
+	if manager.PersistenceError() == nil {
+		t.Fatal("ambiguous rollback failure did not remain degraded")
 	}
 }
 
@@ -272,6 +456,62 @@ func TestRemoveDurableRestoresOperationWhenSaveFails(t *testing.T) {
 	}
 	if manager.Get(op.Name) == nil {
 		t.Fatal("failed durable removal did not restore operation")
+	}
+}
+
+func TestScopedOperationResponseUsesTypedAnyAndCanonicalRPCCode(t *testing.T) {
+	manager := NewOperationManager()
+	op, err := manager.RegisterScopedTargetDurable(
+		"workflows#operation", "update",
+		"projects/demo/locations/us/workflows/flow",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeScopedDurable(op.Name, nil, http.StatusInternalServerError, "failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	persisted := manager.Get(op.Name)
+	if persisted.Error == nil || persisted.Error.Code != 13 {
+		t.Fatalf("persisted error = %#v, want canonical INTERNAL code 13", persisted.Error)
+	}
+	response := ScopedOperationResponse(persisted)
+	metadata := response["metadata"].(map[string]any)
+	if metadata["@type"] != "type.googleapis.com/google.cloud.workflows.v1.OperationMetadata" {
+		t.Fatalf("metadata @type = %#v", metadata["@type"])
+	}
+	operationError := response["error"].(*OperationError)
+	if operationError.Code != 13 {
+		t.Fatalf("serialized error code = %d, want 13", operationError.Code)
+	}
+}
+
+func TestScopedSuccessPersistsTypedTerminalResponse(t *testing.T) {
+	store := &injectedOperationStore{}
+	manager, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := manager.RegisterScopedTargetDurable(
+		"apigateway#operation", "create",
+		"projects/demo/locations/us/gateways/gateway",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := ScopedOperationResponse(restarted.Get(op.Name))
+	typed, ok := response["response"].(map[string]any)
+	if !ok || typed["@type"] != "type.googleapis.com/google.cloud.apigateway.v1.Gateway" {
+		t.Fatalf("terminal response = %#v", response["response"])
 	}
 }
 
@@ -470,6 +710,34 @@ type injectedOperationStore struct {
 	data       []byte
 	saveCount  int
 	failOnSave map[int]error
+}
+
+type postCommitOperationStore struct {
+	mu         sync.Mutex
+	data       []byte
+	saveCount  int
+	failOnSave map[int]error
+}
+
+func (s *postCommitOperationStore) Load(_ string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(s.data, target)
+}
+
+func (s *postCommitOperationStore) Save(_ string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveCount++
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	s.data = data
+	return s.failOnSave[s.saveCount]
 }
 
 func (s *injectedOperationStore) Load(_ string, target any) error {

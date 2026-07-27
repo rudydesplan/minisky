@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,13 @@ import (
 type recordingObserver struct {
 	mu     sync.Mutex
 	events []recordedEvent
+}
+
+type failingAcknowledgedObserver struct{}
+
+func (failingAcknowledgedObserver) HandleEvent(string, string, string) {}
+func (failingAcknowledgedObserver) HandleEventWithAck(string, string, string) error {
+	return errors.New("intent save failed")
 }
 
 type recordedEvent struct {
@@ -65,8 +73,23 @@ func TestPublishNotifiesAllObserversOnceAndPreservesPayload(t *testing.T) {
 		}
 		got := events[0]
 		if got.eventType != "google.cloud.pubsub.topic.v1.messagePublished" ||
-			got.resource != "orders" || got.payload != payload {
+			got.resource != "projects/test/topics/orders" || got.payload != payload {
 			t.Fatalf("%s observer event = %#v", name, got)
 		}
+	}
+}
+
+func TestPublishDoesNotAcknowledgeObserverPersistenceFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	api := NewAPI(nil)
+	api.AddObserver(failingAcknowledgedObserver{})
+	response := httptest.NewRecorder()
+	api.handlePublish(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/topics/orders:publish", strings.NewReader(`{"messages":[]}`)), upstream.URL)
+	if response.Code < 500 {
+		t.Fatalf("status = %d, want retryable failure", response.Code)
 	}
 }

@@ -3,6 +3,17 @@
 This document lists every GCP service domain registered in MiniSky with its
 fidelity tier, persistence model, and current implementation status.
 
+## Support Status
+
+- **Implemented** domains expose their documented bounded runtime contract by
+  default and carry a fidelity tier.
+- **Experimental** domains remain registered but have no promoted fidelity
+  tier because promotion evidence remains incomplete. They return canonical JSON
+  `501 UNIMPLEMENTED` by default. Set
+  `MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1` for one process to expose the
+  prototype handlers; opt-in does not promote their status.
+- **Deferred** domains have no available implementation.
+
 ## Fidelity Tiers
 
 | Tier | Meaning |
@@ -112,6 +123,22 @@ entire service API. Important boundaries:
 |--------|--------|
 | memcache.googleapis.com | Returns 501 UNIMPLEMENTED for all operations |
 
+## Experimental Services
+
+The Phase 18–25 domains marked `experimental` in the machine-readable
+manifest below are package-registered prototypes. The offline
+`make test-phase18-25-evidence` gate covers their canonical public selector,
+default-off/opt-in behavior, validation ordering, scoped IAM where applicable,
+and the package-local evidence referenced by
+`pkg/evidence/phase18_25.json`. It does not establish Terraform provider,
+Docker/backend, or generated-client lifecycle compatibility, so these domains
+remain default-off and do not claim Standard fidelity.
+
+aiplatform.googleapis.com remains implemented for the existing Vertex
+prediction/configuration slice. Its newly integrated Index and Model Registry
+control-plane routes are separately default-off behind the same experimental
+opt-in and do not change that existing evidence claim.
+
 ## Machine-Readable Manifest
 
 <!-- This section is parsed by pkg/registry/manifest_test.go — do not change the format -->
@@ -125,6 +152,7 @@ entire service API. Important boundaries:
 | `cloudbuild.googleapis.com` | standard | hybrid |
 | `cloudfunctions.googleapis.com` | standard | hybrid |
 | `cloudkms.googleapis.com` | standard | file |
+| `cloudprofiler.googleapis.com` | experimental | memory |
 | `cloudresourcemanager.googleapis.com` | standard | file |
 | `cloudscheduler.googleapis.com` | standard | file |
 | `cloudtasks.googleapis.com` | standard | file |
@@ -133,11 +161,14 @@ entire service API. Important boundaries:
 | `dataproc.googleapis.com` | standard | hybrid |
 | `datastore.googleapis.com` | passthrough | docker |
 | `dns.googleapis.com` | standard | file |
+| `documentai.googleapis.com` | experimental | file |
+| `eventarc.googleapis.com` | experimental | file |
 | `firebasehosting.googleapis.com` | passthrough | docker |
 | `firebaseio.com` | passthrough | docker |
 | `firestore.googleapis.com` | passthrough | docker |
 | `iam.googleapis.com` | standard | file |
 | `iamcredentials.googleapis.com` | standard | static |
+| `identityplatform.googleapis.com` | experimental | file |
 | `identitytoolkit.googleapis.com` | passthrough | docker |
 | `logging.googleapis.com` | standard | file |
 | `memcache.googleapis.com` | deferred | static |
@@ -151,3 +182,35 @@ entire service API. Important boundaries:
 | `sqladmin.googleapis.com` | standard | hybrid |
 | `storage.googleapis.com` | passthrough | docker |
 | `sts.googleapis.com` | standard | static |
+| `translate.googleapis.com` | experimental | memory |
+| `vision.googleapis.com` | experimental | memory |
+| `workflows.googleapis.com` | experimental | file |
+| `workflowexecutions.googleapis.com` | experimental | file |
+| `batch.googleapis.com` | experimental | file |
+| `binaryauthorization.googleapis.com` | experimental | file |
+| `cloudtrace.googleapis.com` | experimental | file |
+| `clouderrorreporting.googleapis.com` | experimental | file |
+| `cloudasset.googleapis.com` | experimental | memory |
+| `dlp.googleapis.com` | experimental | file |
+| `dataflow.googleapis.com` | experimental | file |
+| `dialogflow.googleapis.com` | experimental | file |
+| `accesscontextmanager.googleapis.com` | experimental | file |
+| `alloydb.googleapis.com` | experimental | file |
+| `apigateway.googleapis.com` | experimental | file |
+| `clouddeploy.googleapis.com` | experimental | file |
+| `composer.googleapis.com` | experimental | file |
+| `dataform.googleapis.com` | experimental | file |
+| `file.googleapis.com` | experimental | file |
+| `language.googleapis.com` | experimental | static |
+| `managedkafka.googleapis.com` | experimental | file |
+| `networksecurity.googleapis.com` | experimental | file |
+| `networkservices.googleapis.com` | experimental | file |
+| `orgpolicy.googleapis.com` | experimental | file |
+| `privateca.googleapis.com` | experimental | file |
+| `pubsublite.googleapis.com` | experimental | static |
+| `servicecontrol.googleapis.com` | experimental | static |
+| `servicemanagement.googleapis.com` | experimental | static |
+| `servicedirectory.googleapis.com` | experimental | file |
+| `speech.googleapis.com` | experimental | static |
+| `storagetransfer.googleapis.com` | experimental | file |
+| `texttospeech.googleapis.com` | experimental | static |

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
+	"strings"
 
 	"minisky/pkg/orchestrator"
 )
@@ -12,6 +14,10 @@ import (
 // UnsupportedContractPath is reserved for the executable unsupported-route
 // contract. Registered HTTP routes intercept it before dispatching to a shim.
 const UnsupportedContractPath = "/__minisky_contract__/unsupported"
+
+// ExperimentalServicesEnv explicitly enables handlers whose promotion evidence
+// remains incomplete. The only enabling value is "1".
+const ExperimentalServicesEnv = "MINISKY_ENABLE_EXPERIMENTAL_SERVICES"
 
 type FidelityTier string
 
@@ -24,8 +30,9 @@ const (
 type SupportStatus string
 
 const (
-	SupportImplemented SupportStatus = "implemented"
-	SupportDeferred    SupportStatus = "deferred"
+	SupportImplemented  SupportStatus = "implemented"
+	SupportDeferred     SupportStatus = "deferred"
+	SupportExperimental SupportStatus = "experimental"
 )
 
 type PersistenceCategory string
@@ -39,8 +46,8 @@ const (
 )
 
 // Service describes the support contract for an actually registered domain.
-// Deferred domains have no fidelity tier because they expose only an explicit
-// unsupported response.
+// Deferred and experimental domains have no fidelity tier because they are not
+// promoted implementation claims.
 // ProbeUnsupported is false only when constructing or invoking the service
 // would require a lazy Docker backend.
 type Service struct {
@@ -51,7 +58,7 @@ type Service struct {
 	LazyDocker       bool
 	ProbeUnsupported bool
 	BackendContract  string
-	DeferredReason   string
+	SupportReason    string
 }
 
 type serviceMetadata struct {
@@ -70,6 +77,7 @@ var serviceManifest = map[string]serviceMetadata{
 	"cloudbuild.googleapis.com":           {FidelityStandard, PersistenceHybrid, true},
 	"cloudfunctions.googleapis.com":       {FidelityStandard, PersistenceHybrid, true},
 	"cloudkms.googleapis.com":             {FidelityStandard, PersistenceFile, true},
+	"cloudprofiler.googleapis.com":        {"", PersistenceMemory, true},
 	"cloudresourcemanager.googleapis.com": {FidelityStandard, PersistenceFile, true},
 	"cloudscheduler.googleapis.com":       {FidelityStandard, PersistenceFile, true},
 	"cloudtasks.googleapis.com":           {FidelityStandard, PersistenceFile, true},
@@ -78,11 +86,46 @@ var serviceManifest = map[string]serviceMetadata{
 	"dataproc.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
 	"datastore.googleapis.com":            {FidelityPassthrough, PersistenceDocker, false},
 	"dns.googleapis.com":                  {FidelityStandard, PersistenceFile, true},
+	"documentai.googleapis.com":           {"", PersistenceFile, true},
+	"eventarc.googleapis.com":             {"", PersistenceFile, true},
+	"workflows.googleapis.com":            {"", PersistenceFile, true},
+	"workflowexecutions.googleapis.com":   {"", PersistenceFile, true},
+	"batch.googleapis.com":                {"", PersistenceFile, true},
+	"binaryauthorization.googleapis.com":  {"", PersistenceFile, true},
+	"dataflow.googleapis.com":             {"", PersistenceFile, true},
+	"alloydb.googleapis.com":              {"", PersistenceFile, true},
+	"apigateway.googleapis.com":           {"", PersistenceFile, true},
+	"clouddeploy.googleapis.com":          {"", PersistenceFile, true},
+	"composer.googleapis.com":             {"", PersistenceFile, true},
+	"dataform.googleapis.com":             {"", PersistenceFile, true},
+	"file.googleapis.com":                 {"", PersistenceFile, true},
+	"managedkafka.googleapis.com":         {"", PersistenceFile, true},
+	"networksecurity.googleapis.com":      {"", PersistenceFile, true},
+	"networkservices.googleapis.com":      {"", PersistenceFile, true},
+	"orgpolicy.googleapis.com":            {"", PersistenceFile, true},
+	"servicedirectory.googleapis.com":     {"", PersistenceFile, true},
+	"dialogflow.googleapis.com":           {"", PersistenceFile, true},
+	"language.googleapis.com":             {"", PersistenceStatic, true},
+	"privateca.googleapis.com":            {"", PersistenceFile, true},
+	"pubsublite.googleapis.com":           {"", PersistenceStatic, true},
+	"servicecontrol.googleapis.com":       {"", PersistenceStatic, true},
+	"servicemanagement.googleapis.com":    {"", PersistenceStatic, true},
+	"speech.googleapis.com":               {"", PersistenceStatic, true},
+	"texttospeech.googleapis.com":         {"", PersistenceStatic, true},
+	"storagetransfer.googleapis.com":      {"", PersistenceFile, true},
+	"accesscontextmanager.googleapis.com": {"", PersistenceFile, true},
+	"cloudtrace.googleapis.com":           {"", PersistenceFile, true},
+	"clouderrorreporting.googleapis.com":  {"", PersistenceFile, true},
+	"cloudasset.googleapis.com":           {"", PersistenceMemory, true},
+	"dlp.googleapis.com":                  {"", PersistenceFile, true},
+	"vision.googleapis.com":               {"", PersistenceMemory, true},
+	"translate.googleapis.com":            {"", PersistenceMemory, true},
 	"firebasehosting.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
 	"firebaseio.com":                      {FidelityPassthrough, PersistenceDocker, true},
 	"firestore.googleapis.com":            {FidelityPassthrough, PersistenceDocker, false},
 	"iam.googleapis.com":                  {FidelityStandard, PersistenceFile, true},
 	"iamcredentials.googleapis.com":       {FidelityStandard, PersistenceStatic, true},
+	"identityplatform.googleapis.com":     {"", PersistenceFile, true},
 	"identitytoolkit.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
 	"logging.googleapis.com":              {FidelityStandard, PersistenceFile, true},
 	"memcache.googleapis.com":             {"", PersistenceStatic, true},
@@ -100,6 +143,129 @@ var serviceManifest = map[string]serviceMetadata{
 
 var deferredServiceContracts = map[string]string{
 	"memcache.googleapis.com": "Memorystore for Memcached is not implemented; every request returns 501 UNIMPLEMENTED",
+}
+
+var experimentalServiceContracts = map[string]bool{
+	"accesscontextmanager.googleapis.com": true,
+	"alloydb.googleapis.com":              true,
+	"apigateway.googleapis.com":           true,
+	"batch.googleapis.com":                true,
+	"binaryauthorization.googleapis.com":  true,
+	"cloudasset.googleapis.com":           true,
+	"clouddeploy.googleapis.com":          true,
+	"clouderrorreporting.googleapis.com":  true,
+	"cloudprofiler.googleapis.com":        true,
+	"cloudtrace.googleapis.com":           true,
+	"composer.googleapis.com":             true,
+	"dataflow.googleapis.com":             true,
+	"dataform.googleapis.com":             true,
+	"dlp.googleapis.com":                  true,
+	"documentai.googleapis.com":           true,
+	"dialogflow.googleapis.com":           true,
+	"eventarc.googleapis.com":             true,
+	"file.googleapis.com":                 true,
+	"identityplatform.googleapis.com":     true,
+	"language.googleapis.com":             true,
+	"managedkafka.googleapis.com":         true,
+	"networksecurity.googleapis.com":      true,
+	"networkservices.googleapis.com":      true,
+	"orgpolicy.googleapis.com":            true,
+	"privateca.googleapis.com":            true,
+	"pubsublite.googleapis.com":           true,
+	"servicecontrol.googleapis.com":       true,
+	"servicemanagement.googleapis.com":    true,
+	"servicedirectory.googleapis.com":     true,
+	"speech.googleapis.com":               true,
+	"storagetransfer.googleapis.com":      true,
+	"texttospeech.googleapis.com":         true,
+	"translate.googleapis.com":            true,
+	"vision.googleapis.com":               true,
+	"workflows.googleapis.com":            true,
+	"workflowexecutions.googleapis.com":   true,
+}
+
+var experimentalRouteContracts = map[string]func(*http.Request) bool{
+	"aiplatform.googleapis.com": func(request *http.Request) bool {
+		path := request.URL.Path
+		if strings.HasPrefix(path, "/v1/internal/") ||
+			strings.Contains(path, "/batchPredictionJobs") ||
+			strings.Contains(path, "/featurestores") {
+			return false
+		}
+		if strings.Contains(path, "/endpoints/") && strings.HasSuffix(path, ":predict") {
+			return false
+		}
+		if strings.Contains(path, "/publishers/") && strings.Contains(path, "/models/") &&
+			(strings.HasSuffix(path, ":predict") ||
+				strings.HasSuffix(path, ":generateContent") ||
+				strings.HasSuffix(path, ":streamGenerateContent")) {
+			return false
+		}
+		return strings.Contains(path, "/indexes") ||
+			strings.Contains(path, "/indexEndpoints") ||
+			strings.Contains(path, "/models") ||
+			strings.Contains(path, "/operations/")
+	},
+}
+
+func experimentalServicesEnabled() bool {
+	return os.Getenv(ExperimentalServicesEnv) == "1"
+}
+
+// IsExperimentalService reports whether domain is default-gated experimental
+// surface.
+func IsExperimentalService(domain string) bool {
+	return experimentalServiceContracts[domain]
+}
+
+type experimentalGateHandler struct {
+	domain string
+}
+
+func (handler *experimentalGateHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code": http.StatusNotImplemented,
+			"message": "MiniSky: " + handler.domain + " is experimental and disabled; set " +
+				ExperimentalServicesEnv +
+				"=1 to opt in; promotion evidence is incomplete",
+			"status": "UNIMPLEMENTED",
+		},
+	})
+}
+
+func experimentalDisabledHandler(domain string) http.Handler {
+	return &experimentalGateHandler{domain: domain}
+}
+
+// GateExperimentalRequest writes the default-off response for a route-level
+// experimental surface and reports whether dispatch must stop.
+func GateExperimentalRequest(w http.ResponseWriter, request *http.Request, domain string) bool {
+	route := experimentalRouteContracts[domain]
+	if route == nil || experimentalServicesEnabled() || !route(request) {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code": http.StatusNotImplemented,
+			"message": "MiniSky: this " + domain + " route is experimental and disabled; set " +
+				ExperimentalServicesEnv + "=1 to opt in; promotion evidence is incomplete",
+			"status": "UNIMPLEMENTED",
+		},
+	})
+	return true
+}
+
+// IsExperimentalDisabled reports whether a boot-time handler is the default-off
+// experimental gate. Routers use this marker before validation and IAM so every
+// request to a disabled experimental domain receives the same 501 contract.
+func IsExperimentalDisabled(handler http.Handler) bool {
+	_, disabled := handler.(*experimentalGateHandler)
+	return disabled
 }
 
 // lazyBackendContracts records why these domains use backend-gated coverage
@@ -147,9 +313,12 @@ func Services() ([]Service, error) {
 	for domain, lazy := range registered {
 		metadata := serviceManifest[domain]
 		support := SupportImplemented
-		deferredReason := deferredServiceContracts[domain]
-		if deferredReason != "" {
+		supportReason := deferredServiceContracts[domain]
+		if supportReason != "" {
 			support = SupportDeferred
+		} else if experimentalServiceContracts[domain] {
+			support = SupportExperimental
+			supportReason = "Experimental handler is default-off while promotion evidence remains incomplete"
 		}
 		services = append(services, Service{
 			Domain:           domain,
@@ -159,7 +328,7 @@ func Services() ([]Service, error) {
 			LazyDocker:       lazy,
 			ProbeUnsupported: metadata.probeUnsupported,
 			BackendContract:  lazyBackendContracts[domain],
-			DeferredReason:   deferredReason,
+			SupportReason:    supportReason,
 		})
 	}
 	sort.Slice(services, func(i, j int) bool {
@@ -185,6 +354,10 @@ func ContractHandlers(opMgr *orchestrator.OperationManager, svcMgr *orchestrator
 		if !service.ProbeUnsupported {
 			continue
 		}
+		if service.Support == SupportExperimental && !experimentalServicesEnabled() {
+			ctx.shims[service.Domain] = experimentalDisabledHandler(service.Domain)
+			continue
+		}
 		factory := factories[service.Domain]
 		if factory == nil {
 			return nil, fmt.Errorf("service %s is probeable but has no factory", service.Domain)
@@ -195,7 +368,11 @@ func ContractHandlers(opMgr *orchestrator.OperationManager, svcMgr *orchestrator
 
 	handlers := make(map[string]http.Handler, len(ctx.shims))
 	for domain, handler := range ctx.shims {
-		handlers[domain] = ContractHandler(domain, handler)
+		if experimentalServiceContracts[domain] && !experimentalServicesEnabled() {
+			handlers[domain] = handler
+		} else {
+			handlers[domain] = ContractHandler(domain, handler)
+		}
 	}
 	return handlers, nil
 }
@@ -225,6 +402,9 @@ func ContractHandler(domain string, next http.Handler) http.Handler {
 // factories remain concrete during construction, while Docker-dependent
 // mutations are rejected centrally when that boot has no Docker backend.
 func RuntimeHandler(domain string, next http.Handler, dockerAvailable bool) http.Handler {
+	if IsExperimentalDisabled(next) {
+		return next
+	}
 	contract := ContractHandler(domain, next)
 	if dockerAvailable {
 		return contract

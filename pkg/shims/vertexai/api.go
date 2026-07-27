@@ -19,7 +19,6 @@ import (
 	"minisky/pkg/config"
 	"minisky/pkg/observability"
 	"minisky/pkg/orchestrator"
-	"minisky/pkg/registry"
 	"minisky/pkg/state"
 )
 
@@ -28,12 +27,6 @@ const (
 	maxVertexJSONBody   = 1 << 20
 	maxPredictInstances = 100
 )
-
-func init() {
-	registry.Register("aiplatform.googleapis.com", func(ctx *registry.Context) http.Handler {
-		return NewAPI(ctx.SvcMgr)
-	})
-}
 
 type VertexRequest struct {
 	Contents []Content `json:"contents"`

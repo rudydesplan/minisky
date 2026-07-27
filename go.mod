@@ -1,6 +1,6 @@
 module minisky
 
-go 1.26.2
+go 1.26.5
 
 require (
 	cloud.google.com/go/bigtable v1.46.0

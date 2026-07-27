@@ -1,4 +1,4 @@
-.PHONY: dev test ui-install ui-build ui-test test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise benchmark
+.PHONY: dev test ui-install ui-build ui-test test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence benchmark
 
 ui-install:
 	cd ui && npm ci
@@ -68,6 +68,9 @@ test-phase17:
 
 test-phase17-enterprise:
 	MINISKY_PHASE17_ENTERPRISE_INTEGRATION=1 ./scripts/phase17-enterprise-wif-integration.sh
+
+test-phase18-25-evidence:
+	go test -count=1 ./pkg/evidence ./pkg/orchestrator ./pkg/pagination ./pkg/registry ./pkg/router ./pkg/shims/...
 
 benchmark:
 	go test -run='^$$' -bench=BenchmarkGatewayRouting -benchmem -count=5 ./pkg/router

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -175,6 +176,34 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[Router] %s %s%s", r.Method, targetDomain, r.URL.Path)
+
+	if registry.GateExperimentalRequest(w, r, targetDomain) {
+		return
+	}
+
+	p.mu.RLock()
+	gatedHandler := p.routes[targetDomain]
+	p.mu.RUnlock()
+	if registry.IsExperimentalDisabled(gatedHandler) {
+		gatedHandler.ServeHTTP(w, r)
+		return
+	}
+	if targetDomain == "vision.googleapis.com" &&
+		r.Method == http.MethodPost &&
+		r.URL.Path == "/v1/images:annotate" &&
+		projectFromRequest(r) == "" {
+		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"X-Goog-User-Project is required for projectless images:annotate")
+		return
+	}
+	if registry.IsExperimentalService(targetDomain) &&
+		strings.Contains(path.Base(r.URL.Path), ":") {
+		permission, _ := routePermission(targetDomain, r)
+		if permission == "" {
+			p.writeUnimplemented(w, targetDomain+" custom method")
+			return
+		}
+	}
 
 	authorized := false
 	// Exact BigQuery completion candidates run the same authentication and
@@ -451,6 +480,21 @@ func (p *ProxyRouter) authorizeRequest(w http.ResponseWriter, r *http.Request, d
 			return false
 		}
 	}
+	if domain == "eventarc.googleapis.com" && permission == "eventarc.triggers.create" {
+		workflow, workflowProject, valid := eventarcWorkflowFromBody(r)
+		triggerProject := projectFromRequest(r)
+		if workflow != "" && !valid {
+			p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+				"field 'destination.workflow' must use projects/{project}/locations/{location}/workflows/{workflow}")
+			return false
+		}
+		if workflowProject != "" && workflowProject != triggerProject &&
+			!authorizer.Authorize(workflow, principal, "workflows.executions.create") {
+			p.writeAuthError(w, http.StatusForbidden, "PERMISSION_DENIED",
+				"Caller lacks permission workflows.executions.create on cross-project workflow target")
+			return false
+		}
+	}
 	return true
 }
 
@@ -481,6 +525,31 @@ func pubsubTopicFromBody(r *http.Request) (topic, project string, valid bool) {
 		return input.Topic, "", false
 	}
 	return input.Topic, parts[1], true
+}
+
+func eventarcWorkflowFromBody(r *http.Request) (workflow, project string, valid bool) {
+	if r.Body == nil {
+		return "", "", true
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", "", false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var input struct {
+		Destination struct {
+			Workflow string `json:"workflow"`
+		} `json:"destination"`
+	}
+	if json.Unmarshal(body, &input) != nil || input.Destination.Workflow == "" {
+		return "", "", true
+	}
+	parts := strings.Split(strings.Trim(input.Destination.Workflow, "/"), "/")
+	if len(parts) != 6 || parts[0] != "projects" || parts[1] == "" ||
+		parts[2] != "locations" || parts[3] == "" || parts[4] != "workflows" || parts[5] == "" {
+		return input.Destination.Workflow, "", false
+	}
+	return input.Destination.Workflow, parts[1], true
 }
 
 func (p *ProxyRouter) validateProject(w http.ResponseWriter, r *http.Request, domain string) bool {
@@ -563,8 +632,24 @@ type strictIAMCustomRoute struct {
 }
 
 var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
+	"accesscontextmanager.googleapis.com": {
+		{[]string{"/v1/accessPolicies"}, "accesscontextmanager.accessPolicies", false},
+		{[]string{"/v1/accessPolicies/{policy}/accessLevels"}, "accesscontextmanager.accessLevels", false},
+		{[]string{"/v1/accessPolicies/{policy}/servicePerimeters"}, "accesscontextmanager.servicePerimeters", false},
+	},
 	"aiplatform.googleapis.com": {
 		{[]string{"/v1/projects/{project}/locations/{location}/endpoints"}, "aiplatform.endpoints", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/indexes"}, "aiplatform.indexes", false},
+	},
+	"alloydb.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/clusters"}, "alloydb.clusters", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/clusters/{cluster}/instances"}, "alloydb.instances", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "alloydb.operations", false},
+	},
+	"apigateway.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/gateways"}, "apigateway.gateways", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/apis"}, "apigateway.apis", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/apis/{api}/configs"}, "apigateway.apiConfigs", false},
 	},
 	"appengine.googleapis.com": {
 		{[]string{"/v1/projects/{project}/apps/{app}/services"}, "appengine.services", false},
@@ -576,6 +661,10 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v1/projects/{project}/locations/{location}/repositories/{repository}/packages"}, "artifactregistry.packages", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/repositories/{repository}/packages/{package}/versions"}, "artifactregistry.versions", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "artifactregistry.repositories", false},
+	},
+	"batch.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/jobs"}, "batch.jobs", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "batch.operations", false},
 	},
 	"bigquery.googleapis.com": {
 		{[]string{"/bigquery/v2/projects/{project}/datasets", "/v2/projects/{project}/datasets"}, "bigquery.datasets", false},
@@ -590,9 +679,22 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v2/projects/{project}/instances/{instance}/clusters"}, "bigtable.clusters", false},
 		{[]string{"/v2/projects/{project}/instances/{instance}/tables"}, "bigtable.tables", false},
 	},
+	"cloudasset.googleapis.com": {
+		{[]string{"/v1/projects/{project}/assets"}, "cloudasset.assets", false},
+	},
 	"cloudbuild.googleapis.com": {
 		{[]string{"/v1/projects/{project}/builds", "/v1/projects/{project}/locations/{location}/builds"}, "cloudbuild.builds", false},
 		{[]string{"/v1/projects/{project}/triggers"}, "cloudbuild.builds", false},
+	},
+	"clouddeploy.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/deliveryPipelines"}, "clouddeploy.deliveryPipelines", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/deliveryPipelines/{pipeline}/releases"}, "clouddeploy.releases", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/deliveryPipelines/{pipeline}/releases/{release}/rollouts"}, "clouddeploy.rollouts", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "clouddeploy.operations", false},
+	},
+	"clouderrorreporting.googleapis.com": {
+		{[]string{"/v1beta1/projects/{project}/events"}, "clouderrorreporting.errorEvents", false},
+		{[]string{"/v1beta1/projects/{project}/groupStats"}, "clouderrorreporting.errorGroupStats", false},
 	},
 	"cloudfunctions.googleapis.com": {
 		{[]string{"/v1/projects/{project}/locations/{location}/functions", "/v2/projects/{project}/locations/{location}/functions"}, "cloudfunctions.functions", false},
@@ -602,6 +704,9 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v1/projects/{project}/locations/{location}/keyRings"}, "cloudkms.keyRings", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys"}, "cloudkms.cryptoKeys", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions"}, "cloudkms.cryptoKeyVersions", false},
+	},
+	"cloudprofiler.googleapis.com": {
+		{[]string{"/v2/projects/{project}/profiles"}, "cloudprofiler.profiles", false},
 	},
 	"cloudresourcemanager.googleapis.com": {
 		{[]string{"/v3/projects"}, "resourcemanager.projects", false},
@@ -614,6 +719,13 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 	"cloudtasks.googleapis.com": {
 		{[]string{"/v2/projects/{project}/locations/{location}/queues"}, "cloudtasks.queues", false},
 		{[]string{"/v2/projects/{project}/locations/{location}/queues/{queue}/tasks"}, "cloudtasks.tasks", false},
+	},
+	"cloudtrace.googleapis.com": {
+		{[]string{"/v2/projects/{project}/traces"}, "cloudtrace.traces", false},
+	},
+	"composer.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/environments"}, "composer.environments", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "composer.operations", false},
 	},
 	"compute.googleapis.com": {
 		{[]string{"/compute/v1/projects/{project}/zones"}, "compute.zones", false},
@@ -635,15 +747,42 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v1/projects/{project}/locations/{location}/clusters", "/v1/projects/{project}/zones/{zone}/clusters"}, "container.clusters", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/operations", "/v1/projects/{project}/zones/{zone}/operations"}, "container.operations", false},
 	},
+	"dataflow.googleapis.com": {
+		{[]string{"/v1b3/projects/{project}/locations/{location}/jobs"}, "dataflow.jobs", false},
+	},
+	"dataform.googleapis.com": {
+		{[]string{"/v1beta1/projects/{project}/locations/{location}/repositories"}, "dataform.repositories", false},
+		{[]string{"/v1beta1/projects/{project}/locations/{location}/repositories/{repository}/workspaces"}, "dataform.workspaces", false},
+	},
 	"dataproc.googleapis.com": {
 		{[]string{"/v1/projects/{project}/regions/{region}/clusters"}, "dataproc.clusters", false},
 		{[]string{"/v1/projects/{project}/regions/{region}/jobs"}, "dataproc.jobs", false},
 		{[]string{"/v1/projects/{project}/regions/{region}/operations"}, "dataproc.operations", false},
 	},
+	"dlp.googleapis.com": {
+		{[]string{"/v2/projects/{project}/inspectTemplates"}, "dlp.inspectTemplates", false},
+		{[]string{"/v2/projects/{project}/deidentifyTemplates"}, "dlp.deidentifyTemplates", false},
+		{[]string{"/v2/projects/{project}/jobTriggers"}, "dlp.jobTriggers", false},
+	},
 	"dns.googleapis.com": {
 		{[]string{"/dns/v1/projects/{project}/managedZones"}, "dns.managedZones", false},
 		{[]string{"/dns/v1/projects/{project}/managedZones/{zone}/rrsets"}, "dns.resourceRecordSets", false},
 		{[]string{"/dns/v1/projects/{project}/managedZones/{zone}/changes"}, "dns.changes", false},
+	},
+	"documentai.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/processors"}, "documentai.processors", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "documentai.operations", false},
+	},
+	"dialogflow.googleapis.com": {
+		{[]string{"/v3/projects/{project}/locations/{location}/agents"}, "dialogflow.agents", false},
+	},
+	"eventarc.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/triggers"}, "eventarc.triggers", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/channels"}, "eventarc.channels", false},
+	},
+	"file.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/instances"}, "file.instances", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "file.operations", false},
 	},
 	"firebasehosting.googleapis.com": {
 		{[]string{"/v1beta1/projects/{project}/sites"}, "firebasehosting.sites", false},
@@ -660,17 +799,42 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/v1/projects/{project}/locations/{location}/workloadIdentityPools"}, "iam.workloadIdentityPools", false},
 		{[]string{"/v1/projects/{project}/locations/{location}/workloadIdentityPools/{pool}/providers"}, "iam.workloadIdentityPoolProviders", false},
 	},
+	"identityplatform.googleapis.com": {
+		{[]string{"/v2/projects/{project}/tenants"}, "identityplatform.tenants", false},
+		{[]string{"/v2/projects/{project}/oauthIdpConfigs"}, "identityplatform.oauthIdpConfigs", false},
+		{[]string{"/v2/projects/{project}/tenants/{tenant}/oauthIdpConfigs"}, "identityplatform.oauthIdpConfigs", false},
+	},
 	"logging.googleapis.com": {
 		{[]string{"/v2/projects/{project}/sinks"}, "logging.sinks", false},
+	},
+	"managedkafka.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/clusters"}, "managedkafka.clusters", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/clusters/{cluster}/topics"}, "managedkafka.topics", false},
 	},
 	"monitoring.googleapis.com": {
 		{[]string{"/v3/projects/{project}/metricDescriptors"}, "monitoring.metricDescriptors", false},
 		{[]string{"/v3/projects/{project}/timeSeries"}, "monitoring.timeSeries", false},
 	},
+	"networkservices.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/meshes"}, "networkservices.meshes", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/httpRoutes"}, "networkservices.httpRoutes", false},
+	},
+	"networksecurity.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/authorizationPolicies"}, "networksecurity.authorizationPolicies", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/serverTlsPolicies"}, "networksecurity.serverTlsPolicies", false},
+	},
+	"orgpolicy.googleapis.com": {
+		{[]string{"/v2/projects/{project}/policies"}, "orgpolicy.policies", false},
+	},
 	"pubsub.googleapis.com": {
 		{[]string{"/v1/projects/{project}/topics", "/projects/{project}/topics"}, "pubsub.topics", true},
 		{[]string{"/v1/projects/{project}/subscriptions", "/projects/{project}/subscriptions"}, "pubsub.subscriptions", true},
 		{[]string{"/v1/projects/{project}/snapshots", "/projects/{project}/snapshots"}, "pubsub.snapshots", true},
+	},
+	"pubsublite.googleapis.com": {
+		{[]string{"/v1/admin/projects/{project}/locations/{location}/topics"}, "pubsublite.topics", false},
+		{[]string{"/v1/admin/projects/{project}/locations/{location}/subscriptions"}, "pubsublite.subscriptions", false},
+		{[]string{"/v1/admin/projects/{project}/locations/{location}/reservations"}, "pubsublite.reservations", false},
 	},
 	"redis.googleapis.com": {
 		{[]string{"/v1/projects/{project}/locations/{location}/instances"}, "redis.instances", false},
@@ -684,6 +848,11 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 	"secretmanager.googleapis.com": {
 		{[]string{"/v1/projects/{project}/secrets"}, "secretmanager.secrets", false},
 		{[]string{"/v1/projects/{project}/secrets/{secret}/versions"}, "secretmanager.versions", false},
+	},
+	"servicedirectory.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/namespaces"}, "servicedirectory.namespaces", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/namespaces/{namespace}/services"}, "servicedirectory.services", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/namespaces/{namespace}/services/{service}/endpoints"}, "servicedirectory.endpoints", false},
 	},
 	"spanner.googleapis.com": {
 		{[]string{"/v1/projects/{project}/instances"}, "spanner.instances", false},
@@ -700,6 +869,20 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 		{[]string{"/storage/v1/b"}, "storage.buckets", false},
 		{[]string{"/storage/v1/b/{bucket}/o"}, "storage.objects", false},
 	},
+	"storagetransfer.googleapis.com": {
+		{[]string{"/v1/transferJobs"}, "storagetransfer.transferJobs", false},
+		{[]string{"/v1/transferOperations"}, "storagetransfer.transferOperations", false},
+	},
+	"translate.googleapis.com": {
+		{[]string{"/v3/projects/{project}/locations/{location}/glossaries"}, "translate.glossaries", false},
+	},
+	"workflows.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/workflows"}, "workflows.workflows", false},
+		{[]string{"/v1/projects/{project}/locations/{location}/operations"}, "workflows.operations", false},
+	},
+	"workflowexecutions.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/workflows/{workflow}/executions"}, "workflows.executions", false},
+	},
 }
 
 var strictIAMCustomRoutes = []strictIAMCustomRoute{
@@ -709,6 +892,13 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"aiplatform.googleapis.com", http.MethodGet, "/v1/internal/config", "aiplatform.endpoints.get"},
 	{"aiplatform.googleapis.com", http.MethodPost, "/v1/internal/config", "aiplatform.endpoints.update"},
 	{"aiplatform.googleapis.com", http.MethodGet, "/v1/internal/models", "aiplatform.models.list"},
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/models:upload", "aiplatform.models.upload"},
+	{"aiplatform.googleapis.com", http.MethodGet, "/v1/projects/{project}/locations/{location}/models", "aiplatform.models.list"},
+	{"aiplatform.googleapis.com", http.MethodGet, "/v1/projects/{project}/locations/{location}/models/{model}", "aiplatform.models.get"},
+	{"aiplatform.googleapis.com", http.MethodPatch, "/v1/projects/{project}/locations/{location}/models/{model}", "aiplatform.models.update"},
+	{"aiplatform.googleapis.com", http.MethodDelete, "/v1/projects/{project}/locations/{location}/models/{model}", "aiplatform.models.delete"},
+	{"aiplatform.googleapis.com", http.MethodGet, "/v1/projects/{project}/locations/{location}/operations/{operation}", "aiplatform.operations.get"},
+	{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/indexEndpoints/{indexEndpoint}:findNeighbors", "aiplatform.indexEndpoints.findNeighbors"},
 	{"appengine.googleapis.com", http.MethodGet, "/v1/projects/{project}/apps", "appengine.applications.get"},
 	{"appengine.googleapis.com", http.MethodPost, "/v1/projects/{project}/apps", "appengine.applications.create"},
 	{"appengine.googleapis.com", http.MethodPost, "/deploy", "appengine.versions.create"},
@@ -738,6 +928,7 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"compute.googleapis.com", http.MethodGet, "/compute/v1/projects/{project}/global/images/family/{family}", "compute.images.get"},
 	{"dataproc.googleapis.com", http.MethodPost, "/v1/projects/{project}/regions/{region}/jobs:submit", "dataproc.jobs.submit"},
 	{"dataproc.googleapis.com", http.MethodPost, "/v1/projects/{project}/regions/{region}/jobs/{job}:cancel", "dataproc.jobs.cancel"},
+	{"dialogflow.googleapis.com", http.MethodPost, "/v3/projects/{project}/locations/{location}/agents/{agent}/sessions/{session}:detectIntent", "dialogflow.sessions.detectIntent"},
 	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:runQuery", "datastore.entities.list"},
 	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:lookup", "datastore.entities.get"},
 	{"datastore.googleapis.com", http.MethodPost, "/v1/projects/{project}:commit", "datastore.entities.update"},
@@ -770,6 +961,12 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"identitytoolkit.googleapis.com", http.MethodPost, "/v1/accounts:createAuthUri", "firebaseauth.users.get"},
 	{"logging.googleapis.com", http.MethodPost, "/v2/entries:list", "logging.logEntries.list"},
 	{"logging.googleapis.com", http.MethodPost, "/v2/entries:write", "logging.logEntries.create"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:analyzeSentiment", "language.documents.analyzeSentiment"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:analyzeEntities", "language.documents.analyzeEntities"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:analyzeSyntax", "language.documents.analyzeSyntax"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:annotateText", "language.documents.annotateText"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:classifyText", "language.documents.classifyText"},
+	{"language.googleapis.com", http.MethodPost, "/v1/documents:moderateText", "language.documents.moderateText"},
 	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1", "compute.instances.get"},
 	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/project-id", "compute.instances.get"},
 	{"metadata.google.internal", http.MethodGet, "/computeMetadata/v1/project/numeric-project-id", "compute.instances.get"},
@@ -813,6 +1010,29 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:rollback", "spanner.databases.write"},
 	{"storage.googleapis.com", http.MethodPost, "/upload/storage/v1/b/{bucket}/o", "storage.objects.create"},
 	{"storage.googleapis.com", http.MethodPut, "/upload/storage/v1/b/{bucket}/o", "storage.objects.create"},
+	{"binaryauthorization.googleapis.com", http.MethodGet, "/v1/projects/{project}/policy", "binaryauthorization.policy.get"},
+	{"binaryauthorization.googleapis.com", http.MethodPut, "/v1/projects/{project}/policy", "binaryauthorization.policy.update"},
+	{"binaryauthorization.googleapis.com", http.MethodPost, "/v1/projects/{project}/policy:evaluate", "binaryauthorization.policy.evaluate"},
+	{"privateca.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/caPools/{pool}/certificates", "privateca.certificates.create"},
+	{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/{service}:check", "servicecontrol.services.check"},
+	{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/{service}:report", "servicecontrol.services.report"},
+	{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/{service}/configs", "servicemanagement.services.update"},
+	{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/{service}/rollouts", "servicemanagement.services.update"},
+	{"speech.googleapis.com", http.MethodPost, "/v1/speech:recognize", "speech.recognizers.recognize"},
+	{"speech.googleapis.com", http.MethodPost, "/v1/speech:longrunningrecognize", "speech.recognizers.recognize"},
+	{"texttospeech.googleapis.com", http.MethodPost, "/v1/text:synthesize", "texttospeech.synthesizers.synthesize"},
+	// Phase 18-25 custom action routes
+	{"cloudtrace.googleapis.com", http.MethodPost, "/v2/projects/{project}/traces:batchWrite", "cloudtrace.traces.batchWrite"},
+	{"cloudasset.googleapis.com", http.MethodGet, "/v1/projects/{project}:searchAllResources", "cloudasset.assets.searchAllResources"},
+	{"cloudasset.googleapis.com", http.MethodPost, "/v1/projects/{project}:exportAssets", "cloudasset.assets.exportAssets"},
+	{"clouderrorreporting.googleapis.com", http.MethodPost, "/v1beta1/projects/{project}/events:report", "clouderrorreporting.events.report"},
+	{"dlp.googleapis.com", http.MethodPost, "/v2/projects/{project}/content:inspect", "dlp.content.inspect"},
+	{"dlp.googleapis.com", http.MethodPost, "/v2/projects/{project}/content:deidentify", "dlp.content.deidentify"},
+	{"documentai.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/processors/{processor}:process", "documentai.processors.process"},
+	{"vision.googleapis.com", http.MethodPost, "/v1/images:annotate", "vision.images.annotate"},
+	{"translate.googleapis.com", http.MethodPost, "/v3/projects/{project}/locations/{location}:translateText", "translate.locations.translateText"},
+	{"translate.googleapis.com", http.MethodGet, "/v3/projects/{project}/locations/{location}/supportedLanguages", "translate.locations.getSupportedLanguages"},
+	{"workflowexecutions.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/workflows/{workflow}/executions/{execution}:cancel", "workflows.executions.cancel"},
 }
 
 func matchIAMRouteTemplate(path, template string) bool {
@@ -926,6 +1146,9 @@ func projectsFromRequest(r *http.Request) []string {
 			add(project)
 		}
 	}
+	if project := r.Header.Get("X-Goog-User-Project"); project != "" {
+		add(project)
+	}
 	if r.Body != nil && strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
 		originalBody := r.Body
 		body, err := io.ReadAll(io.LimitReader(originalBody, (1<<20)+1))
@@ -959,7 +1182,7 @@ func collectBodyProjects(value any, add func(string)) {
 				if project, ok := nested.(string); ok {
 					add(project)
 				}
-			case "name", "parent", "logName":
+			case "name", "parent", "logName", "workflow":
 				if resource, ok := nested.(string); ok {
 					parts := strings.Split(strings.Trim(resource, "/"), "/")
 					for index, part := range parts {
@@ -1121,7 +1344,8 @@ func legacyLocalDomain(path, fallbackDomain string) string {
 		return "bigquery.googleapis.com"
 	}
 	if (strings.HasPrefix(path, "/v1/projects/") || strings.HasPrefix(path, "/projects/")) &&
-		(strings.Contains(path, "/topics") || strings.Contains(path, "/subscriptions")) {
+		(strings.Contains(path, "/topics") || strings.Contains(path, "/subscriptions")) &&
+		!strings.Contains(path, "/locations/") {
 		return "pubsub.googleapis.com"
 	}
 	if strings.HasPrefix(path, "/compute/") {
@@ -1129,6 +1353,116 @@ func legacyLocalDomain(path, fallbackDomain string) string {
 	}
 	if strings.HasPrefix(path, "/sql/") {
 		return "sqladmin.googleapis.com"
+	}
+
+	// Phase 18-25 services
+	if strings.Contains(path, "/triggers") && strings.Contains(path, "/locations/") && !strings.Contains(path, "/functions") {
+		return "eventarc.googleapis.com"
+	}
+	if strings.Contains(path, "/workflows/") && strings.Contains(path, "/executions") {
+		return "workflowexecutions.googleapis.com"
+	}
+	if strings.Contains(path, "/workflows") {
+		return "workflows.googleapis.com"
+	}
+	if strings.Contains(path, "/v1b3/") && strings.Contains(path, "/jobs") {
+		return "dataflow.googleapis.com"
+	}
+	if strings.Contains(path, "/environments") && strings.Contains(path, "/locations/") {
+		return "composer.googleapis.com"
+	}
+	if strings.Contains(path, "/clusters") && strings.Contains(path, "/topics") {
+		return "managedkafka.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/v1beta1/") && strings.Contains(path, "/repositories") {
+		return "dataform.googleapis.com"
+	}
+	if strings.Contains(path, "/clusters") && strings.Contains(path, "/instances") && !strings.Contains(path, "/container/") {
+		return "alloydb.googleapis.com"
+	}
+	// AlloyDB and Managed Kafka both use /clusters — ambiguous via path alone.
+	// These services must use Host-header routing (custom_endpoint in Terraform).
+	// Only route to AlloyDB if path also contains /instances (unambiguous).
+	if strings.Contains(path, "/clusters") && strings.Contains(path, "/instances") && !strings.Contains(path, "/container/") && strings.Contains(path, "/locations/") {
+		return "alloydb.googleapis.com"
+	}
+	if strings.Contains(path, "/tenants") && strings.HasPrefix(path, "/v2/") {
+		return "identityplatform.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/v1/transferJobs") {
+		return "storagetransfer.googleapis.com"
+	}
+	if strings.Contains(path, "/traces") {
+		return "cloudtrace.googleapis.com"
+	}
+	if strings.Contains(path, "/events:report") || strings.Contains(path, "/groupStats") {
+		return "clouderrorreporting.googleapis.com"
+	}
+	if strings.Contains(path, "/profiles") && strings.HasPrefix(path, "/v2/") {
+		return "cloudprofiler.googleapis.com"
+	}
+	if strings.Contains(path, "/gateways") || (strings.Contains(path, "/apis") && strings.Contains(path, "/locations/") && !strings.Contains(path, "/workflows/")) {
+		return "apigateway.googleapis.com"
+	}
+	if strings.Contains(path, "/deliveryPipelines") {
+		return "clouddeploy.googleapis.com"
+	}
+	if strings.HasPrefix(path, "/v1/images:annotate") {
+		return "vision.googleapis.com"
+	}
+	if strings.Contains(path, ":translateText") || strings.Contains(path, "/supportedLanguages") {
+		return "translate.googleapis.com"
+	}
+	if strings.Contains(path, "/processors") && !strings.Contains(path, "/dataproc/") {
+		return "documentai.googleapis.com"
+	}
+	if strings.Contains(path, "/assets") || strings.Contains(path, ":searchAllResources") || strings.Contains(path, ":exportAssets") {
+		return "cloudasset.googleapis.com"
+	}
+	if strings.Contains(path, "/inspectTemplates") || strings.Contains(path, "/content:inspect") || strings.Contains(path, "/content:deidentify") {
+		return "dlp.googleapis.com"
+	}
+	if strings.Contains(path, "/policies") && strings.HasPrefix(path, "/v2/") && !strings.Contains(path, "/accessPolicies") {
+		return "orgpolicy.googleapis.com"
+	}
+	if strings.Contains(path, "/authorizationPolicies") {
+		return "networksecurity.googleapis.com"
+	}
+	if strings.Contains(path, "/accessPolicies") {
+		return "accesscontextmanager.googleapis.com"
+	}
+	if strings.Contains(path, "/meshes") || strings.Contains(path, "/httpRoutes") {
+		return "networkservices.googleapis.com"
+	}
+	// Batch: /v1/projects/*/locations/*/jobs (NOT /v1b3/ which is Dataflow)
+	if !strings.HasPrefix(path, "/v1b3/") && strings.HasPrefix(path, "/v1/projects/") &&
+		strings.Contains(path, "/locations/") && strings.Contains(path, "/jobs") &&
+		!strings.Contains(path, "/workflows/") {
+		return "batch.googleapis.com"
+	}
+	// Filestore: /v1/projects/*/locations/*/instances (when NOT under /clusters/)
+	if strings.HasPrefix(path, "/v1/projects/") && strings.Contains(path, "/locations/") &&
+		strings.Contains(path, "/instances") && !strings.Contains(path, "/clusters/") {
+		return "file.googleapis.com"
+	}
+	// Service Directory: /v1/projects/*/locations/*/namespaces (with or without /services)
+	if strings.Contains(path, "/namespaces") && strings.Contains(path, "/locations/") &&
+		!strings.Contains(path, "/clusters/") {
+		return "servicedirectory.googleapis.com"
+	}
+
+	// These location-scoped collections are shared by multiple APIs. They need
+	// an explicit host or canonical selector and must not enter the catch-all.
+	if strings.Contains(path, "/locations/") &&
+		(strings.Contains(path, "/clusters") ||
+			strings.Contains(path, "/operations/") ||
+			strings.Contains(path, "/topics") ||
+			strings.Contains(path, "/subscriptions") ||
+			strings.Contains(path, "/indexes") ||
+			strings.Contains(path, "/models") ||
+			strings.Contains(path, "/agents") ||
+			strings.Contains(path, "/caPools")) {
+		return fallbackDomain
 	}
 
 	// Fallback: Cloud Functions / Cloud Run catch-all for /v1 or /v2 with locations

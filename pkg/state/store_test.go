@@ -356,6 +356,157 @@ func TestImportEntryValidatorReceivesTargetStore(t *testing.T) {
 	}
 }
 
+func TestMustRegisterEntryValidatorIsRepeatSafe(t *testing.T) {
+	const entry = "repeat-validator/metadata"
+	validator := func(EntryValidationContext, json.RawMessage) error { return nil }
+
+	MustRegisterEntryValidator(entry, validator)
+	MustRegisterEntryValidator(entry, validator)
+}
+
+func TestRegisterEntryValidatorRejectsDifferentDuplicateWithTypedError(t *testing.T) {
+	const entry = "conflicting-validator/metadata"
+	first := func(EntryValidationContext, json.RawMessage) error { return nil }
+	second := func(EntryValidationContext, json.RawMessage) error { return errors.New("different") }
+
+	if err := RegisterEntryValidator(entry, first); err != nil {
+		t.Fatal(err)
+	}
+	err := RegisterEntryValidator(entry, second)
+	if !errors.Is(err, ErrEntryValidatorConflict) {
+		t.Fatalf("RegisterEntryValidator error = %v, want ErrEntryValidatorConflict", err)
+	}
+}
+
+func TestMustRegisterEntryValidatorPanicsForDifferentDuplicate(t *testing.T) {
+	const entry = "conflicting-must-validator/metadata"
+	MustRegisterEntryValidator(entry, func(EntryValidationContext, json.RawMessage) error { return nil })
+
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("MustRegisterEntryValidator did not panic")
+		}
+	}()
+	MustRegisterEntryValidator(entry, func(EntryValidationContext, json.RawMessage) error {
+		return errors.New("different")
+	})
+}
+
+type failingEntryStore struct {
+	loadErr   error
+	saveErr   error
+	saveCalls int
+}
+
+func (s *failingEntryStore) Load(string, any) error { return s.loadErr }
+
+func (s *failingEntryStore) Save(string, any) error {
+	s.saveCalls++
+	return s.saveErr
+}
+
+func TestGuardedEntryStoreKeepsFailuresSticky(t *testing.T) {
+	cause := errors.New("disk unavailable")
+	delegate := &failingEntryStore{saveErr: cause}
+	store := NewGuardedEntryStore(delegate, nil)
+
+	if err := store.Save("service/metadata", map[string]string{"value": "first"}); !errors.Is(err, cause) {
+		t.Fatalf("first Save error = %v, want %v", err, cause)
+	}
+	delegate.saveErr = nil
+	if err := store.Save("service/metadata", map[string]string{"value": "second"}); !errors.Is(err, cause) {
+		t.Fatalf("second Save error = %v, want sticky %v", err, cause)
+	}
+	if delegate.saveCalls != 1 {
+		t.Fatalf("delegate Save calls = %d, want 1", delegate.saveCalls)
+	}
+}
+
+func TestCorruptLoadPreservesBytesAndFailsClosedForMutations(t *testing.T) {
+	store, err := New(t.TempDir(), "corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const entry = "service/metadata"
+	if err := store.Save(entry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var metadata struct {
+		Items []string `json:"items"`
+	}
+	if err := store.Load(entry, &metadata); err == nil {
+		t.Fatal("corrupt state load succeeded")
+	}
+
+	var raw string
+	if err := store.Load(entry, &raw); err != nil {
+		t.Fatalf("non-mutating raw reload: %v", err)
+	}
+	if raw != "corrupt" {
+		t.Fatalf("raw state = %q, want corrupt", raw)
+	}
+	if err := store.Save("service/other", true); err == nil {
+		t.Fatal("save after corrupt load succeeded")
+	}
+	if err := store.Delete(entry); err == nil {
+		t.Fatal("delete after corrupt load succeeded")
+	}
+
+	after, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("state bytes changed after corrupt load:\nbefore: %s\nafter: %s", before, after)
+	}
+}
+
+func TestValidateResourceMapsRejectsMalformedMetadata(t *testing.T) {
+	type resource struct {
+		Name string `json:"name"`
+	}
+	type metadata struct {
+		Resources map[string]*resource `json:"resources"`
+	}
+
+	for name, value := range map[string]metadata{
+		"nil resource": {
+			Resources: map[string]*resource{"projects/p/resources/r": nil},
+		},
+		"key name mismatch": {
+			Resources: map[string]*resource{
+				"projects/p/resources/r": {Name: "projects/p/resources/other"},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateResourceMaps(&value); err == nil {
+				t.Fatal("ValidateResourceMaps accepted malformed metadata")
+			}
+		})
+	}
+}
+
+func TestValidateResourceMapsAllowsIndependentResourceIDs(t *testing.T) {
+	type resource struct {
+		ID string `json:"id"`
+	}
+	type metadata struct {
+		Networks map[string]*resource `json:"networks"`
+	}
+	value := metadata{
+		Networks: map[string]*resource{"test-project:network-a": {ID: "1"}},
+	}
+	if err := ValidateResourceMaps(&value); err != nil {
+		t.Fatalf("ValidateResourceMaps rejected valid independent ID: %v", err)
+	}
+}
+
 func TestExportImportPortableSnapshot(t *testing.T) {
 	t.Parallel()
 
