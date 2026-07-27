@@ -7,7 +7,7 @@ if [[ "${MINISKY_TERRAFORM_INTEGRATION:-}" != "1" ]]; then
   exit 2
 fi
 
-for command in curl docker go python3 rg terraform; do
+for command in curl docker go grep python3 terraform; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
     exit 1
@@ -136,19 +136,19 @@ PY
       echo "Failed to list Kind clusters during cleanup." >&2
       cleanup_failed=1
     elif [[ -n "${owned_cluster}" ]]; then
-      if rg -Fx "${owned_cluster}" <<<"${kind_clusters}" >/dev/null; then
+      if grep -Fqx -- "${owned_cluster}" <<<"${kind_clusters}"; then
         if ! "${kind_bin}" delete cluster --name "${owned_cluster}"; then
           echo "Failed to delete exact owned Kind backend ${owned_cluster}." >&2
           cleanup_failed=1
         elif ! post_delete_clusters="$("${kind_bin}" get clusters)"; then
           echo "Failed to verify exact owned Kind backend deletion." >&2
           cleanup_failed=1
-        elif rg -Fx "${owned_cluster}" <<<"${post_delete_clusters}" >/dev/null; then
+        elif grep -Fqx -- "${owned_cluster}" <<<"${post_delete_clusters}"; then
           echo "Exact owned Kind backend still exists after deletion: ${owned_cluster}." >&2
           cleanup_failed=1
         fi
       fi
-    elif rg '^minisky-owned-[0-9a-f]{32}$' <<<"${kind_clusters}" >/dev/null; then
+    elif grep -Eq '^minisky-owned-[0-9a-f]{32}$' <<<"${kind_clusters}"; then
       echo "Refusing ambiguous Kind cleanup without durable ownership identity." >&2
       cleanup_failed=1
     fi
@@ -253,7 +253,7 @@ EOF
   )
   kind_bin="${work_dir}/home/.minisky/bin/kind"
   test -x "${kind_bin}"
-  "${kind_bin}" version | rg -F 'kind v0.22.0'
+  "${kind_bin}" version | grep -F 'kind v0.22.0' >/dev/null
   PATH="$(dirname "${kind_bin}"):${PATH}"
   export PATH
 fi
