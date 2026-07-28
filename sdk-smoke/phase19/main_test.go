@@ -120,6 +120,43 @@ func TestDefaultGateUsesGeneratedClientsAndPubSubLiteReceives501(t *testing.T) {
 	}
 }
 
+func TestVerifyDockerBackendsAcceptsReconciledExactOwnedBackends(t *testing.T) {
+	cfg := testConfig(t)
+	parent := locationParent(cfg)
+	record := validEvidence(cfg)
+	record.KafkaCluster = parent + "/clusters/" + cfg.clusterID
+	record.KafkaTopic = record.KafkaCluster + "/topics/" + cfg.topicID
+	record.ComposerEnvironment = parent + "/environments/" + cfg.environmentID
+	record.ComposerState = "RUNNING"
+	if err := writeEvidence(cfg.evidencePath, record); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := map[string]string{
+		"/_minisky/managedkafka.googleapis.com/v1/" + record.KafkaCluster:    `{"name":"` + record.KafkaCluster + `","state":"ACTIVE","bootstrapAddress":"127.0.0.1:19092"}`,
+		"/_minisky/managedkafka.googleapis.com/v1/" + record.KafkaTopic:      `{"name":"` + record.KafkaTopic + `"}`,
+		"/_minisky/composer.googleapis.com/v1/" + record.ComposerEnvironment: `{"name":"` + record.ComposerEnvironment + `","state":"RUNNING","config":{"airflowUri":"http://127.0.0.1:18080"}}`,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := responses[r.URL.Path]
+		if !ok {
+			http.Error(w, fmt.Sprintf("unexpected path %q", r.URL.Path), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(server.Close)
+
+	clients, err := newGeneratedClients(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDockerBackends(context.Background(), clients, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEvidenceRoundTripRejectsMismatchedHierarchy(t *testing.T) {
 	cfg := testConfig(t)
 	record := validEvidence(cfg)
