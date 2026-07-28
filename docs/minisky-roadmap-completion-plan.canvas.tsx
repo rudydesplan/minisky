@@ -30,7 +30,7 @@ const phases = [
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
   ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
-  ["18", "Event workflows", "Experimental · lifecycle + two Terraform gates passed", "Generated clients cover Eventarc, Workflows, Workflow Executions, and Batch; provider 7.41.0 proves bounded Workflows and Eventarc trigger control-plane lifecycles, including Eventarc import"],
+  ["18", "Event workflows", "Experimental · delivery + two Terraform gates passed", "The public gateway proves same-project dispatch plus foreign-topic/project non-delivery; a package race test isolates trigger-project and transport-topic mismatch checks; terminal execution persistence is separate from unproven interrupted-intent replay"],
   ["19", "Pipelines and streaming", "Experimental · core + heavy CI + two Terraform gates passed", "Dataflow/Dataform lifecycle plus exact-owned Kafka protocol and Airflow DAG execution pass; provider 7.41.0 proves bounded Composer and Managed Kafka lifecycles/imports; Pub/Sub Lite stays explicit 501"],
   ["20", "Extended databases", "Experimental · local + CI + four Terraform gates passed", "Provider 7.41.0 proves bounded AlloyDB cluster/primary, Filestore, Identity Platform singleton, and local GCS-to-GCS Storage Transfer lifecycles; production networking remains outside the claims"],
   ["21–22", "Observability and API management", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves the Service Directory namespace/service/endpoint hierarchy; durable ingestion, gateway, rollout, policy, restart, and cleanup gates pass while external deployment and DNS parity remain unsupported"],
@@ -159,6 +159,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
         Linux AMD64 release snapshot, native AMD64/ARM64 packages, and Linux ARM64, macOS ARM64, and Windows AMD64
         CGO jobs all passed. Provider 7.41.0 now passes eleven independently recorded, domain-scoped Terraform
         lifecycles while every Phase 18–25 service remains default-off and bounded by its documented local contract.
+        Phase 18 now also has isolated public-gateway Pub/Sub → Eventarc → Workflows live-dispatch evidence with
+        exact raw request nonce/argument/result checks, foreign-topic/project negative publishes, and separate
+        terminal execution persistence across restart. A package race test independently isolates trigger-project
+        mismatch and configured transport-topic mismatch non-delivery.
         Production-grade semantics remain explicit external boundaries.
       </Callout>
 
@@ -194,6 +198,14 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Kafka/Airflow workflow, exact cleanup, corrected GoReleaser validation, Linux AMD64 snapshot, native
             Linux package jobs, and Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs.
           </Text>
+          <Text tone="secondary">
+            The guarded Phase 18 public-gateway gate separately proves that Pub/Sub publish creates an
+            Eventarc-triggered Workflow execution containing the exact raw PublishRequest nonce, argument, and
+            terminal result, and that the completed execution remains visible after daemon restart. The request is
+            not a CloudEvent envelope. The gate does not interrupt a persisted intent before execution, so
+            deterministic intent replay remains unproven; transport provisioning, OIDC, ordering, exactly-once
+            delivery, and Eventarc promotion remain explicit non-goals.
+          </Text>
         </Stack>
         <Stack gap={8}>
           <H3>Terraform status</H3>
@@ -226,7 +238,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Grid columns="2fr 1fr" gap={20}>
         <Stack gap={8}>
-          <H2>Phase 9, 13, 14, 16, and 17 verified boundaries</H2>
+          <H2>Phase 9, 13, 14, 16, 17, and 18 verified boundaries</H2>
           <Text>
             The real Pack v0.40.8 gate passed locally in about 235 seconds. Storage and Pub/Sub each invoked an
             existing function and a Cloud Run-style service through MiniSky&apos;s local <Code>/v2/deploy</Code>
@@ -235,8 +247,9 @@ export default function MiniSkyRoadmapCompletionPlan() {
           </Text>
           <Text tone="secondary">
             This does not verify the Cloud Run v2 image API, full source builds, Terraform serverless,
-            Eventarc/CloudEvents, Pub/Sub push, Cloud Tasks OIDC/task-header/redirect/dead-letter-queue parity,
-            interrupted task replay, production serverless, or durable/ordered/exactly-once delivery. Scheduler
+            Eventarc CloudEvents parity or transport provisioning, Pub/Sub push, Eventarc/Cloud Tasks
+            OIDC/task-header/redirect/dead-letter-queue parity, interrupted task replay, production serverless,
+            ordering, or exactly-once delivery. The Phase 18 path remains default-off experimental and Scheduler
             remains a manual <Code>:run</Code> HTTP E2E check.
           </Text>
           <Text>
@@ -389,9 +402,12 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Grid>
 
       <Callout tone="info" title="Next provider evidence milestone">
-        Workflows and Eventarc trigger control-plane gates now pass with provider 7.41.0; Eventarc delivery and
-        Pub/Sub transport provisioning remain explicitly outside the claim. Provider 7.41.0 exposes no Batch job
-        resource or Batch custom endpoint. Bounded Composer and Managed Kafka heavy provider gates now pass; the
+        Workflows and Eventarc trigger control-plane gates now pass with provider 7.41.0. A separate guarded
+        public-gateway gate proves live Pub/Sub → Eventarc → Workflows dispatch plus completed execution persistence
+        across restart; deterministic interrupted-intent replay, CloudEvents parity, transport provisioning, OIDC,
+        ordering, exactly-once delivery, and Eventarc promotion remain outside the claim. Provider 7.41.0 exposes no
+        Batch job resource or Batch custom endpoint. Bounded
+        Composer and Managed Kafka heavy provider gates now pass; the
         Kafka subnet is metadata-only and its local broker is plaintext, so no GCP VPC or managed TLS parity is
         claimed. Phase 19 has no Dataform resource, and the current Dataflow API does not expose the provider&apos;s
         template-launch path. Evaluate the smallest truthful Phase 20 provider resource next. Keep every domain experimental and default-off; distribution publication

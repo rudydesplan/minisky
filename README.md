@@ -69,6 +69,18 @@ restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 The complete Go race suite, documentation truth checks, and package/strict-IAM
 evidence pass locally. All six Phase 18–25 generated-client
 workflows passed create, restart, terminal observation, delete, and cleanup locally.
+The guarded `make test-phase18-event-delivery` gate additionally publishes two
+exact raw `PublishRequest` payloads with unique nonces through the canonical
+public Pub/Sub gateway and observes matching Eventarc-triggered Workflow
+arguments and terminal results. Foreign-topic and foreign-project publishes
+through that gateway produce zero nonce-correlated executions; the Eventarc
+package race test separately isolates trigger-project mismatch and configured
+transport-topic mismatch non-delivery. The gate also proves that completed
+executions persist across restart, then deletes trigger → topic → workflow,
+restarts, and proves durable absence and no post-delete delivery. The raw
+request is not a CloudEvent envelope. The gate does not interrupt a persisted
+Eventarc intent before execution, so deterministic intent replay remains
+unproven.
 Phase 19 additionally passed exact-owned Kafka protocol and Airflow DAG
 execution with container and anonymous-volume cleanup. Phase 20 passed AlloyDB,
 Filestore, Identity Platform, Redis-domain Valkey, Storage Transfer, canonical
@@ -94,7 +106,11 @@ provider gates now cover default-off `google_workflows_workflow` and
 no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
 canonical import, while provider 7.41.0 does not support Workflows import. The
 Eventarc gate persists one filter, workflow destination, and Pub/Sub transport
-topic but does not claim event delivery or transport provisioning. No other
+topic but remains a control-plane-only Terraform claim. The separate public
+gateway gate proves only MiniSky's bounded Pub/Sub → Eventarc → Workflows path;
+it does not provide Eventarc transport provisioning, CloudEvents envelope
+parity, deterministic crash-window intent replay, OIDC, ordering, or exactly-once
+delivery, and it does not promote Eventarc from experimental status. No other
 Phase 18 Terraform compatibility is claimed. Separate heavy Phase 19 gates pass
 `google_composer_environment` and `google_managed_kafka_cluster` lifecycles and
 canonical imports against digest-pinned exact-owned backends. Managed Kafka
@@ -454,7 +470,8 @@ service create API and does not demonstrate Terraform-managed serverless.
   Scheduler as a manual `:run` HTTP E2E check.
 
 Unsupported boundaries remain full Cloud Run v2 source build and Terraform
-serverless, Eventarc and CloudEvents envelopes, Pub/Sub push, Cloud Tasks OIDC,
+serverless, Eventarc CloudEvents envelope parity and transport provisioning,
+Pub/Sub push, Eventarc/Cloud Tasks OIDC,
 task-header, redirect, and dead-letter-queue parity, durable event queueing,
 ordering, exactly-once delivery, target-side deduplication, and production
 serverless operation. Interrupted Cloud Tasks are replayed at least once with a

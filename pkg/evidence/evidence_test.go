@@ -569,6 +569,65 @@ func TestPhase18EventarcTerraformGateStaticContract(t *testing.T) {
 	}
 }
 
+func TestPhase18EventDeliveryGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	makefile := read("Makefile")
+	script := read("scripts/phase18-event-delivery-integration.sh")
+	batchEvidence := read("pkg/evidence/batch_gates.json")
+
+	for path, contract := range map[string]struct {
+		source string
+		wants  []string
+	}{
+		"Makefile": {makefile, []string{
+			"test-phase18-event-delivery",
+			"MINISKY_PHASE18_EVENT_DELIVERY_INTEGRATION=1",
+		}},
+		"scripts/phase18-event-delivery-integration.sh": {script, []string{
+			"MINISKY_PHASE18_EVENT_DELIVERY_INTEGRATION",
+			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
+			"/_minisky/pubsub.googleapis.com/v1/",
+			"/_minisky/eventarc.googleapis.com/v1/",
+			"/_minisky/workflows.googleapis.com/v1/",
+			"/_minisky/workflowexecutions.googleapis.com/v1/",
+			"MINISKY_STATE_DIR",
+			"MINISKY_PROFILE",
+			"127.0.0.1",
+			"assert_no_owned_resources",
+			"terminal Workflow result",
+			"trigger-delete-operation",
+			"assert_no_executions_for",
+			"foreign_topic_nonce",
+			"foreign_project_nonce",
+			"assert_no_executions_for_nonces",
+			"deterministic Eventarc intent replay remains unproven",
+		}},
+		"pkg/evidence/batch_gates.json": {batchEvidence, []string{
+			`"script":"scripts/phase18-event-delivery-integration.sh"`,
+			`"makeTarget":"test-phase18-event-delivery"`,
+			"public-gateway Pub/Sub",
+			"foreign-topic and foreign-project",
+			"terminal execution persistence",
+			"deterministic Eventarc intent replay",
+		}},
+	} {
+		for _, want := range contract.wants {
+			if !strings.Contains(contract.source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
 func TestPhase19ComposerTerraformGateStaticContract(t *testing.T) {
 	root := repositoryRoot(t)
 	read := func(path string) string {

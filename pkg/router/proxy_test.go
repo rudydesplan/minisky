@@ -28,6 +28,7 @@ import (
 	"minisky/pkg/shims/bigtable"
 	"minisky/pkg/shims/cloudsql"
 	"minisky/pkg/shims/compute"
+	iamshim "minisky/pkg/shims/iam"
 	"minisky/pkg/shims/serverless"
 	"minisky/pkg/state"
 )
@@ -417,6 +418,120 @@ func TestStrictAuthorizationReturnsRedacted401And403(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), token) {
 		t.Fatalf("denied response=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStrictIAMPubSubPublishDenialsPrecedeDownstreamDelivery(t *testing.T) {
+	const (
+		principal  = "user:publisher@example.com"
+		other      = "user:other@example.com"
+		topic      = "projects/demo/topics/orders"
+		requestURL = "http://localhost/_minisky/pubsub.googleapis.com/v1/" + topic + ":publish"
+	)
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+
+	tests := []struct {
+		name             string
+		authenticated    bool
+		policyResource   string
+		policyPrincipal  string
+		policyPermission string
+		wantStatus       int
+		wantExecutions   int
+	}{
+		{
+			name:             "missing token",
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusUnauthorized,
+		},
+		{
+			name:             "unauthorized principal",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  other,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusForbidden,
+		},
+		{
+			name:             "policy lacks publish permission",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.get",
+			wantStatus:       http.StatusForbidden,
+		},
+		{
+			name:             "project permission inherits",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusNoContent,
+			wantExecutions:   1,
+		},
+		{
+			name:             "topic scoped permission",
+			authenticated:    true,
+			policyResource:   topic,
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusNoContent,
+			wantExecutions:   1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			iamAPI, err := iamshim.NewAPIWithStore(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyBody, err := json.Marshal(map[string]any{
+				"policy": iamshim.IamPolicy{Bindings: []iamshim.Binding{{
+					Role: "permission:" + test.policyPermission, Members: []string{test.policyPrincipal},
+				}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyRequest := httptest.NewRequest(http.MethodPost,
+				"/v1/"+test.policyResource+":setIamPolicy", bytes.NewReader(policyBody))
+			policyResponse := httptest.NewRecorder()
+			iamAPI.ServeHTTP(policyResponse, policyRequest)
+			if policyResponse.Code != http.StatusOK {
+				t.Fatalf("set policy status=%d body=%s", policyResponse.Code, policyResponse.Body.String())
+			}
+
+			executions := 0
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("pubsub.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				executions++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			proxy.ConfigureSecurity(iamAPI, nil, false, "gateway")
+
+			request := httptest.NewRequest(http.MethodPost, requestURL,
+				strings.NewReader(`{"messages":[{"data":"bm9uY2U="}]}`))
+			request.Header.Set("Content-Type", "application/json")
+			if test.authenticated {
+				token, _, err := iamAPI.IssueLocalToken(principal, "gateway",
+					[]string{"https://www.googleapis.com/auth/cloud-platform"}, time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Authorization", "Bearer "+token)
+			}
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if executions != test.wantExecutions {
+				t.Fatalf("downstream executions=%d, want %d", executions, test.wantExecutions)
+			}
+		})
 	}
 }
 

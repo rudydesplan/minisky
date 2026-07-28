@@ -17,6 +17,7 @@ const (
 	maxPersistedDeliveries = 4096
 	maxPersistedPayloads   = 16 << 20
 	deliveryQueueSize      = 64
+	pubSubPublishedType    = "google.cloud.pubsub.topic.v1.messagePublished"
 )
 
 var (
@@ -240,6 +241,17 @@ func replayEligible(delivery *Delivery, triggers map[string]*Trigger, payloads m
 
 // matchesTrigger checks if an event matches the trigger's filters.
 func matchesTrigger(trigger *Trigger, eventType, resource string) bool {
+	if eventType == pubSubPublishedType {
+		triggerProject, triggerOK := canonicalResourceProject(trigger.Name, "triggers")
+		topicProject, topicOK := canonicalResourceProject(resource, "topics")
+		if !triggerOK || !topicOK || triggerProject != topicProject {
+			return false
+		}
+		if trigger.Transport != nil && trigger.Transport.Pubsub != nil &&
+			trigger.Transport.Pubsub.Topic != "" && trigger.Transport.Pubsub.Topic != resource {
+			return false
+		}
+	}
 	if len(trigger.EventFilters) == 0 {
 		return true
 	}
@@ -256,6 +268,19 @@ func matchesTrigger(trigger *Trigger, eventType, resource string) bool {
 		}
 	}
 	return true
+}
+
+func canonicalResourceProject(name, collection string) (string, bool) {
+	parts := strings.Split(name, "/")
+	if len(parts) < 4 || parts[0] != "projects" || parts[1] == "" {
+		return "", false
+	}
+	for i := 2; i+1 < len(parts); i++ {
+		if parts[i] == collection && parts[i+1] != "" && i+2 == len(parts) {
+			return parts[1], true
+		}
+	}
+	return "", false
 }
 
 // matchFilterValue applies the filter operator (exact match or path pattern).
