@@ -1,0 +1,123 @@
+[
+  {
+    "id": "phase15-memcached",
+    "phase": 15,
+    "name": "Bounded Memcached SDK, data-plane, restart, and Terraform lifecycle",
+    "domain": "memcache.googleapis.com",
+    "providerVersion": "7.41.0",
+    "dimensions": [
+      "sdk-create",
+      "sdk-update",
+      "sdk-read",
+      "sdk-list",
+      "sdk-delete",
+      "data-plane-set",
+      "data-plane-get",
+      "daemon-restart",
+      "terraform-apply",
+      "terraform-no-drift",
+      "terraform-restart",
+      "terraform-import-normalization",
+      "terraform-post-import-no-drift",
+      "terraform-destroy",
+      "durable-404",
+      "exact-docker-cleanup"
+    ],
+    "assertions": {
+      "sdk-create": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["run_sdk create"]},
+        {"path": "sdk-smoke/memcache/main.go", "contains": ["Instances.Create("]}
+      ],
+      "sdk-update": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["run_sdk create"]},
+        {"path": "sdk-smoke/memcache/main.go", "contains": ["Instances.Patch("]}
+      ],
+      "sdk-read": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["run_sdk create", "run_sdk verify"]},
+        {"path": "sdk-smoke/memcache/main.go", "contains": ["Instances.Get("]}
+      ],
+      "sdk-list": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["run_sdk create", "run_sdk verify"]},
+        {"path": "sdk-smoke/memcache/main.go", "contains": ["Instances.List("]}
+      ],
+      "sdk-delete": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["run_sdk delete"]},
+        {"path": "sdk-smoke/memcache/main.go", "contains": ["Instances.Delete("]}
+      ],
+      "data-plane-set": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["assert_memcache_protocol \"${sdk_endpoint}\"", "connection.sendall(b\"set \"", "Memcached SET did not return exact STORED"]}
+      ],
+      "data-plane-get": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["assert_memcache_protocol \"${sdk_endpoint}\"", "connection.sendall(b\"get \"", "Memcached GET returned an unexpected VALUE header", "Memcached GET did not return exact END"]}
+      ],
+      "daemon-restart": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["stop_minisky", "start_minisky", "run_sdk verify"]}
+      ],
+      "terraform-apply": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["terraform_bounded -chdir=\"${terraform_dir}\" apply", "-auto-approve -input=false \"${tf_vars[@]}\""]}
+      ],
+      "terraform-no-drift": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["drift_phase=\"post-apply\"", "assert_no_drift"]}
+      ],
+      "terraform-restart": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["drift_phase=\"post-restart\"", "stop_minisky", "start_minisky", "assert_no_drift"]}
+      ],
+      "terraform-import-normalization": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["terraform_bounded -chdir=\"${terraform_dir}\" import", "normalize_imported_provider_state", "validate_import_normalization_plan"]}
+      ],
+      "terraform-post-import-no-drift": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["drift_phase=\"post-import-normalization\"", "assert_no_drift"]}
+      ],
+      "terraform-destroy": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["terraform_bounded -chdir=\"${terraform_dir}\" destroy", "-auto-approve -input=false \"${tf_vars[@]}\""]}
+      ],
+      "durable-404": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["deleted_status=", "if [[ \"${deleted_status}\" != \"404\" ]]"]}
+      ],
+      "exact-docker-cleanup": [
+        {"path": "scripts/memcache-integration.sh", "contains": ["assert_no_memcache_container \"${sdk_backend_id}\"", "assert_no_memcache_container \"${tf_backend_id}\"", "--filter \"label=managed-by=minisky\"", "--filter \"label=minisky.profile=${profile}\"", "--filter \"label=minisky.service=memorystore-memcached\"", "--filter \"label=minisky.resource=${resource_id}\""]}
+      ]
+    },
+    "status": "local-passed-uncommitted",
+    "references": [
+      {
+        "package": "sdk-smoke/memcache",
+        "tests": [
+          "TestGeneratedClientUsesCanonicalFullDomainLifecyclePaths",
+          "TestGeneratedClientUsesCanonicalFullDomainDeletePath"
+        ]
+      },
+      {
+        "package": "pkg/orchestrator",
+        "tests": [
+          "TestMemcachedDockerLifecycleIntegration"
+        ]
+      },
+      {
+        "package": "pkg/shims/memorystore",
+        "tests": [
+          "TestMemcacheProviderLifecycle",
+          "TestMemcacheOperationAndMetadataSurviveRestartWithoutReplay"
+        ]
+      },
+      {
+        "package": "scripts",
+        "tests": [
+          "TestMemcacheDestroyAssertionIsExactAndFailClosed",
+          "TestMemcacheTerraformLifecycleUsesDedicatedUntargetedFixture",
+          "TestMemcacheCleanupAndWatchdogAreBoundedAndDurable",
+          "TestMemcacheTerraformFixtureModelsProviderOnlyFieldsWithoutAPIFabrication"
+        ]
+      }
+    ],
+    "script": "scripts/memcache-integration.sh",
+    "makeTarget": "test-memcache-integration",
+    "note": "In the current uncommitted working tree, make test-memcache-integration using scripts/memcache-integration.sh passed locally. The bounded evidence covers generated Go SDK create, update, read, list, and delete; Memcached data-plane set/get; daemon restart; Google provider 7.41.0 apply, no-drift, restart, import normalization, post-normalization no-drift, and destroy; durable 404 after restart; and exact profile/resource-owned Docker cleanup. This is non-promotable working-tree evidence only: it has no immutable source commit and does not claim an external CI pass or broader service fidelity.",
+    "ci": {
+      "status": "configured-unverified",
+      "workflow": ".github/workflows/critical-integration.yml",
+      "job": "memcache-integration",
+      "note": "The required pull-request and main-branch Memcached lifecycle job is configured, but no external run URL or commit is recorded."
+    }
+  }
+]

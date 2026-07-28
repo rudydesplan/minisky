@@ -19,7 +19,7 @@ import {
 
 const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
-  ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; optional Phase-15 Terraform remains"],
+  ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; bounded Phase-15 provider slices are local-only"],
   ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
   ["9", "Serverless and events", "CI-verified bounded slice", "Linux CI proves Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
@@ -27,7 +27,7 @@ const phases = [
   ["12", "Platform diagnostics", "CI-verified bounded platform slice", "Required CI run 30337314745 proves W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown on the current PR head"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
-  ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
+  ["15", "Data services", "Local-verified bounded slices", "Firestore, Datastore, and Spanner SDK data-plane behavior passes locally; Redis has a guarded provider lifecycle, while Memcached currently has non-promotable working-tree evidence without an immutable source revision"],
   ["16", "ML, monitoring, networking", "CI-verified bounded slices", "Linux critical CI proves persisted PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK + Terraform, and deterministic Vertex restart gates"],
   ["17", "CI/CD, plugins, enterprise", "CI-verified bounded slice", "Linux critical CI proves federated RBAC/quota/audit integration; production controls and external publication remain"],
   ["18", "Event workflows", "Experimental · replay locally proven", "Commit 852d9e3 proves deterministic post-admission restart with the same execution identity; external Terraform CI and exactly-once external side effects remain unverified"],
@@ -39,7 +39,7 @@ const phases = [
 ];
 
 const priorities = [
-  ["1", "Record exact-head Terraform CI", "Let the required 12-entry matrix pass on one external pull-request or main revision, then record its immutable run URL and commit", "Configured CI is not passing evidence"],
+  ["1", "Record exact-head Terraform CI", "Let the required 12-entry Phase 18–25 matrix pass externally at one exact revision, then record its immutable run URL and commit", "Configured CI is not passing evidence"],
   ["2", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
   ["3", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
 ];
@@ -93,12 +93,12 @@ const waves = [
     title: "Wave 5 — Deepen data services",
     phases: "15",
     deliverables: [
-      "15.1 Memorystore: persistence, reconciliation, Redis data volume, SDK and Terraform lifecycle.",
+      "15.1 Memorystore: Redis and Memcached now have bounded persisted control planes, exact-owned Docker reconciliation, generated-client evidence, and guarded provider lifecycles.",
       "15.2 Spanner: reuse the official emulator; add only the admin/LRO slice required by SDK and Terraform.",
       "15.3 Firestore: CRUD and queries with profile-scoped emulator export.",
       "15.4 Datastore: fix the working-directory mount and verify entity/index workflows.",
     ],
-    gate: "Each service has an SDK data-plane proof plus Terraform create/read/no-drift/destroy and restart behavior.",
+    gate: "Accepted Phase 15 slices have local generated-client/backend evidence; claimed Redis and Memcached provider resources have guarded restart/no-drift/destroy lifecycles.",
   },
   {
     title: "Wave 6 — Split the oversized advanced phase",
@@ -153,7 +153,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       </Stack>
 
       <Callout tone="info" title="Implementation status">
-        The registry now verifies 71 domains. Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
+        The registry now verifies 71 domains: 35 implemented, 36 experimental, and 0 deferred. Guarded Terraform-managed HTTP load balancing, Artifact Registry push/list/delete, and the Phase-13
         static-JWKS WIF → delegated impersonation path now pass locally, alongside state durability, Buildpacks
         delivery, Phase-14 cross-project Pub/Sub, Phase-15 emulator, Phase-16 Monitoring/PromQL, Logging, DNS/UDP,
         Subnetwork/IPAM SDK and Terraform, and Vertex prediction restart gates, and Phase-17 federated
@@ -176,19 +176,23 @@ export default function MiniSkyRoadmapCompletionPlan() {
         execution identity to its exact terminal result with no duplicate execution resource and exact-owned cleanup.
         This proves idempotent admission/resource identity, not exactly-once external side effects, CloudEvents parity,
         OIDC, ordering, or transport provisioning.
+        Separately, the machine-readable Memcached service gate records a non-promotable working-tree pass with no
+        immutable source revision. It remains authoritative for the bounded dimensions, tool entry points, and CI
+        state, and makes no broad GCP parity claim.
       </Callout>
 
-      <Callout tone="info" title="Current PR evidence">
-        PR #21 targets 60e82159d7fd80cf6472327b2cd14c2ae1465f23. Required CI run 30337314745 and
+      <Callout tone="info" title="Recorded external evidence">
+        PR #21 evidence targets 60e82159d7fd80cf6472327b2cd14c2ae1465f23. Required CI run 30337314745 and
         critical-integration run 30337314786 both completed successfully. Optional opt-in integration jobs skipped by
         the pull-request workflow are not treated as passes. All twelve Terraform lifecycles remain local-passed;
-        their newly required matrix is configured-unverified until an external exact-revision run passes.
+        their newly required matrix is configured-unverified until an external exact-revision run passes. The
+        separate non-promotable Memcached working-tree gate does not satisfy that matrix.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
         <Card>
           <CardHeader>Registry contract</CardHeader>
-          <CardBody><H2>71 domains</H2><Text tone="secondary">Manifest, docs, IAM, and routing checked</Text></CardBody>
+          <CardBody><H2>71 domains</H2><Text tone="secondary">35 implemented · 36 experimental · 0 deferred</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Phase 18–25 gate</CardHeader>
@@ -250,6 +254,13 @@ export default function MiniSkyRoadmapCompletionPlan() {
             This is local emulation, not GKE or production admission security. The Binary Authorization Terraform
             check is local-passed only. Like the other eleven domain checks, its required matrix entry is
             configured-unverified; it has no invented CI run URL or commit, and it does not promote service fidelity.
+          </Text>
+          <Text tone="secondary">
+            Outside the Phase 18–25 matrix, <Code>pkg/evidence/service_gates.json</Code> is the source of truth for
+            the dedicated Memcached lifecycle dimensions, provider version, script/Make entry points, and local/CI
+            evidence state. Its current local pass belongs only to the uncommitted working tree, is non-promotable,
+            and has no immutable source revision evidence. Cache entries remain ephemeral; GCP networking, HA,
+            maintenance, security, and broad API parity remain unclaimed.
           </Text>
         </Stack>
       </Grid>

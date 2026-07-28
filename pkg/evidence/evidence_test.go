@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -153,6 +154,300 @@ func TestPhase12PlatformGatesAreCompleteAndReferenceable(t *testing.T) {
 	}
 }
 
+func TestPhase15MemcacheGateIsCompleteAndReferenceable(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 {
+		t.Fatalf("service gates = %d, want only the bounded Phase 15 Memcached gate", len(gates))
+	}
+	gate := gates[0]
+	if gate.ID != "phase15-memcached" || gate.Phase != 15 ||
+		gate.Domain != "memcache.googleapis.com" || gate.ProviderVersion != "7.41.0" {
+		t.Fatalf("Memcached gate identity is incomplete: %+v", gate)
+	}
+	if gate.Status != EvidenceLocalPassedUncommitted ||
+		gate.Script != "scripts/memcache-integration.sh" ||
+		gate.MakeTarget != "test-memcache-integration" {
+		t.Fatalf("Memcached local gate is not the exact guarded lifecycle: %+v", gate.EvidenceCheck)
+	}
+	if gate.SourceCommit != "" || gate.RunURL != "" || gate.Commit != "" ||
+		!strings.Contains(gate.Note, "uncommitted working tree") ||
+		!strings.Contains(gate.Note, "non-promotable") {
+		t.Fatalf("Memcached working-tree evidence overstates immutable provenance: %+v", gate.EvidenceCheck)
+	}
+	requiredDimensions := []string{
+		"sdk-create",
+		"sdk-update",
+		"sdk-read",
+		"sdk-list",
+		"sdk-delete",
+		"data-plane-set",
+		"data-plane-get",
+		"daemon-restart",
+		"terraform-apply",
+		"terraform-no-drift",
+		"terraform-restart",
+		"terraform-import-normalization",
+		"terraform-post-import-no-drift",
+		"terraform-destroy",
+		"durable-404",
+		"exact-docker-cleanup",
+	}
+	if !stringSetEqual(gate.Dimensions, requiredDimensions) {
+		t.Errorf("Memcached dimensions = %q, want exactly %q", gate.Dimensions, requiredDimensions)
+	}
+	assertServiceGateAssertions(t, root, gate)
+	cache := make(map[string]string)
+	if err := validateEvidenceCheck(root, gate.ID, gate.EvidenceCheck, cache); err != nil {
+		t.Error(err)
+	}
+	if gate.CI.Status != EvidenceConfiguredUnverified || gate.CI.Note == "" {
+		t.Fatalf("Memcached CI status is not configured-unverified: %+v", gate.CI)
+	}
+	if gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "memcache-integration" {
+		t.Fatalf("Memcached CI configuration hook is incomplete: %+v", gate.CI)
+	}
+	if len(gate.CI.References) != 0 || gate.CI.Script != "" || gate.CI.MakeTarget != "" ||
+		gate.CI.RunURL != "" || gate.CI.Commit != "" || gate.CI.SourceCommit != "" {
+		t.Fatalf("unverified Memcached CI evidence contains execution provenance: %+v", gate.CI)
+	}
+	if err := validateEvidenceCheck(root, gate.ID+" ci", gate.CI, cache); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
+	valid := func() []ServiceGate {
+		return []ServiceGate{{
+			ID:              "phase15-memcached",
+			Phase:           15,
+			Name:            "Memcached",
+			Domain:          "memcache.googleapis.com",
+			ProviderVersion: "7.41.0",
+			Dimensions:      []string{"sdk-create"},
+			Assertions: map[string][]GateAssertion{
+				"sdk-create": {{Path: "scripts/memcache-integration.sh", Contains: []string{"run_sdk create"}}},
+			},
+			EvidenceCheck: EvidenceCheck{
+				Status:     EvidenceLocalPassedUncommitted,
+				References: []TestReference{{Package: "sdk-smoke/memcache", Tests: []string{"TestGeneratedClientUsesCanonicalFullDomainLifecyclePaths"}}},
+				Script:     "scripts/memcache-integration.sh",
+				MakeTarget: "test-memcache-integration",
+				Note:       "passed locally in an uncommitted working tree",
+			},
+			CI: EvidenceCheck{
+				Status:   EvidenceConfiguredUnverified,
+				Workflow: ".github/workflows/critical-integration.yml",
+				Job:      "memcache-integration",
+				Note:     "configured",
+			},
+		}}
+	}
+	encode := func(t *testing.T, gates []ServiceGate) []byte {
+		t.Helper()
+		data, err := json.Marshal(gates)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	tests := []struct {
+		name   string
+		raw    func(*testing.T) []byte
+		mutate func([]ServiceGate)
+	}{
+		{name: "invalid JSON", raw: func(*testing.T) []byte { return []byte(`{"broken"`) }},
+		{name: "missing ID", mutate: func(g []ServiceGate) { g[0].ID = "" }},
+		{name: "duplicate ID", raw: func(t *testing.T) []byte {
+			gates := valid()
+			gates = append(gates, gates[0])
+			gates[1].Name = "duplicate"
+			return encode(t, gates)
+		}},
+		{name: "missing phase", mutate: func(g []ServiceGate) { g[0].Phase = 0 }},
+		{name: "missing name", mutate: func(g []ServiceGate) { g[0].Name = "" }},
+		{name: "missing domain", mutate: func(g []ServiceGate) { g[0].Domain = "" }},
+		{name: "missing local status", mutate: func(g []ServiceGate) { g[0].Status = "" }},
+		{name: "missing references", mutate: func(g []ServiceGate) { g[0].References = nil }},
+		{name: "incomplete reference package", mutate: func(g []ServiceGate) { g[0].References[0].Package = "" }},
+		{name: "incomplete reference tests", mutate: func(g []ServiceGate) { g[0].References[0].Tests = nil }},
+		{name: "empty dimensions", mutate: func(g []ServiceGate) { g[0].Dimensions = nil; g[0].Assertions = nil }},
+		{name: "empty dimension", mutate: func(g []ServiceGate) { g[0].Dimensions = append(g[0].Dimensions, "") }},
+		{name: "duplicate dimension", mutate: func(g []ServiceGate) { g[0].Dimensions = append(g[0].Dimensions, "sdk-create") }},
+		{name: "missing dimension assertion", mutate: func(g []ServiceGate) { g[0].Assertions = nil }},
+		{name: "extra dimension assertion", mutate: func(g []ServiceGate) {
+			g[0].Assertions["sdk-delete"] = []GateAssertion{{Path: "script", Contains: []string{"delete"}}}
+		}},
+		{name: "empty assertion path", mutate: func(g []ServiceGate) { g[0].Assertions["sdk-create"][0].Path = "" }},
+		{name: "empty assertion fragment", mutate: func(g []ServiceGate) { g[0].Assertions["sdk-create"][0].Contains = []string{""} }},
+		{name: "invalid local status", mutate: func(g []ServiceGate) { g[0].Status = EvidenceConfiguredUnverified }},
+		{name: "immutable local pass without source commit", mutate: func(g []ServiceGate) { g[0].Status = EvidenceLocalPassed }},
+		{name: "invalid immutable local source commit", mutate: func(g []ServiceGate) {
+			g[0].Status = EvidenceLocalPassed
+			g[0].SourceCommit = "7022f1b"
+		}},
+		{name: "uncommitted local pass with source commit", mutate: func(g []ServiceGate) { g[0].SourceCommit = strings.Repeat("a", 40) }},
+		{name: "uncommitted local pass with CI provenance", mutate: func(g []ServiceGate) {
+			g[0].RunURL = "https://github.com/rudydesplan/minisky/actions/runs/123456"
+			g[0].Commit = strings.Repeat("a", 40)
+		}},
+		{name: "missing provider version", mutate: func(g []ServiceGate) { g[0].ProviderVersion = "" }},
+		{name: "invalid provider version", mutate: func(g []ServiceGate) { g[0].ProviderVersion = "latest" }},
+		{name: "configured CI with run provenance", mutate: func(g []ServiceGate) {
+			g[0].CI.RunURL = "https://github.com/rudydesplan/minisky/actions/runs/123456"
+			g[0].CI.Commit = strings.Repeat("b", 40)
+		}},
+		{name: "configured CI with source provenance", mutate: func(g []ServiceGate) { g[0].CI.SourceCommit = strings.Repeat("b", 40) }},
+		{name: "CI passed without run URL", mutate: func(g []ServiceGate) {
+			g[0].CI.Status = EvidenceCIPassed
+			g[0].CI.Commit = strings.Repeat("b", 40)
+		}},
+		{name: "CI passed without full commit", mutate: func(g []ServiceGate) {
+			g[0].CI.Status = EvidenceCIPassed
+			g[0].CI.RunURL = "https://github.com/rudydesplan/minisky/actions/runs/123456"
+			g[0].CI.Commit = "7022f1b"
+		}},
+		{name: "CI passed with mutable run URL", mutate: func(g []ServiceGate) {
+			g[0].CI.Status = EvidenceCIPassed
+			g[0].CI.RunURL = "https://github.com/rudydesplan/minisky/actions/runs/latest"
+			g[0].CI.Commit = strings.Repeat("b", 40)
+		}},
+		{name: "unknown local status", mutate: func(g []ServiceGate) { g[0].Status = "mystery" }},
+		{name: "unknown CI status", mutate: func(g []ServiceGate) { g[0].CI.Status = "mystery" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var raw []byte
+			if test.raw != nil {
+				raw = test.raw(t)
+			} else {
+				gates := valid()
+				test.mutate(gates)
+				raw = encode(t, gates)
+			}
+			if _, err := loadServiceGates(raw); err == nil {
+				t.Fatal("malformed service-gate inventory was accepted")
+			}
+		})
+	}
+	if _, err := loadServiceGates(encode(t, valid())); err != nil {
+		t.Fatalf("valid service-gate inventory rejected: %v", err)
+	}
+	immutable := valid()
+	immutable[0].Status = EvidenceLocalPassed
+	immutable[0].SourceCommit = strings.Repeat("a", 40)
+	if _, err := loadServiceGates(encode(t, immutable)); err != nil {
+		t.Fatalf("future immutable local pass rejected: %v", err)
+	}
+}
+
+func assertServiceGateAssertions(t *testing.T, root string, gate ServiceGate) {
+	t.Helper()
+	makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe := gate.MakeTarget + ":\n\t"
+	start := strings.Index(string(makefile), recipe)
+	if start < 0 {
+		t.Fatalf("Make target %q has no active recipe", gate.MakeTarget)
+	}
+	body := string(makefile)[start:]
+	if end := strings.Index(body, "\n\n"); end >= 0 {
+		body = body[:end]
+	}
+	if count := strings.Count(body, gate.Script); count != 1 {
+		t.Fatalf("Make target %q maps to %q %d times, want exactly once", gate.MakeTarget, gate.Script, count)
+	}
+	cache := make(map[string]string)
+	for _, dimension := range gate.Dimensions {
+		assertions := gate.Assertions[dimension]
+		if len(assertions) == 0 {
+			t.Errorf("dimension %q has no active gate assertion", dimension)
+			continue
+		}
+		for _, assertion := range assertions {
+			source, ok := cache[assertion.Path]
+			if !ok {
+				data, err := os.ReadFile(filepath.Join(root, assertion.Path))
+				if err != nil {
+					t.Errorf("%s assertion source %q: %v", dimension, assertion.Path, err)
+					continue
+				}
+				source = string(data)
+				if strings.HasSuffix(assertion.Path, ".sh") {
+					source = strings.Join(activeShellLines(source), "\n")
+				}
+				cache[assertion.Path] = source
+			}
+			for _, fragment := range assertion.Contains {
+				if !strings.Contains(source, fragment) {
+					t.Errorf("%s is not actively asserted by %s fragment %q", dimension, assertion.Path, fragment)
+				}
+			}
+		}
+	}
+}
+
+func TestEvidenceStatusVocabularyIsClosed(t *testing.T) {
+	validRun := "https://github.com/rudydesplan/minisky/actions/runs/123456"
+	validCommit := strings.Repeat("a", 40)
+	checks := []EvidenceCheck{
+		{Status: EvidenceLocalPassed, SourceCommit: validCommit, Note: "immutable local"},
+		{Status: EvidenceLocalPassedUncommitted, Note: "uncommitted local"},
+		{Status: EvidenceCIPassed, RunURL: validRun, Commit: validCommit, Note: "ci"},
+		{Status: EvidenceConfiguredUnverified, Note: "configured"},
+		{Status: EvidenceOptionalUnverified, Note: "optional"},
+		{Status: EvidenceNotApplicable, Note: "not applicable"},
+		{Status: EvidenceAbsent, Note: "absent"},
+	}
+	for _, check := range checks {
+		if err := ValidateEvidenceCheck(check); err != nil {
+			t.Errorf("status %q rejected: %v", check.Status, err)
+		}
+	}
+	if err := ValidateEvidenceCheck(EvidenceCheck{
+		Status: "passing-somewhere",
+		Note:   "not in the vocabulary",
+	}); err == nil {
+		t.Fatal("unknown evidence status was accepted")
+	}
+}
+
+func TestServiceGateFutureCIPassRequiresImmutableProvenance(t *testing.T) {
+	for _, check := range []EvidenceCheck{
+		{Status: EvidenceCIPassed, Note: "missing both"},
+		{
+			Status: EvidenceCIPassed,
+			RunURL: "https://github.com/rudydesplan/minisky/actions/runs/123456",
+			Commit: "7022f1b",
+			Note:   "short commit",
+		},
+		{
+			Status: EvidenceCIPassed,
+			RunURL: "https://github.com/rudydesplan/minisky/actions/runs/latest",
+			Commit: strings.Repeat("a", 40),
+			Note:   "mutable run URL",
+		},
+	} {
+		if err := ValidateEvidenceCheck(check); err == nil {
+			t.Errorf("future Memcached CI pass accepted without immutable provenance: %+v", check)
+		}
+	}
+	if err := ValidateEvidenceCheck(EvidenceCheck{
+		Status: EvidenceCIPassed,
+		RunURL: "https://github.com/rudydesplan/minisky/actions/runs/123456",
+		Commit: strings.Repeat("a", 40),
+		Note:   "immutable future pass",
+	}); err != nil {
+		t.Fatalf("future immutable CI pass rejected: %v", err)
+	}
+}
+
 func TestEvidenceCheckRejectsFabricatedOrMisplacedCIEvidence(t *testing.T) {
 	validRun := "https://github.com/rudydesplan/minisky/actions/runs/123456"
 	validCommit := strings.Repeat("a", 40)
@@ -240,7 +535,11 @@ func TestEvidenceCheckRejectsFabricatedOrMisplacedCIEvidence(t *testing.T) {
 		})
 	}
 
-	for _, status := range []EvidenceStatus{EvidenceLocalPassed, EvidenceConfiguredUnverified} {
+	for _, status := range []EvidenceStatus{
+		EvidenceLocalPassed,
+		EvidenceLocalPassedUncommitted,
+		EvidenceConfiguredUnverified,
+	} {
 		t.Run(string(status)+" carrying CI fields", func(t *testing.T) {
 			err := ValidateEvidenceCheck(EvidenceCheck{
 				Status: status,
@@ -262,6 +561,7 @@ func TestEvidenceCheckRejectsFabricatedOrMisplacedCIEvidence(t *testing.T) {
 	}
 	for _, check := range []EvidenceCheck{
 		{Status: EvidenceLocalPassed, SourceCommit: "852d9e3", Note: "short local source"},
+		{Status: EvidenceLocalPassedUncommitted, SourceCommit: validCommit, Note: "uncommitted local source"},
 		{Status: EvidenceConfiguredUnverified, SourceCommit: validCommit, Note: "configured is not executed"},
 		{Status: EvidenceCIPassed, RunURL: validRun, Commit: validCommit, SourceCommit: validCommit, Note: "ambiguous CI provenance"},
 	} {

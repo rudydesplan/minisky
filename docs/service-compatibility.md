@@ -60,12 +60,21 @@ fidelity tier, persistence model, and current implementation status.
 | dataproc.googleapis.com | Dataproc | Standard | Hybrid | ✅ | — |
 | appengine.googleapis.com | App Engine | Standard | Hybrid | ✅ | — |
 | redis.googleapis.com | Memorystore (Redis) | Standard | Hybrid | ✅ | ✅ |
+| memcache.googleapis.com | Memorystore (Memcached) | Standard | Hybrid | ✅ | Generated service gate |
 | aiplatform.googleapis.com | Vertex AI | Standard | File | — | ✅ |
 | monitoring.googleapis.com | Cloud Monitoring | Standard | File | — | ✅ |
 | logging.googleapis.com | Cloud Logging | Standard | File | — | ✅ |
 | cloudresourcemanager.googleapis.com | Resource Manager | Standard | File | — | ✅ |
 | sts.googleapis.com | Security Token Service | Standard | Static | — | — |
 | metadata.google.internal | Metadata Server | High | Static | — | — |
+
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 
 The checkmarks and guarded labels above identify only a tested slice, not an
 entire service API. Important boundaries:
@@ -92,6 +101,11 @@ entire service API. Important boundaries:
   user lifecycle is tested only through the guarded provider gate; database
   files remain container runtime data and restored instances have no stale
   endpoint.
+- Memorystore for Memcached persists bounded instance and admitted-operation
+  metadata, but not cache entries. The generated service gate above is
+  authoritative for lifecycle dimensions, local evidence status and revision
+  provenance, provider/tool entry points, and CI status. The bounded claim does
+  not include GCP networking, HA, maintenance, security, or broad API parity.
 - Cloud Tasks replays persisted nonterminal tasks once per API lifetime with the
   same task ID and retry budget. This is at-least-once: a crash between target
   acceptance and acknowledgement persistence can duplicate a delivery.

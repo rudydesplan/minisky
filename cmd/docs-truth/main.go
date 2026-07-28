@@ -28,6 +28,8 @@ const (
 	readmeCountEnd       = "<!-- END GENERATED REGISTRY COUNT -->"
 	platformSummaryStart = "<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->"
 	platformSummaryEnd   = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	memcacheSummaryStart = "<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->"
+	memcacheSummaryEnd   = "<!-- END GENERATED MEMCACHED SERVICE GATE -->"
 )
 
 func main() {
@@ -66,6 +68,14 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
+	serviceGates, err := evidence.ServiceGates()
+	if err != nil {
+		return err
+	}
+	memcacheGate, err := selectMemcacheServiceGate(services, serviceGates)
+	if err != nil {
+		return err
+	}
 	catalog, err := renderServiceCatalog(services, inventory)
 	if err != nil {
 		return err
@@ -92,6 +102,10 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	updatedDocs, err = replaceMemcacheServiceGate(updatedDocs, memcacheGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
 	if err := validateHandwrittenClaims(updatedDocs); err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
@@ -105,7 +119,11 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
-	if err := validateMemcacheClaims(updatedDocs, string(stateModel), string(terraformCompatibility)); err != nil {
+	updatedTerraform, err := replaceMemcacheServiceGate(string(terraformCompatibility), memcacheGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", terraformPath, err)
+	}
+	if err := validateMemcacheClaims(updatedDocs, string(stateModel), updatedTerraform); err != nil {
 		return fmt.Errorf("Memcached documentation truth: %w", err)
 	}
 
@@ -114,16 +132,17 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
-	count := fmt.Sprintf(
-		"- **🚀 %d Registry-Verified Domains**: The exact catalog count and generated\n"+
-			"  compatibility rows come from `registry.Services()`. Phase 18–25\n"+
-			"  inventory entries remain experimental and default-off.\n"+
-			"  See [Service Compatibility](docs/service-compatibility.md).\n",
-		len(services),
-	)
+	count, err := renderRegistryCount(services)
+	if err != nil {
+		return err
+	}
 	updatedReadme, err := replaceGeneratedSection(
 		string(readme), readmeCountStart, readmeCountEnd, count,
 	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	updatedReadme, err = replaceMemcacheServiceGate(updatedReadme, memcacheGate)
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
@@ -161,6 +180,7 @@ func generate(root string, check bool) error {
 	}{
 		{docsPath, []byte(updatedDocs)},
 		{readmePath, []byte(updatedReadme)},
+		{terraformPath, []byte(updatedTerraform)},
 		{filepath.Join(root, "cmd", "docs-truth", "testdata", "service-catalog.golden.md"), []byte(catalog)},
 	}
 	var drift []string
@@ -177,6 +197,200 @@ func generate(root string, check bool) error {
 		return fmt.Errorf("generated documentation drift: %s; run go run ./cmd/docs-truth", strings.Join(drift, ", "))
 	}
 	return nil
+}
+
+func selectMemcacheServiceGate(
+	services []registry.Service,
+	gates []evidence.ServiceGate,
+) (evidence.ServiceGate, error) {
+	var matches []evidence.ServiceGate
+	for _, gate := range gates {
+		if gate.Domain == "memcache.googleapis.com" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Memcached service gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	registered := false
+	for _, service := range services {
+		if service.Domain == gate.Domain {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Memcached service gate references unregistered domain %q",
+			gate.Domain,
+		)
+	}
+	if gate.ID == "" || gate.Phase != 15 || gate.ProviderVersion == "" ||
+		gate.Script == "" || gate.MakeTarget == "" ||
+		len(gate.Dimensions) == 0 {
+		return evidence.ServiceGate{}, errors.New("Memcached service gate is missing required lifecycle metadata")
+	}
+	if err := validateMemcacheLocal(gate.EvidenceCheck); err != nil {
+		return evidence.ServiceGate{}, err
+	}
+	if err := validateMemcacheCI(gate.CI); err != nil {
+		return evidence.ServiceGate{}, err
+	}
+	return gate, nil
+}
+
+func validateMemcacheLocal(check evidence.EvidenceCheck) error {
+	if err := evidence.ValidateEvidenceCheck(check); err != nil {
+		return fmt.Errorf("Memcached local evidence: %w", err)
+	}
+	switch check.Status {
+	case evidence.EvidenceLocalPassed:
+		if check.SourceCommit == "" {
+			return errors.New("Memcached immutable local evidence requires a full source commit")
+		}
+	case evidence.EvidenceLocalPassedUncommitted:
+		if check.SourceCommit != "" {
+			return errors.New("Memcached uncommitted local evidence must not include a source commit")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported Memcached local evidence status %q; want local-passed-uncommitted or local-passed",
+			check.Status,
+		)
+	}
+	return nil
+}
+
+func validateMemcacheCI(check evidence.EvidenceCheck) error {
+	if err := evidence.ValidateEvidenceCheck(check); err != nil {
+		return fmt.Errorf("Memcached CI evidence: %w", err)
+	}
+	if check.Workflow == "" || check.Job == "" {
+		return errors.New("Memcached CI evidence requires workflow and job")
+	}
+	switch check.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		if check.RunURL != "" || check.Commit != "" {
+			return errors.New("Memcached configured CI evidence must not include a run URL or commit")
+		}
+	case evidence.EvidenceCIPassed:
+		if check.RunURL == "" || check.Commit == "" {
+			return errors.New("Memcached ci-passed evidence requires an immutable run URL and commit")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported Memcached CI evidence status %q; want configured-unverified or ci-passed",
+			check.Status,
+		)
+	}
+	return nil
+}
+
+func renderMemcacheServiceGate(gate evidence.ServiceGate) (string, error) {
+	if err := validateMemcacheLocal(gate.EvidenceCheck); err != nil {
+		return "", err
+	}
+	if err := validateMemcacheCI(gate.CI); err != nil {
+		return "", err
+	}
+	dimensions := make([]string, len(gate.Dimensions))
+	for index, dimension := range gate.Dimensions {
+		dimensions[index] = "`" + dimension + "`"
+	}
+	var localStatement string
+	switch gate.Status {
+	case evidence.EvidenceLocalPassedUncommitted:
+		localStatement = fmt.Sprintf(
+			"The bounded lifecycle is `%s` in the current working tree with Google provider `%s`, "+
+				"`make %s`, and `%s`. This locally passing working-tree gate is non-promotable "+
+				"and has no immutable source revision evidence.",
+			gate.Status,
+			gate.ProviderVersion,
+			gate.MakeTarget,
+			gate.Script,
+		)
+	case evidence.EvidenceLocalPassed:
+		localStatement = fmt.Sprintf(
+			"The bounded lifecycle is `%s` at immutable source commit `%s` with Google provider `%s`, "+
+				"`make %s`, and `%s`.",
+			gate.Status,
+			gate.SourceCommit,
+			gate.ProviderVersion,
+			gate.MakeTarget,
+			gate.Script,
+		)
+	default:
+		return "", fmt.Errorf("unsupported Memcached local evidence status %q", gate.Status)
+	}
+	var ciStatement string
+	switch gate.CI.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		ciStatement = fmt.Sprintf(
+			"CI is `configured-unverified` in `%s` job `%s`; no external run URL or commit is recorded.",
+			gate.CI.Workflow,
+			gate.CI.Job,
+		)
+	case evidence.EvidenceCIPassed:
+		ciStatement = fmt.Sprintf(
+			"CI is `ci-passed` in [GitHub Actions run %s](%s) on commit `%s`.",
+			path.Base(gate.CI.RunURL),
+			gate.CI.RunURL,
+			gate.CI.Commit,
+		)
+	default:
+		return "", fmt.Errorf("unsupported Memcached CI evidence status %q", gate.CI.Status)
+	}
+	return fmt.Sprintf(
+		"**Generated Memcached service-gate truth:** %s\n\n"+
+			"Lifecycle dimensions (%d): %s.\n\n"+
+			"%s This evidence does not claim broad GCP parity or promote service fidelity.\n",
+		localStatement,
+		len(dimensions),
+		strings.Join(dimensions, ", "),
+		ciStatement,
+	), nil
+}
+
+func replaceMemcacheServiceGate(document string, gate evidence.ServiceGate) (string, error) {
+	summary, err := renderMemcacheServiceGate(gate)
+	if err != nil {
+		return "", err
+	}
+	return replaceGeneratedSection(
+		document,
+		memcacheSummaryStart,
+		memcacheSummaryEnd,
+		summary,
+	)
+}
+
+func renderRegistryCount(services []registry.Service) (string, error) {
+	counts := map[registry.SupportStatus]int{
+		registry.SupportImplemented:  0,
+		registry.SupportExperimental: 0,
+		registry.SupportDeferred:     0,
+	}
+	for _, service := range services {
+		if _, known := counts[service.Support]; !known {
+			return "", fmt.Errorf("service %s has unsupported status %q", service.Domain, service.Support)
+		}
+		counts[service.Support]++
+	}
+	return fmt.Sprintf(
+		"- **🚀 %d Registry-Verified Domains**: %d implemented, %d experimental, "+
+			"and %d deferred.\n"+
+			"  The exact counts and generated compatibility rows come from\n"+
+			"  `registry.Services()`. Phase 18–25 inventory entries remain\n"+
+			"  experimental and default-off. See [Service Compatibility](docs/service-compatibility.md).\n",
+		len(services),
+		counts[registry.SupportImplemented],
+		counts[registry.SupportExperimental],
+		counts[registry.SupportDeferred],
+	), nil
 }
 
 func validateHandwrittenClaims(document string) error {
@@ -196,6 +410,10 @@ func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibi
 	if count := strings.Count(catalog, "`memcache.googleapis.com`"); count != 1 {
 		return fmt.Errorf("generated service catalog contains Memcached %d times, want exactly once", count)
 	}
+	const memcacheCatalogPrefix = "| `memcache.googleapis.com` | standard | hybrid | implemented | standard | No |"
+	if !strings.Contains(catalog, memcacheCatalogPrefix) {
+		return errors.New("generated service catalog does not classify Memcached as implemented standard/hybrid and default-on")
+	}
 	for name, document := range map[string]string{
 		"service compatibility": serviceCompatibility,
 		"state model":           stateModel,
@@ -211,7 +429,6 @@ func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibi
 			}
 		}
 	}
-	normalizedTerraform := strings.Join(strings.Fields(terraformCompatibility), " ")
 	for _, required := range []string{
 		"Memcached metadata is profile-persisted",
 		"owned Memcached containers",
@@ -220,12 +437,10 @@ func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibi
 			return fmt.Errorf("state model is missing %q", required)
 		}
 	}
+	normalizedTerraform := strings.Join(strings.Fields(terraformCompatibility), " ")
 	for _, required := range []string{
 		"`memcache_custom_endpoint`",
 		"`google_memcache_instance`",
-		"configured but unverified",
-		"A prior local guarded Memcached SDK/Terraform lifecycle passed",
-		"That hardened sequence is not recorded as passing",
 		"`effective_labels` is computed by the",
 		"provider from API `labels`",
 	} {
@@ -233,11 +448,21 @@ func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibi
 			return fmt.Errorf("Terraform compatibility is missing %q", required)
 		}
 	}
+	for name, document := range map[string]string{
+		"service compatibility":   serviceCompatibility,
+		"Terraform compatibility": terraformCompatibility,
+	} {
+		if strings.Count(document, memcacheSummaryStart) != 1 ||
+			strings.Count(document, memcacheSummaryEnd) != 1 {
+			return fmt.Errorf("%s must contain exactly one generated Memcached service-gate section", name)
+		}
+	}
 	for _, line := range strings.Split(terraformCompatibility, "\n") {
 		lower := strings.ToLower(line)
 		if strings.Contains(lower, "memcache") &&
-			(strings.Contains(lower, "passed locally") || strings.Contains(lower, "acceptance-tested")) {
-			return fmt.Errorf("Terraform compatibility prematurely claims a Memcached pass: %q", strings.TrimSpace(line))
+			(strings.Contains(lower, "configured but unverified") ||
+				strings.Contains(lower, "not recorded as passing")) {
+			return fmt.Errorf("Terraform compatibility retains stale Memcached status: %q", strings.TrimSpace(line))
 		}
 	}
 	return nil

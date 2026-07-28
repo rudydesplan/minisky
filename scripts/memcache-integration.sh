@@ -71,6 +71,22 @@ terraform_bounded() {
   run_bounded "${terraform_command_timeout_seconds}" terraform "$@"
 }
 
+memcache_backend_id() {
+  run_bounded 10 python3 -c '
+import hashlib
+import sys
+
+hasher = hashlib.sha256()
+for part in sys.argv[1:]:
+    encoded = part.encode("utf-8")
+    if not encoded or len(encoded) > 1024:
+        raise SystemExit("Memcached backend identity segment is outside bounds")
+    hasher.update(len(encoded).to_bytes(4, "big"))
+    hasher.update(encoded)
+print("memcache-" + hasher.hexdigest()[:32])
+' "$@"
+}
+
 wait_for_pid_exit() {
   local pid="$1"
   local seconds="$2"
@@ -254,6 +270,9 @@ ui_port="$(free_port)"
 gateway="http://127.0.0.1:${api_port}"
 project="local-dev-project"
 location="us-central1"
+sdk_instance_id="minisky-sdk-memcached"
+sdk_import="projects/${project}/locations/${location}/instances/${sdk_instance_id}"
+sdk_backend_id="$(memcache_backend_id "${project}" "${location}" "${sdk_instance_id}")"
 
 export HOME="${work_dir}/home"
 export MINISKY_STATE_DIR="${work_dir}/state"
@@ -298,44 +317,259 @@ run_sdk() {
   MINISKY_ENDPOINT="${gateway}" \
     MINISKY_PROJECT_ID="${project}" \
     MINISKY_MEMCACHE_LOCATION="${location}" \
-    MINISKY_MEMCACHE_INSTANCE_ID="minisky-sdk-memcached" \
+    MINISKY_MEMCACHE_INSTANCE_ID="${sdk_instance_id}" \
     MINISKY_MEMCACHE_MODE="$1" \
     go run ./sdk-smoke/memcache
 }
 
-assert_no_memcache_container() {
+inspect_exact_memcache_container() {
+  local container_id="${1:?Memcached container ID is required}"
+  local resource_id="${2:?Memcached resource ID is required}"
+  local inspection
+  if ! inspection="$(run_bounded 10 docker inspect --type container \
+    --format '{{json .Id}}{{"\t"}}{{json .State.Running}}{{"\t"}}{{json .State.Status}}{{"\t"}}{{json .Config.Labels}}{{"\t"}}{{json (index .NetworkSettings.Ports "11211/tcp")}}' \
+    "${container_id}" 2>&1)"; then
+    echo "Exact-owned Memcached Docker inspect failed: ${inspection}" >&2
+    return 1
+  fi
+  run_bounded 10 python3 -c '
+import ipaddress
+import json
+import re
+import sys
+
+inspection, expected_id, profile, resource_id = sys.argv[1:]
+if len(inspection.encode("utf-8")) > 16384:
+    raise SystemExit("Memcached Docker inspect output exceeds 16 KiB")
+parts = inspection.split("\t")
+if len(parts) != 5:
+    raise SystemExit("Memcached Docker inspect output is malformed")
+container_id, running, status, labels, bindings = (json.loads(part) for part in parts)
+if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+    raise SystemExit("Memcached Docker inspect returned a malformed immutable ID")
+if container_id != expected_id:
+    raise SystemExit("Memcached immutable ID changed during protocol evidence")
+expected_labels = dict([
+    ("managed-by", "minisky"),
+    ("minisky.profile", profile),
+    ("minisky.service", "memorystore-memcached"),
+    ("minisky.resource", resource_id),
+])
+if labels != expected_labels:
+    raise SystemExit("Memcached container labels do not exactly match ownership")
+if running is not True or status != "running":
+    raise SystemExit("Exact-owned Memcached container is not running")
+if not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict):
+    raise SystemExit("Memcached 11211/tcp must have exactly one published binding")
+host = bindings[0].get("HostIp")
+port_text = bindings[0].get("HostPort")
+if not isinstance(host, str) or not isinstance(port_text, str) or not port_text.isascii() or not port_text.isdigit():
+    raise SystemExit("Memcached published endpoint is malformed")
+try:
+    address = ipaddress.ip_address(host)
+    port = int(port_text)
+except ValueError as error:
+    raise SystemExit("Memcached published endpoint is malformed") from error
+if not address.is_loopback or not 1 <= port <= 65535:
+    raise SystemExit("Memcached published endpoint is not loopback")
+endpoint = f"[{host}]:{port}" if address.version == 6 else f"{host}:{port}"
+print(f"{container_id}\t{endpoint}")
+' "${inspection}" "${container_id}" "${profile}" "${resource_id}"
+}
+
+discover_exact_memcache_container() {
+  local resource_id="${1:?Memcached resource ID is required}"
   local inventory
-  if ! inventory="$(docker ps -aq \
+  local container_ids=()
+  if ! inventory="$(run_bounded 10 docker ps -aq --no-trunc \
     --filter "label=managed-by=minisky" \
     --filter "label=minisky.profile=${profile}" \
     --filter "label=minisky.service=memorystore-memcached" \
-    --filter "label=minisky.resource=${tf_import}" 2>&1)"; then
+    --filter "label=minisky.resource=${resource_id}" 2>&1)"; then
+    echo "Exact-owned Memcached Docker inventory failed: ${inventory}" >&2
+    return 1
+  fi
+  while IFS= read -r container_id; do
+    if [[ -n "${container_id}" ]]; then
+      container_ids+=("${container_id}")
+    fi
+  done <<<"${inventory}"
+  if [[ "${#container_ids[@]}" -ne 1 ]]; then
+    echo "Exact-owned Memcached Docker inventory found ${#container_ids[@]} containers, want 1." >&2
+    return 1
+  fi
+  inspect_exact_memcache_container "${container_ids[0]}" "${resource_id}"
+}
+
+assert_exact_memcache_container_binding() {
+  local expected_id="${1:?Memcached container ID is required}"
+  local resource_id="${2:?Memcached resource ID is required}"
+  local expected_endpoint="${3:?Memcached endpoint is required}"
+  local current_binding
+  local current_id
+  local current_endpoint
+  current_binding="$(inspect_exact_memcache_container "${expected_id}" "${resource_id}")"
+  IFS=$'\t' read -r current_id current_endpoint <<<"${current_binding}"
+  if [[ "${current_id}" != "${expected_id}" ]]; then
+    echo "Memcached immutable ID changed during protocol evidence." >&2
+    return 1
+  fi
+  if [[ "${current_endpoint}" != "${expected_endpoint}" ]]; then
+    echo "Memcached published endpoint changed during protocol evidence." >&2
+    return 1
+  fi
+}
+
+discover_sdk_memcache_endpoint() {
+  local expected_endpoint="${1:?Exact-owned Memcached endpoint is required}"
+  local response_file="${work_dir}/sdk-memcache-instance.json"
+  run_bounded 10 curl --fail --silent --show-error --max-time 5 \
+    "${gateway}/_minisky/memcache.googleapis.com/v1/${sdk_import}" \
+    --output "${response_file}"
+  run_bounded 10 python3 -c '
+import ipaddress
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_name = sys.argv[2]
+expected_endpoint = sys.argv[3]
+raw = path.read_bytes()
+if not raw or len(raw) > 1 << 20:
+    raise SystemExit("Memcached API response is empty or exceeds 1 MiB")
+document = json.loads(raw)
+if document.get("name") != expected_name or document.get("state") != "READY":
+    raise SystemExit("Memcached API response does not identify the ready SDK instance")
+nodes = document.get("memcacheNodes")
+if not isinstance(nodes, list) or len(nodes) != 1:
+    raise SystemExit("Memcached API response must expose exactly one node")
+host = nodes[0].get("host")
+port = nodes[0].get("port")
+if not isinstance(host, str) or not isinstance(port, int) or isinstance(port, bool):
+    raise SystemExit("Memcached node endpoint is malformed")
+try:
+    address = ipaddress.ip_address(host)
+except ValueError as error:
+    raise SystemExit("Memcached node host is not an IP literal") from error
+if not ipaddress.ip_address(host).is_loopback or not 1 <= port <= 65535:
+    raise SystemExit("Memcached node endpoint is not bounded to loopback")
+api_node_endpoint = f"[{host}]:{port}" if address.version == 6 else f"{host}:{port}"
+if document.get("discoveryEndpoint") != api_node_endpoint:
+    raise SystemExit("Memcached discovery endpoint does not match its exact node")
+if document.get("discoveryEndpoint") != expected_endpoint:
+    raise SystemExit("Memcached API endpoint does not match exact-owned Docker endpoint")
+print(api_node_endpoint)
+' "${response_file}" "${sdk_import}" "${expected_endpoint}"
+}
+
+assert_memcache_protocol() {
+  local endpoint="$1"
+  local key="$2"
+  local value="$3"
+  run_bounded 10 python3 -c '
+import ipaddress
+import socket
+import sys
+
+endpoint, key, value = sys.argv[1:]
+host, separator, port_text = endpoint.rpartition(":")
+host = host.removeprefix("[").removesuffix("]")
+if not separator or not host or not port_text.isascii() or not port_text.isdigit():
+    raise SystemExit("Memcached endpoint is malformed")
+try:
+    address = ipaddress.ip_address(host)
+    port = int(port_text)
+except ValueError as error:
+    raise SystemExit("Memcached endpoint is malformed") from error
+if not address.is_loopback or not 1 <= port <= 65535:
+    raise SystemExit("Memcached endpoint must be loopback with a valid port")
+try:
+    key_bytes = key.encode("ascii")
+except UnicodeEncodeError as error:
+    raise SystemExit("Memcached evidence key must be ASCII") from error
+value_bytes = value.encode("utf-8")
+if not key_bytes or len(key_bytes) > 250 or any(byte <= 32 or byte == 127 for byte in key_bytes):
+    raise SystemExit("Memcached evidence key is outside protocol bounds")
+if len(value_bytes) > 1024 or b"\r" in value_bytes or b"\n" in value_bytes:
+    raise SystemExit("Memcached evidence value is outside protocol bounds")
+
+def read_line(reader):
+    line = reader.readline(513)
+    if len(line) > 512 or not line.endswith(b"\r\n"):
+        raise RuntimeError("Memcached returned an invalid or oversized response line")
+    return line
+
+def read_exact(reader, size):
+    result = bytearray()
+    while len(result) < size:
+        chunk = reader.read(size - len(result))
+        if not chunk:
+            raise RuntimeError("Memcached closed before the bounded response completed")
+        result.extend(chunk)
+    return bytes(result)
+
+with socket.create_connection((host, port), timeout=2) as connection:
+    connection.settimeout(2)
+    reader = connection.makefile("rb")
+    size = str(len(value_bytes)).encode("ascii")
+    connection.sendall(b"set " + key_bytes + b" 0 30 " + size + b"\r\n" + value_bytes + b"\r\n")
+    if read_line(reader) != b"STORED\r\n":
+        raise RuntimeError("Memcached SET did not return exact STORED")
+    connection.sendall(b"get " + key_bytes + b"\r\n")
+    if read_line(reader) != b"VALUE " + key_bytes + b" 0 " + size + b"\r\n":
+        raise RuntimeError("Memcached GET returned an unexpected VALUE header")
+    if read_exact(reader, len(value_bytes) + 2) != value_bytes + b"\r\n":
+        raise RuntimeError("Memcached GET returned a different value")
+    if read_line(reader) != b"END\r\n":
+        raise RuntimeError("Memcached GET did not return exact END")
+print(f"Memcached protocol set/get passed: endpoint={endpoint} key={key} bytes={len(value_bytes)}")
+' "${endpoint}" "${key}" "${value}"
+}
+
+assert_no_memcache_container() {
+  local resource_id="${1:?Memcached resource ID is required}"
+  local inventory
+  if ! inventory="$(run_bounded 10 docker ps -aq \
+    --filter "label=managed-by=minisky" \
+    --filter "label=minisky.profile=${profile}" \
+    --filter "label=minisky.service=memorystore-memcached" \
+    --filter "label=minisky.resource=${resource_id}" 2>&1)"; then
     echo "Memcached Docker inventory failed: ${inventory}" >&2
     return 1
   fi
   if [[ -n "${inventory}" ]]; then
-    echo "Exact-owned Memcached container remains after destroy: ${inventory}" >&2
+    echo "Exact-owned Memcached container remains for ${resource_id}: ${inventory}" >&2
     return 1
   fi
 }
 
 start_minisky
 run_sdk create
+sdk_binding="$(discover_exact_memcache_container "${sdk_backend_id}")"
+IFS=$'\t' read -r sdk_container_id sdk_endpoint <<<"${sdk_binding}"
+discover_sdk_memcache_endpoint "${sdk_endpoint}" >/dev/null
+assert_exact_memcache_container_binding "${sdk_container_id}" "${sdk_backend_id}" "${sdk_endpoint}"
+assert_memcache_protocol "${sdk_endpoint}" "minisky-protocol-evidence" "memcached-data-plane-ok"
+assert_exact_memcache_container_binding "${sdk_container_id}" "${sdk_backend_id}" "${sdk_endpoint}"
 stop_minisky
 start_minisky
 run_sdk verify
 run_sdk delete
+assert_no_memcache_container "${sdk_backend_id}"
 
 terraform_dir="${repository_root}/terraform/memcache"
 terraform_state="${work_dir}/terraform.tfstate"
+tf_instance_id="minisky-terraform-memcached"
 tf_vars=(
   -var="minisky_endpoint=${gateway}"
   -var="project_id=${project}"
   -var="region=${location}"
-  -var="instance_name=minisky-terraform-memcached"
+  -var="instance_name=${tf_instance_id}"
 )
 tf_address='google_memcache_instance.compatibility'
-tf_import="projects/${project}/locations/${location}/instances/minisky-terraform-memcached"
+tf_import="projects/${project}/locations/${location}/instances/${tf_instance_id}"
+tf_backend_id="$(memcache_backend_id "${project}" "${location}" "${tf_instance_id}")"
 
 assert_no_drift() {
   local plan_exit
@@ -460,6 +694,6 @@ if [[ "${deleted_status}" != "404" ]]; then
   echo "Memcached GET after Terraform destroy returned ${deleted_status}, want 404." >&2
   exit 1
 fi
-assert_no_memcache_container
+assert_no_memcache_container "${tf_backend_id}"
 
-echo "Memcached SDK and Terraform apply/restart/import-normalization/no-drift/destroy lifecycle passed."
+echo "Memcached SDK protocol and Terraform apply/restart/import-normalization/no-drift/destroy lifecycle passed."

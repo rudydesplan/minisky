@@ -182,6 +182,9 @@ jobs:
       - name: Test Go code with race detector
         run: go test -race ./cmd/... ./pkg/... ./ui
 
+      - name: Test integration script contracts
+        run: go test -count=1 ./scripts
+
       - name: Build MiniSky
         run: go build -trimpath ./cmd/minisky
 
@@ -302,6 +305,11 @@ jobs:
           test "${phase24_25_refusal_status}" -eq 2
           grep -F "Refusing Phase 24-25 SDK integration" phase24-25-refusal.log >/dev/null
           rm phase24-25-refusal.log
+
+      - name: Validate Memcached integration script
+        run: |
+          bash -n scripts/memcache-integration.sh
+          shellcheck scripts/memcache-integration.sh
 
       - name: Verify air-gapped bundle workflow
         run: ./scripts/airgap-bundle-test.sh

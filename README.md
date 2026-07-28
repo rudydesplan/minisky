@@ -18,6 +18,10 @@ the complete native release-equivalent gate remains a promotion prerequisite. On
 dependencies and required images are available locally, verified workflows can
 run offline; first use may pull lazily loaded emulator images.
 
+The bounded Memorystore for Memcached milestone is tracked by the generated
+service-gate section below. It remains a deliberately narrow local emulator
+slice rather than a broad GCP/Memcached parity claim.
+
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Mini Movement](https://img.shields.io/badge/Mini-Family-blue.svg)](https://github.com/topics/mini-cloud)
@@ -27,11 +31,18 @@ run offline; first use may pull lazily loaded emulator images.
 ## ✨ Features
 
 <!-- BEGIN GENERATED REGISTRY COUNT -->
-- **🚀 71 Registry-Verified Domains**: The exact catalog count and generated
-  compatibility rows come from `registry.Services()`. Phase 18–25
-  inventory entries remain experimental and default-off.
-  See [Service Compatibility](docs/service-compatibility.md).
+- **🚀 71 Registry-Verified Domains**: 35 implemented, 36 experimental, and 0 deferred.
+  The exact counts and generated compatibility rows come from
+  `registry.Services()`. Phase 18–25 inventory entries remain
+  experimental and default-off. See [Service Compatibility](docs/service-compatibility.md).
 <!-- END GENERATED REGISTRY COUNT -->
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
   and operational views. Dashboard exposure is not service-fidelity or
   Terraform-compatibility evidence.
@@ -418,7 +429,7 @@ require network access; the command does not prune global Docker resources.
 | 12 | Observability and request diagnostics | Bounded W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay response, and shutdown pass locally and in required CI | ✅ CI-verified bounded platform slice |
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
-| 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
+| 15 | Extended data services and caching | Spanner, Firestore, Datastore, Redis, and Memcached have bounded locally verified SDK/backend slices; Redis and Memcached also have guarded provider lifecycles | ✅ Local-verified bounded slices |
 | 16 | ML/AI, monitoring, and advanced networking | Linux CI verifies Monitoring/PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK and Terraform lifecycles, and Vertex prediction restart gates | ✅ CI-verified bounded slices |
 | 17 | CI/CD integration, plugin ecosystem, and enterprise | Linux CI verifies the bounded WIF/RBAC/quota/audit cross-gate; external identity, distributed controls, plugin loading, and publication remain deferred | ✅ CI-verified bounded slice |
 
@@ -612,24 +623,25 @@ shared VPC packet routing.
 
 ### Phase 15 — Extended data services and caching
 
-**Status (2026-07-25): bounded emulator slices implemented.** Memorystore
-metadata and owned Redis lifecycle, profile-scoped Spanner/Firestore/Datastore
-backends, and SDK/Terraform fixtures have local contract and static validation.
-The guarded Docker data-plane suite passed locally after public emulator images
-were preflighted without inheriting host credential helpers; its SDK smoke
-covered Firestore document CRUD/query, Datastore entity/ancestor operations,
-and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
+**Status (2026-07-28): bounded local emulator slices verified.** Profile-scoped
+Firestore and Datastore backends and the official Spanner emulator passed their
+generated-client data-plane gate. Redis has a persisted metadata/owned-Valkey
+provider slice. The generated Memcached service gate above is authoritative for
+its lifecycle dimensions, local evidence status and revision provenance,
+provider/tool entry points, and CI state. Cache contents are intentionally
+ephemeral. GCP networking, HA,
+maintenance, security, and broad API parity are not claimed. Firestore
+listeners and rules remain unsupported.
 
-- Add a Spanner emulator with DDL support, read/write transactions, and
-  query execution.
-- Promote Firestore beyond metadata-only to support document CRUD, queries,
-  real-time listeners, and security rules evaluation.
-- Emulate Datastore (legacy mode) with entity operations, indexes, and
-  ancestor queries.
-- Add Memorystore emulation backed by a local Redis instance for caching
-  and session workflows.
-- Verify each data service with SDK-level integration tests and Terraform
-  resource lifecycle.
+- [x] Run the official Spanner emulator with bounded DDL, read/write, and query
+  behavior.
+- [x] Support bounded Firestore document CRUD and queries; keep real-time
+  listeners and security-rules evaluation unsupported.
+- [x] Support bounded Datastore entity CRUD and ancestor queries.
+- [x] Provide separate bounded Redis and Memcached Docker-backed Memorystore
+  lifecycles with profile-persisted metadata.
+- [x] Verify the accepted Phase 15 slices with generated-client/backend evidence
+  and guarded Terraform lifecycles where a provider resource is claimed.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
 
@@ -773,6 +785,10 @@ local-passed only; their required matrix is configured but has no external
 exact-head pass record.
 
 The next evidence milestones are:
+
+The bounded Memcached lifecycle is no longer a deferred implementation
+priority. Its machine-readable service gate above owns the local and CI evidence
+wording and does not change the unresolved Phase 18–25 matrix requirement below.
 
 1. obtain one exact-head external run in which all 12 required Phase 18–25
    Terraform matrix entries pass, then record its immutable run URL and full

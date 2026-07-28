@@ -61,24 +61,13 @@ the BigQuery v2 API base path expected by the provider. Google provider 7.41.0
 constructs `google_service_account` through its IAM beta client, which is why
 the example overrides `iam_beta_custom_endpoint`.
 
-## Configured but unverified resources
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
 
-| Terraform resource | Bounded local configuration | Verification status |
-| :--- | :--- | :--- |
-| `google_memcache_instance` | Provider `7.41.0` uses the locally configured `memcache_custom_endpoint`; the default-off root fixture and dedicated untargeted integration fixture set one node with required `node_count`, `node_config.cpu_count`, and `node_config.memory_size_mb` fields | configured but unverified |
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
 
-A prior local guarded Memcached SDK/Terraform lifecycle passed with provider
-`7.41.0`; no external CI run or commit evidence is recorded, so the row remains
-configured but unverified. The hardened runner is configured to limit import
-normalization by structural plan inspection to provider-only
-`deletion_protection`, `terraform_labels`, and timeout state. It compares the
-API resource before and after applying that saved plan, requires
-post-normalization no-drift, destroys the instance, restarts the daemon, and
-requires durable `404` plus exact-owned container absence before generic
-cleanup. That hardened sequence is not recorded as passing. `effective_labels`
-is computed by the provider from API `labels`; neither field is fabricated by
-the fixture. The gate uses the dedicated one-resource fixture without `-target`
-or plan-text filtering.
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 
 ## Acceptance-tested resources
 
@@ -102,6 +91,7 @@ or plan-text filtering.
 | `google_compute_subnetwork` (optional Phase 16) | Profile-persisted bounded regional IPv4 metadata plus one exact owned Docker bridge | Regional Compute LRO | Canonical import preserves bridge identity; destroy removes metadata and the exact bridge |
 | `google_compute_instance` (optional Phase 16) | One profile-owned container with one NIC on the bounded regional IPv4 subnetwork | Zonal Compute LRO | Canonical metadata and Docker-observed primary IPv4 address are exposed when enabled |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
+| `google_memcache_instance` (guarded Phase 15) | Profile-persisted metadata plus an exact-owned Memcached container with an ephemeral cache and loopback endpoint | Service LRO | See the generated Memcached service gate above |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
 | `google_eventarc_trigger` (optional Phase 18) | Profile-persisted trigger control-plane metadata with a Workflows destination | Service LRO | Filter, destination, and Pub/Sub transport metadata survive restart and canonical import; destroy remains 404 after a final restart |
@@ -125,7 +115,7 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Spanner,
+The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Memcached, Spanner,
 Phase-16 networking/instance, and Phase-18 Workflows/Eventarc resources are
 disabled by default and local-profile-only. Artifact Registry
 uses profile-owned Registry v2, and `emulator-config` is not a production
@@ -138,8 +128,8 @@ subnetwork with `enable_phase16_network_resources = true`; their outputs are
 `enable_phase18_workflows_resource = true`; the dependent Eventarc trigger also
 requires `enable_phase18_eventarc_resource = true`. The Phase 25 Binary
 Authorization singleton is separately default-off behind
-`enable_phase25_binary_authorization_policy = true`. The configured but
-unverified Memcached fixture is separately default-off behind
+`enable_phase25_binary_authorization_policy = true`. The Memcached root fixture
+remains separately default-off behind
 `enable_memcache_resource = true`.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
@@ -156,6 +146,22 @@ Compute/VPC/load-balancer surfaces, and general Cloud SQL or GKE APIs remain
 outside the claim. See
 `docs/service-compatibility.md`; API routes alone do not establish provider
 compatibility.
+
+The dedicated one-resource Memcached fixture uses the configured
+`memcache_custom_endpoint` and the lifecycle entry points named by the generated
+service gate above. Its guarded import normalization structurally allows only provider-side
+`deletion_protection`, `terraform_labels`, and timeout state, applied the saved
+plan, proves that the API resource is unchanged, and requires post-import no
+drift. `effective_labels` is computed by the provider from API `labels`;
+neither field is fabricated in the fixture. The bounded lifecycle requires
+destroy to be followed by another daemon restart, a durable `404`, and
+exact-owned Memcached container absence.
+The gate uses an untargeted fixture, bounded commands and overall timeout,
+stable collision locks, isolated HOME/provider/profile/Terraform state, and
+fail-closed cleanup. Cache contents are ephemeral and excluded from metadata
+export. The generated service gate is authoritative for local status, revision
+provenance, and CI status; the claim does not include GCP networking, HA,
+maintenance, security, or broad Memorystore API parity.
 
 The separate guarded Phase-16 Terraform gate targets only
 `google_compute_network.phase16[0]` and

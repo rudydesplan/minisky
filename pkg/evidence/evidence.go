@@ -51,13 +51,14 @@ var aggregateGatesJSON []byte
 type EvidenceStatus string
 
 const (
-	GitHubRepository                            = "rudydesplan/minisky"
-	EvidenceLocalPassed          EvidenceStatus = "local-passed"
-	EvidenceCIPassed             EvidenceStatus = "ci-passed"
-	EvidenceConfiguredUnverified EvidenceStatus = "configured-unverified"
-	EvidenceOptionalUnverified   EvidenceStatus = "optional-unverified"
-	EvidenceNotApplicable        EvidenceStatus = "not-applicable"
-	EvidenceAbsent               EvidenceStatus = "absent"
+	GitHubRepository                              = "rudydesplan/minisky"
+	EvidenceLocalPassed            EvidenceStatus = "local-passed"
+	EvidenceLocalPassedUncommitted EvidenceStatus = "local-passed-uncommitted"
+	EvidenceCIPassed               EvidenceStatus = "ci-passed"
+	EvidenceConfiguredUnverified   EvidenceStatus = "configured-unverified"
+	EvidenceOptionalUnverified     EvidenceStatus = "optional-unverified"
+	EvidenceNotApplicable          EvidenceStatus = "not-applicable"
+	EvidenceAbsent                 EvidenceStatus = "absent"
 )
 
 type TestReference struct {
@@ -93,6 +94,28 @@ type PlatformGate struct {
 
 //go:embed platform_gates.json
 var platformGatesJSON []byte
+
+// ServiceGate records a bounded service lifecycle without adding the service
+// to the default-off Phase 18-25 promotion inventory.
+type GateAssertion struct {
+	Path     string   `json:"path"`
+	Contains []string `json:"contains"`
+}
+
+type ServiceGate struct {
+	ID              string                     `json:"id"`
+	Phase           int                        `json:"phase"`
+	Name            string                     `json:"name"`
+	Domain          string                     `json:"domain"`
+	ProviderVersion string                     `json:"providerVersion"`
+	Dimensions      []string                   `json:"dimensions"`
+	Assertions      map[string][]GateAssertion `json:"assertions"`
+	CI              EvidenceCheck              `json:"ci"`
+	EvidenceCheck
+}
+
+//go:embed service_gates.json
+var serviceGatesJSON []byte
 
 // TerraformCheck records one provider lifecycle for exactly one service
 // domain. Terraform evidence is intentionally not represented as a batch-wide
@@ -224,9 +247,117 @@ func PlatformGates() ([]PlatformGate, error) {
 	return gates, nil
 }
 
+// ServiceGates returns bounded service evidence that is independent of the
+// experimental Phase 18-25 promotion matrix.
+func ServiceGates() ([]ServiceGate, error) {
+	return loadServiceGates(serviceGatesJSON)
+}
+
+func loadServiceGates(data []byte) ([]ServiceGate, error) {
+	var gates []ServiceGate
+	if err := json.Unmarshal(data, &gates); err != nil {
+		return nil, fmt.Errorf("decode service gates: %w", err)
+	}
+	seen := make(map[string]bool, len(gates))
+	for _, gate := range gates {
+		if gate.ID == "" || gate.Phase == 0 || gate.Name == "" ||
+			gate.Domain == "" || gate.ProviderVersion == "" {
+			return nil, fmt.Errorf("service gate has incomplete identity: %+v", gate)
+		}
+		if seen[gate.ID] {
+			return nil, fmt.Errorf("duplicate service gate %q", gate.ID)
+		}
+		seen[gate.ID] = true
+		dimensions := make(map[string]bool, len(gate.Dimensions))
+		for _, dimension := range gate.Dimensions {
+			if dimension == "" {
+				return nil, fmt.Errorf("%s has an empty lifecycle dimension", gate.ID)
+			}
+			if dimensions[dimension] {
+				return nil, fmt.Errorf("%s duplicates lifecycle dimension %q", gate.ID, dimension)
+			}
+			dimensions[dimension] = true
+		}
+		if len(dimensions) == 0 {
+			return nil, fmt.Errorf("%s has no lifecycle dimensions", gate.ID)
+		}
+		if len(gate.Assertions) != len(dimensions) {
+			return nil, fmt.Errorf("%s assertion dimensions do not exactly match lifecycle dimensions", gate.ID)
+		}
+		for dimension, assertions := range gate.Assertions {
+			if !dimensions[dimension] {
+				return nil, fmt.Errorf("%s assertion names unknown dimension %q", gate.ID, dimension)
+			}
+			if len(assertions) == 0 {
+				return nil, fmt.Errorf("%s dimension %q has no gate assertions", gate.ID, dimension)
+			}
+			for _, assertion := range assertions {
+				if assertion.Path == "" || len(assertion.Contains) == 0 {
+					return nil, fmt.Errorf("%s dimension %q has an incomplete gate assertion", gate.ID, dimension)
+				}
+				for _, fragment := range assertion.Contains {
+					if fragment == "" {
+						return nil, fmt.Errorf("%s dimension %q has an empty assertion fragment", gate.ID, dimension)
+					}
+				}
+			}
+		}
+		if err := ValidateEvidenceCheck(gate.EvidenceCheck); err != nil {
+			return nil, fmt.Errorf("%s local evidence: %w", gate.ID, err)
+		}
+		switch gate.Status {
+		case EvidenceLocalPassed:
+			if gate.SourceCommit == "" || !fullCommitPattern.MatchString(gate.SourceCommit) {
+				return nil, fmt.Errorf("%s immutable local evidence requires a full source commit", gate.ID)
+			}
+		case EvidenceLocalPassedUncommitted:
+			if gate.SourceCommit != "" {
+				return nil, fmt.Errorf("%s uncommitted local evidence must not include a source commit", gate.ID)
+			}
+		default:
+			return nil, fmt.Errorf(
+				"%s local evidence status must be %q or %q",
+				gate.ID,
+				EvidenceLocalPassed,
+				EvidenceLocalPassedUncommitted,
+			)
+		}
+		if gate.Script == "" || gate.MakeTarget == "" || len(gate.References) == 0 {
+			return nil, fmt.Errorf("%s local evidence requires script, Make target, and references", gate.ID)
+		}
+		for _, reference := range gate.References {
+			if reference.Package == "" || len(reference.Tests) == 0 {
+				return nil, fmt.Errorf("%s local evidence has an incomplete test reference", gate.ID)
+			}
+			for _, test := range reference.Tests {
+				if test == "" {
+					return nil, fmt.Errorf("%s local evidence has an empty test reference", gate.ID)
+				}
+			}
+		}
+		if !providerVersionPattern.MatchString(gate.ProviderVersion) {
+			return nil, fmt.Errorf("%s provider version %q is not exact", gate.ID, gate.ProviderVersion)
+		}
+		if err := ValidateEvidenceCheck(gate.CI); err != nil {
+			return nil, fmt.Errorf("%s CI evidence: %w", gate.ID, err)
+		}
+		if gate.CI.Status != EvidenceConfiguredUnverified && gate.CI.Status != EvidenceCIPassed {
+			return nil, fmt.Errorf("%s CI evidence status must be configured-unverified or ci-passed", gate.ID)
+		}
+		if gate.CI.Workflow == "" || gate.CI.Job == "" {
+			return nil, fmt.Errorf("%s CI evidence requires workflow and job", gate.ID)
+		}
+		if len(gate.CI.References) != 0 || gate.CI.Script != "" || gate.CI.MakeTarget != "" {
+			return nil, fmt.Errorf("%s CI evidence must not duplicate local execution references", gate.ID)
+		}
+	}
+	return gates, nil
+}
+
 var (
-	fullCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	actionsRunPattern = regexp.MustCompile(
+	fullCommitPattern      = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	providerVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	actionsRunPattern      = regexp.MustCompile(
 		`^/` + regexp.QuoteMeta(GitHubRepository) + `/actions/runs/[0-9]+$`,
 	)
 )
@@ -254,7 +385,7 @@ func ValidateEvidenceCheck(check EvidenceCheck) error {
 		if !fullCommitPattern.MatchString(check.Commit) {
 			return fmt.Errorf("ci-passed requires a lowercase 40-hex commit")
 		}
-	case EvidenceLocalPassed, EvidenceConfiguredUnverified, EvidenceOptionalUnverified,
+	case EvidenceLocalPassed, EvidenceLocalPassedUncommitted, EvidenceConfiguredUnverified, EvidenceOptionalUnverified,
 		EvidenceNotApplicable, EvidenceAbsent:
 		if check.RunURL != "" || check.Commit != "" {
 			return fmt.Errorf("%s must not include CI run or commit fields", check.Status)
