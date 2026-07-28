@@ -73,6 +73,7 @@ test-phase16-vertex:
 
 test-phase17:
 	go test ./scripts ./pkg/pluginsdk ./pkg/security ./pkg/dashboard ./pkg/router ./pkg/observability ./cmd/minisky
+	node --test .github/actions/setup-minisky/index.test.mjs
 	node --check .github/actions/setup-minisky/index.mjs
 	node --check .github/actions/setup-minisky/cleanup.mjs
 	bash -n scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh

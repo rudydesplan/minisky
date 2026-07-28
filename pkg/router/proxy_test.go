@@ -27,9 +27,11 @@ import (
 	"minisky/pkg/shims/bigquery"
 	"minisky/pkg/shims/bigtable"
 	"minisky/pkg/shims/binaryauthorization"
+	"minisky/pkg/shims/cloudasset"
 	"minisky/pkg/shims/cloudsql"
 	"minisky/pkg/shims/compute"
 	iamshim "minisky/pkg/shims/iam"
+	"minisky/pkg/shims/orgpolicy"
 	"minisky/pkg/shims/serverless"
 	"minisky/pkg/state"
 )
@@ -109,6 +111,113 @@ func TestSpannerTerraformCompatibilityPreservesLifecycleRequests(t *testing.T) {
 				t.Fatalf("body=%s", response.Body.String())
 			}
 		})
+	}
+}
+
+func TestPhase24ProviderRoutingPreservesEncodedPathEvidence(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("orgpolicy.googleapis.com", orgpolicy.NewAPI())
+	proxy.RegisterShim("cloudasset.googleapis.com", cloudasset.NewAPIWithInventory(nil, ""))
+
+	tests := []struct {
+		name   string
+		path   string
+		status int
+		symbol string
+	}{
+		{
+			name:   "org policy single encoded alias",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/%70olicies",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "org policy double encoded alias",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/%2570olicies",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "org policy encoded separator",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/policies/compute%2FrequireOsLogin",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset single encoded decimal alias",
+			path:   "/_minisky/cloudasset/v1/organizations/%31%32%33/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset double encoded decimal alias",
+			path:   "/_minisky/cloudasset/v1/organizations/%2531%2532%2533/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset encoded separator",
+			path:   "/_minisky/cloudasset/v1/organizations/123%2Fextra/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset canonical unsupported parent",
+			path:   "/_minisky/cloudasset/v1/organizations/123/assets",
+			status: http.StatusNotImplemented, symbol: "UNIMPLEMENTED",
+		},
+		{
+			name:   "cloud asset leading zero parent",
+			path:   "/_minisky/cloudasset/v1/organizations/0123/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, httptest.NewRequest(
+				http.MethodGet, "http://localhost"+test.path, nil,
+			))
+			if response.Code != test.status ||
+				!strings.Contains(response.Body.String(), `"`+test.symbol+`"`) {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProviderRoutingKeepsCanonicalPathsAndEncodedQueriesCompatible(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("orgpolicy.googleapis.com", orgpolicy.NewAPI())
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/_minisky/orgpolicy/v2/projects/project-a/policies?filter=name%3Afoo%2Fbar",
+		nil,
+	)
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("canonical provider status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	var gotPath, gotRawPath, gotQuery string
+	proxy.RegisterShim("example.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		gotRawPath = request.URL.RawPath
+		gotQuery = request.URL.RawQuery
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	response = httptest.NewRecorder()
+	proxy.ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/_minisky/example/v1/items?name=folder%2Fitem&label=a%3Ab",
+		nil,
+	))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("unrelated route status=%d body=%s", response.Code, response.Body.String())
+	}
+	if gotPath != "/v1/items" || gotRawPath != "" ||
+		gotQuery != "name=folder%2Fitem&label=a%3Ab" {
+		t.Fatalf("path=%q rawPath=%q query=%q", gotPath, gotRawPath, gotQuery)
 	}
 }
 

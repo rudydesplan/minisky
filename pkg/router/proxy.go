@@ -1508,8 +1508,17 @@ func canonicalEndpoint(path string) (selector, servicePath string, canonical boo
 }
 
 func rewriteRequestPath(r *http.Request, path string) {
+	hadEncodedPath := r.URL.RawPath != "" || strings.Contains(r.URL.EscapedPath(), "%")
 	r.URL.Path = path
-	r.URL.RawPath = ""
+	if hadEncodedPath {
+		// Keep a valid RawPath equivalent of the rewritten Path. The exact gateway
+		// prefix is intentionally removed, while the non-empty RawPath preserves
+		// evidence that the caller supplied path encoding for downstream canonical
+		// path validation. Query encoding remains untouched in RawQuery.
+		r.URL.RawPath = (&url.URL{Path: path}).EscapedPath()
+	} else {
+		r.URL.RawPath = ""
+	}
 	r.RequestURI = r.URL.RequestURI()
 }
 

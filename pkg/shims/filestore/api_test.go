@@ -193,6 +193,89 @@ func TestLocalShareDataSurvivesMetadataRestart(t *testing.T) {
 	}
 }
 
+func TestRestartFailsClosedWhenOwnedShareTreeIsMissing(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	name := "projects/test/locations/us-central1/instances/missing-data"
+	seed := newAPI(newTestAPI().opMgr, store)
+	seed.instances[name] = &Instance{
+		Name: name, Tier: "BASIC_HDD", State: "READY",
+		FileShares: []FileShare{{Name: "share1", CapacityGb: 1024}},
+	}
+	if err := seed.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newAPI(newTestAPI().opMgr, store)
+	restarted.dataRoot = t.TempDir()
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.instances[name]; got == nil || got.State != "ERROR" {
+		t.Fatalf("missing data-plane state = %#v, want ERROR", got)
+	}
+	if err := restarted.WriteShareFile(name, "share1", "new.txt", []byte("new")); err == nil {
+		t.Fatal("write recreated a missing share tree")
+	}
+}
+
+func TestRestartRejectsSymlinkedInstanceParentPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("descriptor-pinned filesystem traversal is unavailable on Windows")
+	}
+	store := &mockStore{data: make(map[string][]byte)}
+	name := "projects/test/locations/us-central1/instances/symlinked-data"
+	seed := newAPI(newTestAPI().opMgr, store)
+	seed.instances[name] = &Instance{
+		Name: name, Tier: "BASIC_HDD", State: "READY",
+		FileShares: []FileShare{{Name: "share1", CapacityGb: 1024}},
+	}
+	if err := seed.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Mkdir(filepath.Join(outside, "share1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, seed.instanceDataKey(name))); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	restarted := newAPI(newTestAPI().opMgr, store)
+	restarted.dataRoot = root
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.instances[name]; got == nil || got.State != "ERROR" {
+		t.Fatalf("symlinked data-plane state = %#v, want ERROR", got)
+	}
+}
+
+func TestCorruptStateFailsClosedWithoutOverwritingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt-filestore")
+	store, err := state.New(root, "corrupt-filestore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(filestoreStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+
+	api := NewAPI(nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/v1/projects/test/locations/us-central1/instances", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var persisted string
+	if err := store.Load(filestoreStateEntry, &persisted); err != nil || persisted != "corrupt" {
+		t.Fatalf("corrupt state changed: %q err=%v", persisted, err)
+	}
+}
+
 func TestCreateInstanceMissingTier(t *testing.T) {
 	api := newTestAPI()
 	body := `{"fileShares":[{"name":"share1","capacityGb":"1024"}]}`

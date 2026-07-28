@@ -43,6 +43,59 @@ func TestCreateJobRunsBoundedPipelineToCompletion(t *testing.T) {
 	waitForJobState(t, api, created.ID, "JOB_STATE_DONE")
 }
 
+func TestTerminalPersistenceFailureRecordsStoppedState(t *testing.T) {
+	root := t.TempDir()
+	const profile = "terminal-failure"
+	durableStore, err := state.New(root, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegate := &failNthDataflowStore{delegate: durableStore, failAt: 3}
+	guarded := state.NewGuardedEntryStore(delegate, nil)
+	api := newTestAPI()
+	api.stateStore = guarded
+	api.readState = freshDataflowReader(t, root, profile)
+	body := `{"name":"my-batch-job","type":"JOB_TYPE_BATCH","steps":[{"name":"create","kind":"Create","properties":{"elements":["a"]}}]}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1b3/projects/p/locations/l/jobs", bytes.NewBufferString(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var job Job
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	waitForJobState(t, api, job.ID, "JOB_STATE_STOPPED")
+	if guarded.Degraded() == nil {
+		t.Fatal("terminal save failure did not degrade GuardedEntryStore")
+	}
+
+	get := httptest.NewRecorder()
+	api.ServeHTTP(get, httptest.NewRequest(http.MethodGet,
+		"/v1b3/projects/p/locations/l/jobs/"+job.ID, nil))
+	if get.Code != http.StatusServiceUnavailable {
+		t.Fatalf("degraded GET status = %d, want 503: %s", get.Code, get.Body.String())
+	}
+
+	freshStore, err := state.New(root, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := newTestAPI()
+	restarted.stateStore = state.NewGuardedEntryStore(freshStore, nil)
+	restarted.readState = freshDataflowReader(t, root, profile)
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.jobs[job.ID].CurrentState; got != "JOB_STATE_STOPPED" {
+		t.Fatalf("restart state = %q, want STOPPED", got)
+	}
+	if got := api.jobs[job.ID].CurrentState; got != restarted.jobs[job.ID].CurrentState {
+		t.Fatalf("in-memory state = %q, restart state = %q", got, restarted.jobs[job.ID].CurrentState)
+	}
+}
+
 func TestCreateJobRejectsUnsupportedPipelineBeforeMutation(t *testing.T) {
 	api := newTestAPI()
 	body := `{"name":"streaming","type":"JOB_TYPE_STREAMING","steps":[{"name":"read","kind":"Create"}]}`
@@ -54,6 +107,28 @@ func TestCreateJobRejectsUnsupportedPipelineBeforeMutation(t *testing.T) {
 	}
 	if len(api.jobs) != 0 {
 		t.Fatal("unsupported pipeline mutated state")
+	}
+}
+
+func TestCreateJobPersistenceFailureDoesNotConsumeID(t *testing.T) {
+	api := newTestAPI()
+	api.stateStore = state.NewGuardedEntryStore(
+		&failingDataflowStore{saveErr: fmt.Errorf("disk full")}, nil)
+	body := `{"name":"first","type":"JOB_TYPE_BATCH","steps":[{"name":"create","kind":"Create","properties":{"elements":["a"]}}]}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1b3/projects/p/locations/l/jobs", bytes.NewBufferString(body)))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", response.Code, response.Body.String())
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	if api.nextID != 1 {
+		t.Fatalf("nextID = %d, want 1 after rolled-back create", api.nextID)
+	}
+	if len(api.jobs) != 0 {
+		t.Fatalf("jobs = %d, want no committed job", len(api.jobs))
 	}
 }
 
@@ -82,6 +157,38 @@ func TestCancelStopsRunningLocalJobWithoutTerminalOverwrite(t *testing.T) {
 		t.Fatalf("cancel: expected 200, got %d: %s", cancelResponse.Code, cancelResponse.Body.String())
 	}
 	waitForJobState(t, api, job.ID, "JOB_STATE_CANCELLED")
+}
+
+func TestCancelPersistenceFailureKeepsRunningJobCancellable(t *testing.T) {
+	api := newTestAPI()
+	api.stateStore = state.NewGuardedEntryStore(
+		&failingDataflowStore{saveErr: fmt.Errorf("disk full")}, nil)
+	cancelled := make(chan struct{})
+	api.jobs["1"] = &Job{
+		ID:           "1",
+		ProjectID:    "p",
+		Location:     "l",
+		CurrentState: "JOB_STATE_RUNNING",
+	}
+	api.cancels["1"] = func() { close(cancelled) }
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPut,
+		"/v1b3/projects/p/locations/l/jobs/1",
+		bytes.NewBufferString(`{"requestedState":"JOB_STATE_CANCELLED"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", response.Code, response.Body.String())
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("failed persistence cancelled the running job")
+	default:
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	if api.jobs["1"].CurrentState != "JOB_STATE_RUNNING" || api.cancels["1"] == nil {
+		t.Fatalf("rollback lost running job control: job=%+v cancel=%v", api.jobs["1"], api.cancels["1"] != nil)
+	}
 }
 
 func TestGetJob(t *testing.T) {
@@ -391,6 +498,42 @@ func waitForJobState(t *testing.T, api *API, id, want string) {
 type mockStateStore struct {
 	mu   sync.Mutex
 	data map[string][]byte
+}
+
+type failingDataflowStore struct {
+	saveErr error
+}
+
+func (s *failingDataflowStore) Save(string, any) error { return s.saveErr }
+func (s *failingDataflowStore) Load(string, any) error { return state.ErrNotFound }
+
+type failNthDataflowStore struct {
+	delegate *state.Store
+	failAt   int
+	saves    int
+}
+
+func (s *failNthDataflowStore) Save(name string, value any) error {
+	s.saves++
+	if s.saves == s.failAt {
+		return fmt.Errorf("disk full")
+	}
+	return s.delegate.Save(name, value)
+}
+
+func (s *failNthDataflowStore) Load(name string, target any) error {
+	return s.delegate.Load(name, target)
+}
+
+func freshDataflowReader(t *testing.T, root, profile string) func(*dataflowMetadata) error {
+	t.Helper()
+	return func(metadata *dataflowMetadata) error {
+		store, err := state.New(root, profile)
+		if err != nil {
+			return err
+		}
+		return store.Load(dataflowStateEntry, metadata)
+	}
 }
 
 func (m *mockStateStore) Save(name string, value any) error {

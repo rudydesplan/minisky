@@ -618,6 +618,72 @@ func TestPersistAndReload(t *testing.T) {
 	}
 }
 
+func TestReloadReconcilesExactOwnedAirflowBackendWithoutProvisioning(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	name := "projects/p/locations/l/environments/e1"
+	if err := store.Save(composerStateEntry, composerMetadata{Environments: map[string]*Environment{
+		name: {
+			Name:  name,
+			State: "RUNNING",
+			Config: &EnvironmentConfig{
+				AirflowURI: "http://stale.invalid",
+			},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeAirflowBackend{endpoint: "http://127.0.0.1:18080", owned: true}
+	api := &API{
+		opMgr:        orchestrator.NewOperationManager(),
+		stateStore:   store,
+		environments: make(map[string]*Environment),
+		backend:      backend,
+	}
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	environment := api.environments[name]
+	if environment == nil || environment.State != "RUNNING" ||
+		environment.Config == nil || environment.Config.AirflowURI != backend.endpoint {
+		t.Fatalf("reconciled environment = %+v", environment)
+	}
+	if backend.provisionCalls != 0 || backend.reconcileCalls != 1 {
+		t.Fatalf("restart provision calls = %d, reconcile calls = %d; want 0 and 1",
+			backend.provisionCalls, backend.reconcileCalls)
+	}
+}
+
+func TestReloadGivesEachAirflowResourceAFairReconcileBudget(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	environments := make(map[string]*Environment)
+	for _, id := range []string{"a", "b", "c"} {
+		name := "projects/p/locations/l/environments/" + id
+		environments[name] = &Environment{Name: name, State: "RUNNING"}
+	}
+	if err := store.Save(composerStateEntry, composerMetadata{Environments: environments}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &budgetAirflowBackend{}
+	api := &API{
+		opMgr:            orchestrator.NewOperationManager(),
+		stateStore:       store,
+		environments:     make(map[string]*Environment),
+		backend:          backend,
+		reconcileTimeout: 10 * time.Millisecond,
+	}
+	start := time.Now()
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if backend.reconcileCalls != 3 {
+		t.Fatalf("reconcile calls = %d, want 3", backend.reconcileCalls)
+	}
+	if elapsed < 20*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("reconciliation elapsed = %v, want independent bounded budgets", elapsed)
+	}
+}
+
 func TestConcurrentCreateAndGet(t *testing.T) {
 	api := newTestAPI()
 	const n = 50
@@ -665,12 +731,35 @@ type mockStore struct {
 }
 
 type fakeAirflowBackend struct {
-	endpoint    string
-	deleteCalls int
+	endpoint       string
+	owned          bool
+	provisionCalls int
+	reconcileCalls int
+	deleteCalls    int
 }
 
+type budgetAirflowBackend struct {
+	reconcileCalls int
+}
+
+func (*budgetAirflowBackend) Provision(context.Context, string) (string, error) {
+	return "", nil
+}
+func (b *budgetAirflowBackend) Reconcile(ctx context.Context, _ string) (string, bool, error) {
+	b.reconcileCalls++
+	<-ctx.Done()
+	return "", false, ctx.Err()
+}
+func (*budgetAirflowBackend) Delete(context.Context, string) error { return nil }
+
 func (b *fakeAirflowBackend) Provision(context.Context, string) (string, error) {
+	b.provisionCalls++
 	return b.endpoint, nil
+}
+
+func (b *fakeAirflowBackend) Reconcile(context.Context, string) (string, bool, error) {
+	b.reconcileCalls++
+	return b.endpoint, b.owned, nil
 }
 
 func (b *fakeAirflowBackend) Delete(context.Context, string) error {

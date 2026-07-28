@@ -186,7 +186,7 @@ jobs:
         run: go build -trimpath ./cmd/minisky
 
       - name: Validate local action JavaScript
-        run: node --check .github/actions/setup-minisky/index.mjs && node --check .github/actions/setup-minisky/cleanup.mjs
+        run: node --test .github/actions/setup-minisky/index.test.mjs && node --check .github/actions/setup-minisky/index.mjs && node --check .github/actions/setup-minisky/cleanup.mjs
 
       - name: Start built artifact with local action
         id: minisky

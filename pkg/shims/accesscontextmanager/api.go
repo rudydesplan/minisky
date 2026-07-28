@@ -78,14 +78,15 @@ type Condition struct {
 
 // API implements the Access Context Manager v1 REST shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	stateStore acmStateStore
-	policies   map[string]*AccessPolicy
-	perimeters map[string]*ServicePerimeter
-	levels     map[string]*AccessLevel
-	seqNum     int
+	mu             sync.RWMutex
+	persistMu      sync.Mutex
+	opMgr          *orchestrator.OperationManager
+	stateStore     acmStateStore
+	policies       map[string]*AccessPolicy
+	perimeters     map[string]*ServicePerimeter
+	levels         map[string]*AccessLevel
+	seqNum         int
+	persistenceErr error
 }
 
 // NewAPI creates a new Access Context Manager API shim with persistence.
@@ -96,6 +97,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	api := newAPI(opMgr, state.NewGuardedEntryStore(store, err))
 	if err != nil {
+		api.markPersistenceFailure(err)
 		log.Printf("[Shim: AccessContextManager] persistence degraded: %v", err)
 		return api
 	}
@@ -123,6 +125,11 @@ func newTestAPI() *API {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: AccessContextManager] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.PersistenceError() != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"Access Context Manager persistence is unavailable")
+		return
+	}
 
 	switch {
 	case strings.HasSuffix(r.URL.Path, ":checkAccess") && r.Method == http.MethodPost:

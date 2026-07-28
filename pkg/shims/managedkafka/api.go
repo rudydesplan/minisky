@@ -75,17 +75,20 @@ type Topic struct {
 
 // API implements the Managed Kafka v1 REST shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	stateStore managedKafkaStateStore
-	clusters   map[string]*Cluster
-	topics     map[string]*Topic
-	backend    kafkaBackend
+	mu               sync.RWMutex
+	mutationMu       sync.Mutex
+	persistMu        sync.Mutex
+	opMgr            *orchestrator.OperationManager
+	stateStore       managedKafkaStateStore
+	clusters         map[string]*Cluster
+	topics           map[string]*Topic
+	backend          kafkaBackend
+	reconcileTimeout time.Duration
 }
 
 type kafkaBackend interface {
 	Provision(context.Context, string) (string, error)
+	Reconcile(context.Context, string) (string, bool, error)
 	Delete(context.Context, string) error
 	CreateTopic(context.Context, string, *Topic) error
 	UpdateTopic(context.Context, string, *Topic) error
@@ -111,6 +114,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: ManagedKafka] state rehydration failed: %v", err)
+		api.stateStore = state.NewGuardedEntryStore(store, err)
 	}
 	return api
 }
@@ -162,6 +166,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	project, location, ok := parseParent(r.URL.Path)
@@ -225,6 +232,8 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
 		bootstrap, err := api.backend.Provision(context.Background(), name)
 		api.mu.Lock()
 		current := api.clusters[name]
@@ -332,6 +341,9 @@ func (api *API) listClusters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) patchCluster(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := parseClusterName(r.URL.Path)
 	updateMask := r.URL.Query().Get("updateMask")
@@ -437,6 +449,9 @@ func (api *API) patchCluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	name := parseClusterName(r.URL.Path)
 	project, location, _ := parseParent(r.URL.Path)
 
@@ -527,6 +542,9 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createTopic(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	// Parse cluster parent from path: .../clusters/{cluster}/topics
@@ -666,6 +684,9 @@ func (api *API) listTopics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) patchTopic(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := parseTopicName(r.URL.Path)
 	updateMask := r.URL.Query().Get("updateMask")
@@ -745,6 +766,9 @@ func (api *API) patchTopic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteTopic(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	name := parseTopicName(r.URL.Path)
 
 	api.mu.Lock()

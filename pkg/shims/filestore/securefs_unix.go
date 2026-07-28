@@ -137,6 +137,25 @@ func secureTreeUsage(root, relative string, maxFiles int, maxBytes int64) (int, 
 	return directoryUsage(fd, maxFiles, maxBytes)
 }
 
+func secureDirectoryExists(root, relative string) (bool, error) {
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if err == unix.ENOENT {
+			return false, nil
+		}
+		return false, err
+	}
+	defer unix.Close(rootFD)
+	fd, err := walkDirectory(rootFD, splitSecurePath(relative), false)
+	if err != nil {
+		if err == unix.ENOENT || err == unix.ENOTDIR || err == unix.ELOOP {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, unix.Close(fd)
+}
+
 func secureFileSize(root, relative string) (int64, bool, error) {
 	parts := splitSecurePath(relative)
 	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)

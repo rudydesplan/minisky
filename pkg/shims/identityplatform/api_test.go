@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -319,6 +320,152 @@ func TestInitializeProjectConfigReconcilesPostCommitSaveError(t *testing.T) {
 	}
 }
 
+func TestPatchTenantConfigReconcilesPostCommitSaveError(t *testing.T) {
+	store := &postCommitIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+	}
+	api := newAPI(newTestAPI().opMgr, state.NewGuardedEntryStore(store, nil))
+	backend := &fakeAuthBackend{}
+	api.authBackend = backend
+	tenantName := "projects/test/tenants/t1"
+	configName := tenantName + "/config"
+	api.tenants[tenantName] = &Tenant{Name: tenantName}
+	api.tenantConfigs[configName] = &TenantConfig{Name: configName, DisplayName: "before"}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.failNext = true
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v2/"+configName+"?updateMask=displayName",
+		bytes.NewBufferString(`{"displayName":"after"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if got := api.tenantConfigs[configName]; got == nil || got.DisplayName != "after" {
+		t.Fatalf("visible config = %#v", got)
+	}
+	if backend.tenantCalls != 1 {
+		t.Fatalf("backend calls = %d, want committed update without rollback", backend.tenantCalls)
+	}
+
+	restarted := newAPI(newTestAPI().opMgr, store)
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.tenantConfigs[configName]; got == nil || got.DisplayName != "after" {
+		t.Fatalf("durable config = %#v", got)
+	}
+}
+
+func TestPatchProjectConfigReconcilesPostCommitSaveError(t *testing.T) {
+	store := &postCommitIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+	}
+	api := newAPI(newTestAPI().opMgr, state.NewGuardedEntryStore(store, nil))
+	backend := &fakeAuthBackend{}
+	api.authBackend = backend
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.failNext = true
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/admin/v2/projects/test/config?updateMask=authorizedDomains",
+		bytes.NewBufferString(`{"authorizedDomains":["localhost"]}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if backend.projectCalls != 1 {
+		t.Fatalf("backend calls = %d, want committed update without rollback", backend.projectCalls)
+	}
+
+	var durable identityPlatformMetadata
+	if err := store.Load(identityPlatformStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	config := durable.ProjectConfigs["projects/test/config"]
+	if config == nil || !reflect.DeepEqual(config.AuthorizedDomains, []string{"localhost"}) {
+		t.Fatalf("durable project config = %#v", config)
+	}
+}
+
+func TestProjectConfigAmbiguousSaveAndReadbackFailureFailsClosed(t *testing.T) {
+	store := &postCommitIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+	}
+	api := newAPI(newTestAPI().opMgr, state.NewGuardedEntryStore(store, nil))
+	backend := &fakeAuthBackend{}
+	api.authBackend = backend
+	name := "projects/test/config"
+	api.projectConfigs[name] = &ProjectConfig{Name: name, AuthorizedDomains: []string{"before.example"}}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.failNext = true
+	store.loadErr = errors.New("injected project config readback failure")
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/admin/v2/projects/test/config?updateMask=authorizedDomains",
+		bytes.NewBufferString(`{"authorizedDomains":["after.example"]}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if api.initializationError() == nil {
+		t.Fatal("ambiguous project config durability did not become sticky")
+	}
+	if backend.projectCalls != 2 || backend.lastProjectConfig == nil ||
+		!reflect.DeepEqual(backend.lastProjectConfig.AuthorizedDomains, []string{"before.example"}) {
+		t.Fatalf("backend reconciliation calls=%d config=%#v", backend.projectCalls, backend.lastProjectConfig)
+	}
+	blocked := httptest.NewRecorder()
+	api.ServeHTTP(blocked, httptest.NewRequest(http.MethodGet, "/admin/v2/projects/test/config", nil))
+	if blocked.Code != http.StatusServiceUnavailable {
+		t.Fatalf("subsequent status = %d: %s", blocked.Code, blocked.Body.String())
+	}
+}
+
+func TestTenantConfigAmbiguousSaveAndReadbackFailureFailsClosed(t *testing.T) {
+	store := &postCommitIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+	}
+	api := newAPI(newTestAPI().opMgr, state.NewGuardedEntryStore(store, nil))
+	backend := &fakeAuthBackend{}
+	api.authBackend = backend
+	tenantName := "projects/test/tenants/t1"
+	configName := tenantName + "/config"
+	api.tenants[tenantName] = &Tenant{Name: tenantName}
+	api.tenantConfigs[configName] = &TenantConfig{Name: configName, DisplayName: "before"}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.failNext = true
+	store.loadErr = errors.New("injected tenant config readback failure")
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v2/"+configName+"?updateMask=displayName",
+		bytes.NewBufferString(`{"displayName":"after"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if api.initializationError() == nil {
+		t.Fatal("ambiguous tenant config durability did not become sticky")
+	}
+	if backend.tenantCalls != 2 || backend.lastTenantConfig == nil ||
+		backend.lastTenantConfig.DisplayName != "before" {
+		t.Fatalf("backend reconciliation calls=%d config=%#v", backend.tenantCalls, backend.lastTenantConfig)
+	}
+	blocked := httptest.NewRecorder()
+	api.ServeHTTP(blocked, httptest.NewRequest(http.MethodGet, "/v2/"+configName, nil))
+	if blocked.Code != http.StatusServiceUnavailable {
+		t.Fatalf("subsequent status = %d: %s", blocked.Code, blocked.Body.String())
+	}
+}
+
 func TestInitializeProjectConfigSerializesProvisionalStateAndRollback(t *testing.T) {
 	store := &blockingFirstIdentityPlatformStore{
 		mockStore:   mockStore{data: make(map[string][]byte)},
@@ -378,6 +525,138 @@ func TestInitializeProjectConfigSerializesProvisionalStateAndRollback(t *testing
 	}
 	if restarted.projectConfigs["projects/test/config"] == nil {
 		t.Fatal("serialized successful initialization was lost after restart")
+	}
+}
+
+func TestPatchTenantConfigSerializesBackendMemorySaveAndRollback(t *testing.T) {
+	store := &blockingFirstIdentityPlatformStore{
+		mockStore:   mockStore{data: make(map[string][]byte)},
+		saveEntered: make(chan struct{}),
+		releaseSave: make(chan struct{}),
+	}
+	tenantName := "projects/test/tenants/t1"
+	configName := tenantName + "/config"
+	initial := identityPlatformMetadata{
+		Tenants:       map[string]*Tenant{tenantName: {Name: tenantName}},
+		TenantConfigs: map[string]*TenantConfig{configName: {Name: configName, DisplayName: "before"}},
+	}
+	if err := store.mockStore.Save(identityPlatformStateEntry, initial); err != nil {
+		t.Fatal(err)
+	}
+	api := newAPI(newTestAPI().opMgr, store)
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	backend := newSequencedAuthBackend()
+	api.authBackend = backend
+
+	patch := func(displayName string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+			"/v2/"+configName+"?updateMask=displayName",
+			bytes.NewBufferString(`{"displayName":"`+displayName+`"}`)))
+		return response
+	}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- patch("first") }()
+	<-store.saveEntered
+	firstBackend := <-backend.calls
+	if firstBackend.DisplayName != "first" {
+		t.Fatalf("first backend config = %#v", firstBackend)
+	}
+
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { secondDone <- patch("second") }()
+	select {
+	case config := <-backend.calls:
+		t.Fatalf("second backend call overtook first transaction: %#v", config)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(store.releaseSave)
+	if response := <-firstDone; response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d: %s", response.Code, response.Body.String())
+	}
+	rollback := <-backend.calls
+	if rollback.DisplayName != "before" {
+		t.Fatalf("rollback config = %#v", rollback)
+	}
+	secondBackend := <-backend.calls
+	if secondBackend.DisplayName != "second" {
+		t.Fatalf("second backend config = %#v", secondBackend)
+	}
+	if response := <-secondDone; response.Code != http.StatusOK {
+		t.Fatalf("second status = %d: %s", response.Code, response.Body.String())
+	}
+
+	if got := api.tenantConfigs[configName]; got == nil || got.DisplayName != "second" {
+		t.Fatalf("visible final config = %#v", got)
+	}
+	var durable identityPlatformMetadata
+	if err := store.Load(identityPlatformStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if got := durable.TenantConfigs[configName]; got == nil || got.DisplayName != "second" {
+		t.Fatalf("durable final config = %#v", got)
+	}
+}
+
+func TestPatchTenantConfigSaveFailureRestoresPriorConfig(t *testing.T) {
+	store := &failingIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+	}
+	api := newAPI(newTestAPI().opMgr, store)
+	backend := &fakeAuthBackend{}
+	api.authBackend = backend
+	tenantName := "projects/test/tenants/t1"
+	configName := tenantName + "/config"
+	api.tenants[tenantName] = &Tenant{Name: tenantName}
+	api.tenantConfigs[configName] = &TenantConfig{
+		Name: configName, DisplayName: "before", DisableAuth: false,
+	}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	store.fail = true
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPatch,
+		"/v2/"+configName+"?updateMask=displayName",
+		bytes.NewBufferString(`{"displayName":"after"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if got := api.tenantConfigs[configName]; got == nil || got.DisplayName != "before" {
+		t.Fatalf("visible config after failed save = %#v", got)
+	}
+	if backend.tenantCalls != 2 || backend.lastTenantConfig == nil ||
+		backend.lastTenantConfig.DisplayName != "before" {
+		t.Fatalf("backend rollback calls=%d config=%#v", backend.tenantCalls, backend.lastTenantConfig)
+	}
+}
+
+func TestCorruptStateFailsClosedWithoutOverwritingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt-identity-platform")
+	store, err := state.New(root, "corrupt-identity-platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(identityPlatformStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+
+	api := NewAPI(nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/v2/projects/test/tenants", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var persisted string
+	if err := store.Load(identityPlatformStateEntry, &persisted); err != nil || persisted != "corrupt" {
+		t.Fatalf("corrupt state changed: %q err=%v", persisted, err)
 	}
 }
 
@@ -584,6 +863,14 @@ type failingIdentityPlatformStore struct {
 type postCommitIdentityPlatformStore struct {
 	mockStore
 	failNext bool
+	loadErr  error
+}
+
+func (s *postCommitIdentityPlatformStore) Load(name string, target any) error {
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	return s.mockStore.Load(name, target)
 }
 
 func (s *postCommitIdentityPlatformStore) Save(name string, value any) error {
@@ -625,17 +912,38 @@ func (s *failingIdentityPlatformStore) Save(name string, value any) error {
 }
 
 type fakeAuthBackend struct {
-	projectCalls int
-	tenantCalls  int
+	projectCalls      int
+	tenantCalls       int
+	lastProjectConfig *ProjectConfig
+	lastTenantConfig  *TenantConfig
 }
 
-func (f *fakeAuthBackend) ApplyProjectConfig(context.Context, string, *ProjectConfig) error {
-	f.projectCalls++
+type sequencedAuthBackend struct {
+	calls chan *TenantConfig
+}
+
+func newSequencedAuthBackend() *sequencedAuthBackend {
+	return &sequencedAuthBackend{calls: make(chan *TenantConfig, 8)}
+}
+
+func (b *sequencedAuthBackend) ApplyProjectConfig(context.Context, string, *ProjectConfig) error {
 	return nil
 }
 
-func (f *fakeAuthBackend) ApplyTenantConfig(context.Context, string, string, *TenantConfig) error {
+func (b *sequencedAuthBackend) ApplyTenantConfig(_ context.Context, _, _ string, config *TenantConfig) error {
+	b.calls <- cloneTenantConfig(config)
+	return nil
+}
+
+func (f *fakeAuthBackend) ApplyProjectConfig(_ context.Context, _ string, config *ProjectConfig) error {
+	f.projectCalls++
+	f.lastProjectConfig = cloneProjectConfig(config)
+	return nil
+}
+
+func (f *fakeAuthBackend) ApplyTenantConfig(_ context.Context, _, _ string, config *TenantConfig) error {
 	f.tenantCalls++
+	f.lastTenantConfig = cloneTenantConfig(config)
 	return nil
 }
 

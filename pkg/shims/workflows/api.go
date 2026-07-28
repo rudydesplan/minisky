@@ -75,14 +75,18 @@ type ExecutionError struct {
 
 // API implements the Workflows v1 and Workflow Executions v1 REST shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	stateStore workflowsStateStore
-	workflows  map[string]*Workflow
-	executions map[string]*Execution
-	cancels    map[string]context.CancelFunc
-	revCounter int // monotonic revision counter
+	mu               sync.RWMutex
+	persistMu        sync.Mutex
+	eventExecutionMu sync.Mutex
+	opMgr            *orchestrator.OperationManager
+	stateStore       workflowsStateStore
+	workflows        map[string]*Workflow
+	executions       map[string]*Execution
+	eventAdmissions  map[string]*eventAdmission
+	cancels          map[string]context.CancelFunc
+	revCounter       int // monotonic revision counter
+
+	afterEventAdmission func(string, string) error
 }
 
 // NewAPI creates a new Workflows API shim with persistence.
@@ -92,12 +96,14 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	api := &API{
-		opMgr:      opMgr,
-		stateStore: state.NewGuardedEntryStore(store, err),
-		workflows:  make(map[string]*Workflow),
-		executions: make(map[string]*Execution),
-		cancels:    make(map[string]context.CancelFunc),
+		opMgr:           opMgr,
+		stateStore:      state.NewGuardedEntryStore(store, err),
+		workflows:       make(map[string]*Workflow),
+		executions:      make(map[string]*Execution),
+		eventAdmissions: make(map[string]*eventAdmission),
+		cancels:         make(map[string]context.CancelFunc),
 	}
+	configureEventAdmissionPause(api)
 	if err != nil {
 		log.Printf("[Shim: Workflows] persistence degraded: %v", err)
 		return api
@@ -111,10 +117,11 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 // newTestAPI creates an in-memory API for testing (no persistence).
 func newTestAPI() *API {
 	return &API{
-		opMgr:      orchestrator.NewOperationManager(),
-		workflows:  make(map[string]*Workflow),
-		executions: make(map[string]*Execution),
-		cancels:    make(map[string]context.CancelFunc),
+		opMgr:           orchestrator.NewOperationManager(),
+		workflows:       make(map[string]*Workflow),
+		executions:      make(map[string]*Execution),
+		eventAdmissions: make(map[string]*eventAdmission),
+		cancels:         make(map[string]context.CancelFunc),
 	}
 }
 
@@ -387,6 +394,9 @@ func (api *API) patchWorkflow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteWorkflow(w http.ResponseWriter, r *http.Request) {
+	api.eventExecutionMu.Lock()
+	defer api.eventExecutionMu.Unlock()
+
 	name := parseWorkflowName(r.URL.Path)
 	api.mu.Lock()
 	wf, exists := api.workflows[name]
@@ -397,9 +407,14 @@ func (api *API) deleteWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(api.workflows, name)
 	deletedExecutions := make(map[string]*Execution)
+	deletedAdmissions := make(map[string]*eventAdmission)
 	for executionName, execution := range api.executions {
 		if strings.HasPrefix(executionName, name+"/executions/") {
 			deletedExecutions[executionName] = execution
+			if admission := api.eventAdmissions[executionName]; admission != nil {
+				deletedAdmissions[executionName] = admission
+				delete(api.eventAdmissions, executionName)
+			}
 			delete(api.executions, executionName)
 		}
 	}
@@ -412,6 +427,9 @@ func (api *API) deleteWorkflow(w http.ResponseWriter, r *http.Request) {
 		for executionName, execution := range deletedExecutions {
 			api.executions[executionName] = execution
 		}
+		for executionName, admission := range deletedAdmissions {
+			api.eventAdmissions[executionName] = admission
+		}
 		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
 		return
@@ -421,6 +439,9 @@ func (api *API) deleteWorkflow(w http.ResponseWriter, r *http.Request) {
 		api.workflows[name] = wf
 		for executionName, execution := range deletedExecutions {
 			api.executions[executionName] = execution
+		}
+		for executionName, admission := range deletedAdmissions {
+			api.eventAdmissions[executionName] = admission
 		}
 		api.mu.Unlock()
 		api.compensateMutation(op.Name, err)
@@ -575,13 +596,17 @@ func (api *API) cancelExecution(w http.ResponseWriter, r *http.Request) {
 	}
 	original := deepCopyExecution(exec)
 	workflowsSnapshot, executionsSnapshot, revisionCounter := api.snapshotLocked()
+	originalEventAdmissions := api.eventAdmissionsSnapshotLocked()
+	eventAdmissionsSnapshot := api.eventAdmissionsSnapshotLocked()
 	api.mu.RUnlock()
 	candidate := deepCopyExecution(executionsSnapshot[name])
 	candidate.State = "CANCELLED"
 	candidate.EndTime = time.Now().UTC().Format(time.RFC3339Nano)
 	executionsSnapshot[name] = candidate
+	delete(eventAdmissionsSnapshot, name)
 	metadata := workflowsMetadata{
-		Workflows: workflowsSnapshot, Executions: executionsSnapshot, RevCounter: revisionCounter,
+		Workflows: workflowsSnapshot, Executions: executionsSnapshot,
+		EventAdmissions: eventAdmissionsSnapshot, RevCounter: revisionCounter,
 	}
 	if api.stateStore != nil {
 		if err := api.stateStore.Save(workflowsStateEntry, metadata); err != nil {
@@ -594,7 +619,8 @@ func (api *API) cancelExecution(w http.ResponseWriter, r *http.Request) {
 			}
 			originalExecutions[name] = original
 			if compensationErr := api.stateStore.Save(workflowsStateEntry, workflowsMetadata{
-				Workflows: workflowsSnapshot, Executions: originalExecutions, RevCounter: revisionCounter,
+				Workflows: workflowsSnapshot, Executions: originalExecutions,
+				EventAdmissions: originalEventAdmissions, RevCounter: revisionCounter,
 			}); compensationErr != nil {
 				api.opMgr.MarkPersistenceFailure(fmt.Errorf("cancel compensation save: %w", compensationErr))
 				var durable workflowsMetadata
@@ -613,6 +639,10 @@ func (api *API) cancelExecution(w http.ResponseWriter, r *http.Request) {
 				api.mu.Lock()
 				api.workflows = durable.Workflows
 				api.executions = durable.Executions
+				api.eventAdmissions = durable.EventAdmissions
+				if api.eventAdmissions == nil {
+					api.eventAdmissions = make(map[string]*eventAdmission)
+				}
 				api.revCounter = durable.RevCounter
 				durableExecution := api.executions[name]
 				var cancel context.CancelFunc
@@ -639,17 +669,20 @@ func (api *API) cancelExecution(w http.ResponseWriter, r *http.Request) {
 	if current != nil && current.State == "ACTIVE" {
 		current.State = candidate.State
 		current.EndTime = candidate.EndTime
+		delete(api.eventAdmissions, name)
 		cancel = api.cancels[name]
 	}
 	clone := deepCopyExecution(current)
 	completionWon := current != nil && current.State != "CANCELLED"
 	if completionWon && api.stateStore != nil {
 		workflowsSnapshot, executionsSnapshot, revisionCounter = api.snapshotLocked()
+		eventAdmissionsSnapshot = api.eventAdmissionsSnapshotLocked()
 	}
 	api.mu.Unlock()
 	if completionWon && api.stateStore != nil {
 		if err := api.stateStore.Save(workflowsStateEntry, workflowsMetadata{
-			Workflows: workflowsSnapshot, Executions: executionsSnapshot, RevCounter: revisionCounter,
+			Workflows: workflowsSnapshot, Executions: executionsSnapshot,
+			EventAdmissions: eventAdmissionsSnapshot, RevCounter: revisionCounter,
 		}); err != nil {
 			api.opMgr.MarkPersistenceFailure(err)
 			api.persistMu.Unlock()

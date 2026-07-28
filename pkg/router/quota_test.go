@@ -104,6 +104,26 @@ func TestQuotaDefaultsDisabledAndJSONScopes(t *testing.T) {
 	}
 }
 
+func TestQuotaLimiterOwnsConfigurationSnapshot(t *testing.T) {
+	services := map[string]QuotaRule{
+		"compute.googleapis.com": {Limit: 1, Window: time.Minute},
+	}
+	limiter, err := NewQuotaLimiter(QuotaConfig{Services: services}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	services["compute.googleapis.com"] = QuotaRule{Limit: 100, Window: time.Hour}
+	delete(services, "compute.googleapis.com")
+
+	if decision := limiter.Allow("compute.googleapis.com", "/v1/resources", "demo"); !decision.Allowed {
+		t.Fatalf("first request denied: %#v", decision)
+	}
+	if decision := limiter.Allow("compute.googleapis.com", "/v1/resources", "demo"); decision.Allowed {
+		t.Fatalf("configuration mutation changed live limiter: %#v", decision)
+	}
+}
+
 func TestAuthorizedRequestsConsumeQuotaAfterAuthentication(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
 	limiter, err := NewQuotaLimiter(QuotaConfig{

@@ -22,6 +22,10 @@ type identityPlatformStateStore interface {
 	Save(string, any) error
 }
 
+type durableIdentityPlatformStateReader interface {
+	LoadDurable(string, any) error
+}
+
 type identityPlatformMetadata struct {
 	Tenants         map[string]*Tenant         `json:"tenants"`
 	OAuthIdpConfigs map[string]*OAuthIdpConfig `json:"oauthIdpConfigs"`
@@ -91,7 +95,7 @@ func (api *API) persistState() error {
 
 func (api *API) reconcileProjectConfig(name string, intended *ProjectConfig) (*ProjectConfig, bool, error) {
 	var metadata identityPlatformMetadata
-	if err := api.stateStore.Load(identityPlatformStateEntry, &metadata); err != nil {
+	if err := api.loadDurableState(&metadata); err != nil {
 		if !isNotFound(err) {
 			return nil, false, err
 		}
@@ -106,6 +110,32 @@ func (api *API) reconcileProjectConfig(name string, intended *ProjectConfig) (*P
 	}
 	api.mu.Unlock()
 	return durable, reflect.DeepEqual(durable, intended), nil
+}
+
+func (api *API) reconcileTenantConfig(name string, intended *TenantConfig) (*TenantConfig, bool, error) {
+	var metadata identityPlatformMetadata
+	if err := api.loadDurableState(&metadata); err != nil {
+		if !isNotFound(err) {
+			return nil, false, err
+		}
+		metadata.TenantConfigs = nil
+	}
+	durable := cloneTenantConfig(metadata.TenantConfigs[name])
+	api.mu.Lock()
+	if durable == nil {
+		delete(api.tenantConfigs, name)
+	} else {
+		api.tenantConfigs[name] = cloneTenantConfig(durable)
+	}
+	api.mu.Unlock()
+	return durable, reflect.DeepEqual(durable, intended), nil
+}
+
+func (api *API) loadDurableState(metadata *identityPlatformMetadata) error {
+	if reader, ok := api.stateStore.(durableIdentityPlatformStateReader); ok {
+		return reader.LoadDurable(identityPlatformStateEntry, metadata)
+	}
+	return api.stateStore.Load(identityPlatformStateEntry, metadata)
 }
 
 func (api *API) loadState() error {

@@ -19,6 +19,8 @@ import (
 	"minisky/pkg/state"
 )
 
+var errSimulatedEventAdmissionInterruption = errors.New("simulated interruption after admission")
+
 func TestCreateWorkflow(t *testing.T) {
 	api := newTestAPI()
 	body := `{"sourceContents":"[{\"return\":\"hello\"}]"}`
@@ -965,11 +967,111 @@ func TestCreateExecutionFromEventFailsClosedOnSaveError(t *testing.T) {
 	name := "projects/p/locations/l/workflows/w"
 	api.workflows[name] = &Workflow{Name: name, State: "ACTIVE", RevisionID: "1", SourceContents: `[{"return":"ok"}]`}
 
-	if err := api.CreateExecutionFromEvent(name, `{}`); err == nil {
+	if err := api.CreateExecutionFromEvent(name, `{}`, "delivery-1"); err == nil {
 		t.Fatal("expected persistence error")
 	}
 	if len(api.executions) != 0 {
 		t.Fatal("failed event execution must be rolled back")
+	}
+}
+
+func TestCreateExecutionFromEventIsIdempotentByDeliveryID(t *testing.T) {
+	api := newTestAPI()
+	name := "projects/p/locations/l/workflows/w"
+	api.workflows[name] = &Workflow{
+		Name: name, State: "ACTIVE", RevisionID: "1",
+		SourceContents: `[{"return":"ok"}]`,
+	}
+
+	if err := api.CreateExecutionFromEvent(name, `{"nonce":"phase18"}`, "delivery-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.CreateExecutionFromEvent(name, `{"nonce":"phase18"}`, "delivery-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.executions) != 1 {
+		t.Fatalf("executions = %d, want one idempotent execution resource", len(api.executions))
+	}
+	execution := api.executions[name+"/executions/event-delivery-1"]
+	if execution == nil || execution.State != "SUCCEEDED" || execution.Result != `"ok"` {
+		t.Fatalf("execution = %#v, want terminal result", execution)
+	}
+	if err := api.CreateExecutionFromEvent(name, `{"nonce":"different"}`, "delivery-1"); err == nil {
+		t.Fatal("delivery ID collision with a different payload was accepted")
+	}
+}
+
+func TestEventAdmissionInterruptedBeforeStartResumesSameExecutionAfterReload(t *testing.T) {
+	store := &postCommitWorkflowStore{data: make(map[string][]byte)}
+	name := "projects/p/locations/l/workflows/w"
+	first := newTestAPI()
+	first.stateStore = store
+	first.workflows[name] = &Workflow{
+		Name: name, State: "ACTIVE", RevisionID: "1",
+		SourceContents: `[{"return":"${args}"}]`,
+	}
+	first.afterEventAdmission = func(executionName, deliveryID string) error {
+		if executionName != name+"/executions/event-delivery-1" || deliveryID != "delivery-1" {
+			t.Fatalf("admission = (%q, %q)", executionName, deliveryID)
+		}
+		return errSimulatedEventAdmissionInterruption
+	}
+	payload := `{"nonce":"resume"}`
+	if err := first.CreateExecutionFromEvent(name, payload, "delivery-1"); !errors.Is(err, errSimulatedEventAdmissionInterruption) {
+		t.Fatalf("admission error = %v", err)
+	}
+
+	restarted := newTestAPI()
+	restarted.stateStore = store
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.CreateExecutionFromEvent(name, payload, "delivery-1"); err != nil {
+		t.Fatal(err)
+	}
+	executionName := name + "/executions/event-delivery-1"
+	execution := restarted.executions[executionName]
+	if execution == nil || execution.Name != executionName || execution.State != "SUCCEEDED" ||
+		execution.Result != payload {
+		t.Fatalf("resumed execution = %#v", execution)
+	}
+	if len(restarted.executions) != 1 {
+		t.Fatalf("execution resources = %d, want one", len(restarted.executions))
+	}
+}
+
+func TestRunningEventExecutionInterruptedDoesNotReportSuccessAfterReload(t *testing.T) {
+	store := &postCommitWorkflowStore{data: make(map[string][]byte)}
+	name := "projects/p/locations/l/workflows/w"
+	executionName := name + "/executions/event-delivery-1"
+	store.seed(t, workflowsMetadata{
+		Workflows: map[string]*Workflow{name: {
+			Name: name, State: "ACTIVE", RevisionID: "1",
+			SourceContents: `[{"return":"unsafe-to-repeat"}]`,
+		}},
+		Executions: map[string]*Execution{executionName: {
+			Name: executionName, State: "ACTIVE", Argument: `{"nonce":"running"}`,
+			WorkflowRevisionID: "1",
+		}},
+		EventAdmissions: map[string]*eventAdmission{executionName: {
+			DeliveryID: "delivery-1", Phase: eventAdmissionRunning,
+		}},
+	})
+
+	restarted := newTestAPI()
+	restarted.stateStore = store
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	execution := restarted.executions[executionName]
+	if execution == nil || execution.State != "FAILED" || execution.Result != "" {
+		t.Fatalf("interrupted execution = %#v", execution)
+	}
+	if err := restarted.CreateExecutionFromEvent(name, `{"nonce":"running"}`, "delivery-1"); err == nil {
+		t.Fatal("interrupted running execution was reported as successful")
+	}
+	if len(restarted.executions) != 1 {
+		t.Fatalf("execution resources = %d, want one non-success resource", len(restarted.executions))
 	}
 }
 
@@ -1089,6 +1191,17 @@ type postCommitWorkflowStore struct {
 	mu       sync.Mutex
 	data     map[string][]byte
 	failNext bool
+}
+
+func (s *postCommitWorkflowStore) seed(t *testing.T, metadata workflowsMetadata) {
+	t.Helper()
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.data[workflowsStateEntry] = raw
+	s.mu.Unlock()
 }
 
 type ambiguousCancelWorkflowStore struct {

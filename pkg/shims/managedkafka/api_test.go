@@ -803,6 +803,11 @@ func TestPersistAndReload(t *testing.T) {
 	if cluster.BootstrapAddress != "127.0.0.1:19092" {
 		t.Fatalf("rehydrated cluster has broker address %q", cluster.BootstrapAddress)
 	}
+	backend := api2.backend.(*fakeKafkaBackend)
+	if backend.provisionCalls != 0 || backend.reconcileCalls != 1 {
+		t.Fatalf("restart provision calls = %d, reconcile calls = %d; want 0 and 1",
+			backend.provisionCalls, backend.reconcileCalls)
+	}
 	topic, ok := api2.topics["projects/p/locations/l/clusters/c1/topics/t1"]
 	if !ok {
 		t.Fatal("topic not found after reload")
@@ -811,6 +816,38 @@ func TestPersistAndReload(t *testing.T) {
 		t.Fatalf("expected partitionCount=6, got %d", topic.PartitionCount)
 	}
 	api2.mu.RUnlock()
+}
+
+func TestReloadGivesEachKafkaResourceAFairReconcileBudget(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	clusters := make(map[string]*Cluster)
+	for _, id := range []string{"a", "b", "c"} {
+		name := "projects/p/locations/l/clusters/" + id
+		clusters[name] = &Cluster{Name: name, State: "ACTIVE"}
+	}
+	if err := store.Save(managedKafkaStateEntry, managedKafkaMetadata{Clusters: clusters}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &budgetKafkaBackend{}
+	api := &API{
+		opMgr:            orchestrator.NewOperationManager(),
+		stateStore:       store,
+		clusters:         make(map[string]*Cluster),
+		topics:           make(map[string]*Topic),
+		backend:          backend,
+		reconcileTimeout: 10 * time.Millisecond,
+	}
+	start := time.Now()
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if backend.reconcileCalls != 3 {
+		t.Fatalf("reconcile calls = %d, want 3", backend.reconcileCalls)
+	}
+	if elapsed < 20*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("reconciliation elapsed = %v, want independent bounded budgets", elapsed)
+	}
 }
 
 func TestConcurrentCreateAndGet(t *testing.T) {
@@ -860,12 +897,42 @@ type mockStore struct {
 }
 
 type fakeKafkaBackend struct {
-	bootstrap   string
-	deleteCalls int
+	bootstrap      string
+	provisionCalls int
+	reconcileCalls int
+	deleteCalls    int
+}
+
+type budgetKafkaBackend struct {
+	reconcileCalls int
+}
+
+func (*budgetKafkaBackend) Provision(context.Context, string) (string, error) {
+	return "", nil
+}
+func (b *budgetKafkaBackend) Reconcile(ctx context.Context, _ string) (string, bool, error) {
+	b.reconcileCalls++
+	<-ctx.Done()
+	return "", false, ctx.Err()
+}
+func (*budgetKafkaBackend) Delete(context.Context, string) error { return nil }
+func (*budgetKafkaBackend) CreateTopic(context.Context, string, *Topic) error {
+	return nil
+}
+func (*budgetKafkaBackend) UpdateTopic(context.Context, string, *Topic) error {
+	return nil
+}
+func (*budgetKafkaBackend) DeleteTopic(context.Context, string, string) error {
+	return nil
 }
 
 func (b *fakeKafkaBackend) Provision(context.Context, string) (string, error) {
+	b.provisionCalls++
 	return b.bootstrap, nil
+}
+func (b *fakeKafkaBackend) Reconcile(context.Context, string) (string, bool, error) {
+	b.reconcileCalls++
+	return b.bootstrap, b.bootstrap != "", nil
 }
 func (b *fakeKafkaBackend) Delete(context.Context, string) error {
 	b.deleteCalls++

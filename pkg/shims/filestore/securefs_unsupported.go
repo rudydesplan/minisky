@@ -18,6 +18,9 @@ func secureRename(string, string, string) error {
 func secureTreeUsage(string, string, int, int64) (int, int64, error) {
 	return 0, 0, errSecureFilesystemUnsupported
 }
+func secureDirectoryExists(string, string) (bool, error) {
+	return false, errSecureFilesystemUnsupported
+}
 func secureFileSize(string, string) (int64, bool, error) {
 	return 0, false, errSecureFilesystemUnsupported
 }

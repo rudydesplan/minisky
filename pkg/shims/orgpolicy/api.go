@@ -110,8 +110,12 @@ func (api *API) seedConstraints() {
 
 // ServeHTTP routes requests to the appropriate handler.
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Shim: Org Policy] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if !canonicalOrgPolicyRequestPath(r) {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "non-canonical Org Policy request path")
+		return
+	}
+	log.Printf("[Shim: Org Policy] %s %s", r.Method, r.URL.Path)
 
 	path := r.URL.Path
 
@@ -193,6 +197,13 @@ func (api *API) listConstraints(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) routePolicies(w http.ResponseWriter, r *http.Request) {
+	collection, valid := canonicalPolicyRoute(r.URL.Path)
+	if !valid ||
+		(r.Method == http.MethodPost && !collection) ||
+		((r.Method == http.MethodPatch || r.Method == http.MethodDelete) && collection) {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid canonical policy route")
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		api.createPolicy(w, r)
@@ -211,6 +222,41 @@ func (api *API) routePolicies(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func canonicalOrgPolicyRequestPath(request *http.Request) bool {
+	if request.URL.RawPath != "" || strings.Contains(request.URL.EscapedPath(), "%") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(request.URL.Path, "/"), "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.Contains(part, `\`) {
+			return false
+		}
+		for _, character := range part {
+			if character < 0x20 || character == 0x7f {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func canonicalPolicyRoute(path string) (collection, valid bool) {
+	if !strings.HasPrefix(path, "/v2/") {
+		return false, false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/v2/"), "/")
+	if len(parts) != 3 && len(parts) != 4 {
+		return false, false
+	}
+	if parts[0] != "projects" || !validPolicyScopeSegment(parts[1]) || parts[2] != "policies" {
+		return false, false
+	}
+	if len(parts) == 3 {
+		return true, true
+	}
+	return false, validPolicyID(parts[3])
+}
+
 func (api *API) createPolicy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
@@ -225,9 +271,10 @@ func (api *API) createPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate name format: projects/{p}/policies/{constraintName}
-	if !strings.Contains(resource.Name, "/policies/") {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid policy name format")
+	_, ok := policyConstraintForRequest(r.URL.Path, resource.Name)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"policy name must exactly match the request project")
 		return
 	}
 
@@ -318,6 +365,10 @@ func (api *API) listPolicies(w http.ResponseWriter, r *http.Request) {
 func (api *API) patchPolicy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := parsePolicyName(r.URL.Path)
+	if _, ok := policyConstraintForRequest(r.URL.Path, name); !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid canonical policy name")
+		return
+	}
 
 	api.mu.Lock()
 	existing, ok := api.policies[name]
@@ -357,6 +408,10 @@ func (api *API) patchPolicy(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) deletePolicy(w http.ResponseWriter, r *http.Request) {
 	name := parsePolicyName(r.URL.Path)
+	if _, ok := policyConstraintForRequest(r.URL.Path, name); !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid canonical policy name")
+		return
+	}
 
 	api.mu.Lock()
 	resource, exists := api.policies[name]
@@ -413,6 +468,69 @@ func isCollectionPath(path string) bool {
 	// If path is like projects/{p}/policies (no trailing segment after policies)
 	parts := strings.Split(trimmed, "/")
 	return len(parts) >= 2 && parts[len(parts)-1] == "policies"
+}
+
+func policyConstraintForRequest(path, policyName string) (string, bool) {
+	parent := parsePolicyParent(path)
+	parentParts := strings.Split(parent, "/")
+	if len(parentParts) != 2 || parentParts[0] != "projects" ||
+		!validPolicyScopeSegment(parentParts[1]) {
+		return "", false
+	}
+	prefix := parent + "/policies/"
+	if !strings.HasPrefix(policyName, prefix) {
+		return "", false
+	}
+	policyID := strings.TrimPrefix(policyName, prefix)
+	if !validPolicyID(policyID) {
+		return "", false
+	}
+	return "constraints/" + policyID, true
+}
+
+func validPolicyID(policyID string) bool {
+	if policyID == "" || !policyIDAlphaNumeric(rune(policyID[0])) ||
+		!policyIDAlphaNumeric(rune(policyID[len(policyID)-1])) {
+		return false
+	}
+	previousSeparator := false
+	for _, character := range policyID {
+		if policyIDAlphaNumeric(character) {
+			previousSeparator = false
+			continue
+		}
+		if character != '.' && character != '_' && character != '-' {
+			return false
+		}
+		if previousSeparator {
+			return false
+		}
+		previousSeparator = true
+	}
+	return true
+}
+
+func policyIDAlphaNumeric(character rune) bool {
+	return (character >= 'a' && character <= 'z') ||
+		(character >= 'A' && character <= 'Z') ||
+		(character >= '0' && character <= '9')
+}
+
+func validPolicyScopeSegment(segment string) bool {
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for index, character := range segment {
+		alphaNumeric := (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9')
+		if !alphaNumeric && character != '-' {
+			return false
+		}
+		if (index == 0 || index == len(segment)-1) && !alphaNumeric {
+			return false
+		}
+	}
+	return true
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

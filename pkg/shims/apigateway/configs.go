@@ -243,6 +243,11 @@ func (api *API) proxyForResource(resourceName string) (http.Handler, error) {
 		return nil, err
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	direct := proxy.Director
+	proxy.Director = func(request *http.Request) {
+		direct(request)
+		request.Host = target.Host
+	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
 		writeError(w, http.StatusBadGateway, "UNAVAILABLE", "local API backend unavailable")
 	}

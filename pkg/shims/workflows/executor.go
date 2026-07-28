@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -32,11 +33,19 @@ var noRedirectClient = &http.Client{
 // ExecuteWorkflow runs a workflow's source contents asynchronously and updates execution state.
 func (api *API) ExecuteWorkflow(ctx context.Context, execName, sourceContents, argument string) {
 	defer api.finishExecution(execName)
+	if err := api.executeWorkflow(ctx, execName, sourceContents, argument); err != nil {
+		log.Printf("[Workflows] execution %s failed: %v", execName, err)
+	}
+}
+
+func (api *API) executeWorkflow(ctx context.Context, execName, sourceContents, argument string) error {
 	result, err := runWorkflow(ctx, sourceContents, argument)
 
 	api.mu.Lock()
 	exec := api.executions[execName]
+	updated := false
 	if exec != nil && exec.State == "ACTIVE" {
+		updated = true
 		exec.EndTime = time.Now().UTC().Format(time.RFC3339Nano)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -53,49 +62,165 @@ func (api *API) ExecuteWorkflow(ctx context.Context, execName, sourceContents, a
 			exec.Result = result
 		}
 	}
+	delete(api.eventAdmissions, execName)
 	api.mu.Unlock()
-
-	if err := api.persistState(); err != nil {
-		log.Printf("[Workflows] persist execution outcome failed: %v", err)
+	if !updated && err == nil {
+		err = fmt.Errorf("execution %q did not remain active through completion", execName)
 	}
+
+	if persistErr := api.persistState(); persistErr != nil {
+		return fmt.Errorf("persist execution outcome: %w", persistErr)
+	}
+	return err
 }
 
 // CreateExecutionFromEvent implements the Eventarc WorkflowsExecutor interface.
-func (api *API) CreateExecutionFromEvent(workflowName, eventPayload string) error {
+// The stable delivery ID makes admission idempotent across daemon restarts.
+func (api *API) CreateExecutionFromEvent(workflowName, eventPayload, deliveryID string) error {
+	if !validEventDeliveryID(deliveryID) {
+		return fmt.Errorf("invalid Eventarc delivery ID")
+	}
+	api.eventExecutionMu.Lock()
+	defer api.eventExecutionMu.Unlock()
+
 	api.mu.RLock()
 	wf := api.workflows[workflowName]
+	if wf != nil {
+		wf = deepCopyWorkflow(wf)
+	}
 	api.mu.RUnlock()
 	if wf == nil {
 		return fmt.Errorf("workflow not found: %s", workflowName)
 	}
 
-	execID := fmt.Sprintf("event-%d", time.Now().UnixNano())
+	execID := "event-" + deliveryID
 	execName := fmt.Sprintf("%s/executions/%s", workflowName, execID)
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	exec := &Execution{
-		Name:               execName,
-		StartTime:          now,
-		State:              "ACTIVE",
-		Argument:           eventPayload,
-		WorkflowRevisionID: wf.RevisionID,
+	sourceContents := wf.SourceContents
+	api.mu.RLock()
+	existing := api.executions[execName]
+	admission := api.eventAdmissions[execName]
+	if existing != nil {
+		existing = deepCopyExecution(existing)
+	}
+	if admission != nil {
+		clone := *admission
+		admission = &clone
+	}
+	api.mu.RUnlock()
+	if existing != nil {
+		if existing.Argument != eventPayload {
+			return fmt.Errorf("Eventarc delivery ID %q conflicts with an existing execution", deliveryID)
+		}
+		switch existing.State {
+		case "SUCCEEDED":
+			return nil
+		case "ACTIVE":
+			if admission == nil || admission.DeliveryID != deliveryID ||
+				admission.Phase != eventAdmissionAdmitted {
+				return fmt.Errorf("Eventarc execution %q is active but not safely resumable", execName)
+			}
+			if existing.WorkflowRevisionID != wf.RevisionID {
+				return fmt.Errorf("Eventarc execution %q workflow revision changed before resume", execName)
+			}
+		default:
+			return fmt.Errorf("Eventarc execution %q is terminal with state %s", execName, existing.State)
+		}
+	}
+
+	if existing == nil {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		exec := &Execution{
+			Name:               execName,
+			StartTime:          now,
+			State:              "ACTIVE",
+			Argument:           eventPayload,
+			WorkflowRevisionID: wf.RevisionID,
+		}
+
+		api.mu.Lock()
+		api.executions[execName] = exec
+		api.eventAdmissions[execName] = &eventAdmission{
+			DeliveryID: deliveryID,
+			Phase:      eventAdmissionAdmitted,
+		}
+		api.mu.Unlock()
+
+		if err := api.persistState(); err != nil {
+			api.mu.Lock()
+			delete(api.executions, execName)
+			delete(api.eventAdmissions, execName)
+			api.mu.Unlock()
+			api.compensateState(err)
+			return fmt.Errorf("persist event execution admission: %w", err)
+		}
+		if api.afterEventAdmission != nil {
+			if err := api.afterEventAdmission(execName, deliveryID); err != nil {
+				return err
+			}
+		}
 	}
 
 	api.mu.Lock()
-	api.executions[execName] = exec
-	api.mu.Unlock()
-
-	if err := api.persistState(); err != nil {
-		api.mu.Lock()
-		delete(api.executions, execName)
+	currentAdmission := api.eventAdmissions[execName]
+	if currentAdmission == nil || currentAdmission.DeliveryID != deliveryID ||
+		currentAdmission.Phase != eventAdmissionAdmitted {
 		api.mu.Unlock()
+		return fmt.Errorf("Eventarc execution %q admission is not safely resumable", execName)
+	}
+	currentAdmission.Phase = eventAdmissionRunning
+	api.mu.Unlock()
+	if err := api.persistState(); err != nil {
 		api.compensateState(err)
-		return fmt.Errorf("persist event execution: %w", err)
+		return fmt.Errorf("persist event execution start: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	api.startExecution(execName, cancel)
-	go api.ExecuteWorkflow(ctx, execName, wf.SourceContents, eventPayload)
-	return nil
+	defer api.finishExecution(execName)
+	return api.executeWorkflow(ctx, execName, sourceContents, eventPayload)
+}
+
+const eventAdmissionPauseFileEnv = "MINISKY_TEST_WORKFLOWS_ADMISSION_PAUSE_FILE"
+
+func configureEventAdmissionPause(api *API) {
+	pauseFile := strings.TrimSpace(os.Getenv(eventAdmissionPauseFileEnv))
+	if pauseFile == "" || os.Getenv("MINISKY_PHASE18_EVENT_DELIVERY_INTEGRATION") != "1" {
+		return
+	}
+	api.afterEventAdmission = func(executionName, deliveryID string) error {
+		marker, err := json.Marshal(map[string]string{
+			"deliveryId":    deliveryID,
+			"executionName": executionName,
+		})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(pauseFile, marker, 0o600); err != nil {
+			return fmt.Errorf("write Eventarc admission pause marker: %w", err)
+		}
+		releaseFile := pauseFile + ".release"
+		for {
+			if _, err := os.Stat(releaseFile); err == nil {
+				return nil
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("inspect Eventarc admission release marker: %w", err)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+}
+
+func validEventDeliveryID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+			!(r >= '0' && r <= '9') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // runWorkflow interprets a JSON workflow definition.

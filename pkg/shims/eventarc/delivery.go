@@ -1,6 +1,7 @@
 package eventarc
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ const (
 	maxPersistedDeliveries = 4096
 	maxPersistedPayloads   = 16 << 20
 	deliveryQueueSize      = 64
+	maxDeliveryIDAttempts  = 8
 	pubSubPublishedType    = "google.cloud.pubsub.topic.v1.messagePublished"
 )
 
@@ -24,6 +26,7 @@ var (
 	errEventPayloadTooLarge     = errors.New("event payload exceeds 256 KiB limit")
 	errTooManyMatchingTriggers  = errors.New("event matches too many triggers")
 	errDeliveryCapacityExceeded = errors.New("event delivery capacity exceeded")
+	errDeliveryIDUnavailable    = errors.New("event delivery ID unavailable")
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +43,7 @@ type CloudEvent struct {
 
 // WorkflowsExecutor is implemented by the workflows shim to receive events.
 type WorkflowsExecutor interface {
-	CreateExecutionFromEvent(workflowName, eventPayload string) error
+	CreateExecutionFromEvent(workflowName, eventPayload, deliveryID string) error
 }
 
 // Delivery is a durable at-least-once delivery outcome. ATTEMPTING and FAILED
@@ -109,10 +112,24 @@ func (api *API) HandleEventWithAck(eventType, resource, payload string) error {
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].Name < matches[j].Name })
 
-	payloadID := generateUUID()
-	ids := make([]string, 0, len(matches))
+	if api.afterMatch != nil {
+		api.afterMatch()
+	}
+
 	api.mu.Lock()
-	if len(api.deliveries)+len(matches) > maxPersistedDeliveries {
+	currentMatches := make([]*Trigger, 0, len(matches))
+	for _, matched := range matches {
+		current := api.triggers[matched.Name]
+		if current != nil && current.Destination != nil && current.Destination.Workflow != "" &&
+			matchesTrigger(current, eventType, resource) {
+			currentMatches = append(currentMatches, current)
+		}
+	}
+	if len(currentMatches) == 0 {
+		api.mu.Unlock()
+		return nil
+	}
+	if len(api.deliveries)+len(currentMatches) > maxPersistedDeliveries {
 		api.mu.Unlock()
 		return errDeliveryCapacityExceeded
 	}
@@ -130,15 +147,56 @@ func (api *API) HandleEventWithAck(eventType, resource, payload string) error {
 	if api.deliveries == nil {
 		api.deliveries = make(map[string]*Delivery)
 	}
+	generator := api.newDeliveryID
+	if generator == nil {
+		generator = secureDeliveryID
+	}
+	reserved := make(map[string]struct{}, len(currentMatches)+1)
+	nextID := func() (string, error) {
+		for attempt := 0; attempt < maxDeliveryIDAttempts; attempt++ {
+			id, err := generator()
+			if err != nil {
+				return "", fmt.Errorf("%w: %v", errDeliveryIDUnavailable, err)
+			}
+			if !validDeliveryID(id) {
+				continue
+			}
+			if _, exists := api.payloads[id]; exists {
+				continue
+			}
+			if _, exists := api.deliveries[id]; exists {
+				continue
+			}
+			if _, exists := reserved[id]; exists {
+				continue
+			}
+			reserved[id] = struct{}{}
+			return id, nil
+		}
+		return "", errDeliveryIDUnavailable
+	}
+	payloadID, err := nextID()
+	if err != nil {
+		api.mu.Unlock()
+		return err
+	}
+	ids := make([]string, 0, len(currentMatches))
+	for range currentMatches {
+		id, err := nextID()
+		if err != nil {
+			api.mu.Unlock()
+			return err
+		}
+		ids = append(ids, id)
+	}
 	api.payloads[payloadID] = payload
-	for _, trigger := range matches {
+	for index, trigger := range currentMatches {
 		log.Printf("[Eventarc] Trigger matched: %s", trigger.Name)
-		id := generateUUID()
+		id := ids[index]
 		api.deliveries[id] = &Delivery{
 			ID: id, Trigger: trigger.Name, Workflow: trigger.Destination.Workflow,
 			EventType: eventType, Resource: resource, PayloadRef: payloadID, State: "ATTEMPTING",
 		}
-		ids = append(ids, id)
 	}
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
@@ -154,6 +212,17 @@ func (api *API) HandleEventWithAck(eventType, resource, payload string) error {
 		api.enqueueDelivery(id)
 	}
 	return nil
+}
+
+func secureDeliveryID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
 }
 
 func (api *API) enqueueDelivery(id string) {
@@ -190,7 +259,7 @@ func (api *API) attemptDelivery(id string) error {
 	if exec == nil {
 		err = fmt.Errorf("workflows executor unavailable")
 	} else {
-		err = exec.CreateExecutionFromEvent(workflow, payload)
+		err = exec.CreateExecutionFromEvent(workflow, payload, id)
 	}
 
 	api.mu.Lock()

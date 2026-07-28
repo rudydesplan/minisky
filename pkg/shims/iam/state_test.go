@@ -31,10 +31,11 @@ func TestIAMMetadataSurvivesRestart(t *testing.T) {
 		t.Fatalf("create status = %d, body = %s", response.Code, response.Body.String())
 	}
 	setTestPolicy(t, api, []Binding{{
-		Role:    "roles/storage.objectViewer",
+		Role:    "roles/minisky.viewer",
 		Members: []string{"user:alice@example.com"},
 	}})
 
+	t.Setenv("MINISKY_IAM_MODE", "strict")
 	restarted, err := NewAPIWithStore(store)
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +51,12 @@ func TestIAMMetadataSurvivesRestart(t *testing.T) {
 	decodeResponse(t, response, &account)
 	if account.DisplayName != "Worker" {
 		t.Fatalf("display name = %q, want Worker", account.DisplayName)
+	}
+	if !restarted.Authorize("projects/test-project", "user:alice@example.com", "minisky.dashboard.view") {
+		t.Fatal("persisted viewer binding did not authorize after restart")
+	}
+	if restarted.Authorize("projects/test-project", "user:alice@example.com", "minisky.dashboard.manage") {
+		t.Fatal("persisted viewer binding elevated after restart")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"minisky/pkg/state"
@@ -15,6 +16,7 @@ import (
 func TestApiConfigHierarchyAndLoopbackProxy(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Backend-Path", r.URL.Path)
+		w.Header().Set("X-Backend-Host", r.Host)
 		_, _ = w.Write([]byte("proxied"))
 	}))
 	defer backend.Close()
@@ -38,12 +40,17 @@ func TestApiConfigHierarchyAndLoopbackProxy(t *testing.T) {
 		t.Fatalf("GatewayProxy: %v", err)
 	}
 	proxyRec := httptest.NewRecorder()
-	handler.ServeHTTP(proxyRec, httptest.NewRequest(http.MethodGet, "/hello?x=1", nil))
+	proxyReq := httptest.NewRequest(http.MethodGet, "/hello?x=1", nil)
+	proxyReq.Host = "metadata.google.internal"
+	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusOK || proxyRec.Body.String() != "proxied" {
 		t.Fatalf("proxy status=%d body=%q", proxyRec.Code, proxyRec.Body.String())
 	}
 	if proxyRec.Header().Get("X-Backend-Path") != "/hello" {
 		t.Fatalf("backend path=%q", proxyRec.Header().Get("X-Backend-Path"))
+	}
+	if got, want := proxyRec.Header().Get("X-Backend-Host"), strings.TrimPrefix(backend.URL, "http://"); got != want {
+		t.Fatalf("backend host=%q, want pinned loopback host %q", got, want)
 	}
 
 	deleteGateway := httptest.NewRecorder()

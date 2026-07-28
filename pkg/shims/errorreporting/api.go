@@ -17,6 +17,8 @@ import (
 	"minisky/pkg/state"
 )
 
+const maxRetainedEventsPerGroup = 100
+
 func init() {
 	registry.Register("clouderrorreporting.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI()
@@ -86,11 +88,12 @@ type ErrorGroupInfo struct {
 
 // API implements the Error Reporting v1beta1 REST shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	stateStore errorreportingStateStore
-	groups     map[string]*ErrorGroupStats // key: projectId:groupId
-	events     map[string][]ErrorEvent     // key: projectId:groupId
+	mu             sync.RWMutex
+	persistMu      sync.Mutex
+	stateStore     errorreportingStateStore
+	groups         map[string]*ErrorGroupStats // key: projectId:groupId
+	events         map[string][]ErrorEvent     // key: projectId:groupId
+	persistenceErr error
 }
 
 // NewAPI creates a new Error Reporting API shim with persistence.
@@ -102,6 +105,7 @@ func NewAPI() *API {
 		events:     make(map[string][]ErrorEvent),
 	}
 	if err != nil {
+		api.persistenceErr = err
 		log.Printf("[Shim: Error Reporting] persistence degraded: %v", err)
 		return api
 	}
@@ -173,6 +177,12 @@ func (api *API) reportEvent(w http.ResponseWriter, r *http.Request) {
 
 	api.persistMu.Lock()
 	api.mu.Lock()
+	if api.persistenceErr != nil {
+		api.mu.Unlock()
+		api.persistMu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Error Reporting persistence is unavailable")
+		return
+	}
 	groupsBefore := make(map[string]*ErrorGroupStats, len(api.groups))
 	for groupKey, group := range api.groups {
 		groupsBefore[groupKey] = deepCopyGroupStats(group)
@@ -207,7 +217,11 @@ func (api *API) reportEvent(w http.ResponseWriter, r *http.Request) {
 	group.Count = strconv.FormatInt(count, 10)
 	group.LastSeenTime = event.EventTime
 
-	api.events[key] = append(api.events[key], event)
+	retained := append(api.events[key], event)
+	if len(retained) > maxRetainedEventsPerGroup {
+		retained = retained[len(retained)-maxRetainedEventsPerGroup:]
+	}
+	api.events[key] = retained
 	api.mu.Unlock()
 
 	if api.stateStore != nil {
@@ -229,6 +243,7 @@ func (api *API) reportEvent(w http.ResponseWriter, r *http.Request) {
 			api.mu.Lock()
 			api.groups = groupsBefore
 			api.events = eventsBefore
+			api.persistenceErr = fmt.Errorf("persist Error Reporting event: %w", err)
 			api.mu.Unlock()
 			api.persistMu.Unlock()
 			writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
@@ -240,6 +255,12 @@ func (api *API) reportEvent(w http.ResponseWriter, r *http.Request) {
 	// events:report returns empty {} on success
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{})
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
 }
 
 // listGroupStats handles GET /v1beta1/projects/{projectId}/groupStats

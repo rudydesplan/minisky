@@ -274,6 +274,34 @@ func (handler *shutdownFuncHandler) Shutdown(ctx context.Context) error {
 	return handler.shutdown(ctx)
 }
 
+func TestShutdownPluginsContainsLifecyclePanic(t *testing.T) {
+	persisted := false
+	err := shutdownPlugins(context.Background(), map[string]http.Handler{
+		"panic.example": &shutdownFuncHandler{
+			Handler: http.NotFoundHandler(),
+			shutdown: func(context.Context) error {
+				panic("plugin secret must not escape")
+			},
+		},
+		"persistence.example": &shutdownFuncHandler{
+			Handler: http.NotFoundHandler(),
+			shutdown: func(context.Context) error {
+				persisted = true
+				return nil
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "panic.example: plugin shutdown panicked") {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if strings.Contains(err.Error(), "plugin secret") {
+		t.Fatalf("shutdown error leaked panic value: %v", err)
+	}
+	if !persisted {
+		t.Fatal("plugin panic starved another shutdown hook")
+	}
+}
+
 func TestShutdownPluginsDoesNotStarvePersistenceBehindBlockedPlugin(t *testing.T) {
 	blockedStarted := make(chan struct{})
 	releaseBlocked := make(chan struct{})

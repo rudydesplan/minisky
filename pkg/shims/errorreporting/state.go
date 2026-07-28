@@ -89,11 +89,27 @@ func (api *API) loadState() error {
 		}
 		return err
 	}
+	migrated := false
+	for key, events := range meta.Events {
+		if len(events) <= maxRetainedEventsPerGroup {
+			continue
+		}
+		start := len(events) - maxRetainedEventsPerGroup
+		meta.Events[key] = append([]ErrorEvent(nil), events[start:]...)
+		migrated = true
+	}
 	if meta.Groups != nil {
 		api.groups = meta.Groups
 	}
 	if meta.Events != nil {
 		api.events = meta.Events
+	}
+	if migrated {
+		if err := api.stateStore.Save(errorreportingStateEntry, meta); err != nil {
+			migrationErr := fmt.Errorf("persist Error Reporting event retention migration: %w", err)
+			api.persistenceErr = migrationErr
+			return migrationErr
+		}
 	}
 	return nil
 }

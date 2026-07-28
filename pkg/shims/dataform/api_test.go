@@ -340,6 +340,44 @@ func TestCompileAndInvokeEmptyWorkspaceDurably(t *testing.T) {
 	}
 }
 
+func TestCompilationPersistenceFailureDoesNotConsumeID(t *testing.T) {
+	store := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: fmt.Errorf("disk full")},
+	}
+	guarded := state.NewGuardedEntryStore(store, nil)
+	api := newAPI(newTestAPI().opMgr, guarded)
+	repoName := "projects/test/locations/us-central1/repositories/r1"
+	workspaceName := repoName + "/workspaces/ws1"
+	api.repositories[repoName] = &Repository{Name: repoName}
+	api.workspaces[workspaceName] = &Workspace{Name: workspaceName}
+
+	request := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+			"/v1beta1/"+repoName+"/compilationResults",
+			bytes.NewBufferString(`{"workspace":"`+workspaceName+`"}`)))
+		return response
+	}
+	if response := request(); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want 503: %s", response.Code, response.Body.String())
+	}
+	if api.nextCompilationID != 1 || len(api.compilationResults) != 0 {
+		t.Fatalf("rollback left nextCompilationID=%d results=%d, want 1 and 0",
+			api.nextCompilationID, len(api.compilationResults))
+	}
+	if guarded.Degraded() == nil {
+		t.Fatal("failed save did not degrade GuardedEntryStore")
+	}
+	if response := request(); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want sticky 503: %s", response.Code, response.Body.String())
+	}
+	if api.nextCompilationID != 1 || len(api.compilationResults) != 0 || store.saveCalls != 1 {
+		t.Fatalf("sticky failure changed counter=%d results=%d delegate saves=%d",
+			api.nextCompilationID, len(api.compilationResults), store.saveCalls)
+	}
+}
+
 func TestCompilationRejectsForeignWorkspaceBeforeMutation(t *testing.T) {
 	api := newTestAPI()
 	repoName := "projects/test/locations/us-central1/repositories/r1"
@@ -436,8 +474,10 @@ func TestConcurrentWorkspaceCreateAndParentDeleteNeverOrphans(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type mockStore struct {
-	mu   sync.Mutex
-	data map[string][]byte
+	mu         sync.Mutex
+	data       map[string][]byte
+	failOnSave map[int]error
+	saveCalls  int
 }
 
 func (m *mockStore) Load(name string, target any) error {
@@ -453,6 +493,10 @@ func (m *mockStore) Load(name string, target any) error {
 func (m *mockStore) Save(name string, value any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.saveCalls++
+	if err := m.failOnSave[m.saveCalls]; err != nil {
+		return err
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err

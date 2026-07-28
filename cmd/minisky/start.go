@@ -785,7 +785,7 @@ func shutdownPlugins(ctx context.Context, shims map[string]http.Handler) error {
 		go func() {
 			completed <- shutdownResult{
 				domain: target.domain,
-				err:    target.lifecycle.Shutdown(ctx),
+				err:    invokePluginShutdown(ctx, target.lifecycle),
 			}
 		}()
 	}
@@ -818,6 +818,17 @@ func shutdownPlugins(ctx context.Context, shims map[string]http.Handler) error {
 		result = errors.Join(result, fmt.Errorf("%s: %w", failure.domain, failure.err))
 	}
 	return result
+}
+
+func invokePluginShutdown(ctx context.Context, lifecycle interface {
+	Shutdown(context.Context) error
+}) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("plugin shutdown panicked")
+		}
+	}()
+	return lifecycle.Shutdown(ctx)
 }
 
 func shutdownTelemetryAndPlugins(

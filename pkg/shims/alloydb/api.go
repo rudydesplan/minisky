@@ -108,6 +108,7 @@ type API struct {
 	stateStore alloydbStateStore
 	clusters   map[string]*Cluster
 	instances  map[string]*Instance
+	initErr    error
 }
 
 // NewAPI creates a new AlloyDB API shim with persistence.
@@ -127,14 +128,24 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 	}
 	if err != nil {
 		log.Printf("[Shim: AlloyDB] persistence degraded: %v", err)
+		api.initErr = fmt.Errorf("open AlloyDB state: %w", err)
 		return api
 	}
-	if err := api.loadState(); err != nil {
-		log.Printf("[Shim: AlloyDB] state rehydration failed: %v", err)
-		return api
+	api.initializeState()
+	if api.initErr != nil {
+		log.Printf("[Shim: AlloyDB] initialization failed: %v", api.initErr)
 	}
-	api.reconcileBackends()
 	return api
+}
+
+func (api *API) initializeState() {
+	if err := api.loadState(); err != nil {
+		api.initErr = fmt.Errorf("load AlloyDB state: %w", err)
+		return
+	}
+	if err := api.reconcileBackends(); err != nil {
+		api.initErr = fmt.Errorf("reconcile AlloyDB state: %w", err)
+	}
 }
 
 // newTestAPI creates an in-memory API for testing (no persistence).
@@ -150,6 +161,10 @@ func newTestAPI() *API {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: AlloyDB] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.initErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "AlloyDB state is unavailable")
+		return
+	}
 
 	switch {
 	case strings.Contains(r.URL.Path, "/operations/") && r.Method == http.MethodGet:

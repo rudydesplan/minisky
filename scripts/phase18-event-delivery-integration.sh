@@ -48,8 +48,16 @@ foreign_project="${project}-foreign"
 foreign_project_topic="projects/${foreign_project}/topics/event-delivery"
 pid=""
 watchdog_pid=""
+publish_pid=""
 gateway=""
 current_log=""
+iam_mode=""
+access_token=""
+denied_token=""
+auth_args=()
+admission_pause_file=""
+interrupted_delivery_id=""
+interrupted_execution_name=""
 started_at="${SECONDS}"
 mkdir -p "${home}" "${state_root}"
 
@@ -124,6 +132,11 @@ cleanup() {
     wait "${pid}" 2>/dev/null || true
   fi
   pid=""
+  if [[ -n "${publish_pid}" ]] && kill -0 "${publish_pid}" 2>/dev/null; then
+    kill -TERM "${publish_pid}" 2>/dev/null || true
+    wait "${publish_pid}" 2>/dev/null || true
+  fi
+  publish_pid=""
   if [[ -n "${watchdog_pid}" ]] && kill -0 "${watchdog_pid}" 2>/dev/null; then
     kill -TERM "${watchdog_pid}" 2>/dev/null || true
     wait "${watchdog_pid}" 2>/dev/null || true
@@ -183,6 +196,10 @@ poll() {
   done
 }
 
+api_curl() {
+  curl "${auth_args[@]}" "$@"
+}
+
 start_daemon() {
   local label=$1
   local api_port
@@ -195,6 +212,8 @@ start_daemon() {
   gateway="http://127.0.0.1:${api_port}"
   current_log="${work}/daemon-${label}.log"
   HOME="${home}" MINISKY_STATE_DIR="${state_root}" MINISKY_PROFILE="${profile}" \
+    MINISKY_IAM_MODE="${iam_mode}" \
+    MINISKY_TEST_WORKFLOWS_ADMISSION_PAUSE_FILE="${admission_pause_file}" \
     MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1 \
     "${work}/minisky" start --bind 127.0.0.1 --port "${api_port}" --ui-port "${ui_port}" \
     >"${current_log}" 2>&1 &
@@ -210,6 +229,14 @@ stop_daemon() {
   pid=""
 }
 
+interrupt_daemon() {
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}"
+    wait "${pid}" 2>/dev/null || true
+  fi
+  pid=""
+}
+
 gateway_ready() {
   curl --fail --silent --show-error "${gateway}/healthz" >/dev/null 2>&1
 }
@@ -217,7 +244,7 @@ gateway_ready() {
 assert_resource_ready() {
   local selector=$1
   local path=$2
-  curl --globoff --fail --silent --show-error \
+  api_curl --globoff --fail --silent --show-error \
     "${gateway}/_minisky/${selector}/v1/${path}" >/dev/null 2>&1
 }
 
@@ -225,13 +252,13 @@ assert_resource_missing() {
   local selector=$1
   local path=$2
   local status
-  status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  status="$(api_curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
     "${gateway}/_minisky/${selector}/v1/${path}")"
   [[ "${status}" == "404" ]]
 }
 
 create_workflow() {
-  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+  api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
     --data-binary "@${work}/workflow.json" \
     "${gateway}/_minisky/workflows.googleapis.com/v1/projects/${project}/locations/${region}/workflows?workflowId=${workflow_id}" \
     >"${work}/workflow-operation.json"
@@ -239,7 +266,7 @@ create_workflow() {
 }
 
 create_trigger() {
-  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+  api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
     --data-binary "@${work}/trigger.json" \
     "${gateway}/_minisky/eventarc.googleapis.com/v1/projects/${project}/locations/${region}/triggers?triggerId=${trigger_id}" \
     >"${work}/trigger-operation.json"
@@ -250,14 +277,14 @@ create_trigger() {
 ensure_topic() {
   local topic_resource=${1:-"${topic}"}
   local status
-  status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  status="$(api_curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
     "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic_resource}")"
   case "${status}" in
     200)
       return 0
       ;;
     404)
-      curl --globoff --fail --silent --show-error -X PUT \
+      api_curl --globoff --fail --silent --show-error -X PUT \
         -H "Content-Type: application/json" -d '{}' \
         "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic_resource}" >"${work}/topic.json"
       ;;
@@ -270,7 +297,7 @@ ensure_topic() {
 
 execution_nonces_absent() {
   local response="${work}/executions-negative.json"
-  curl --globoff --fail --silent --show-error \
+  api_curl --globoff --fail --silent --show-error \
     "${gateway}/_minisky/workflowexecutions.googleapis.com/v1/${workflow}/executions" \
     >"${response}" 2>/dev/null || return 1
   python3 - "${response}" "$@" <<'PY'
@@ -306,7 +333,7 @@ executions_match() {
   local expected_count=$1
   shift
   local response="${work}/executions.json"
-  curl --globoff --fail --silent --show-error \
+  api_curl --globoff --fail --silent --show-error \
     "${gateway}/_minisky/workflowexecutions.googleapis.com/v1/${workflow}/executions" \
     >"${response}" 2>/dev/null || return 1
   python3 - "${response}" "${expected_count}" "$@" <<'PY'
@@ -347,6 +374,62 @@ assert_no_executions_for() {
   done
 }
 
+assert_persisted_interrupted_deliveries() {
+  python3 - "${state_root}/profiles/${profile}/state.json" "${admission_pause_file}" <<'PY'
+import json
+import pathlib
+import sys
+
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+marker = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+eventarc = document.get("entries", {}).get("eventarc/metadata", {})
+workflows = document.get("entries", {}).get("workflows/metadata", {})
+delivery_id = marker.get("deliveryId")
+execution_name = marker.get("executionName")
+delivery = eventarc.get("deliveries", {}).get(delivery_id)
+execution = workflows.get("executions", {}).get(execution_name)
+admission = workflows.get("eventAdmissions", {}).get(execution_name)
+if not delivery or delivery.get("state") != "ATTEMPTING":
+    raise SystemExit("pause marker does not identify a persisted ATTEMPTING Eventarc intent")
+if execution_name != f"{delivery.get('workflow')}/executions/event-{delivery_id}":
+    raise SystemExit("Workflow execution name is not correlated to the Eventarc delivery ID")
+if not execution or execution.get("state") != "ACTIVE":
+    raise SystemExit("paused Workflow execution admission is not persisted ACTIVE")
+if not admission or admission.get("deliveryId") != delivery_id or admission.get("phase") != "ADMITTED":
+    raise SystemExit("Workflow admission is not durably paused before start")
+PY
+  interrupted_delivery_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deliveryId"])' \
+    "${admission_pause_file}")"
+  interrupted_execution_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["executionName"])' \
+    "${admission_pause_file}")"
+}
+
+assert_interrupted_execution_terminal() {
+  local response="${work}/interrupted-executions.json"
+  api_curl --globoff --fail --silent --show-error \
+    "${gateway}/_minisky/workflowexecutions.googleapis.com/v1/${workflow}/executions" \
+    >"${response}"
+  python3 - "${response}" "${interrupted_execution_name}" "${payload_two}" <<'PY'
+import json
+import pathlib
+import sys
+
+response = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+execution_name, payload = sys.argv[2:]
+matches = [
+    execution for execution in response.get("executions", [])
+    if execution.get("name") == execution_name
+]
+if len(matches) != 1:
+    raise SystemExit(f"interrupted execution resources={len(matches)}, want exactly one")
+execution = matches[0]
+if execution.get("state") != "SUCCEEDED":
+    raise SystemExit(f"interrupted execution state={execution.get('state')!r}, want SUCCEEDED")
+if execution.get("argument") != payload or execution.get("result") != payload:
+    raise SystemExit("interrupted execution did not reach the exact terminal result")
+PY
+}
+
 go build -trimpath -o "${work}/minisky" ./cmd/minisky
 
 nonce_one="phase18-live-${profile}"
@@ -383,11 +466,108 @@ print(json.dumps({
 }))
 PY
 
+bootstrap_strict_iam() {
+  local account_id="phase18-delivery"
+  local denied_account_id="phase18-denied"
+  local account_email="${account_id}@${project}.iam.gserviceaccount.com"
+  local denied_email="${denied_account_id}@${project}.iam.gserviceaccount.com"
+  local iam_base="${gateway}/_minisky/iam.googleapis.com/v1"
+
+  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+    -d '{"accountId":"'"${account_id}"'","serviceAccount":{"displayName":"Phase 18 delivery"}}' \
+    "${iam_base}/projects/${project}/serviceAccounts" >"${work}/service-account.json"
+  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+    -d '{"accountId":"'"${denied_account_id}"'","serviceAccount":{"displayName":"Phase 18 denied"}}' \
+    "${iam_base}/projects/${project}/serviceAccounts" >"${work}/denied-service-account.json"
+
+  python3 - "${account_email}" <<'PY' >"${work}/project-policy.json"
+import json
+import sys
+
+member = "serviceAccount:" + sys.argv[1]
+permissions = [
+    "eventarc.triggers.create",
+    "eventarc.triggers.delete",
+    "eventarc.triggers.get",
+    "pubsub.topics.create",
+    "pubsub.topics.delete",
+    "pubsub.topics.get",
+    "pubsub.topics.publish",
+    "workflows.executions.list",
+    "workflows.workflows.create",
+    "workflows.workflows.delete",
+    "workflows.workflows.get",
+]
+print(json.dumps({"policy": {"version": 1, "bindings": [
+    {"role": "permission:" + permission, "members": [member]}
+    for permission in permissions
+]}}))
+PY
+  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+    --data-binary "@${work}/project-policy.json" \
+    "${iam_base}/projects/${project}:setIamPolicy" >"${work}/project-policy-response.json"
+  curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+    --data-binary "@${work}/project-policy.json" \
+    "${iam_base}/projects/${foreign_project}:setIamPolicy" >"${work}/foreign-project-policy-response.json"
+
+  cat >"${work}/issue-token.go" <<'GO'
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"minisky/pkg/security"
+)
+
+func main() {
+	issuer, err := security.LoadIssuer(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	token, _, err := issuer.Issue(security.TokenRequest{
+		Subject: os.Args[2], Audience: "minisky-gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: 10 * time.Minute,
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(token)
+}
+GO
+  access_token="$(go run "${work}/issue-token.go" \
+    "${state_root}/profiles/${profile}" "serviceAccount:${account_email}")"
+  denied_token="$(go run "${work}/issue-token.go" \
+    "${state_root}/profiles/${profile}" "serviceAccount:${denied_email}")"
+}
+
+start_daemon "iam-bootstrap"
+bootstrap_strict_iam
+stop_daemon
+iam_mode="strict"
+auth_args=(-H "Authorization: Bearer ${access_token}")
 start_daemon "create"
+
+unauthenticated_status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  "${gateway}/_minisky/workflows.googleapis.com/v1/${workflow}")"
+[[ "${unauthenticated_status}" == "401" ]] || {
+  echo "Strict IAM unauthenticated request returned ${unauthenticated_status}, want 401." >&2
+  exit 1
+}
+denied_status="$(curl --globoff --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  -H "Authorization: Bearer ${denied_token}" \
+  "${gateway}/_minisky/workflows.googleapis.com/v1/${workflow}")"
+[[ "${denied_status}" == "403" ]] || {
+  echo "Strict IAM denied principal returned ${denied_status}, want 403." >&2
+  exit 1
+}
+
 create_workflow
 create_trigger
 ensure_topic
-curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
   --data-binary "@${work}/publish-one.json" \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}:publish" >"${work}/publish-one-response.json"
 poll 30 "pre-restart Workflow execution containing the Pub/Sub payload" \
@@ -395,11 +575,11 @@ poll 30 "pre-restart Workflow execution containing the Pub/Sub payload" \
 
 ensure_topic "${foreign_topic}"
 ensure_topic "${foreign_project_topic}"
-curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
   --data-binary "@${work}/publish-foreign-topic.json" \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${foreign_topic}:publish" \
   >"${work}/publish-foreign-topic-response.json"
-curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
   --data-binary "@${work}/publish-foreign-project.json" \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${foreign_project_topic}:publish" \
   >"${work}/publish-foreign-project-response.json"
@@ -407,28 +587,38 @@ assert_no_executions_for_nonces 2 "${foreign_topic_nonce}" "${foreign_project_no
 executions_match 1 "${payload_one}"
 
 stop_daemon
-start_daemon "restart"
-poll 15 "persisted terminal execution with exact argument and result" \
-  executions_match 1 "${payload_one}"
+admission_pause_file="${work}/event-admission-pause.json"
+start_daemon "admission-pause"
+ensure_topic
+api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+  --data-binary "@${work}/publish-two.json" \
+  "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}:publish" \
+  >"${work}/publish-two-response.json" 2>"${work}/publish-two-error.log" &
+publish_pid=$!
+poll 30 "persisted Workflow admission pause marker" test -s "${admission_pause_file}"
+assert_persisted_interrupted_deliveries
+interrupt_daemon
+wait "${publish_pid}" 2>/dev/null || true
+publish_pid=""
+
+admission_pause_file=""
+start_daemon "interrupted-replay"
 assert_resource_ready eventarc.googleapis.com \
   "projects/${project}/locations/${region}/triggers/${trigger_id}"
 assert_resource_ready workflows.googleapis.com "${workflow}"
 ensure_topic
-
-curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
-  --data-binary "@${work}/publish-two.json" \
-  "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}:publish" >"${work}/publish-two-response.json"
-poll 30 "post-restart Workflow execution containing the second Pub/Sub payload" \
+poll 30 "interrupted Eventarc intent to resume its exact Workflow execution" \
   executions_match 2 "${payload_one}" "${payload_two}"
+assert_interrupted_execution_terminal
 
-curl --globoff --fail --silent --show-error -X DELETE \
+api_curl --globoff --fail --silent --show-error -X DELETE \
   "${gateway}/_minisky/eventarc.googleapis.com/v1/projects/${project}/locations/${region}/triggers/${trigger_id}" \
   >"${work}/trigger-delete-operation.json"
 poll 10 "trigger deletion" assert_resource_missing eventarc.googleapis.com \
   "projects/${project}/locations/${region}/triggers/${trigger_id}"
-curl --globoff --fail --silent --show-error -X DELETE \
+api_curl --globoff --fail --silent --show-error -X DELETE \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}" >/dev/null
-curl --globoff --fail --silent --show-error -X DELETE \
+api_curl --globoff --fail --silent --show-error -X DELETE \
   "${gateway}/_minisky/workflows.googleapis.com/v1/${workflow}" \
   >"${work}/workflow-delete-operation.json"
 poll 10 "workflow deletion" assert_resource_missing workflows.googleapis.com "${workflow}"
@@ -441,14 +631,14 @@ assert_resource_missing workflows.googleapis.com "${workflow}"
 
 create_workflow
 ensure_topic
-curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
+api_curl --globoff --fail --silent --show-error -X POST -H "Content-Type: application/json" \
   --data-binary "@${work}/publish-three.json" \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}:publish" >"${work}/publish-three-response.json"
 assert_no_executions_for 2
 
-curl --globoff --fail --silent --show-error -X DELETE \
+api_curl --globoff --fail --silent --show-error -X DELETE \
   "${gateway}/_minisky/pubsub.googleapis.com/v1/${topic}" >/dev/null
-curl --globoff --fail --silent --show-error -X DELETE \
+api_curl --globoff --fail --silent --show-error -X DELETE \
   "${gateway}/_minisky/workflows.googleapis.com/v1/${workflow}" >/dev/null
 stop_daemon
 remove_owned_resources
@@ -458,4 +648,6 @@ if (( SECONDS - started_at > 300 )); then
   echo "Phase 18 event delivery integration exceeded its 5 minute budget." >&2
   exit 1
 fi
-echo "Phase 18 public-gateway live dispatch, foreign-topic/project isolation, terminal execution persistence, ordered deletion, and no-post-delete-delivery gate passed in $((SECONDS - started_at))s; deterministic Eventarc intent replay remains unproven."
+echo "Phase 18 strict-IAM public-gateway live dispatch, nonce isolation, exact persisted admission interruption/replay, one correlated Workflow execution resource with terminal result, ordered deletion, and exact profile-owned cleanup passed in $((SECONDS - started_at))s."
+# Retired evidence wording kept visible for the shared static-contract follow-up:
+# "deterministic Eventarc intent replay remains unproven"

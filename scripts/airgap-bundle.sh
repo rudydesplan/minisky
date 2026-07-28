@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cleanup_dir=""
+cleanup() {
+  if [[ -n "$cleanup_dir" ]]; then
+    rm -rf -- "$cleanup_dir"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -107,14 +116,29 @@ EOF
       exit 1
     }
     command -v python3 >/dev/null 2>&1 || { echo "python3 is required to verify a bundle" >&2; exit 1; }
-    verified="$(python3 - "$bundle" <<'PY'
+    load_copy=""
+    if [[ "$load_image" -eq 1 ]]; then
+      command -v docker >/dev/null 2>&1 || { echo "docker is required to load the image" >&2; exit 1; }
+      cleanup_dir="$(mktemp -d "${TMPDIR:-/tmp}/minisky-airgap-load.XXXXXX")"
+      chmod 700 "$cleanup_dir"
+      load_copy="$cleanup_dir/minisky-image.tar"
+    fi
+    verified="$(python3 - "$bundle" "$load_copy" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import re
+import stat
 import sys
 
 bundle = pathlib.Path(sys.argv[1])
+load_copy = pathlib.Path(sys.argv[2]) if sys.argv[2] else None
+if bundle.is_symlink() or not bundle.is_dir():
+    raise SystemExit("Bundle root must be a real directory")
+for path in bundle.iterdir():
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"Bundle entry must be a regular file: {path.name}")
 manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
 if manifest.get("format") != "minisky-airgap-bundle" or manifest.get("version") != 1:
     raise SystemExit("Unsupported air-gap manifest")
@@ -126,6 +150,8 @@ if image is not None:
     if not isinstance(image, str) or not image:
         raise SystemExit("Manifest image reference is invalid")
     expected.insert(1, "minisky-image.tar")
+elif load_copy is not None:
+    raise SystemExit("Bundle has no image archive")
 files = manifest.get("files")
 if not isinstance(files, list) or any(not isinstance(item, str) for item in files):
     raise SystemExit("Manifest files must be a string list")
@@ -150,21 +176,49 @@ if set(entries) != set(expected):
     missing = sorted(set(expected) - set(entries))
     raise SystemExit(f"Missing checksum entries: {', '.join(missing)}")
 
-physical = {path.name for path in bundle.iterdir() if path.is_file()}
+physical = {path.name for path in bundle.iterdir()}
 if physical != set(expected) | {"SHA256SUMS"}:
     raise SystemExit("Bundle contains unexpected or missing files")
+
+def open_regular(path):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"Bundle entry must be a regular file: {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    after = os.fstat(descriptor)
+    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        os.close(descriptor)
+        raise SystemExit(f"Bundle entry changed while opening: {path.name}")
+    return descriptor
+
 for name in expected:
-    actual = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
+    descriptor = open_regular(bundle / name)
+    destination = None
+    digest = hashlib.sha256()
+    try:
+        if name == "minisky-image.tar" and load_copy is not None:
+            destination_descriptor = os.open(load_copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            destination = os.fdopen(destination_descriptor, "wb")
+        with os.fdopen(descriptor, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                if destination is not None:
+                    destination.write(chunk)
+        if destination is not None:
+            destination.flush()
+            os.fsync(destination.fileno())
+    finally:
+        if destination is not None:
+            destination.close()
+    actual = digest.hexdigest()
     if actual != entries[name]:
         raise SystemExit(f"Checksum mismatch: {name}")
 print(len(expected))
 PY
 )"
     if [[ "$load_image" -eq 1 ]]; then
-      has_image="$(python3 -c 'import json,sys; print("yes" if json.load(open(sys.argv[1], encoding="utf-8")).get("image") else "no")' "$bundle/manifest.json")"
-      [[ "$has_image" == "yes" ]] || { echo "Bundle has no image archive" >&2; exit 1; }
-      command -v docker >/dev/null 2>&1 || { echo "docker is required to load the image" >&2; exit 1; }
-      docker load --input "$bundle/minisky-image.tar"
+      docker load --input "$load_copy"
     fi
     echo "Verified $verified checksummed bundle file(s)"
     ;;
