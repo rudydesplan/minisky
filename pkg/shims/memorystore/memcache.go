@@ -524,7 +524,14 @@ func validateMemcacheCreate(route memcacheRoute, instance *MemcacheInstance) (st
 
 func (api *MemcacheAPI) completeMemcacheCreate(operationName, name string, spec MemcacheBackendSpec) error {
 	api.mutationMu.Lock()
-	defer api.mutationMu.Unlock()
+	mutationOwned := true
+	releaseMutation := func() {
+		if mutationOwned {
+			mutationOwned = false
+			api.mutationMu.Unlock()
+		}
+	}
+	defer releaseMutation()
 
 	ctx, cancel := context.WithTimeout(context.Background(), memcacheBackendTimeout)
 	result, provisionErr := provisionMemcacheBackend(ctx, api.backend, spec)
@@ -547,10 +554,11 @@ func (api *MemcacheAPI) completeMemcacheCreate(operationName, name string, spec 
 		if provisionErr == nil {
 			message = "Memcached backend ownership could not be verified"
 		}
-		finalizeErr := api.finalizeMemcacheFailure(
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(
 			operationName,
 			message,
 			(compensated || authoritativelyAbsent) && persistErr == nil,
+			releaseMutation,
 		)
 		return errors.Join(errors.New(message), cleanupErr, persistErr, finalizeErr)
 	}
@@ -565,8 +573,9 @@ func (api *MemcacheAPI) completeMemcacheCreate(operationName, name string, spec 
 		if cleanupErr == nil {
 			persistErr = api.commit(candidate)
 		}
-		finalizeErr := api.finalizeMemcacheFailure(operationName,
-			"Memcached backend returned invalid endpoints", cleanupErr == nil && persistErr == nil)
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(operationName,
+			"Memcached backend returned invalid endpoints", cleanupErr == nil && persistErr == nil,
+			releaseMutation)
 		return errors.Join(err, cleanupErr, persistErr, finalizeErr)
 	}
 	candidate := api.snapshot()
@@ -590,13 +599,16 @@ func (api *MemcacheAPI) completeMemcacheCreate(operationName, name string, spec 
 		if cleanupErr == nil {
 			compensationErr = api.commit(compensation)
 		}
-		finalizeErr := api.finalizeMemcacheFailure(operationName,
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(operationName,
 			"Memcached state persistence failed after backend creation",
 			cleanupErr == nil && compensationErr == nil,
+			releaseMutation,
 		)
 		return errors.Join(err, cleanupErr, compensationErr, finalizeErr)
 	}
-	if err := api.finalizeMemcacheInstanceSuccess(operationName, persisted.Instance); err != nil {
+	if err := api.finalizeMemcacheInstanceSuccessWithBarrier(
+		operationName, persisted.Instance, releaseMutation,
+	); err != nil {
 		api.setInitializationError(err)
 		return err
 	}
@@ -775,11 +787,20 @@ func parseMemcacheUpdateMask(raw string) (map[string]struct{}, string, int, stri
 
 func (api *MemcacheAPI) completeMemcacheUpdate(operationName, name string, previous memcachePersistedInstance, mask map[string]struct{}) error {
 	api.mutationMu.Lock()
-	defer api.mutationMu.Unlock()
+	mutationOwned := true
+	releaseMutation := func() {
+		if mutationOwned {
+			mutationOwned = false
+			api.mutationMu.Unlock()
+		}
+	}
+	defer releaseMutation()
 
 	current := api.getPersisted(name)
 	if current.Instance == nil {
-		return api.finalizeMemcacheFailure(operationName, "Memcached update metadata disappeared", false)
+		return api.finalizeMemcacheFailureWithBarrier(
+			operationName, "Memcached update metadata disappeared", false, releaseMutation,
+		)
 	}
 	var result MemcacheBackendResult
 	var updateErr error
@@ -795,7 +816,9 @@ func (api *MemcacheAPI) completeMemcacheUpdate(operationName, name string, previ
 		candidate := api.snapshot()
 		candidate[name] = cloneMemcachePersisted(previous)
 		persistErr := api.commit(candidate)
-		finalizeErr := api.finalizeMemcacheFailure(operationName, "Memcached backend update failed", persistErr == nil)
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(
+			operationName, "Memcached backend update failed", persistErr == nil, releaseMutation,
+		)
 		return errors.Join(updateErr, persistErr, finalizeErr)
 	}
 	candidate := api.snapshot()
@@ -807,8 +830,8 @@ func (api *MemcacheAPI) completeMemcacheUpdate(operationName, name string, previ
 		if err != nil {
 			candidate[name] = cloneMemcachePersisted(previous)
 			persistErr := api.commit(candidate)
-			finalizeErr := api.finalizeMemcacheFailure(operationName,
-				"Memcached backend returned invalid endpoints", persistErr == nil)
+			finalizeErr := api.finalizeMemcacheFailureWithBarrier(operationName,
+				"Memcached backend returned invalid endpoints", persistErr == nil, releaseMutation)
 			return errors.Join(err, persistErr, finalizeErr)
 		}
 		ready.Instance.MemcacheNodes = nodes
@@ -816,11 +839,13 @@ func (api *MemcacheAPI) completeMemcacheUpdate(operationName, name string, previ
 	}
 	candidate[name] = ready
 	if err := api.commit(candidate); err != nil {
-		finalizeErr := api.finalizeMemcacheFailure(operationName,
-			"Memcached state persistence failed after backend update", false)
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(operationName,
+			"Memcached state persistence failed after backend update", false, releaseMutation)
 		return errors.Join(err, finalizeErr)
 	}
-	if err := api.finalizeMemcacheInstanceSuccess(operationName, ready.Instance); err != nil {
+	if err := api.finalizeMemcacheInstanceSuccessWithBarrier(
+		operationName, ready.Instance, releaseMutation,
+	); err != nil {
 		api.setInitializationError(err)
 		return err
 	}
@@ -887,24 +912,95 @@ func (api *MemcacheAPI) deleteMemcacheInstance(w http.ResponseWriter, _ *http.Re
 
 func (api *MemcacheAPI) completeMemcacheDelete(operationName, name string, previous memcachePersistedInstance) error {
 	api.mutationMu.Lock()
-	defer api.mutationMu.Unlock()
+	mutationOwned := true
+	releaseMutation := func() {
+		if mutationOwned {
+			mutationOwned = false
+			api.mutationMu.Unlock()
+		}
+	}
+	defer releaseMutation()
 
 	if err := api.deleteMemcacheBackend(previous.BackendID); err != nil {
-		finalizeErr := api.finalizeMemcacheFailure(operationName, "Memcached backend deletion failed", false)
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(
+			operationName, "Memcached backend deletion failed", false, releaseMutation,
+		)
 		return errors.Join(err, finalizeErr)
 	}
 	candidate := api.snapshot()
 	delete(candidate, name)
 	if err := api.commit(candidate); err != nil {
-		finalizeErr := api.finalizeMemcacheFailure(operationName,
-			"Memcached state persistence failed after backend deletion", false)
+		finalizeErr := api.finalizeMemcacheFailureWithBarrier(operationName,
+			"Memcached state persistence failed after backend deletion", false, releaseMutation)
 		return errors.Join(err, finalizeErr)
 	}
-	if err := api.finalizeMemcacheEmptySuccess(operationName); err != nil {
+	if err := api.finalizeMemcacheEmptySuccessWithBarrier(operationName, releaseMutation); err != nil {
 		api.setInitializationError(err)
 		return err
 	}
 	return nil
+}
+
+func (api *MemcacheAPI) finalizeMemcacheInstanceSuccessWithBarrier(
+	operationName string,
+	instance *MemcacheInstance,
+	releaseMutation func(),
+) error {
+	response, err := typedMemcacheInstance(instance)
+	if err != nil {
+		return api.finalizeMemcacheFailureWithBarrier(
+			operationName, "encode Memcached operation response", false, releaseMutation,
+		)
+	}
+	return api.finalizeMemcacheWithBarrier(operationName, response, 0, "", true, releaseMutation)
+}
+
+func (api *MemcacheAPI) finalizeMemcacheEmptySuccessWithBarrier(
+	operationName string,
+	releaseMutation func(),
+) error {
+	response := json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`)
+	return api.finalizeMemcacheWithBarrier(operationName, response, 0, "", true, releaseMutation)
+}
+
+func (api *MemcacheAPI) finalizeMemcacheFailureWithBarrier(
+	operationName string,
+	message string,
+	stateCommitted bool,
+	releaseMutation func(),
+) error {
+	return api.finalizeMemcacheWithBarrier(
+		operationName, nil, 13, message, stateCommitted, releaseMutation,
+	)
+}
+
+func (api *MemcacheAPI) finalizeMemcacheWithBarrier(
+	operationName string,
+	response json.RawMessage,
+	code int,
+	message string,
+	clearAssociation bool,
+	releaseMutation func(),
+) error {
+	err := api.opMgr.FinalizeScopedDurableWithBarrier(
+		operationName,
+		response,
+		code,
+		message,
+		func() error {
+			defer releaseMutation()
+			if !clearAssociation {
+				return nil
+			}
+			return api.clearMemcacheOperation(operationName)
+		},
+	)
+	if errors.Is(err, orchestrator.ErrOperationTerminalBarrier) {
+		api.setInitializationError(fmt.Errorf(
+			"finalize Memcached operation %q: %w", operationName, err,
+		))
+	}
+	return err
 }
 
 func (api *MemcacheAPI) finalizeMemcacheInstanceSuccess(operationName string, instance *MemcacheInstance) error {
