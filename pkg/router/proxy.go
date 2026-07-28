@@ -219,6 +219,12 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		gatedHandler.ServeHTTP(w, r)
 		return
 	}
+	if targetDomain == "binaryauthorization.googleapis.com" &&
+		!validBinaryAuthorizationProjectPath(r.URL.Path) {
+		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"Binary Authorization project identifier is invalid")
+		return
+	}
 	if targetDomain == "vision.googleapis.com" &&
 		r.Method == http.MethodPost &&
 		r.URL.Path == "/v1/images:annotate" &&
@@ -727,6 +733,54 @@ func routePermission(domain string, r *http.Request) (string, string) {
 		return permission, resource
 	}
 	return "", resource
+}
+
+func validBinaryAuthorizationProjectPath(requestPath string) bool {
+	const prefix = "/v1/projects/"
+	if !strings.HasPrefix(requestPath, prefix) {
+		return true
+	}
+	rest := strings.TrimPrefix(requestPath, prefix)
+	project, _, found := strings.Cut(rest, "/")
+	if !found || project == "" {
+		return false
+	}
+	if allDecimal(project) {
+		return true
+	}
+	if project[0] < 'a' || project[0] > 'z' {
+		return false
+	}
+	last := project[len(project)-1]
+	if !lowercaseOrDigit(last) {
+		return false
+	}
+	for _, character := range project {
+		if character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func lowercaseOrDigit(character byte) bool {
+	return character >= 'a' && character <= 'z' ||
+		character >= '0' && character <= '9'
+}
+
+func allDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type strictIAMResourceRoute struct {

@@ -28,6 +28,43 @@ func TestServiceCatalogGolden(t *testing.T) {
 	}
 }
 
+func TestGeneratedServiceDocumentListsEachDomainExactlyOnce(t *testing.T) {
+	services, inventory, err := truth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := renderServiceCatalog(services, inventory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile(filepath.Join("testdata", "service-catalog.golden.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := os.ReadFile(filepath.Join("..", "..", "docs", "service-compatibility.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	regenerated, err := replaceGeneratedSection(
+		string(document), serviceCatalogStart, serviceCatalogEnd, catalog,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range services {
+		literal := "`" + service.Domain + "`"
+		if count := strings.Count(catalog, literal); count != 1 {
+			t.Errorf("generated catalog lists %q %d times, want exactly once", service.Domain, count)
+		}
+		if count := strings.Count(string(golden), literal); count != 1 {
+			t.Errorf("golden catalog lists %q %d times, want exactly once", service.Domain, count)
+		}
+		if count := strings.Count(regenerated, literal); count != 1 {
+			t.Errorf("regenerated service document lists %q %d times, want exactly once", service.Domain, count)
+		}
+	}
+}
+
 func TestRenderingIsDeterministic(t *testing.T) {
 	services, inventory, err := truth()
 	if err != nil {
@@ -91,7 +128,7 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"1 default-off",
 		"1 Terraform claim",
 		"6 batch gates",
-		"11 per-domain Terraform checks",
+		"12 per-domain Terraform checks",
 		"Package-unit gates passed locally: 6/6",
 		"strict-IAM gates passed locally: 6/6",
 		"Generated-client lifecycle gates passed locally: 6/6",
@@ -106,6 +143,7 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 			t.Errorf("summary does not contain %q:\n%s", want, got)
 		}
 	}
+
 }
 
 func TestRenderPhase12PlatformSummaryBranchesOnCIStatus(t *testing.T) {
@@ -289,6 +327,108 @@ func TestValidateHandwrittenClaimsRejectsStaleTerraformAbsence(t *testing.T) {
 	if err := validateHandwrittenClaims(
 		"Per-domain Terraform claims and boundaries are listed in the generated catalog."); err != nil {
 		t.Fatalf("rejected current per-domain wording: %v", err)
+	}
+}
+
+func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	readme := strings.Join(strings.Fields(read("README.md")), " ")
+	for _, want := range []string{
+		"`google_binary_authorization_policy`",
+		"observes whitelist allow and enforced deny before restart",
+		"After restart, it proves policy persistence and no drift",
+		"does not repeat those decisions",
+		"matching import returns `0`",
+		"stale import returns `2`",
+		"Destroy resets the singleton to the exact default policy",
+		"enforced `DENY` locally blocks MiniSky Cloud Deploy rollouts",
+		"`DRYRUN_AUDIT_LOG_ONLY` permits rollout and returns `AUDIT`",
+		"no durable audit record or log is created",
+		"returns explicit `UNSUPPORTED`",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README does not contain %q", want)
+		}
+	}
+
+	terraformDocs := strings.Join(strings.Fields(read("docs/terraform-compatibility.md")), " ")
+	for _, want := range []string{
+		"`google_binary_authorization_policy` (optional Phase 25)",
+		"Provider `7.41.0`",
+		"matching import",
+		"exit `0`",
+		"stale import",
+		"exit `2`",
+		"exact default policy",
+		"observes a whitelist allow plus an enforced default-rule deny before restart",
+		"After restart, the gate proves policy persistence and zero drift",
+		"does not repeat the allow/deny observations",
+		"enforced `DENY` locally blocks MiniSky Cloud Deploy rollouts",
+		"`DRYRUN_AUDIT_LOG_ONLY` permits rollout and returns `AUDIT`",
+		"no durable audit record or log is created",
+		"returns explicit `UNSUPPORTED`",
+		"not service fidelity promotion, GKE admission, or production admission security",
+	} {
+		if !strings.Contains(terraformDocs, want) {
+			t.Errorf("Terraform documentation does not contain %q", want)
+		}
+	}
+
+	serviceDocs := strings.Join(strings.Fields(read("docs/service-compatibility.md")), " ")
+	for _, want := range []string{
+		"Binary Authorization Terraform claim is an independent Phase 24–25 `local-passed` check",
+		"no recorded CI run URL or commit",
+		"does not inherit the generated-client batch CI status",
+		"experimental/default-off support",
+		"pre-restart allow/deny observation",
+		"restart persistence/no-drift",
+		"Cloud Deploy deny",
+		"dry-run AUDIT permit",
+		"without durable audit logging",
+	} {
+		if !strings.Contains(serviceDocs, want) {
+			t.Errorf("Service compatibility documentation does not contain %q", want)
+		}
+	}
+
+	golden := strings.Join(strings.Fields(read("cmd/docs-truth/testdata/service-catalog.golden.md")), " ")
+	for _, want := range []string{
+		"pre-restart allow/deny observation",
+		"restart persistence/no-drift",
+		"Cloud Deploy deny",
+		"dry-run AUDIT permit",
+		"explicit unsupported outcomes",
+		"without durable audit logging",
+	} {
+		if !strings.Contains(golden, want) {
+			t.Errorf("Service catalog golden does not contain %q", want)
+		}
+	}
+
+	for name, document := range map[string]string{
+		"README":                readme,
+		"Terraform docs":        terraformDocs,
+		"service compatibility": serviceDocs,
+		"service golden":        golden,
+	} {
+		for _, stale := range []string{
+			"records only the local advisory outcome",
+			"allow/deny observations survive restart",
+			"dry-run audit permits deployment and records",
+		} {
+			if strings.Contains(document, stale) {
+				t.Errorf("%s retains misleading wording %q", name, stale)
+			}
+		}
 	}
 }
 

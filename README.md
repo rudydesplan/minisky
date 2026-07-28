@@ -45,9 +45,9 @@ run offline; first use may pull lazily loaded emulator images.
 ### Phase 18–25 Services (Experimental)
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
-**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+**Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -144,6 +144,21 @@ including a real bounded local advisory decision, restart, zero drift, canonical
 import reconciliation, delete, durable 404, empty-list cleanup, and fallback to
 the seeded constraint default. This is local simulation, not production
 enforcement, IAM, organization hierarchy, or compliance.
+A separate locally passed Phase 25 gate covers only the default-off
+`google_binary_authorization_policy` project singleton with provider `7.41.0`.
+It applies the deny policy and observes whitelist allow and enforced deny
+before restart. After restart, it proves policy persistence and no drift; it
+does not repeat those decisions. A matching import returns `0`; a stale import
+returns `2` before apply reconciles it to zero drift. Destroy resets the
+singleton to the exact default policy and persists that reset across another
+restart. Package evidence separately proves enforced `DENY` locally blocks
+MiniSky Cloud Deploy rollouts. `DRYRUN_AUDIT_LOG_ONLY` permits rollout and
+returns `AUDIT`; no durable audit record or log is created. Attestation,
+global-policy, and cluster-rule evaluation each returns explicit `UNSUPPORTED`.
+This is Terraform compatibility evidence and local emulation, not fidelity
+promotion, GKE admission, or production admission security. Binary
+Authorization remains experimental and default-off. This Phase 25 Terraform
+gate has local-pass evidence only; no CI run or commit is claimed.
 Unsupported methods return canonical 501
 responses rather than simulated success; Cloud CDN/Armor remains within the
 Compute domain and does not claim full GCP data-plane parity.

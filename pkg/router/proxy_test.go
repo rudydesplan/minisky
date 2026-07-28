@@ -26,6 +26,7 @@ import (
 	"minisky/pkg/shims/appengine"
 	"minisky/pkg/shims/bigquery"
 	"minisky/pkg/shims/bigtable"
+	"minisky/pkg/shims/binaryauthorization"
 	"minisky/pkg/shims/cloudsql"
 	"minisky/pkg/shims/compute"
 	iamshim "minisky/pkg/shims/iam"
@@ -1113,6 +1114,141 @@ func TestExperimentalCanonicalRoutingDescriptors(t *testing.T) {
 				t.Fatalf("route response=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestBinaryAuthorizationProviderPutBoundsThroughCanonicalRouter(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("binaryauthorization.googleapis.com", api)
+	oversized := `{"description":"` + strings.Repeat("x", 1<<20) + `"}`
+	for _, test := range []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "fixed"},
+		{name: "chunked", chunked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPut,
+				"http://localhost/_minisky/binaryauthorization/v1/projects/demo/policy",
+				strings.NewReader(oversized))
+			request.Header.Set("Content-Type", "application/json")
+			if test.chunked {
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if decision := api.Evaluate("projects/demo", "example/image"); decision.Reason != "policy not found" {
+				t.Fatalf("oversized request mutated policy: %#v", decision)
+			}
+		})
+	}
+
+	request := httptest.NewRequest(http.MethodPut,
+		"http://localhost/_minisky/binaryauthorization/v1/projects/demo/policy",
+		strings.NewReader(`{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("provider PUT without name status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBinaryAuthorizationStrictIAMRejectsAmbiguousProjectBeforeAuthorization(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "user:alice@example.com",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`
+	for _, projectPath := range []string{"acme:prod", "acme%3Aprod"} {
+		t.Run(projectPath, func(t *testing.T) {
+			api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatches := 0
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("binaryauthorization.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dispatches++
+				api.ServeHTTP(w, r)
+			}))
+			authorizer := &recordingAuthorizer{
+				issuer: issuer,
+				allowed: map[resourcePermission]bool{{
+					resource:   "projects/acme",
+					permission: "binaryauthorization.policy.update",
+				}: true},
+			}
+			proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+			request := httptest.NewRequest(http.MethodPut,
+				"http://localhost/_minisky/binaryauthorization/v1/projects/"+projectPath+"/policy",
+				strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest ||
+				!strings.Contains(response.Body.String(), `"INVALID_ARGUMENT"`) {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(authorizer.checks) != 0 {
+				t.Fatalf("ambiguous project reached authorizer: %+v", authorizer.checks)
+			}
+			if dispatches != 0 {
+				t.Fatalf("ambiguous project dispatched %d times", dispatches)
+			}
+		})
+	}
+
+	api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatches := 0
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("binaryauthorization.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatches++
+		api.ServeHTTP(w, r)
+	}))
+	authorizer := &recordingAuthorizer{
+		issuer: issuer,
+		allowed: map[resourcePermission]bool{{
+			resource:   "projects/acme-prod",
+			permission: "binaryauthorization.policy.update",
+		}: true},
+	}
+	proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+	request := httptest.NewRequest(http.MethodPut,
+		"http://localhost/_minisky/binaryauthorization/v1/projects/acme-prod/policy",
+		strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid project status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dispatches != 1 || len(authorizer.checks) != 1 ||
+		authorizer.checks[0].resource != "projects/acme-prod" {
+		t.Fatalf("dispatches=%d checks=%+v", dispatches, authorizer.checks)
 	}
 }
 

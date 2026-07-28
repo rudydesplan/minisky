@@ -126,9 +126,9 @@ entire service API. Important boundaries:
 ## Experimental Services
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
-**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+**Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 The Phase 18–25 domains marked `experimental` in the machine-readable
@@ -167,6 +167,10 @@ The separate Phase 19 Kafka/Airflow backend job passed on commit
 including its final exact-owned cleanup step. Bounded Terraform provider
 evidence is tracked per domain in the generated catalog below; all experimental
 domains remain default-off and do not claim Standard fidelity.
+The Binary Authorization Terraform claim is an independent Phase 24–25
+`local-passed` check with no recorded CI run URL or commit. It does not inherit
+the generated-client batch CI status and does not promote the service beyond
+experimental/default-off support.
 
 aiplatform.googleapis.com remains implemented for the existing Vertex
 prediction/configuration slice. Its newly integrated Index and Model Registry
@@ -190,7 +194,7 @@ opt-in and do not change that existing evidence claim.
 | `bigquery.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `bigtable.googleapis.com` | standard | hybrid | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `bigtableadmin.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
-| `binaryauthorization.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | project policy persistence and advisory local evaluation<br>Package tests only: `pkg/shims/binaryauthorization.TestPolicyRestartSaveFailureAndAuthorization`<br>`pkg/shims/binaryauthorization.TestEvaluateRequestUsesActivePolicy`<br>`pkg/shims/binaryauthorization.TestInvalidPersistedPolicyIsRejected` | No |
+| `binaryauthorization.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | project policy persistence and bounded local enforcement; provider 7.41.0 apply with pre-restart allow/deny observation, restart persistence/no-drift, matching-import/stale-import-reconcile/destroy-reset, plus package-proven Cloud Deploy deny, dry-run AUDIT permit, and explicit unsupported outcomes without durable audit logging or GKE/production admission security<br>Package tests only: `pkg/shims/binaryauthorization.TestPolicyRestartSaveFailureAndAuthorization`<br>`pkg/shims/binaryauthorization.TestEvaluateRequestUsesActivePolicy`<br>`pkg/shims/binaryauthorization.TestInvalidPersistedPolicyIsRejected`<br>`pkg/shims/binaryauthorization.TestUnsupportedEvaluationModesRemainExplicit`<br>`pkg/shims/binaryauthorization.TestDryRunRuleReportsDenialWithoutBlockingDeployment` | Yes |
 | `cloudasset.googleapis.com` | experimental | memory | experimental | — (not promoted) | Yes | in-memory inventory projection; no restart claim<br>Package tests only: `pkg/shims/cloudasset.TestListAssetsPagination` | No |
 | `cloudbuild.googleapis.com` | standard | hybrid | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `clouddeploy.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | delivery hierarchy metadata and loopback-only rollout<br>Package tests only: `pkg/shims/clouddeploy.TestFullHierarchy`<br>`pkg/shims/clouddeploy.TestRolloutRejectsSSRFAndUnsupportedStrategy`<br>`pkg/shims/clouddeploy.TestCloudDeployHierarchySurvivesRestart` | No |

@@ -423,6 +423,21 @@ resource "google_org_policy_policy" "phase24" {
   }
 }
 
+# Binary Authorization policy is a project singleton. Provider 7.41.0 resets
+# it to its default ALWAYS_ALLOW policy on destroy rather than deleting it.
+resource "google_binary_authorization_policy" "phase25" {
+  count = local.use_minisky && var.enable_phase25_binary_authorization_policy ? 1 : 0
+
+  admission_whitelist_patterns {
+    name_pattern = "gcr.io/minisky-phase25/allowed/*"
+  }
+
+  default_admission_rule {
+    evaluation_mode  = "ALWAYS_DENY"
+    enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+  }
+}
+
 # The repository metadata is served by MiniSky while pushed image manifests and
 # blobs live in the profile-owned Registry v2 backend.
 resource "google_artifact_registry_repository" "phase10" {

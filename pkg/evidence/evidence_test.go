@@ -63,7 +63,8 @@ func TestPhase18To25InventoryMatchesRegistryTruth(t *testing.T) {
 				entry.Domain != "composer.googleapis.com" && entry.Domain != "managedkafka.googleapis.com" &&
 				entry.Domain != "file.googleapis.com" && entry.Domain != "identityplatform.googleapis.com" &&
 				entry.Domain != "alloydb.googleapis.com" && entry.Domain != "servicedirectory.googleapis.com" &&
-				entry.Domain != "documentai.googleapis.com" && entry.Domain != "orgpolicy.googleapis.com" {
+				entry.Domain != "documentai.googleapis.com" && entry.Domain != "orgpolicy.googleapis.com" &&
+				entry.Domain != "binaryauthorization.googleapis.com" {
 				if entry.Domain == "storagetransfer.googleapis.com" {
 					continue
 				}
@@ -84,8 +85,8 @@ func TestPhase18To25InventoryMatchesRegistryTruth(t *testing.T) {
 			}
 		}
 	}
-	if terraformClaims != 11 {
-		t.Errorf("Terraform claims = %d, want eleven passed bounded provider lifecycles", terraformClaims)
+	if terraformClaims != 12 {
+		t.Errorf("Terraform claims = %d, want twelve passed bounded provider lifecycles", terraformClaims)
 	}
 }
 
@@ -354,7 +355,9 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 				t.Errorf("%s has Terraform checks in both %s and %s", check.Domain, prior, gate.ID)
 			}
 			terraformCheckByDomain[check.Domain] = gate.ID
-			if domainGate[check.Domain] != gate.ID {
+			crossPhaseBinaryAuthorization := gate.ID == "phase24-25" &&
+				check.Domain == "binaryauthorization.googleapis.com"
+			if domainGate[check.Domain] != gate.ID && !crossPhaseBinaryAuthorization {
 				t.Errorf("%s Terraform check is not owned by batch %s", check.Domain, gate.ID)
 			}
 			if check.Status != EvidenceLocalPassed || check.Note == "" ||
@@ -400,15 +403,19 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 				entry.Domain, entry.GeneratedClientBoundary)
 		}
 		checkGate, hasCheck := terraformCheckByDomain[entry.Domain]
-		if entry.TerraformClaim && (!hasCheck || checkGate != entry.BatchGate) {
+		expectedCheckGate := entry.BatchGate
+		if entry.Domain == "binaryauthorization.googleapis.com" {
+			expectedCheckGate = "phase24-25"
+		}
+		if entry.TerraformClaim && (!hasCheck || checkGate != expectedCheckGate) {
 			t.Errorf("%s claims Terraform without its own batch-scoped check", entry.Domain)
 		}
 		if !entry.TerraformClaim && hasCheck {
 			t.Errorf("%s has Terraform check without a domain claim", entry.Domain)
 		}
 	}
-	if len(terraformCheckByDomain) != 11 {
-		t.Errorf("per-domain Terraform checks = %d, want 11", len(terraformCheckByDomain))
+	if len(terraformCheckByDomain) != 12 {
+		t.Errorf("per-domain Terraform checks = %d, want 12", len(terraformCheckByDomain))
 	}
 }
 
@@ -1348,6 +1355,176 @@ func TestPhase24OrgPolicyTerraformGateStaticContract(t *testing.T) {
 	}
 }
 
+func TestPhase25BinaryAuthorizationTerraformGateStaticContract(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	contracts := map[string][]string{
+		"terraform/providers.tf": {
+			"binary_authorization_custom_endpoint",
+			"/_minisky/binaryauthorization/v1/",
+		},
+		"terraform/main.tf": {
+			`resource "google_binary_authorization_policy" "phase25"`,
+			"enable_phase25_binary_authorization_policy",
+			`name_pattern = "gcr.io/minisky-phase25/allowed/*"`,
+			`evaluation_mode  = "ALWAYS_DENY"`,
+			`enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"`,
+		},
+		"terraform/variables.tf": {
+			"variable \"enable_phase25_binary_authorization_policy\" {\n" +
+				"  description = \"Manage the optional local Phase-25 Binary Authorization project policy\"\n" +
+				"  type        = bool\n" +
+				"  default     = false\n" +
+				"}",
+		},
+		"terraform/outputs.tf": {
+			"output \"phase25_binary_authorization_policy_name\" {\n" +
+				"  description = \"Canonical name of the optional local Binary Authorization policy, or null when disabled\"\n" +
+				"  value       = local.use_minisky && var.enable_phase25_binary_authorization_policy ? \"projects/${var.project_id}/policy\" : null\n" +
+				"}",
+		},
+		"Makefile": {
+			"test-phase25-binary-authorization-terraform:",
+			"MINISKY_PHASE25_BINARY_AUTHORIZATION_TERRAFORM_INTEGRATION=1 ./scripts/phase25-binary-authorization-terraform-integration.sh",
+		},
+		"scripts/phase25-binary-authorization-terraform-integration.sh": {
+			"MINISKY_PHASE25_BINARY_AUTHORIZATION_TERRAFORM_INTEGRATION",
+			"binary_authorization_custom_endpoint",
+			"google_binary_authorization_policy.phase25[0]",
+			`assert_plan_exit 0 "matching import refresh"`,
+			`assert_plan_exit 2 "stale import refresh"`,
+			`assert_plan_exit 0 "stale import reconcile"`,
+			`state rm -backup="${work}/state-before-import.backup"`,
+			`state rm -backup="${work}/state-before-stale-import.backup"`,
+			`"projects/${project}"`,
+			`"gcr.io/google_containers/*"`,
+			`"ALWAYS_ALLOW"`,
+			`for stale in ("description", "globalPolicyEvaluationMode", "clusterAdmissionRules")`,
+			"trap cleanup EXIT",
+			"trap 'cleanup 130' INT",
+			"trap 'cleanup 143' TERM",
+			`rm -rf "${work}"`,
+			`rmdir "${lock}"`,
+		},
+	}
+	for path, wants := range contracts {
+		source := read(path)
+		for _, want := range wants {
+			if !strings.Contains(source, want) {
+				t.Errorf("%s does not contain %q", path, want)
+			}
+		}
+	}
+}
+
+func TestPhase25BinaryAuthorizationTerraformEvidenceIsLocalOnly(t *testing.T) {
+	gates, err := BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, gate := range gates {
+		if gate.ID != "phase24-25" {
+			continue
+		}
+		for _, check := range gate.TerraformChecks {
+			if check.Domain != "binaryauthorization.googleapis.com" {
+				continue
+			}
+			if check.Status != EvidenceLocalPassed {
+				t.Fatalf("Binary Authorization Terraform evidence status = %q, want local-passed", check.Status)
+			}
+			if check.Script != "scripts/phase25-binary-authorization-terraform-integration.sh" ||
+				check.MakeTarget != "test-phase25-binary-authorization-terraform" {
+				t.Fatalf("Binary Authorization Terraform evidence references = %+v", check)
+			}
+			if check.RunURL != "" || check.Commit != "" || check.Workflow != "" || check.Job != "" {
+				t.Fatalf("local Binary Authorization Terraform evidence contains CI provenance: %+v", check)
+			}
+			return
+		}
+		t.Fatal("phase24-25 gate has no Binary Authorization Terraform check")
+	}
+	t.Fatal("phase24-25 gate is missing")
+}
+
+func TestPhase25BinaryAuthorizationClaimsStayTruthful(t *testing.T) {
+	inventory, err := Phase18To25()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var methodNote string
+	for _, entry := range inventory {
+		if entry.Domain == "binaryauthorization.googleapis.com" {
+			methodNote = entry.MethodNote
+			break
+		}
+	}
+	if methodNote == "" {
+		t.Fatal("Binary Authorization inventory entry is missing")
+	}
+	for _, want := range []string{
+		"pre-restart allow/deny observation",
+		"restart persistence/no-drift",
+		"Cloud Deploy deny",
+		"dry-run AUDIT permit",
+		"without durable audit logging",
+		"GKE/production admission security",
+	} {
+		if !strings.Contains(methodNote, want) {
+			t.Errorf("Binary Authorization method note does not contain %q: %s", want, methodNote)
+		}
+	}
+
+	gates, err := BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkNote string
+	for _, gate := range gates {
+		if gate.ID != "phase24-25" {
+			continue
+		}
+		for _, check := range gate.TerraformChecks {
+			if check.Domain == "binaryauthorization.googleapis.com" {
+				checkNote = check.Note
+			}
+		}
+	}
+	if checkNote == "" {
+		t.Fatal("Binary Authorization Terraform evidence note is missing")
+	}
+	for _, want := range []string{
+		"allow/deny observations before restart",
+		"after restart, policy persistence and zero drift",
+		"enforced DENY blocks MiniSky Cloud Deploy rollouts",
+		"DRYRUN_AUDIT_LOG_ONLY permits rollout and returns AUDIT",
+		"without creating a durable audit record or log",
+		"attestation/global/cluster evaluation returns explicit UNSUPPORTED",
+		"not GKE or production admission security",
+		"no CI pass is recorded",
+	} {
+		if !strings.Contains(checkNote, want) {
+			t.Errorf("Binary Authorization Terraform note does not contain %q: %s", want, checkNote)
+		}
+	}
+	for _, stale := range []string{
+		"records audit",
+		"recording only",
+		"allow/deny observations survive restart",
+	} {
+		if strings.Contains(methodNote, stale) || strings.Contains(checkNote, stale) {
+			t.Errorf("Binary Authorization evidence retains misleading wording %q", stale)
+		}
+	}
+}
+
 func TestPromotedTerraformStateRemovalBackupsStayInTemporaryWorkdirs(t *testing.T) {
 	root := repositoryRoot(t)
 	scripts := []string{
@@ -1432,10 +1609,22 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(data)
+	source := strings.Join(strings.Fields(string(data)), " ")
 	for _, want := range []string{
-		"eleven independently recorded, domain-scoped Terraform",
-		"Eleven bounded provider lifecycles now pass",
+		"twelve independently recorded, domain-scoped Terraform",
+		"Twelve bounded provider lifecycles now pass",
+		"google_binary_authorization_policy",
+		"matching import returns 0",
+		"stale import returns 2",
+		"exact default policy",
+		"apply observes allow/deny before restart",
+		"after restart, the gate proves policy persistence and no drift",
+		"without repeating those decisions",
+		"enforced DENY locally blocks MiniSky Cloud Deploy rollouts",
+		"DRYRUN_AUDIT_LOG_ONLY permits rollout and returns AUDIT",
+		"no durable audit record or log is created",
+		"returns explicit UNSUPPORTED",
+		"not GKE or production admission security",
 		"without batch-wide production promotion",
 	} {
 		if !strings.Contains(source, want) {
@@ -1447,6 +1636,8 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 		"Phase 18–25 Terraform evidence remain unverified or absent",
 		"first Phase 18 Terraform slice for one default-off",
 		"one Workflows provider slice passes locally",
+		"records only the local advisory outcome",
+		"allow/deny observations survive restart",
 	} {
 		if strings.Contains(source, stale) {
 			t.Errorf("roadmap canvas retains stale Terraform claim %q", stale)

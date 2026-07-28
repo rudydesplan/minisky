@@ -118,6 +118,11 @@ output "phase24_org_policy_name" {
   value       = local.use_minisky && var.enable_phase24_org_policy ? "projects/${var.project_id}/policies/compute.disableSerialPortAccess" : null
 }
 
+output "phase25_binary_authorization_policy_name" {
+  description = "Canonical name of the optional local Binary Authorization policy, or null when disabled"
+  value       = local.use_minisky && var.enable_phase25_binary_authorization_policy ? "projects/${var.project_id}/policy" : null
+}
+
 output "phase10_artifact_repository_name" {
   description = "Name of the optional local Phase-10 Artifact Registry repository, or null when disabled"
   value       = var.enable_phase10_artifact_resources ? google_artifact_registry_repository.phase10[0].name : null

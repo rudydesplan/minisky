@@ -35,7 +35,7 @@ const phases = [
   ["20", "Extended databases", "Experimental · local + CI + four Terraform gates passed", "Provider 7.41.0 proves bounded AlloyDB cluster/primary, Filestore, Identity Platform singleton, and local GCS-to-GCS Storage Transfer lifecycles; production networking remains outside the claims"],
   ["21–22", "Observability and API management", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves the Service Directory namespace/service/endpoint hierarchy; durable ingestion, gateway, rollout, policy, restart, and cleanup gates pass while external deployment and DNS parity remain unsupported"],
   ["23", "AI and ML services", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one metadata-only Document AI processor lifecycle; bounded client contracts, restart, sensitive-data absence, and cleanup pass while processing and inference parity remain unsupported"],
-  ["24–25", "Security and networking", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one project Organization Policy lifecycle and bounded local decision; CA, Binary Authorization, DLP, asset, perimeter, routing, restart, and cleanup pass without production enforcement claims"],
+  ["24–25", "Security and networking", "Experimental · batch CI + two local Terraform gates", "Provider 7.41.0 proves bounded Organization Policy and Binary Authorization project-policy lifecycles locally; both remain local emulation without production enforcement claims"],
 ];
 
 const waves = [
@@ -126,7 +126,7 @@ const waves = [
       "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI. Phase 19 heavy Kafka/Airflow backend CI passed on commit d657e4b; bounded local Workflows and Eventarc Terraform claims now exist.",
+    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI. Twelve domain-scoped Terraform checks pass locally; Binary Authorization has no separate CI pass record.",
   },
 ];
 
@@ -138,7 +138,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Stack gap={8}>
         <Row align="center" justify="space-between" wrap>
           <H1>MiniSky roadmap completion plan</H1>
-          <Pill active>Repository audit · 2026-07-27</Pill>
+          <Pill active>Repository audit · 2026-07-28</Pill>
         </Row>
         <Text tone="secondary">
           A dependency-ordered plan grounded in <Code>README.md</Code>, <Code>PRODUCT.md</Code>,
@@ -157,7 +157,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         pass locally, including the applicable Docker and loopback backend boundaries. All six external CI gates
         passed on commit 62d6fa2. On commit d657e4b, Phase 19 Kafka/Airflow, the corrected GoReleaser validation,
         Linux AMD64 release snapshot, native AMD64/ARM64 packages, and Linux ARM64, macOS ARM64, and Windows AMD64
-        CGO jobs all passed. Provider 7.41.0 now passes eleven independently recorded, domain-scoped Terraform
+        CGO jobs all passed. Provider 7.41.0 now passes twelve independently recorded, domain-scoped Terraform
         lifecycles while every Phase 18–25 service remains default-off and bounded by its documented local contract.
         Phase 18 now also has isolated public-gateway Pub/Sub → Eventarc → Workflows live-dispatch evidence with
         exact raw request nonce/argument/result checks, foreign-topic/project negative publishes, and separate
@@ -177,7 +177,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Card>
         <Card>
           <CardHeader>Promotion status</CardHeader>
-          <CardBody><H2>Default-off</H2><Text tone="secondary">Eleven bounded provider lifecycles pass without batch-wide production promotion</Text></CardBody>
+          <CardBody><H2>Default-off</H2><Text tone="secondary">Twelve bounded provider lifecycles pass without batch-wide production promotion</Text></CardBody>
         </Card>
       </Grid>
 
@@ -210,7 +210,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         <Stack gap={8}>
           <H3>Terraform status</H3>
           <Text tone="secondary">
-            Eleven bounded provider lifecycles now pass with provider 7.41.0, including the coupled
+            Twelve bounded provider lifecycles now pass with provider 7.41.0, including the coupled
             <Code>google_alloydb_cluster</Code> and <Code>google_alloydb_instance</Code> gate. AlloyDB proves
             real PostgreSQL protocol persistence, restart reconciliation, no drift, canonical imports, ordered
             destroy, durable 404s, and exact-owned cleanup without claiming production networking or HA parity.
@@ -219,6 +219,17 @@ export default function MiniSkyRoadmapCompletionPlan() {
             claiming document processing, OCR quality, or model inference.
             Organization Policy additionally proves one project boolean policy and advisory decision without claiming
             production enforcement, IAM, or compliance.
+            Binary Authorization adds only the default-off <Code>google_binary_authorization_policy</Code> singleton:
+            apply observes allow/deny before restart; after restart, the gate proves policy persistence and no drift
+            without repeating those decisions; matching import returns 0, stale import returns 2 before reconciliation
+            reaches zero drift, and destroy restores and persists the exact default policy.
+          </Text>
+          <Text tone="secondary">
+            Independent package evidence proves enforced DENY locally blocks MiniSky Cloud Deploy rollouts.
+            DRYRUN_AUDIT_LOG_ONLY permits rollout and returns AUDIT; no durable audit record or log is created.
+            Unsupported attestation, global-policy, and cluster-rule evaluation returns explicit UNSUPPORTED.
+            This is local emulation, not GKE or production admission security. The Binary Authorization Terraform
+            check is local-passed only; it has no invented CI run URL or commit, and it does not promote service fidelity.
           </Text>
         </Stack>
       </Grid>
@@ -401,17 +412,17 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Stack>
       </Grid>
 
-      <Callout tone="info" title="Next provider evidence milestone">
-        Workflows and Eventarc trigger control-plane gates now pass with provider 7.41.0. A separate guarded
+      <Callout tone="info" title="Latest bounded provider evidence">
+        Workflows and Eventarc trigger control-plane gates pass with provider 7.41.0. A separate guarded
         public-gateway gate proves live Pub/Sub → Eventarc → Workflows dispatch plus completed execution persistence
         across restart; deterministic interrupted-intent replay, CloudEvents parity, transport provisioning, OIDC,
-        ordering, exactly-once delivery, and Eventarc promotion remain outside the claim. Provider 7.41.0 exposes no
-        Batch job resource or Batch custom endpoint. Bounded
-        Composer and Managed Kafka heavy provider gates now pass; the
-        Kafka subnet is metadata-only and its local broker is plaintext, so no GCP VPC or managed TLS parity is
-        claimed. Phase 19 has no Dataform resource, and the current Dataflow API does not expose the provider&apos;s
-        template-launch path. Evaluate the smallest truthful Phase 20 provider resource next. Keep every domain experimental and default-off; distribution publication
-        remains a separate release workflow.
+        ordering, exactly-once delivery, and Eventarc promotion remain outside that claim. Provider 7.41.0 exposes no
+        Batch job resource or Batch custom endpoint.
+        The Phase 25 Binary Authorization singleton now has an independent local-passed provider 7.41.0 record,
+        exact script and Make target, import/no-drift/reset semantics, and temporary backup/cleanup references.
+        This is separate from the already recorded Phase 24–25 generated-client CI gate: no Binary Authorization
+        Terraform CI pass is claimed. Keep every domain experimental and default-off; fidelity promotion,
+        production enforcement, and distribution publication remain separate workflows.
       </Callout>
     </Stack>
   );

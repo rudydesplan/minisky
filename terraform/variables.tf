@@ -244,6 +244,12 @@ variable "enable_phase24_org_policy" {
   default     = false
 }
 
+variable "enable_phase25_binary_authorization_policy" {
+  description = "Manage the optional local Phase-25 Binary Authorization project policy"
+  type        = bool
+  default     = false
+}
+
 variable "phase16_instance_name" {
   description = "Name of the optional local Phase-16 Compute instance"
   type        = string

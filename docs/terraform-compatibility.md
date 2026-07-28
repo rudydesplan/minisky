@@ -31,6 +31,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | Provider setting | Canonical endpoint | Routed domain |
 | :--- | :--- | :--- |
 | `artifact_registry_custom_endpoint` | `http://127.0.0.1:8080/_minisky/artifactregistry/` | `artifactregistry.googleapis.com` |
+| `binary_authorization_custom_endpoint` | `http://127.0.0.1:8080/_minisky/binaryauthorization/v1/` | `binaryauthorization.googleapis.com` |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `compute_custom_endpoint` | `http://127.0.0.1:8080/_minisky/compute/compute/v1/` | `compute.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
@@ -94,6 +95,7 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_service_directory_namespace` + `google_service_directory_service` + `google_service_directory_endpoint` (optional Phase 21) | Persisted isolated hierarchy and opaque endpoint registration metadata | Synchronous hierarchy | API observation before/after restart, no-drift, three canonical imports/reconciliation, child-first destroy, durable 404s, and empty-list cleanup pass |
 | `google_document_ai_processor` (optional Phase 23) | Persisted processor control-plane metadata | Create synchronous; delete service LRO | API observation before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, and empty-list cleanup pass |
 | `google_org_policy_policy` (optional Phase 24) | Persisted project boolean policy and bounded advisory evaluation | Synchronous policy lifecycle | Local enforced decision before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, empty-list cleanup, and constraint-default fallback pass |
+| `google_binary_authorization_policy` (optional Phase 25) | Persisted project singleton policy with bounded local Cloud Deploy enforcement | Singleton reset lifecycle | Apply and pre-restart allow/deny observation, restart persistence/no-drift, matching import exit 0, stale import exit 2 then reconciliation/no-drift, and destroy reset to the exact persisted default policy pass locally |
 
 The table sets `deletion_protection = false`, and the dataset sets
 `delete_contents_on_destroy = true`, so the example can be destroyed
@@ -114,7 +116,9 @@ Spanner configuration. Enable Artifact Registry with
 subnetwork with `enable_phase16_network_resources = true`; their outputs are
 `null` or empty while disabled. Enable the bounded Workflows resource with
 `enable_phase18_workflows_resource = true`; the dependent Eventarc trigger also
-requires `enable_phase18_eventarc_resource = true`.
+requires `enable_phase18_eventarc_resource = true`. The Phase 25 Binary
+Authorization singleton is separately default-off behind
+`enable_phase25_binary_authorization_policy = true`.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
@@ -251,6 +255,35 @@ zero drift, canonical full-ID import with reconciliation, delete, durable 404,
 empty-list cleanup, and fallback to the seeded constraint default. This is a
 bounded local policy simulation, not production enforcement, IAM, inferred
 organization hierarchy, or compliance.
+
+The separate Phase 25 gate targets only
+`google_binary_authorization_policy.phase25[0]`. Provider `7.41.0` applies the
+project singleton through the canonical Binary Authorization endpoint and
+observes a whitelist allow plus an enforced default-rule deny before restart.
+After restart, the gate proves policy persistence and zero drift; it does not
+repeat the allow/deny observations. Removing the resource from Terraform state
+uses a temporary backup; a matching import of `projects/<project>` then
+produces plan exit `0`. The gate next writes deliberately stale remote
+description metadata, removes state with a second temporary backup, imports the
+same singleton, and requires stale import plan exit `2`; targeted apply
+reconciles the policy and the next plan returns `0`. Destroy does not delete a
+Binary Authorization singleton: it resets the API object to the exact default
+policy—`gcr.io/google_containers/*`, `ALWAYS_ALLOW`, and
+`ENFORCED_BLOCK_AND_AUDIT_LOG`—with stale description, global-policy, and
+cluster-rule fields absent. A final restart proves that reset persists.
+
+Independent package tests cover the evaluation boundary omitted from the
+provider fixture: enforced `DENY` locally blocks MiniSky Cloud Deploy rollouts.
+`DRYRUN_AUDIT_LOG_ONLY` permits rollout and returns `AUDIT`; no durable audit
+record or log is created. Unsupported attestation, global-policy, and
+cluster-rule evaluation returns explicit `UNSUPPORTED`. This is Terraform
+lifecycle compatibility and local emulation, not service fidelity promotion,
+GKE admission, or production admission security. The service remains
+experimental and default-off. The gate is recorded as `local-passed`
+only—there is no claimed CI run URL or commit. Its guarded runner uses isolated
+temporary HOME, Terraform data/state, profile state, ports, sanitized
+diagnostics, state backups, and EXIT/INT/TERM cleanup; it removes the temporary
+work directory and process lock on exit.
 
 ## Go, Python, and Java SDK smoke suites
 

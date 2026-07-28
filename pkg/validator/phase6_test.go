@@ -256,8 +256,8 @@ func TestPhase6CreateContracts(t *testing.T) {
 			domain:      "binaryauthorization.googleapis.com",
 			method:      http.MethodPut,
 			path:        "/v1/projects/test-project/policy",
-			validBody:   `{"name":"projects/test-project/policy","defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW"}}`,
-			invalidBody: `{"name":"projects/test-project/policy"}`,
+			validBody:   `{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
+			invalidBody: `{}`,
 			wantMessage: "defaultAdmissionRule",
 		},
 	}

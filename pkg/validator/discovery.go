@@ -813,7 +813,6 @@ var embeddedRules = []ServiceSchema{
 	{Domain: "binaryauthorization.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "PUT", PathGlob: "/v1/projects/*/policy", ContentType: "application/json",
 			RequiredBody: []BodyField{
-				{Path: "name", Type: "string", Message: "field 'name' is required for policy.update"},
 				{Path: "defaultAdmissionRule", Type: "object", Message: "field 'defaultAdmissionRule' is required for policy.update"},
 			}},
 		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/policy:evaluate", ContentType: "application/json",

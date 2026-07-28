@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +19,12 @@ import (
 )
 
 const phase24Image = "us-docker.pkg.dev/demo/releases/app@sha256:abc"
+
+type phase24ErrorEvaluator struct {
+	err error
+}
+
+func (e phase24ErrorEvaluator) EvaluateImage(string, string) error { return e.err }
 
 func TestBootInjectsBinaryAuthorizationEvaluator(t *testing.T) {
 	t.Setenv(registry.ExperimentalServicesEnv, "1")
@@ -35,13 +42,17 @@ func TestBootInjectsBinaryAuthorizationEvaluator(t *testing.T) {
 
 func TestRolloutBinaryAuthorizationDecision(t *testing.T) {
 	tests := []struct {
-		name       string
-		project    string
-		policy     *binaryauthorization.Policy
-		wantState  string
-		wantCalled int32
-		wantError  bool
-		wantCode   int
+		name         string
+		project      string
+		policy       *binaryauthorization.Policy
+		wantState    string
+		wantCalled   int32
+		wantError    bool
+		wantCode     int
+		wantMessage  string
+		unsupported  bool
+		unavailable  bool
+		evaluatorErr error
 	}{
 		{
 			name:    "allow",
@@ -65,11 +76,82 @@ func TestRolloutBinaryAuthorizationDecision(t *testing.T) {
 			wantCode:  7,
 		},
 		{
+			name:    "dry-run denial does not block",
+			project: "dry-run",
+			policy: &binaryauthorization.Policy{
+				Name: "projects/dry-run/policy",
+				DefaultAdmissionRule: binaryauthorization.AdmissionRule{
+					EvaluationMode:  "ALWAYS_DENY",
+					EnforcementMode: "DRYRUN_AUDIT_LOG_ONLY",
+				},
+			},
+			wantState:  "SUCCEEDED",
+			wantCalled: 1,
+		},
+		{
+			name:    "attestation remains explicitly unsupported",
+			project: "attestation",
+			policy: &binaryauthorization.Policy{
+				Name: "projects/attestation/policy",
+				DefaultAdmissionRule: binaryauthorization.AdmissionRule{
+					EvaluationMode:        "REQUIRE_ATTESTATION",
+					EnforcementMode:       "ENFORCED_BLOCK_AND_AUDIT_LOG",
+					RequireAttestationsBy: []string{"projects/security/attestors/provenance"},
+				},
+			},
+			wantState:   "FAILED",
+			wantError:   true,
+			wantCode:    12,
+			wantMessage: "evaluation unsupported",
+			unsupported: true,
+		},
+		{
+			name:    "dry-run attestation does not block",
+			project: "dry-run-attestation",
+			policy: &binaryauthorization.Policy{
+				Name: "projects/dry-run-attestation/policy",
+				DefaultAdmissionRule: binaryauthorization.AdmissionRule{
+					EvaluationMode:        "REQUIRE_ATTESTATION",
+					EnforcementMode:       "DRYRUN_AUDIT_LOG_ONLY",
+					RequireAttestationsBy: []string{"projects/security/attestors/provenance"},
+				},
+			},
+			wantState:  "SUCCEEDED",
+			wantCalled: 1,
+		},
+		{
+			name:    "global policy remains explicitly unsupported",
+			project: "global-policy",
+			policy: &binaryauthorization.Policy{
+				Name:                       "projects/global-policy/policy",
+				GlobalPolicyEvaluationMode: "ENABLE",
+				DefaultAdmissionRule: binaryauthorization.AdmissionRule{
+					EvaluationMode:  "ALWAYS_ALLOW",
+					EnforcementMode: "ENFORCED_BLOCK_AND_AUDIT_LOG",
+				},
+			},
+			wantState:   "FAILED",
+			wantError:   true,
+			wantCode:    12,
+			wantMessage: "evaluation unsupported",
+			unsupported: true,
+		},
+		{
 			name:      "missing policy defaults to deny",
 			project:   "missing",
 			wantState: "FAILED",
 			wantError: true,
 			wantCode:  7,
+		},
+		{
+			name:         "persistence outage is unavailable",
+			project:      "outage",
+			wantState:    "FAILED",
+			wantError:    true,
+			wantCode:     14,
+			wantMessage:  "unavailable",
+			unavailable:  true,
+			evaluatorErr: fmt.Errorf("sticky initialization: %w", binaryauthorization.ErrPersistence),
 		},
 	}
 
@@ -91,7 +173,11 @@ func TestRolloutBinaryAuthorizationDecision(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			api, release := phase24API(test.project, evaluator)
+			var policyEvaluator imagePolicyEvaluator = evaluator
+			if test.evaluatorErr != nil {
+				policyEvaluator = phase24ErrorEvaluator{err: test.evaluatorErr}
+			}
+			api, release := phase24API(test.project, policyEvaluator)
 			opName := createPhase24Rollout(t, api, release, target.URL)
 			op := waitPhase24Operation(t, api.opMgr, opName)
 
@@ -112,6 +198,15 @@ func TestRolloutBinaryAuthorizationDecision(t *testing.T) {
 			}
 			if test.wantError && op.Error.Code != test.wantCode {
 				t.Fatalf("operation error code = %d, want %d", op.Error.Code, test.wantCode)
+			}
+			if test.wantMessage != "" && !strings.Contains(op.Error.Message, test.wantMessage) {
+				t.Fatalf("operation error = %q, want %q", op.Error.Message, test.wantMessage)
+			}
+			if test.unsupported && strings.Contains(op.Error.Message, "denied image") {
+				t.Fatalf("unsupported evaluation reported as denial: %q", op.Error.Message)
+			}
+			if test.unavailable && strings.Contains(op.Error.Message, "denied image") {
+				t.Fatalf("unavailable evaluation reported as denial: %q", op.Error.Message)
 			}
 		})
 	}
