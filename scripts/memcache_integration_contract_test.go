@@ -66,7 +66,7 @@ func TestMemcacheIntegrationUsesStableSharedLockBeforeDockerChecks(t *testing.T)
 }
 
 func TestMemcacheIntegrationAlternateTMPDIRCannotBypassSharedLock(t *testing.T) {
-	bin := t.TempDir()
+	bin := presenceOnlyRequiredCommands(t, "curl", "docker", "go", "python3", "terraform")
 	logPath := filepath.Join(bin, "mkdir.log")
 	fakeMkdir := `#!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_MKDIR_LOG}"
@@ -99,7 +99,7 @@ exit 1
 }
 
 func TestMemcacheIntegrationAlternateTMPDIRRunsCannotRace(t *testing.T) {
-	bin := t.TempDir()
+	bin := presenceOnlyRequiredCommands(t, "curl", "docker", "go", "python3", "terraform")
 	lockRoot := filepath.Join(t.TempDir(), "locks")
 	marker := filepath.Join(t.TempDir(), "docker-info")
 	release := filepath.Join(t.TempDir(), "release")
@@ -133,15 +133,26 @@ if [[ "${1:-}" == "info" ]]; then
 fi
 exit 74
 `
+	fakePython := `#!/bin/bash
+if [[ "$#" -eq 4 && "$1" == "-" && "$2" == "15" && "$3" == "docker" && "$4" == "info" ]]; then
+  exec docker info
+fi
+printf 'Unexpected fake python3 invocation:' >&2
+printf ' %q' "$@" >&2
+printf '\n' >&2
+exit 75
+`
 	for nameAndSource := range map[string]string{
-		"mkdir":  fakeMkdir,
-		"rmdir":  fakeRmdir,
-		"docker": fakeDocker,
+		"mkdir":   fakeMkdir,
+		"rmdir":   fakeRmdir,
+		"docker":  fakeDocker,
+		"python3": fakePython,
 	} {
 		if err := os.WriteFile(filepath.Join(bin, nameAndSource), []byte(map[string]string{
-			"mkdir":  fakeMkdir,
-			"rmdir":  fakeRmdir,
-			"docker": fakeDocker,
+			"mkdir":   fakeMkdir,
+			"rmdir":   fakeRmdir,
+			"docker":  fakeDocker,
+			"python3": fakePython,
 		}[nameAndSource]), 0o700); err != nil {
 			t.Fatal(err)
 		}

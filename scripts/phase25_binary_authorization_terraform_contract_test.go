@@ -98,15 +98,18 @@ func TestPhase25BinaryAuthorizationTerraformGuard(t *testing.T) {
 
 func TestPhase25BinaryAuthorizationTerraformCollisionRefusal(t *testing.T) {
 	temp := t.TempDir()
+	bin := presenceOnlyRequiredCommands(t, "curl", "go", "python3", "terraform")
 	lock := filepath.Join(temp, "minisky-phase25-binary-authorization-terraform-integration.lock")
 	if err := os.Mkdir(lock, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	command := exec.Command("./phase25-binary-authorization-terraform-integration.sh")
 	command.Env = append(
-		withoutEnvironment(os.Environ(), "MINISKY_PHASE25_BINARY_AUTHORIZATION_TERRAFORM_INTEGRATION", "TMPDIR"),
+		withoutEnvironment(os.Environ(),
+			"MINISKY_PHASE25_BINARY_AUTHORIZATION_TERRAFORM_INTEGRATION", "TMPDIR", "PATH"),
 		"MINISKY_PHASE25_BINARY_AUTHORIZATION_TERRAFORM_INTEGRATION=1",
 		"TMPDIR="+temp,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
 	output, err := command.CombinedOutput()
 	exit, ok := err.(*exec.ExitError)
@@ -164,7 +167,7 @@ if [[ "${1:-}" == "-p" ]]; then printf 'injected\n' >"${3}/injected"; fi
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			temp := t.TempDir()
-			bin := t.TempDir()
+			bin := presenceOnlyRequiredCommands(t, "curl", "go", "python3", "terraform")
 			helper := "mkdir"
 			if test.name == "mktemp failure" {
 				helper = "mktemp"
