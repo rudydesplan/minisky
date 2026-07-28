@@ -1,4 +1,4 @@
-.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase18-event-delivery test-phase18-eventarc-terraform test-phase18-workflows-terraform test-phase19-sdk test-phase19-heavy-backend test-phase19-composer-terraform test-phase19-managed-kafka-terraform test-phase20-sdk test-phase20-alloydb-terraform test-phase20-filestore-terraform test-phase20-identity-platform-terraform test-phase20-storage-transfer-terraform test-phase21-22-sdk test-phase21-service-directory-terraform test-phase23-sdk test-phase23-document-ai-terraform test-phase24-25-sdk test-phase24-org-policy-terraform benchmark
+.PHONY: dev test ui-install ui-build ui-test check-docs-truth test-integration test-kind test-java-sdk-compile test-java-sdk-smoke test-event-delivery test-phase10-artifact test-phase11-distribution test-phase12-observability-contract test-phase12-observability test-phase13-wif test-phase16-monitoring test-phase16-logging test-phase16-dns test-phase16-subnetwork test-phase16-subnetwork-terraform test-phase16-vertex test-phase17 test-phase17-enterprise test-phase18-25-evidence test-phase18-25-sdk test-phase18-event-delivery test-phase18-eventarc-terraform test-phase18-workflows-terraform test-phase19-sdk test-phase19-heavy-backend test-phase19-composer-terraform test-phase19-managed-kafka-terraform test-phase20-sdk test-phase20-alloydb-terraform test-phase20-filestore-terraform test-phase20-identity-platform-terraform test-phase20-storage-transfer-terraform test-phase21-22-sdk test-phase21-service-directory-terraform test-phase23-sdk test-phase23-document-ai-terraform test-phase24-25-sdk test-phase24-org-policy-terraform benchmark
 
 ui-install:
 	cd ui && npm ci
@@ -44,7 +44,10 @@ test-phase11-distribution:
 	./scripts/phase11-distribution-test.sh --self-test
 	./scripts/phase11-distribution-test.sh --static
 
-test-phase12-observability:
+test-phase12-observability-contract:
+	./scripts/phase12-observability-integration-test.sh
+
+test-phase12-observability: test-phase12-observability-contract
 	MINISKY_PHASE12_OBSERVABILITY_INTEGRATION=1 ./scripts/phase12-observability-integration.sh
 
 test-phase13-wif:

@@ -206,10 +206,7 @@ var startCmd = &cobra.Command{
 			Endpoint:       otelEndpoint,
 			ServiceVersion: version.Version,
 		})
-		if telemetryErr != nil {
-			log.Printf("[WARN] OpenTelemetry disabled after setup failure: %v", telemetryErr)
-			telemetryShutdown = func(context.Context) error { return nil }
-		}
+		telemetryShutdown = telemetrySetupOrNoop(telemetryShutdown, telemetryErr)
 		telemetryClosed := false
 		defer func() {
 			if telemetryClosed {
@@ -219,11 +216,6 @@ var startCmd = &cobra.Command{
 			defer cancelTelemetry()
 			result = errors.Join(result, telemetryShutdown(telemetryCtx))
 		}()
-		gatewayObservability := observability.New(observability.Config{
-			Capacity:           1000,
-			ReplayEnabled:      replayEnabled,
-			ReplayMaxBodyBytes: replayMaxBody,
-		})
 		quotaLimiter, err := router.ParseQuotaConfigJSON(quotaConfigJSON, time.Now)
 		if err != nil {
 			return fmt.Errorf("parse quota configuration: %w", err)
@@ -258,6 +250,17 @@ var startCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("select service domains: %w", err)
 		}
+		knownServices := make([]string, 0, len(exposedShims)+len(exposedLazyDomains))
+		for domain := range exposedShims {
+			knownServices = append(knownServices, domain)
+		}
+		knownServices = append(knownServices, exposedLazyDomains...)
+		gatewayObservability := observability.New(observability.Config{
+			Capacity:           1000,
+			ReplayEnabled:      replayEnabled,
+			ReplayMaxBodyBytes: replayMaxBody,
+			KnownServices:      knownServices,
+		})
 		iamAPI := shims["iam.googleapis.com"].(*iam.API)
 		projectAPI := shims["cloudresourcemanager.googleapis.com"].(*resourcemanager.API)
 		proxyRouter.ConfigureSecurity(iamAPI, projectAPI, enforceProjects, tokenAudience)
@@ -433,6 +436,17 @@ var startCmd = &cobra.Command{
 		}
 		return errors.Join(listenerErr, shutdownErr)
 	},
+}
+
+func telemetrySetupOrNoop(
+	shutdown func(context.Context) error,
+	setupErr error,
+) func(context.Context) error {
+	if setupErr == nil {
+		return shutdown
+	}
+	log.Printf("[WARN] OpenTelemetry disabled after setup failure: %v", setupErr)
+	return func(context.Context) error { return nil }
 }
 
 func waitForDaemonListener(ctx context.Context, results <-chan error) error {

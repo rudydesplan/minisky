@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -364,6 +366,25 @@ func TestTelemetryDeadlineDoesNotStarvePluginPersistence(t *testing.T) {
 	case <-persisted:
 	default:
 		t.Fatal("plugin persistence was starved by telemetry shutdown")
+	}
+}
+
+func TestTelemetrySetupFailureWarnsAndReturnsNoop(t *testing.T) {
+	previousWriter := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	sentinel := errors.New("invalid OTLP endpoint")
+	shutdown := telemetrySetupOrNoop(func(context.Context) error {
+		return errors.New("unexpected original shutdown call")
+	}, sentinel)
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("fallback shutdown: %v", err)
+	}
+	if !strings.Contains(logs.String(), "OpenTelemetry disabled after setup failure") ||
+		!strings.Contains(logs.String(), sentinel.Error()) {
+		t.Fatalf("startup warning = %q", logs.String())
 	}
 }
 

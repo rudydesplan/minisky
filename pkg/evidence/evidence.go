@@ -1,10 +1,12 @@
-// Package evidence exposes the executable Phase 18-25 evidence inventory.
+// Package evidence exposes machine-readable platform and service evidence.
 package evidence
 
 import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"regexp"
 )
 
 type GeneratedClientBoundary string
@@ -49,6 +51,7 @@ var aggregateGatesJSON []byte
 type EvidenceStatus string
 
 const (
+	GitHubRepository                            = "rudydesplan/minisky"
 	EvidenceLocalPassed          EvidenceStatus = "local-passed"
 	EvidenceCIPassed             EvidenceStatus = "ci-passed"
 	EvidenceConfiguredUnverified EvidenceStatus = "configured-unverified"
@@ -76,6 +79,19 @@ type EvidenceCheck struct {
 	Commit     string          `json:"commit,omitempty"`
 	Note       string          `json:"note"`
 }
+
+// PlatformGate records one platform-level verification boundary. It remains
+// distinct from BatchGate because platform diagnostics are not experimental
+// service domains and do not participate in Phase 18-25 promotion.
+type PlatformGate struct {
+	ID    string        `json:"id"`
+	Phase int           `json:"phase"`
+	Name  string        `json:"name"`
+	Check EvidenceCheck `json:"check"`
+}
+
+//go:embed platform_gates.json
+var platformGatesJSON []byte
 
 // TerraformCheck records one provider lifecycle for exactly one service
 // domain. Terraform evidence is intentionally not represented as a batch-wide
@@ -151,5 +167,81 @@ func BatchGates() ([]BatchGate, error) {
 	if err := json.Unmarshal(batchGatesJSON, &gates); err != nil {
 		return nil, fmt.Errorf("decode Phase 18-25 batch gates: %w", err)
 	}
+	for _, gate := range gates {
+		checks := map[string]EvidenceCheck{
+			"packageUnit":              gate.PackageUnit,
+			"generatedClientLifecycle": gate.GeneratedClientLifecycle,
+			"daemonRestart":            gate.DaemonRestart,
+			"realBackendDocker":        gate.RealBackendDocker,
+			"strictIAM":                gate.StrictIAM,
+			"cleanup":                  gate.Cleanup,
+			"ci":                       gate.CI,
+		}
+		if gate.BackendCI.Status != "" {
+			checks["backendCI"] = gate.BackendCI
+		}
+		for name, check := range checks {
+			if err := ValidateEvidenceCheck(check); err != nil {
+				return nil, fmt.Errorf("%s %s: %w", gate.ID, name, err)
+			}
+		}
+		for _, check := range gate.TerraformChecks {
+			if err := ValidateEvidenceCheck(check.EvidenceCheck); err != nil {
+				return nil, fmt.Errorf("%s Terraform check for %s: %w", gate.ID, check.Domain, err)
+			}
+		}
+	}
 	return gates, nil
+}
+
+// PlatformGates returns the checked-in platform verification inventory.
+func PlatformGates() ([]PlatformGate, error) {
+	var gates []PlatformGate
+	if err := json.Unmarshal(platformGatesJSON, &gates); err != nil {
+		return nil, fmt.Errorf("decode platform gates: %w", err)
+	}
+	for _, gate := range gates {
+		if gate.ID == "" || gate.Phase == 0 || gate.Name == "" {
+			return nil, fmt.Errorf("platform gate has incomplete identity: %+v", gate)
+		}
+		if err := ValidateEvidenceCheck(gate.Check); err != nil {
+			return nil, fmt.Errorf("%s: %w", gate.ID, err)
+		}
+	}
+	return gates, nil
+}
+
+var (
+	fullCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	actionsRunPattern = regexp.MustCompile(
+		`^/` + regexp.QuoteMeta(GitHubRepository) + `/actions/runs/[0-9]+$`,
+	)
+)
+
+// ValidateEvidenceCheck prevents configured or local evidence from being
+// presented as an immutable CI pass and rejects incomplete CI pass claims.
+func ValidateEvidenceCheck(check EvidenceCheck) error {
+	if check.Status == "" || check.Note == "" {
+		return fmt.Errorf("status and note are required")
+	}
+	switch check.Status {
+	case EvidenceCIPassed:
+		runURL, err := url.Parse(check.RunURL)
+		if err != nil || runURL.Scheme != "https" || runURL.Host != "github.com" ||
+			!actionsRunPattern.MatchString(runURL.Path) || runURL.RawQuery != "" ||
+			runURL.Fragment != "" || runURL.User != nil {
+			return fmt.Errorf("ci-passed requires a %s GitHub Actions run URL", GitHubRepository)
+		}
+		if !fullCommitPattern.MatchString(check.Commit) {
+			return fmt.Errorf("ci-passed requires a lowercase 40-hex commit")
+		}
+	case EvidenceLocalPassed, EvidenceConfiguredUnverified, EvidenceOptionalUnverified,
+		EvidenceNotApplicable, EvidenceAbsent:
+		if check.RunURL != "" || check.Commit != "" {
+			return fmt.Errorf("%s must not include CI run or commit fields", check.Status)
+		}
+	default:
+		return fmt.Errorf("unknown evidence status %q", check.Status)
+	}
+	return nil
 }

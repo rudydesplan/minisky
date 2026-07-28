@@ -386,7 +386,7 @@ require network access; the command does not prune global Docker resources.
 | 9 | Executable serverless and event delivery | A guarded local Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes; Scheduler remains manual `:run` E2E | ✅ Verified bounded local slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
-| 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
+| 12 | Observability and request diagnostics | Bounded W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay response, and shutdown pass locally; required CI is configured without an external pass record | ✅ Verified bounded local slice |
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
 | 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
@@ -520,16 +520,13 @@ and rpm are not published.
 
 ### Phase 12 — Observability and request diagnostics
 
-- Emit structured JSON logs for every API request with correlation IDs,
-  latency, and response status.
-- Integrate OpenTelemetry tracing so spans propagate across gateway, shims,
-  and Docker-backed services.
-- Expose a Prometheus-compatible `/metrics` endpoint for request rates, error
-  rates, and resource counts.
-- Provide opt-in replay for eligible same-gateway calls, with bounded JSON body
-  capture, sensitive-field rejection, and recursion prevention.
-- Surface gateway request and trace correlation data in a dedicated Dashboard
-  view and headless diagnostics CLI, separate from Cloud Logging.
+<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->
+**Generated Phase 12 platform truth:** Local passes: 3/4.
+
+The bounded platform diagnostics slice covers bounded W3C propagation, sanitized structured access logs, low-cardinality Prometheus metrics, bounded sanitized OTLP export inspection, exporter degradation without changing API responses, bounded replay responses, and graceful shutdown. Replay provides project-keyed lookup scoping, not cross-project authorization. Required pull-request/main CI and optional manual execution are configured, but no external Phase 12 pass is recorded.
+
+This platform diagnostics layer is separate from the experimental Phase 21–22 service domains. A persistent trace backend, remote diagnostics listener, Cloud Logging parity, and RBAC replay isolation remain deferred.
+<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->
 
 ### Phase 13 — Security, authentication, and credential simulation
 

@@ -537,3 +537,5 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	}
 	return function(request)
 }
+
+func (roundTripFunc) MiniSkyPrivacySafeTransport() {}

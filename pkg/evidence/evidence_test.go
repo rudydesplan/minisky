@@ -111,6 +111,146 @@ func TestPhase18To25InventoryReferencesExecutablePackageTests(t *testing.T) {
 	}
 }
 
+func TestPhase12PlatformGatesAreCompleteAndReferenceable(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := PlatformGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]EvidenceStatus{
+		"phase12-package-race-unit":   EvidenceLocalPassed,
+		"phase12-guarded-integration": EvidenceLocalPassed,
+		"phase12-guard-self-test":     EvidenceLocalPassed,
+		"phase12-ci":                  EvidenceConfiguredUnverified,
+	}
+	if len(gates) != len(want) {
+		t.Fatalf("platform gates = %d, want %d", len(gates), len(want))
+	}
+	cache := make(map[string]string)
+	for _, gate := range gates {
+		status, ok := want[gate.ID]
+		if !ok {
+			t.Errorf("unexpected platform gate %q", gate.ID)
+			continue
+		}
+		delete(want, gate.ID)
+		if gate.Phase != 12 || gate.Name == "" {
+			t.Errorf("%s has incomplete platform identity: %+v", gate.ID, gate)
+		}
+		if gate.Check.Status != status {
+			t.Errorf("%s status = %q, want %q", gate.ID, gate.Check.Status, status)
+		}
+		if err := validateEvidenceCheck(root, gate.ID, gate.Check, cache); err != nil {
+			t.Errorf("%s: %v", gate.ID, err)
+		}
+	}
+	for id := range want {
+		t.Errorf("missing platform gate %q", id)
+	}
+}
+
+func TestEvidenceCheckRejectsFabricatedOrMisplacedCIEvidence(t *testing.T) {
+	validRun := "https://github.com/rudydesplan/minisky/actions/runs/123456"
+	validCommit := strings.Repeat("a", 40)
+	tests := []struct {
+		name  string
+		run   string
+		sha   string
+		valid bool
+	}{
+		{
+			name:  "repository run and full commit",
+			run:   validRun,
+			sha:   validCommit,
+			valid: true,
+		},
+		{
+			name: "missing run",
+			sha:  validCommit,
+		},
+		{
+			name: "wrong owner",
+			run:  "https://github.com/other/minisky/actions/runs/123456",
+			sha:  validCommit,
+		},
+		{
+			name: "wrong repository",
+			run:  "https://github.com/rudydesplan/other/actions/runs/123456",
+			sha:  validCommit,
+		},
+		{
+			name: "wrong host",
+			run:  "https://example.com/rudydesplan/minisky/actions/runs/123456",
+			sha:  validCommit,
+		},
+		{
+			name: "host suffix attack",
+			run:  "https://github.com.evil.test/rudydesplan/minisky/actions/runs/123456",
+			sha:  validCommit,
+		},
+		{
+			name: "wrong scheme",
+			run:  "http://github.com/rudydesplan/minisky/actions/runs/123456",
+			sha:  validCommit,
+		},
+		{
+			name: "malformed run path",
+			run:  "https://github.com/rudydesplan/minisky/actions/runs/latest",
+			sha:  validCommit,
+		},
+		{
+			name: "extra path",
+			run:  "https://github.com/rudydesplan/minisky/actions/runs/123456/jobs/7",
+			sha:  validCommit,
+		},
+		{
+			name: "query",
+			run:  validRun + "?attempt=1",
+			sha:  validCommit,
+		},
+		{
+			name: "fragment",
+			run:  validRun + "#summary",
+			sha:  validCommit,
+		},
+		{
+			name: "short commit",
+			run:  validRun,
+			sha:  "deadbeef",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateEvidenceCheck(EvidenceCheck{
+				Status: EvidenceCIPassed,
+				RunURL: test.run,
+				Commit: test.sha,
+				Note:   "recorded",
+			})
+			if test.valid && err != nil {
+				t.Fatalf("valid evidence rejected: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("invalid evidence accepted")
+			}
+		})
+	}
+
+	for _, status := range []EvidenceStatus{EvidenceLocalPassed, EvidenceConfiguredUnverified} {
+		t.Run(string(status)+" carrying CI fields", func(t *testing.T) {
+			err := ValidateEvidenceCheck(EvidenceCheck{
+				Status: status,
+				RunURL: validRun,
+				Commit: validCommit,
+				Note:   "conflated",
+			})
+			if err == nil {
+				t.Fatal("non-CI status accepted immutable CI fields")
+			}
+		})
+	}
+}
+
 func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 	root := repositoryRoot(t)
 	inventory, err := Phase18To25()
@@ -139,10 +279,6 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 	terraformCheckByDomain := make(map[string]string)
 	cache := make(map[string]string)
 	makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,28 +317,8 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			checks["backendCI"] = gate.BackendCI
 		}
 		for name, check := range checks {
-			if check.Status == "" || check.Note == "" {
-				t.Errorf("%s %s has incomplete status metadata: %+v", gate.ID, name, check)
-			}
-			for _, reference := range check.References {
-				assertTestReferences(t, root, cache, gate.ID+" "+name, reference.Package, reference.Tests)
-			}
-			if check.Script != "" {
-				if _, err := os.Stat(filepath.Join(root, check.Script)); err != nil {
-					t.Errorf("%s %s script %q: %v", gate.ID, name, check.Script, err)
-				}
-			}
-			if check.MakeTarget != "" &&
-				!strings.Contains(string(makefile), "\n"+check.MakeTarget+":") {
-				t.Errorf("%s %s references missing Make target %q", gate.ID, name, check.MakeTarget)
-			}
-			if check.Workflow != "" {
-				if _, err := os.Stat(filepath.Join(root, check.Workflow)); err != nil {
-					t.Errorf("%s %s workflow %q: %v", gate.ID, name, check.Workflow, err)
-				}
-			}
-			if check.Job != "" && !strings.Contains(string(workflow), "\n  "+check.Job+":") {
-				t.Errorf("%s %s references missing CI job %q", gate.ID, name, check.Job)
+			if err := validateEvidenceCheck(root, gate.ID+" "+name, check, cache); err != nil {
+				t.Error(err)
 			}
 		}
 		generatedStatus := EvidenceConfiguredUnverified
@@ -1345,6 +1461,76 @@ func repositoryRoot(t *testing.T) string {
 		t.Fatal("resolve evidence test path")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func validateEvidenceCheck(
+	root string,
+	evidenceName string,
+	check EvidenceCheck,
+	cache map[string]string,
+) error {
+	if err := ValidateEvidenceCheck(check); err != nil {
+		return fmt.Errorf("%s: %w", evidenceName, err)
+	}
+	var problems []string
+	for _, reference := range check.References {
+		matches, err := filepath.Glob(filepath.Join(root, reference.Package, "*_test.go"))
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		if len(matches) == 0 {
+			problems = append(problems, fmt.Sprintf("reference package %q has no tests", reference.Package))
+			continue
+		}
+		source := cache[reference.Package]
+		if source == "" {
+			var joined strings.Builder
+			for _, match := range matches {
+				data, err := os.ReadFile(match)
+				if err != nil {
+					problems = append(problems, err.Error())
+					continue
+				}
+				joined.Write(data)
+			}
+			source = joined.String()
+			cache[reference.Package] = source
+		}
+		for _, testName := range reference.Tests {
+			if !strings.Contains(source, "func "+testName+"(") {
+				problems = append(problems,
+					fmt.Sprintf("references missing %s.%s", reference.Package, testName))
+			}
+		}
+	}
+	if check.Script != "" {
+		if _, err := os.Stat(filepath.Join(root, check.Script)); err != nil {
+			problems = append(problems, fmt.Sprintf("script %q: %v", check.Script, err))
+		}
+	}
+	if check.MakeTarget != "" {
+		makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
+		if err != nil {
+			problems = append(problems, err.Error())
+		} else if !strings.Contains(string(makefile), "\n"+check.MakeTarget+":") {
+			problems = append(problems, fmt.Sprintf("references missing Make target %q", check.MakeTarget))
+		}
+	}
+	if check.Workflow != "" {
+		workflow, err := os.ReadFile(filepath.Join(root, check.Workflow))
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("workflow %q: %v", check.Workflow, err))
+		} else if check.Job != "" && !strings.Contains(string(workflow), "\n  "+check.Job+":") {
+			problems = append(problems, fmt.Sprintf("references missing CI job %q", check.Job))
+		}
+	} else if check.Job != "" {
+		problems = append(problems, "CI job is present without a workflow")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("%s: %s", evidenceName, strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 func assertTestReferences(

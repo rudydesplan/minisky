@@ -108,6 +108,163 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 	}
 }
 
+func TestRenderPhase12PlatformSummaryBranchesOnCIStatus(t *testing.T) {
+	validRun := "https://github.com/rudydesplan/minisky/actions/runs/123"
+	validCommit := strings.Repeat("a", 40)
+	tests := []struct {
+		name      string
+		check     evidence.EvidenceCheck
+		want      string
+		forbidden string
+	}{
+		{
+			name:  "configured unverified",
+			check: evidence.EvidenceCheck{Status: evidence.EvidenceConfiguredUnverified, Note: "configured"},
+			want:  "Required pull-request/main CI and optional manual execution are configured, but no external Phase 12 pass is recorded.",
+		},
+		{
+			name: "ci passed",
+			check: evidence.EvidenceCheck{
+				Status: evidence.EvidenceCIPassed,
+				RunURL: validRun,
+				Commit: validCommit,
+				Note:   "recorded",
+			},
+			want:      "Required Phase 12 CI passed in [GitHub Actions run 123](" + validRun + ") on commit `" + validCommit + "`.",
+			forbidden: "no external Phase 12 pass is recorded",
+		},
+		{
+			name:  "optional unverified",
+			check: evidence.EvidenceCheck{Status: evidence.EvidenceOptionalUnverified, Note: "optional"},
+			want:  "Phase 12 CI is optional and externally unverified.",
+		},
+		{
+			name:  "local passed",
+			check: evidence.EvidenceCheck{Status: evidence.EvidenceLocalPassed, Note: "local only"},
+			want:  "The Phase 12 CI check is recorded only as local-passed; no external CI pass is recorded.",
+		},
+		{
+			name:  "not applicable",
+			check: evidence.EvidenceCheck{Status: evidence.EvidenceNotApplicable, Note: "not applicable"},
+			want:  "Phase 12 CI is marked not-applicable by machine evidence.",
+		},
+		{
+			name:  "absent",
+			check: evidence.EvidenceCheck{Status: evidence.EvidenceAbsent, Note: "absent"},
+			want:  "Phase 12 CI evidence is absent.",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gates := []evidence.PlatformGate{
+				{
+					ID:    "phase12-package-race-unit",
+					Phase: 12,
+					Name:  "Local gate",
+					Check: evidence.EvidenceCheck{Status: evidence.EvidenceLocalPassed, Note: "passed here"},
+				},
+				{ID: "phase12-ci", Phase: 12, Name: "CI gate", Check: test.check},
+			}
+			got, err := renderPhase12PlatformSummary(gates)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				test.want,
+				"bounded W3C propagation",
+				"project-keyed lookup scoping, not cross-project authorization",
+				"persistent trace backend",
+				"RBAC replay isolation",
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("Phase 12 summary does not contain %q:\n%s", want, got)
+				}
+			}
+			if test.forbidden != "" && strings.Contains(got, test.forbidden) {
+				t.Errorf("Phase 12 summary contains contradictory %q:\n%s", test.forbidden, got)
+			}
+		})
+	}
+}
+
+func TestPhase12ClaimsMatchMachineCIEvidence(t *testing.T) {
+	validRun := "https://github.com/rudydesplan/minisky/actions/runs/123"
+	validCommit := strings.Repeat("a", 40)
+	tests := []struct {
+		name     string
+		check    evidence.EvidenceCheck
+		document string
+		valid    bool
+	}{
+		{
+			name:     "configured rejects premature pass",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceConfiguredUnverified, Note: "configured"},
+			document: "Phase 12 is CI-verified.",
+		},
+		{
+			name:     "configured accepts truthful wording",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceConfiguredUnverified, Note: "configured"},
+			document: "Phase 12 required CI is configured; no external pass is recorded.",
+			valid:    true,
+		},
+		{
+			name:     "optional rejects premature pass",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceOptionalUnverified, Note: "optional"},
+			document: "Phase 12 CI passed.",
+		},
+		{
+			name:     "local rejects premature pass",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceLocalPassed, Note: "local"},
+			document: "Phase 12 CI has passed.",
+		},
+		{
+			name:     "not applicable rejects premature pass",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceNotApplicable, Note: "not applicable"},
+			document: "Phase 12 is CI-verified.",
+		},
+		{
+			name:     "absent rejects premature pass",
+			check:    evidence.EvidenceCheck{Status: evidence.EvidenceAbsent, Note: "absent"},
+			document: "Phase 12 CI passed.",
+		},
+		{
+			name: "passed accepts pass wording",
+			check: evidence.EvidenceCheck{
+				Status: evidence.EvidenceCIPassed,
+				RunURL: validRun,
+				Commit: validCommit,
+				Note:   "recorded",
+			},
+			document: "Phase 12 CI passed in GitHub Actions.",
+			valid:    true,
+		},
+		{
+			name: "passed rejects stale unverified wording",
+			check: evidence.EvidenceCheck{
+				Status: evidence.EvidenceCIPassed,
+				RunURL: validRun,
+				Commit: validCommit,
+				Note:   "recorded",
+			},
+			document: "Phase 12 has no external pass recorded.",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gates := []evidence.PlatformGate{{
+				ID: "phase12-ci", Phase: 12, Name: "CI", Check: test.check,
+			}}
+			err := validatePhase12Claims(test.document, gates)
+			if test.valid && err != nil {
+				t.Fatalf("truthful claim rejected: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("claim contradicted machine CI evidence")
+			}
+		})
+	}
+}
+
 func TestWriteOrCheckDetectsDrift(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "doc.md")
 	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {

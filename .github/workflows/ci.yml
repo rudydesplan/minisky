@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       run_phase12_observability_integration:
-        description: Run Phase 12 loopback observability acceptance
+        description: On manual dispatch, run required Phase 12 loopback observability acceptance
         required: false
         type: boolean
         default: false
@@ -260,9 +260,9 @@ jobs:
 
       - name: Validate integration script syntax
         run: |
-          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase18-eventarc-terraform-integration.sh scripts/phase18-workflows-terraform-integration.sh scripts/phase19-composer-terraform-integration.sh scripts/phase19-managed-kafka-terraform-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-alloydb-terraform-integration.sh scripts/phase20-filestore-terraform-integration.sh scripts/phase20-identity-platform-terraform-integration.sh scripts/phase20-storage-transfer-terraform-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase21-service-directory-terraform-integration.sh scripts/phase23-document-ai-terraform-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/phase24-org-policy-terraform-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase12-observability-integration-test.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase18-eventarc-terraform-integration.sh scripts/phase18-workflows-terraform-integration.sh scripts/phase19-composer-terraform-integration.sh scripts/phase19-managed-kafka-terraform-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-alloydb-terraform-integration.sh scripts/phase20-filestore-terraform-integration.sh scripts/phase20-identity-platform-terraform-integration.sh scripts/phase20-storage-transfer-terraform-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase21-service-directory-terraform-integration.sh scripts/phase23-document-ai-terraform-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/phase24-org-policy-terraform-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
           ./scripts/phase11-distribution-test.sh --self-test
-          MINISKY_PHASE12_OBSERVABILITY_SELF_TEST=1 ./scripts/phase12-observability-integration.sh
+          make test-phase12-observability-contract
           MINISKY_KIND_SELF_TEST=1 ./scripts/kind-integration.sh
           MINISKY_RELEASE_TAG_POLICY_SELF_TEST=1 ./scripts/release-tag-policy.sh
           MINISKY_PHASE16_SUBNETWORK_SELF_TEST=1 ./scripts/phase16-subnetwork-integration.sh
@@ -804,7 +804,10 @@ jobs:
 
   phase12-observability-integration:
     name: Phase 12 loopback observability acceptance
-    if: github.event_name == 'workflow_dispatch' && inputs.run_phase12_observability_integration
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' && inputs.run_phase12_observability_integration
     needs: quality
     permissions:
       contents: read
@@ -826,7 +829,24 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run Phase 12 observability integration
-        run: make test-phase12-observability
+        env:
+          MINISKY_PHASE12_DIAGNOSTICS_DIR: ${{ runner.temp }}/phase12-observability-diagnostics
+        run: |
+          mkdir -p "${MINISKY_PHASE12_DIAGNOSTICS_DIR}"
+          if ! make test-phase12-observability; then
+            printf '%s\n' 'Phase 12 acceptance failed; inspect the bounded sanitized diagnostics.' \
+              >"${MINISKY_PHASE12_DIAGNOSTICS_DIR}/ci-summary.txt"
+            exit 1
+          fi
+
+      - name: Retain Phase 12 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase12-observability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/phase12-observability-diagnostics
+          if-no-files-found: error
+          retention-days: 7
 
   phase15-emulator-integration:
     name: Firestore, Datastore, and Spanner SDK acceptance

@@ -1,5 +1,5 @@
-// Command docs-truth renders compatibility documentation from registry and
-// Phase 18-25 evidence metadata.
+// Command docs-truth renders compatibility and platform documentation from
+// machine-readable repository evidence.
 package main
 
 import (
@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -18,12 +20,14 @@ import (
 )
 
 const (
-	serviceCatalogStart = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
-	serviceCatalogEnd   = "<!-- END GENERATED SERVICE CATALOG -->"
-	phaseSummaryStart   = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
-	phaseSummaryEnd     = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
-	readmeCountStart    = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
-	readmeCountEnd      = "<!-- END GENERATED REGISTRY COUNT -->"
+	serviceCatalogStart  = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
+	serviceCatalogEnd    = "<!-- END GENERATED SERVICE CATALOG -->"
+	phaseSummaryStart    = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
+	phaseSummaryEnd      = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
+	readmeCountStart     = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
+	readmeCountEnd       = "<!-- END GENERATED REGISTRY COUNT -->"
+	platformSummaryStart = "<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	platformSummaryEnd   = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
 )
 
 func main() {
@@ -51,6 +55,14 @@ func truth() ([]registry.Service, []evidence.PhaseService, error) {
 
 func generate(root string, check bool) error {
 	services, inventory, err := truth()
+	if err != nil {
+		return err
+	}
+	platformGates, err := evidence.PlatformGates()
+	if err != nil {
+		return err
+	}
+	platformSummary, err := renderPhase12PlatformSummary(platformGates)
 	if err != nil {
 		return err
 	}
@@ -108,6 +120,27 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
+	updatedReadme, err = replaceGeneratedSection(
+		updatedReadme, platformSummaryStart, platformSummaryEnd, platformSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	if err := validatePhase12Claims(updatedReadme, platformGates); err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "docs", "minisky-roadmap-completion-plan.canvas.tsx"),
+		filepath.Join(root, "docs", "adr", "0012-local-observability-and-request-replay.md"),
+	} {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := validatePhase12Claims(string(document), platformGates); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	}
 
 	targets := []struct {
 		path string
@@ -136,6 +169,103 @@ func generate(root string, check bool) error {
 func validateHandwrittenClaims(document string) error {
 	if strings.Contains(document, "Terraform provider evidence remains absent") {
 		return errors.New("stale batch-wide Terraform absence claim; use generated per-domain evidence")
+	}
+	return nil
+}
+
+func renderPhase12PlatformSummary(gates []evidence.PlatformGate) (string, error) {
+	localPassed := 0
+	var ciCheck *evidence.EvidenceCheck
+	seen := make(map[string]bool, len(gates))
+	for _, gate := range gates {
+		if gate.Phase != 12 {
+			return "", fmt.Errorf("platform gate %s belongs to phase %d, want 12", gate.ID, gate.Phase)
+		}
+		if seen[gate.ID] {
+			return "", fmt.Errorf("duplicate platform gate %q", gate.ID)
+		}
+		seen[gate.ID] = true
+		if err := evidence.ValidateEvidenceCheck(gate.Check); err != nil {
+			return "", fmt.Errorf("%s: %w", gate.ID, err)
+		}
+		if gate.ID == "phase12-ci" {
+			if ciCheck != nil {
+				return "", errors.New("duplicate phase12-ci platform gate")
+			}
+			check := gate.Check
+			ciCheck = &check
+		}
+		switch gate.Check.Status {
+		case evidence.EvidenceLocalPassed:
+			localPassed++
+		}
+	}
+	if ciCheck == nil {
+		return "", errors.New("missing phase12-ci platform gate")
+	}
+	var ciStatement string
+	switch ciCheck.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		ciStatement = "Required pull-request/main CI and optional manual execution are configured, but no external Phase 12 pass is recorded."
+	case evidence.EvidenceCIPassed:
+		ciStatement = fmt.Sprintf(
+			"Required Phase 12 CI passed in [GitHub Actions run %s](%s) on commit `%s`.",
+			path.Base(ciCheck.RunURL), ciCheck.RunURL, ciCheck.Commit,
+		)
+	case evidence.EvidenceOptionalUnverified:
+		ciStatement = "Phase 12 CI is optional and externally unverified."
+	case evidence.EvidenceLocalPassed:
+		ciStatement = "The Phase 12 CI check is recorded only as local-passed; no external CI pass is recorded."
+	case evidence.EvidenceNotApplicable:
+		ciStatement = "Phase 12 CI is marked not-applicable by machine evidence."
+	case evidence.EvidenceAbsent:
+		ciStatement = "Phase 12 CI evidence is absent."
+	default:
+		return "", fmt.Errorf("unsupported Phase 12 CI status %q", ciCheck.Status)
+	}
+	return fmt.Sprintf(
+		"**Generated Phase 12 platform truth:** Local passes: %d/%d.\n\n"+
+			"The bounded platform diagnostics slice covers bounded W3C propagation, sanitized structured access logs, "+
+			"low-cardinality Prometheus metrics, bounded sanitized OTLP export inspection, exporter degradation without "+
+			"changing API responses, bounded replay responses, and graceful shutdown. Replay provides project-keyed "+
+			"lookup scoping, not cross-project authorization. %s\n\n"+
+			"This platform diagnostics layer is separate from the experimental Phase 21–22 service domains. A persistent "+
+			"trace backend, remote diagnostics listener, Cloud Logging parity, and RBAC replay isolation remain deferred.\n",
+		localPassed, len(gates), ciStatement,
+	), nil
+}
+
+var (
+	phase12CIPassedPattern = regexp.MustCompile(
+		`(?is)phase\s*12.{0,160}(?:ci[- ]verified|ci\s+(?:has\s+)?passed)|(?:ci[- ]verified|ci\s+(?:has\s+)?passed).{0,160}phase\s*12`,
+	)
+	phase12CIUnverifiedPattern = regexp.MustCompile(
+		`(?is)phase\s*12.{0,160}(?:no\s+external.{0,20}pass.{0,20}recorded|externally\s+unverified|configured-unverified)|(?:no\s+external.{0,20}pass.{0,20}recorded|externally\s+unverified|configured-unverified).{0,160}phase\s*12`,
+	)
+)
+
+func validatePhase12Claims(document string, gates []evidence.PlatformGate) error {
+	var ciCheck *evidence.EvidenceCheck
+	for _, gate := range gates {
+		if gate.ID == "phase12-ci" {
+			if ciCheck != nil {
+				return errors.New("duplicate phase12-ci platform gate")
+			}
+			check := gate.Check
+			ciCheck = &check
+		}
+	}
+	if ciCheck == nil {
+		return errors.New("missing phase12-ci platform gate")
+	}
+	if err := evidence.ValidateEvidenceCheck(*ciCheck); err != nil {
+		return fmt.Errorf("phase12-ci: %w", err)
+	}
+	if ciCheck.Status != evidence.EvidenceCIPassed && phase12CIPassedPattern.MatchString(document) {
+		return errors.New("Phase 12 cannot be described as CI-verified without ci-passed machine evidence")
+	}
+	if ciCheck.Status == evidence.EvidenceCIPassed && phase12CIUnverifiedPattern.MatchString(document) {
+		return errors.New("Phase 12 cannot be described as externally unverified with ci-passed machine evidence")
 	}
 	return nil
 }

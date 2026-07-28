@@ -24,7 +24,7 @@ const phases = [
   ["9", "Serverless and events", "Verified bounded local slice", "Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes pass; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
   ["11", "DX and distribution", "CI-verified distribution slice", "GoReleaser Linux AMD64 snapshot, native amd64/arm64 deb/rpm, and Linux ARM64/macOS ARM64/Windows AMD64 CGO gates pass; publication remains external"],
-  ["12", "Observability", "Local slice", "Persistent span backend intentionally deferred"],
+  ["12", "Platform diagnostics", "Verified bounded local slice · CI configured", "W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown pass locally; external CI pass remains unrecorded"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
@@ -65,12 +65,12 @@ const waves = [
     title: "Wave 3 — Platform diagnostics",
     phases: "12",
     deliverables: [
-      "Introduce request-context and middleware seams with a shared redaction policy.",
-      "Add structured gateway access logs, optional OTel traces, and low-cardinality Prometheus metrics.",
-      "Expose local-only query APIs and dashboard views.",
-      "Add opt-in, bounded, same-gateway replay only after privacy and SSRF decisions are recorded.",
+      "Keep structured access logs, W3C propagation, optional OTLP/HTTP export, and Prometheus metrics bounded and sanitized.",
+      "Inspect bounded OTLP captures without retaining raw capture files in CI failure diagnostics.",
+      "Keep diagnostics on the loopback Dashboard listener, separate from Cloud Logging and the Phase 21–22 service domains.",
+      "Treat replay as opt-in in-process execution with project-keyed lookup scoping, not cross-project authorization.",
     ],
-    gate: "Trace propagation, redaction, metric cardinality, exporter failure, shutdown, and replay isolation tests pass under race detection.",
+    gate: "Package/race, guard self-test, and guarded loopback/OTLP gates pass locally. Required PR/main CI plus optional manual execution are configured, but no external run URL and full commit are recorded.",
   },
   {
     title: "Wave 4 — Identity and tenant boundaries",
@@ -392,10 +392,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
           <Text>5. Add restart, destroy, failure-injection, and platform evidence where relevant.</Text>
         </Stack>
         <Stack gap={8}>
-          <H2>Decisions to record before coding</H2>
+          <H2>Recorded decisions and remaining boundaries</H2>
           <Text>Profile versus GCP project semantics and Docker multi-project strategy.</Text>
-          <Text>Telemetry storage, cardinality, redaction, and metrics listener.</Text>
-          <Text>Replay capture/privacy/SSRF boundary.</Text>
+          <Text>ADR 0012 fixes bounded in-memory telemetry, redaction, low-cardinality labels, and a loopback metrics listener.</Text>
+          <Text>ADR 0012 fixes bounded in-process replay; persistent traces, a remote listener, Cloud Logging parity, and RBAC replay isolation remain deferred.</Text>
           <Text>TLS trust model and local token format.</Text>
           <Text>Dynamic plugin process boundary, compatibility, signing, and sandboxing.</Text>
         </Stack>
