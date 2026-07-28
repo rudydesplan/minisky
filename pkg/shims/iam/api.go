@@ -974,6 +974,12 @@ var rolePermissions = map[string][]string{
 		"pubsub.topics.get",
 		"pubsub.topics.list",
 	},
+	"roles/spanner.admin": {
+		"spanner.backups.list",
+	},
+	"roles/spanner.viewer": {
+		"spanner.backups.list",
+	},
 }
 
 func permissionsForPrincipal(policy *IamPolicy, principal string) map[string]struct{} {

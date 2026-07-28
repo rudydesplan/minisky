@@ -77,6 +77,76 @@ func TestRedisLifecycleValidationPersistenceAndOwnedReconciliation(t *testing.T)
 	}
 }
 
+func TestRedisAcceptsTerraformProviderCreatePayload(t *testing.T) {
+	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	create := redisRequest(api, http.MethodPost,
+		"/v1/projects/local-dev-project/locations/us-central1/instances?instanceId=minisky-terraform",
+		`{"connectMode":"DIRECT_PEERING","labels":{"goog-terraform-provisioned":"true"},"memorySizeGb":1,"name":"projects/local-dev-project/locations/us-central1/instances/minisky-terraform","redisVersion":"REDIS_7_2","tier":"BASIC","transitEncryptionMode":"DISABLED"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", create.Code, create.Body.String())
+	}
+	waitForRedisOperation(t, api, operationNameFromResponse(t, create))
+
+	get := redisRequest(api, http.MethodGet,
+		"/v1/projects/local-dev-project/locations/us-central1/instances/minisky-terraform", "")
+	if get.Code != http.StatusOK ||
+		!strings.Contains(get.Body.String(), `"connectMode":"DIRECT_PEERING"`) ||
+		!strings.Contains(get.Body.String(), `"transitEncryptionMode":"DISABLED"`) {
+		t.Fatalf("get status = %d, body = %s", get.Code, get.Body.String())
+	}
+}
+
+func TestRedisRejectsUnsupportedTransportModesBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "encrypted transit",
+			body: `{"tier":"BASIC","memorySizeGb":1,"transitEncryptionMode":"SERVER_AUTHENTICATION"}`,
+		},
+		{
+			name: "unknown transit mode",
+			body: `{"tier":"BASIC","memorySizeGb":1,"transitEncryptionMode":"UNKNOWN_MODE"}`,
+		},
+		{
+			name: "private service access",
+			body: `{"tier":"BASIC","memorySizeGb":1,"connectMode":"PRIVATE_SERVICE_ACCESS"}`,
+		},
+		{
+			name: "unknown connect mode",
+			body: `{"tier":"BASIC","memorySizeGb":1,"connectMode":"UNKNOWN_MODE"}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+			api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response := redisRequest(api, http.MethodPost,
+				"/v1/projects/test/locations/us-central1/instances?instanceId=cache", test.body)
+			assertRedisError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+			if backend.provisionCalls != 0 {
+				t.Fatalf("provision calls=%d, want 0", backend.provisionCalls)
+			}
+			api.mu.RLock()
+			instanceCount := len(api.instances)
+			operationCount := len(api.operations)
+			api.mu.RUnlock()
+			if instanceCount != 0 || operationCount != 0 {
+				t.Fatalf("instances=%d operations=%d, want no mutation", instanceCount, operationCount)
+			}
+		})
+	}
+}
+
 func TestRedisDomainUsesValkeyBackendImage(t *testing.T) {
 	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
 	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil)

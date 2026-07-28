@@ -177,6 +177,31 @@ func TestServiceAccountViewerCanReadAccount(t *testing.T) {
 	}
 }
 
+func TestSpannerReadRolesCanListBackups(t *testing.T) {
+	for _, role := range []string{"roles/spanner.viewer", "roles/spanner.admin"} {
+		t.Run(role, func(t *testing.T) {
+			const (
+				projectResource  = "projects/test-project"
+				instanceResource = projectResource + "/instances/cache"
+				principal        = "user:alice@example.com"
+			)
+			for _, policyResource := range []string{instanceResource, projectResource} {
+				api := newAPI(nil)
+				api.strict = true
+				api.policies[policyResource] = &IamPolicy{Bindings: []Binding{{
+					Role: role, Members: []string{principal},
+				}}}
+				if !api.Authorize(instanceResource, principal, "spanner.backups.list") {
+					t.Fatalf("%s binding at %s does not authorize the instance", role, policyResource)
+				}
+				if api.Authorize(instanceResource, "user:bob@example.com", "spanner.backups.list") {
+					t.Fatalf("%s binding at %s authorized an unbound principal", role, policyResource)
+				}
+			}
+		})
+	}
+}
+
 func TestMiniSkyLocalRolesCoverDashboardAndGatewayPermissions(t *testing.T) {
 	t.Setenv("MINISKY_IAM_MODE", "strict")
 	api := newAPI(nil)

@@ -45,6 +45,71 @@ func gzipJSONBody(t *testing.T, body string) *bytes.Reader {
 	return bytes.NewReader(compressed.Bytes())
 }
 
+func TestSpannerTerraformCompatibilityListsNoEmulatorBackups(t *testing.T) {
+	backendCalls := 0
+	handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		backendCalls++
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"code":12}`))
+	}))
+	request := httptest.NewRequest(http.MethodGet,
+		"/v1/projects/local-dev-project/instances/minisky-terraform/backups", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content type=%q", response.Header().Get("Content-Type"))
+	}
+	var result struct {
+		Backups []json.RawMessage `json:"backups"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Backups == nil || len(result.Backups) != 0 {
+		t.Fatalf("backups=%v, want empty array", result.Backups)
+	}
+	if backendCalls != 0 {
+		t.Fatalf("backend calls=%d, want 0", backendCalls)
+	}
+}
+
+func TestSpannerTerraformCompatibilityPreservesLifecycleRequests(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"delete database", http.MethodDelete, "/v1/projects/p/instances/i/databases/d"},
+		{"delete instance", http.MethodDelete, "/v1/projects/p/instances/i"},
+		{"poll operation", http.MethodGet, "/v1/projects/p/instances/i/operations/o"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var method, requestPath string
+			handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				method = request.Method
+				requestPath = request.URL.Path
+				_, _ = w.Write([]byte(`{"name":"operations/o","done":true}`))
+			}))
+			request := httptest.NewRequest(test.method, test.path, nil)
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if method != test.method || requestPath != test.path {
+				t.Fatalf("backend request=%s %s, want %s %s", method, requestPath, test.method, test.path)
+			}
+			if response.Body.String() != `{"name":"operations/o","done":true}` {
+				t.Fatalf("body=%s", response.Body.String())
+			}
+		})
+	}
+}
+
 func TestRouterDecodesBoundedGzipJSONBeforeValidationAndDispatch(t *testing.T) {
 	const body = `{"name":"java-smoke"}`
 	var received []byte
@@ -164,9 +229,11 @@ type resourcePermission struct {
 }
 
 type recordingAuthorizer struct {
-	issuer  *localsecurity.Issuer
-	allowed map[resourcePermission]bool
-	checks  []authorizationCheck
+	issuer           *localsecurity.Issuer
+	allowedPrincipal string
+	inheritProject   bool
+	allowed          map[resourcePermission]bool
+	checks           []authorizationCheck
 }
 
 func (a *recordingAuthorizer) EnforcementEnabled() bool { return true }
@@ -174,7 +241,21 @@ func (a *recordingAuthorizer) Authorize(resource, principal, permission string) 
 	a.checks = append(a.checks, authorizationCheck{
 		resource: resource, principal: principal, permission: permission,
 	})
-	return a.allowed[resourcePermission{resource: resource, permission: permission}]
+	if a.allowedPrincipal != "" && principal != a.allowedPrincipal {
+		return false
+	}
+	if a.allowed[resourcePermission{resource: resource, permission: permission}] {
+		return true
+	}
+	if a.inheritProject {
+		parts := strings.Split(resource, "/")
+		if len(parts) >= 2 {
+			return a.allowed[resourcePermission{
+				resource: strings.Join(parts[:2], "/"), permission: permission,
+			}]
+		}
+	}
+	return false
 }
 func (a *recordingAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
 	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
@@ -205,6 +286,84 @@ func TestIAMServiceAccountReadAuthorizesExactAccountResource(t *testing.T) {
 	const want = "projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com"
 	if resource != want {
 		t.Fatalf("resource = %q, want %q", resource, want)
+	}
+}
+
+func TestSpannerBackupsCompatibilityRunsAfterStrictIAM(t *testing.T) {
+	const (
+		project             = "local-dev-project"
+		authorizedPrincipal = "user:alice@example.com"
+	)
+	permission, resource := routePermission("spanner.googleapis.com", httptest.NewRequest(
+		http.MethodGet,
+		"/v1/projects/local-dev-project/instances/minisky-terraform/backups",
+		nil,
+	))
+	instanceResource := "projects/" + project + "/instances/minisky-terraform"
+	if permission != "spanner.backups.list" || resource != instanceResource {
+		t.Fatalf("permission=%q resource=%q", permission, resource)
+	}
+
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	for _, test := range []struct {
+		name, principal, policyResource string
+		wantStatus                      int
+	}{
+		{"instance binding", authorizedPrincipal, instanceResource, http.StatusOK},
+		{"inherited project binding", authorizedPrincipal, "projects/" + project, http.StatusOK},
+		{"unauthorized principal", "user:bob@example.com", "projects/" + project, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer := &recordingAuthorizer{
+				issuer:           issuer,
+				allowedPrincipal: authorizedPrincipal,
+				inheritProject:   true,
+				allowed: map[resourcePermission]bool{{
+					resource: test.policyResource, permission: "spanner.backups.list",
+				}: true},
+			}
+			dispatches := 0
+			handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("backup list reached unsupported emulator method")
+			}))
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim("spanner.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dispatches++
+				handler.ServeHTTP(w, r)
+			}))
+			router.ConfigureSecurity(authorizer, nil, false, "gateway")
+
+			token, _, err := issuer.Issue(localsecurity.TokenRequest{
+				Subject: test.principal, Audience: "gateway",
+				Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet,
+				"http://localhost/_minisky/spanner/v1/projects/local-dev-project/instances/minisky-terraform/backups",
+				nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			wantDispatches := 0
+			if test.wantStatus == http.StatusOK {
+				wantDispatches = 1
+			}
+			if dispatches != wantDispatches {
+				t.Fatalf("dispatches=%d want=%d", dispatches, wantDispatches)
+			}
+			if len(authorizer.checks) != 1 || authorizer.checks[0].resource != instanceResource {
+				t.Fatalf("authorization checks=%+v, want exact instance resource", authorizer.checks)
+			}
+			if test.wantStatus == http.StatusOK && !strings.Contains(response.Body.String(), `"backups":[]`) {
+				t.Fatalf("body=%s", response.Body.String())
+			}
+		})
 	}
 }
 

@@ -158,6 +158,23 @@ func (p *ProxyRouter) RegisterLazyDocker(domain string) {
 	log.Printf("[Router] Registered Lazy Docker Backend: %s (boots on first request)", domain)
 }
 
+func wrapSpannerEmulatorProxy(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if r.Method == http.MethodGet &&
+			len(parts) == 6 &&
+			parts[0] == "v1" &&
+			parts[1] == "projects" &&
+			parts[3] == "instances" &&
+			parts[5] == "backups" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"backups": []any{}})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	suppliedPrincipal := callerSuppliedPrincipal(strings.TrimSpace(r.Header.Get("X-MiniSky-Principal")))
 	r.Header.Del("X-MiniSky-Principal")
@@ -298,8 +315,12 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if internalURL != "" {
 			// Dynamically wire (or re-wire if container moved IP) the discovered internal URL
 			target, _ := url.Parse(internalURL)
-			proxy := httputil.NewSingleHostReverseProxy(target)
-			proxy.Transport = observability.InstrumentTransport(http.DefaultTransport)
+			reverseProxy := httputil.NewSingleHostReverseProxy(target)
+			reverseProxy.Transport = observability.InstrumentTransport(http.DefaultTransport)
+			var proxy http.Handler = reverseProxy
+			if targetDomain == "spanner.googleapis.com" {
+				proxy = wrapSpannerEmulatorProxy(proxy)
+			}
 			p.mu.Lock()
 			p.routes[targetDomain] = proxy
 			p.mu.Unlock()
@@ -663,6 +684,10 @@ func routePermission(domain string, r *http.Request) (string, string) {
 				topic := strings.TrimPrefix(path, "/v1/")
 				topic = strings.TrimPrefix(topic, "/")
 				return route.permission, strings.TrimSuffix(topic, ":publish")
+			}
+			if domain == "spanner.googleapis.com" && route.permission == "spanner.backups.list" {
+				instance := strings.TrimPrefix(path, "/v1/")
+				return route.permission, strings.TrimSuffix(instance, "/backups")
 			}
 			return route.permission, resource
 		}
@@ -1095,6 +1120,7 @@ var strictIAMCustomRoutes = []strictIAMCustomRoute{
 	{"redis.googleapis.com", http.MethodPost, "/v1/projects/{project}/locations/{location}/instances/{instance}:upgrade", "redis.instances.update"},
 	{"secretmanager.googleapis.com", http.MethodPost, "/v1/projects/{project}/secrets/{secret}:addVersion", "secretmanager.versions.add"},
 	{"secretmanager.googleapis.com", http.MethodGet, "/v1/projects/{project}/secrets/{secret}/versions/{version}:access", "secretmanager.versions.access"},
+	{"spanner.googleapis.com", http.MethodGet, "/v1/projects/{project}/instances/{instance}/backups", "spanner.backups.list"},
 	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions:batchCreate", "spanner.sessions.create"},
 	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:executeSql", "spanner.databases.read"},
 	{"spanner.googleapis.com", http.MethodPost, "/v1/projects/{project}/instances/{instance}/databases/{database}/sessions/{session}:executeStreamingSql", "spanner.databases.read"},
