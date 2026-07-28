@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -214,6 +216,218 @@ func TestProjectAndTenantConfigUseInjectedAuthBackend(t *testing.T) {
 	}
 }
 
+func TestInitializeProjectConfigForProvider(t *testing.T) {
+	api := newAPI(newTestAPI().opMgr, nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v2/projects/test:initializeAuth", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d: %s", response.Code, response.Body.String())
+	}
+	var config ProjectConfig
+	if err := json.Unmarshal(response.Body.Bytes(), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.Name != "projects/test/config" {
+		t.Fatalf("config name = %q", config.Name)
+	}
+}
+
+func TestInitializeProjectConfigRollsBackOnPersistenceFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		existing   *ProjectConfig
+		wantStatus int
+	}{
+		{name: "restores absence", wantStatus: http.StatusServiceUnavailable},
+		{name: "restores prior state", existing: &ProjectConfig{
+			Name:              "projects/test/config",
+			AuthorizedDomains: []string{"prior.example"},
+		}, wantStatus: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &failingIdentityPlatformStore{
+				mockStore: mockStore{data: make(map[string][]byte)},
+				fail:      true,
+			}
+			api := newAPI(newTestAPI().opMgr, store)
+			if test.existing != nil {
+				api.projectConfigs[test.existing.Name] = cloneProjectConfig(test.existing)
+				store.fail = false
+				if err := api.persistState(); err != nil {
+					t.Fatal(err)
+				}
+				store.fail = true
+			}
+
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+				"/v2/projects/test:initializeAuth", bytes.NewBufferString(`{}`)))
+			if response.Code != test.wantStatus {
+				t.Fatalf("initialize status = %d: %s", response.Code, response.Body.String())
+			}
+
+			got := api.projectConfigs["projects/test/config"]
+			if test.existing == nil {
+				if got != nil {
+					t.Fatalf("failed initialization left in-memory config: %#v", got)
+				}
+			} else if got == nil || len(got.AuthorizedDomains) != 1 ||
+				got.AuthorizedDomains[0] != "prior.example" {
+				t.Fatalf("failed initialization did not restore prior config: %#v", got)
+			}
+
+			restarted := newAPI(newTestAPI().opMgr, store)
+			if err := restarted.loadState(); err != nil {
+				t.Fatal(err)
+			}
+			reloaded := restarted.projectConfigs["projects/test/config"]
+			if test.existing == nil {
+				if reloaded != nil {
+					t.Fatalf("failed initialization persisted config across restart: %#v", reloaded)
+				}
+			} else if reloaded == nil || len(reloaded.AuthorizedDomains) != 1 ||
+				reloaded.AuthorizedDomains[0] != "prior.example" {
+				t.Fatalf("restart did not retain prior config: %#v", reloaded)
+			}
+		})
+	}
+}
+
+func TestInitializeProjectConfigReconcilesPostCommitSaveError(t *testing.T) {
+	store := &postCommitIdentityPlatformStore{
+		mockStore: mockStore{data: make(map[string][]byte)},
+		failNext:  true,
+	}
+	api := newAPI(newTestAPI().opMgr, store)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v2/projects/test:initializeAuth", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("post-commit initialize status = %d: %s", response.Code, response.Body.String())
+	}
+	if api.projectConfigs["projects/test/config"] == nil {
+		t.Fatal("post-commit initialization was rolled back in memory")
+	}
+
+	restarted := newAPI(newTestAPI().opMgr, store)
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.projectConfigs["projects/test/config"] == nil {
+		t.Fatal("successful reconciliation did not survive restart")
+	}
+}
+
+func TestInitializeProjectConfigSerializesProvisionalStateAndRollback(t *testing.T) {
+	store := &blockingFirstIdentityPlatformStore{
+		mockStore:   mockStore{data: make(map[string][]byte)},
+		saveEntered: make(chan struct{}),
+		releaseSave: make(chan struct{}),
+	}
+	api := newAPI(newTestAPI().opMgr, store)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+			"/v2/projects/test:initializeAuth", bytes.NewBufferString(`{}`)))
+		firstDone <- response
+	}()
+	<-store.saveEntered
+
+	getDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"/admin/v2/projects/test/config", nil))
+		getDone <- response
+	}()
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+			"/v2/projects/test:initializeAuth", bytes.NewBufferString(`{}`)))
+		secondDone <- response
+	}()
+
+	for name, done := range map[string]<-chan *httptest.ResponseRecorder{
+		"get": getDone, "second initialize": secondDone,
+	} {
+		select {
+		case response := <-done:
+			t.Fatalf("%s observed provisional initialization: %d %s",
+				name, response.Code, response.Body.String())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+
+	close(store.releaseSave)
+	if response := <-firstDone; response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first initialize status = %d: %s", response.Code, response.Body.String())
+	}
+	if response := <-secondDone; response.Code != http.StatusOK {
+		t.Fatalf("second initialize status = %d: %s", response.Code, response.Body.String())
+	}
+	if response := <-getDone; response.Code != http.StatusOK {
+		t.Fatalf("get status = %d: %s", response.Code, response.Body.String())
+	}
+
+	restarted := newAPI(newTestAPI().opMgr, store)
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.projectConfigs["projects/test/config"] == nil {
+		t.Fatal("serialized successful initialization was lost after restart")
+	}
+}
+
+func TestIdentityToolkitUserWorkflowUsesInjectedAuthHandler(t *testing.T) {
+	var paths []string
+	api := newAPI(newTestAPI().opMgr, nil)
+	api.authHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"localId":"user-1","idToken":"token"}`))
+	})
+
+	for _, path := range []string{
+		"/v1/accounts:signUp",
+		"/v1/accounts:signInWithPassword",
+		"/v1/accounts:lookup",
+	} {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path,
+			bytes.NewBufferString(`{"email":"user@example.test","password":"secret","returnSecureToken":true}`)))
+		if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"localId":"user-1"`)) {
+			t.Fatalf("%s = %d %s", path, response.Code, response.Body.String())
+		}
+	}
+	if len(paths) != 3 {
+		t.Fatalf("forwarded paths = %#v", paths)
+	}
+}
+
+func TestIdentityToolkitUserWorkflowWithoutBackendIsUnsupported(t *testing.T) {
+	api := newTestAPI()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/accounts:signUp",
+		bytes.NewBufferString(`{"email":"user@example.test","password":"secret"}`)))
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Status != "UNIMPLEMENTED" {
+		t.Fatalf("error status = %q", envelope.Error.Status)
+	}
+}
+
 func TestCreateOAuthIdpConfigNoParent(t *testing.T) {
 	api := newTestAPI()
 	body := `{"clientId":"c"}`
@@ -360,6 +574,54 @@ func TestConcurrentAccess(t *testing.T) {
 type mockStore struct {
 	mu   sync.Mutex
 	data map[string][]byte
+}
+
+type failingIdentityPlatformStore struct {
+	mockStore
+	fail bool
+}
+
+type postCommitIdentityPlatformStore struct {
+	mockStore
+	failNext bool
+}
+
+func (s *postCommitIdentityPlatformStore) Save(name string, value any) error {
+	if err := s.mockStore.Save(name, value); err != nil {
+		return err
+	}
+	if s.failNext {
+		s.failNext = false
+		return errors.New("injected post-commit save failure")
+	}
+	return nil
+}
+
+type blockingFirstIdentityPlatformStore struct {
+	mockStore
+	saveEntered chan struct{}
+	releaseSave chan struct{}
+	once        sync.Once
+}
+
+func (s *blockingFirstIdentityPlatformStore) Save(name string, value any) error {
+	first := false
+	s.once.Do(func() {
+		first = true
+		close(s.saveEntered)
+		<-s.releaseSave
+	})
+	if first {
+		return errors.New("injected pre-commit save failure")
+	}
+	return s.mockStore.Save(name, value)
+}
+
+func (s *failingIdentityPlatformStore) Save(name string, value any) error {
+	if s.fail {
+		return fmt.Errorf("injected save failure")
+	}
+	return s.mockStore.Save(name, value)
 }
 
 type fakeAuthBackend struct {

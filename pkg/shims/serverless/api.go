@@ -315,7 +315,9 @@ func deliverEvent(client *http.Client, targetURL, payload string) {
 }
 
 func triggerMatches(trigger *EventTrigger, eventType, resource string) bool {
-	if trigger == nil || (trigger.EventType != "" && trigger.EventType != eventType) {
+	if trigger == nil ||
+		(trigger.EventType != "" && trigger.EventType != eventType &&
+			!equivalentStorageEventTypes(trigger.EventType, eventType)) {
 		return false
 	}
 
@@ -331,6 +333,19 @@ func triggerMatches(trigger *EventTrigger, eventType, resource string) bool {
 		return resourceMatches(trigger.Resource, resource, "buckets")
 	default:
 		return trigger.Resource != "" && trigger.Resource == resource
+	}
+}
+
+func equivalentStorageEventTypes(configured, actual string) bool {
+	switch configured {
+	case "google.storage.object.finalize", "google.cloud.storage.object.v1.finalized":
+		return actual == "google.storage.object.finalize" ||
+			actual == "google.cloud.storage.object.v1.finalized"
+	case "google.storage.object.delete", "google.cloud.storage.object.v1.deleted":
+		return actual == "google.storage.object.delete" ||
+			actual == "google.cloud.storage.object.v1.deleted"
+	default:
+		return false
 	}
 }
 

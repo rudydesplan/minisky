@@ -12,12 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
+	"minisky/pkg/pagination"
 	"minisky/pkg/registry"
 	"minisky/pkg/state"
 )
@@ -322,10 +324,6 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "resourceNames must contain at most 100 resources")
 		return
 	}
-	if body.PageToken != "" {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "pageToken is not supported")
-		return
-	}
 	if body.OrderBy != "" && body.OrderBy != "timestamp asc" && body.OrderBy != "timestamp desc" {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", `orderBy must be empty, "timestamp asc", or "timestamp desc"`)
 		return
@@ -356,10 +354,36 @@ func (api *API) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		return entries[i].Timestamp < entries[j].Timestamp
 	})
-	if body.PageSize > 0 && len(entries) > body.PageSize {
-		entries = entries[:body.PageSize]
+	type keyedEntry struct {
+		entry LogEntry
+		key   string
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+	keyed := make([]keyedEntry, len(entries))
+	for index, entry := range entries {
+		keyed[index] = keyedEntry{
+			entry: entry,
+			key:   fmt.Sprintf("%09d:%s:%s", index, entry.Timestamp, entry.InsertId),
+		}
+	}
+	pageSize := body.PageSize
+	if pageSize == 0 {
+		pageSize = 50
+	}
+	page, nextToken, err := pagination.Page(keyed, pageSize, body.PageToken, pagination.Scope{
+		Service: "logging.entries",
+		Parent:  strings.Join(body.ResourceNames, "\x00"),
+		Filter:  body.Filter,
+		OrderBy: body.OrderBy,
+	}, func(item keyedEntry) string { return item.key })
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid pageToken")
+		return
+	}
+	result := make([]LogEntry, len(page))
+	for index := range page {
+		result[index] = page[index].entry
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"entries": result, "nextPageToken": nextToken})
 }
 
 func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
@@ -413,6 +437,25 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(sink)
 			return
 		}
+		pageSize := 0
+		if value := r.URL.Query().Get("pageSize"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 0 || parsed > 1000 {
+				writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "pageSize must be between 0 and 1000")
+				return
+			}
+			pageSize = parsed
+		}
+		sinkFilter := r.URL.Query().Get("filter")
+		if sinkFilter != "" && sinkFilter != `in_scope("DEFAULT")` {
+			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "only the default sink listing scope is implemented")
+			return
+		}
+		sinkOrder := r.URL.Query().Get("orderBy")
+		if sinkOrder != "" {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "orderBy is not supported for sink listings")
+			return
+		}
 		api.mu.RLock()
 		sinks := make([]LogSink, 0)
 		for sinkKey, sink := range api.sinks {
@@ -421,8 +464,78 @@ func (api *API) handleSinks(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		api.mu.RUnlock()
-		sort.Slice(sinks, func(i, j int) bool { return sinks[i].Name < sinks[j].Name })
-		_ = json.NewEncoder(w).Encode(map[string]any{"sinks": sinks})
+		page, nextToken, err := pagination.Page(sinks, pageSize, r.URL.Query().Get("pageToken"), pagination.Scope{
+			Service: "logging.sinks",
+			Parent:  "projects/" + project,
+			Filter:  sinkFilter,
+			OrderBy: sinkOrder,
+		}, func(sink LogSink) string { return sink.Name })
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid pageToken")
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"sinks": page, "nextPageToken": nextToken})
+	case http.MethodPatch:
+		if collection {
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+			return
+		}
+		updateMask := r.URL.Query().Get("updateMask")
+		var patch LogSink
+		if err := decodeJSON(r, &patch); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid sink JSON")
+			return
+		}
+		fields := []string{"destination", "filter"}
+		if updateMask != "" {
+			fields = strings.Split(updateMask, ",")
+		}
+		for index := range fields {
+			fields[index] = strings.TrimSpace(fields[index])
+			switch fields[index] {
+			case "destination", "filter", "description":
+			default:
+				writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "unsupported sink update field: "+fields[index])
+				return
+			}
+		}
+		var updated LogSink
+		var validationErr error
+		err := api.commitMutation(func() error {
+			current, exists := api.sinks[key]
+			if !exists {
+				return errLoggingNotFound
+			}
+			updated = current
+			for _, field := range fields {
+				switch field {
+				case "destination":
+					updated.Destination = patch.Destination
+				case "filter":
+					updated.Filter = patch.Filter
+				case "description":
+					updated.Description = patch.Description
+				}
+			}
+			if validationErr = validateSink(updated); validationErr != nil {
+				return validationErr
+			}
+			api.sinks[key] = updated
+			return nil
+		})
+		if errors.Is(err, errLoggingNotFound) {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "sink not found: "+name)
+			return
+		}
+		if validationErr != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", validationErr.Error())
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist sink update")
+			return
+		}
+		_ = json.NewEncoder(w).Encode(updated)
 	case http.MethodDelete:
 		if collection {
 			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")

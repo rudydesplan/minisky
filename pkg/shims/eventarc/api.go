@@ -228,6 +228,29 @@ func (api *API) createTrigger(w http.ResponseWriter, r *http.Request) {
 	trigger.CreateTime = now
 	trigger.UpdateTime = now
 	trigger.Etag = computeEtag(&trigger)
+	validateOnly, err := optionalBoolQuery(r, "validateOnly")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	if validateOnly {
+		api.mu.RLock()
+		_, exists := api.triggers[name]
+		api.mu.RUnlock()
+		if exists {
+			writeError(w, http.StatusConflict, "ALREADY_EXISTS", "trigger already exists: "+triggerID)
+			return
+		}
+		op, err := api.opMgr.RegisterScopedTargetDurable("eventarc#operation", "create", name)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to register operation")
+			return
+		}
+		_ = api.opMgr.FinalizeScopedDurable(op.Name,
+			typedResponse("type.googleapis.com/google.cloud.eventarc.v1.Trigger", &trigger), 0, "")
+		_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
+		return
+	}
 
 	api.mu.Lock()
 	if _, exists := api.triggers[name]; exists {
@@ -258,10 +281,13 @@ func (api *API) createTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.opMgr.RunAsync(op.Name, func() error {
+	go func() {
 		time.Sleep(50 * time.Millisecond)
-		return nil
-	})
+		response := typedResponse("type.googleapis.com/google.cloud.eventarc.v1.Trigger", &trigger)
+		if err := api.opMgr.FinalizeScopedDurable(op.Name, response, 0, ""); err != nil {
+			log.Printf("[Eventarc] finalize create operation: %v", err)
+		}
+	}()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -347,12 +373,32 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := parseTriggerName(r.URL.Path)
 	updateMask := r.URL.Query().Get("updateMask")
+	validateOnly, err := optionalBoolQuery(r, "validateOnly")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	allowMissing, err := optionalBoolQuery(r, "allowMissing")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
 
 	api.mu.Lock()
 	existing, ok := api.triggers[name]
 	if !ok {
 		api.mu.Unlock()
+		if allowMissing {
+			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+				"Eventarc patch allowMissing creation is recognized but not implemented")
+			return
+		}
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "trigger not found: "+name)
+		return
+	}
+	if err := validateTriggerUpdateMask(updateMask); err != nil {
+		api.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 
@@ -368,7 +414,8 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 	var merged map[string]any
 	_ = json.Unmarshal(existingRaw, &merged)
 
-	if updateMask != "" {
+	mutableFields := []string{"destination", "labels"}
+	if updateMask != "" && updateMask != "*" {
 		fields := strings.Split(updateMask, ",")
 		for _, field := range fields {
 			field = strings.TrimSpace(field)
@@ -377,9 +424,10 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// No mask: merge all provided fields
-		for k, v := range patch {
-			merged[k] = v
+		for _, field := range mutableFields {
+			if v, exists := patch[field]; exists {
+				merged[field] = v
+			}
 		}
 	}
 
@@ -405,6 +453,18 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated.Etag = computeEtag(&updated)
+	if validateOnly {
+		api.mu.Unlock()
+		op, err := api.opMgr.RegisterScopedTargetDurable("eventarc#operation", "update", name)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to register operation")
+			return
+		}
+		_ = api.opMgr.FinalizeScopedDurable(op.Name,
+			typedResponse("type.googleapis.com/google.cloud.eventarc.v1.Trigger", &updated), 0, "")
+		_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
+		return
+	}
 	oldTrigger := api.triggers[name]
 	api.triggers[name] = &updated
 	api.mu.Unlock()
@@ -425,32 +485,59 @@ func (api *API) patchTrigger(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
-	api.opMgr.MarkDone(op.Name)
+	response := typedResponse("type.googleapis.com/google.cloud.eventarc.v1.Trigger", &updated)
+	_ = api.opMgr.FinalizeScopedDurable(op.Name, response, 0, "")
 
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"name": op.Name,
-		"done": true,
-		"metadata": map[string]any{
-			"@type":      "type.googleapis.com/google.cloud.eventarc.v1.OperationMetadata",
-			"target":     name,
-			"verb":       "update",
-			"apiVersion": "v1",
-		},
-		"response": map[string]any{
-			"@type": "type.googleapis.com/google.cloud.eventarc.v1.Trigger",
-		},
-	})
+	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
 }
 
 func (api *API) deleteTrigger(w http.ResponseWriter, r *http.Request) {
 	name := parseTriggerName(r.URL.Path)
+	allowMissing, err := optionalBoolQuery(r, "allowMissing")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	validateOnly, err := optionalBoolQuery(r, "validateOnly")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
 
 	api.mu.Lock()
 	trigger, exists := api.triggers[name]
 	if !exists {
 		api.mu.Unlock()
+		if allowMissing {
+			op, err := api.opMgr.RegisterScopedTargetDurable("eventarc#operation", "delete", name)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to register operation")
+				return
+			}
+			_ = api.opMgr.FinalizeScopedDurable(op.Name,
+				json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`), 0, "")
+			_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
+			return
+		}
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "trigger not found: "+name)
+		return
+	}
+	if etag := r.URL.Query().Get("etag"); etag != "" && etag != trigger.Etag {
+		api.mu.Unlock()
+		writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "trigger etag does not match")
+		return
+	}
+	if validateOnly {
+		api.mu.Unlock()
+		op, err := api.opMgr.RegisterScopedTargetDurable("eventarc#operation", "delete", name)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to register operation")
+			return
+		}
+		_ = api.opMgr.FinalizeScopedDurable(op.Name,
+			json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`), 0, "")
+		_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
 		return
 	}
 	delete(api.triggers, name)
@@ -474,19 +561,11 @@ func (api *API) deleteTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.opMgr.MarkDone(op.Name)
+	_ = api.opMgr.FinalizeScopedDurable(op.Name,
+		json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`), 0, "")
 
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"name": op.Name,
-		"done": true,
-		"metadata": map[string]any{
-			"@type":      "type.googleapis.com/google.cloud.eventarc.v1.OperationMetadata",
-			"target":     name,
-			"verb":       "delete",
-			"apiVersion": "v1",
-		},
-	})
+	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
 }
 
 func (api *API) getOperation(w http.ResponseWriter, r *http.Request) {
@@ -584,6 +663,40 @@ func validateDestination(project string, destination *Destination) error {
 		return errUnsupportedDestination
 	}
 	return nil
+}
+
+func validateTriggerUpdateMask(mask string) error {
+	if mask == "" {
+		return nil
+	}
+	for _, field := range strings.Split(mask, ",") {
+		field = strings.TrimSpace(field)
+		if field != "destination" && field != "labels" && field != "*" {
+			return fmt.Errorf("Eventarc triggers only support updating destination and labels")
+		}
+	}
+	return nil
+}
+
+func typedResponse(typeURL string, value any) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	var response map[string]any
+	_ = json.Unmarshal(raw, &response)
+	response["@type"] = typeURL
+	raw, _ = json.Marshal(response)
+	return raw
+}
+
+func optionalBoolQuery(r *http.Request, name string) (bool, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", name)
+	}
+	return value, nil
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

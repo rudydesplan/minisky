@@ -45,6 +45,21 @@ const (
 	PersistenceStatic PersistenceCategory = "static"
 )
 
+type DockerRequestBody string
+
+const (
+	DockerRequestBodyBatchRunnable  DockerRequestBody = "batch-runnable"
+	DockerRequestBodyAlloyDBPrimary DockerRequestBody = "alloydb-primary"
+)
+
+// DockerOperation identifies one executable HTTP mutation that must fail
+// before handler dispatch when the current boot has no Docker backend.
+type DockerOperation struct {
+	HTTPMethod  string
+	PathGlob    string
+	RequestBody DockerRequestBody
+}
+
 // Service describes the support contract for an actually registered domain.
 // Deferred and experimental domains have no fidelity tier because they are not
 // promoted implementation claims.
@@ -58,6 +73,7 @@ type Service struct {
 	LazyDocker       bool
 	ProbeUnsupported bool
 	BackendContract  string
+	DockerOperations []DockerOperation
 	SupportReason    string
 }
 
@@ -90,16 +106,16 @@ var serviceManifest = map[string]serviceMetadata{
 	"eventarc.googleapis.com":             {"", PersistenceFile, true},
 	"workflows.googleapis.com":            {"", PersistenceFile, true},
 	"workflowexecutions.googleapis.com":   {"", PersistenceFile, true},
-	"batch.googleapis.com":                {"", PersistenceFile, true},
+	"batch.googleapis.com":                {"", PersistenceHybrid, true},
 	"binaryauthorization.googleapis.com":  {"", PersistenceFile, true},
 	"dataflow.googleapis.com":             {"", PersistenceFile, true},
-	"alloydb.googleapis.com":              {"", PersistenceFile, true},
+	"alloydb.googleapis.com":              {"", PersistenceHybrid, true},
 	"apigateway.googleapis.com":           {"", PersistenceFile, true},
 	"clouddeploy.googleapis.com":          {"", PersistenceFile, true},
-	"composer.googleapis.com":             {"", PersistenceFile, true},
+	"composer.googleapis.com":             {"", PersistenceHybrid, true},
 	"dataform.googleapis.com":             {"", PersistenceFile, true},
 	"file.googleapis.com":                 {"", PersistenceFile, true},
-	"managedkafka.googleapis.com":         {"", PersistenceFile, true},
+	"managedkafka.googleapis.com":         {"", PersistenceHybrid, true},
 	"networksecurity.googleapis.com":      {"", PersistenceFile, true},
 	"networkservices.googleapis.com":      {"", PersistenceFile, true},
 	"orgpolicy.googleapis.com":            {"", PersistenceFile, true},
@@ -268,13 +284,40 @@ func IsExperimentalDisabled(handler http.Handler) bool {
 	return disabled
 }
 
-// lazyBackendContracts records why these domains use backend-gated coverage
-// instead of in-process CRUD probes. Their API behavior belongs to the named
-// emulator and is executable only after a successful Docker cold start.
-var lazyBackendContracts = map[string]string{
-	"datastore.googleapis.com": "Google Cloud Datastore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
-	"firestore.googleapis.com": "Google Cloud Firestore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
-	"spanner.googleapis.com":   "Cloud Spanner emulator; cold-start and backend errors are deterministic, database behavior requires Docker",
+// backendContracts records the Docker boundary for services whose persistence
+// includes an executable backend. Pure passthrough domains require a successful
+// cold start; hybrid domains persist metadata while owning bounded Docker work.
+var backendContracts = map[string]string{
+	"alloydb.googleapis.com":      "AlloyDB metadata is profile-persisted; primary instances use exact-owned PostgreSQL containers",
+	"batch.googleapis.com":        "Batch job metadata is profile-persisted; bounded container runnables execute in exact-owned digest-pinned Docker containers",
+	"composer.googleapis.com":     "Composer metadata is profile-persisted; environments use exact-owned Airflow containers",
+	"datastore.googleapis.com":    "Google Cloud Datastore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
+	"firestore.googleapis.com":    "Google Cloud Firestore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
+	"managedkafka.googleapis.com": "Managed Kafka metadata is profile-persisted; clusters use exact-owned Kafka containers",
+	"redis.googleapis.com":        "Memorystore metadata is profile-persisted; instances use exact-owned Valkey containers and volumes",
+	"spanner.googleapis.com":      "Cloud Spanner emulator; cold-start and backend errors are deterministic, database behavior requires Docker",
+}
+
+var dockerOperationContracts = map[string][]DockerOperation{
+	"alloydb.googleapis.com": {
+		{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/clusters/*/instances", RequestBody: DockerRequestBodyAlloyDBPrimary},
+		{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/clusters/*/instances/*"},
+	},
+	"batch.googleapis.com": {
+		{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/jobs", RequestBody: DockerRequestBodyBatchRunnable},
+	},
+	"composer.googleapis.com": {
+		{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/environments"},
+		{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/environments/*"},
+	},
+	"managedkafka.googleapis.com": {
+		{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/clusters"},
+		{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/clusters/*"},
+	},
+	"redis.googleapis.com": {
+		{HTTPMethod: http.MethodPost, PathGlob: "/v1/projects/*/locations/*/instances"},
+		{HTTPMethod: http.MethodDelete, PathGlob: "/v1/projects/*/locations/*/instances/*"},
+	},
 }
 
 // Services returns a stable manifest derived from current factory and lazy
@@ -327,7 +370,8 @@ func Services() ([]Service, error) {
 			Persistence:      metadata.persistence,
 			LazyDocker:       lazy,
 			ProbeUnsupported: metadata.probeUnsupported,
-			BackendContract:  lazyBackendContracts[domain],
+			BackendContract:  backendContracts[domain],
+			DockerOperations: append([]DockerOperation(nil), dockerOperationContracts[domain]...),
 			SupportReason:    supportReason,
 		})
 	}

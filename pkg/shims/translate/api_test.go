@@ -36,8 +36,8 @@ func TestTranslateText(t *testing.T) {
 	if first["translatedText"] != "Hello" {
 		t.Errorf("translatedText = %v, want Hello", first["translatedText"])
 	}
-	if first["detectedSourceLanguage"] != "en" {
-		t.Errorf("detectedSourceLanguage = %v, want en", first["detectedSourceLanguage"])
+	if first["detectedLanguageCode"] != nil {
+		t.Errorf("explicit source language must not claim detection: %v", first["detectedLanguageCode"])
 	}
 	if first["model"] != nil {
 		t.Errorf("identity translation must not claim a model: %v", first["model"])

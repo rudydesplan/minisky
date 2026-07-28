@@ -29,15 +29,15 @@ func (api *API) Evaluate(resource, constraint string, ancestors []string) (Evalu
 		return Evaluation{}, fmt.Errorf("constraint not found")
 	}
 	policyID := strings.TrimPrefix(constraint, "constraints/")
-	for i := len(ancestors) - 1; i >= 0; i-- {
-		name := ancestors[i] + "/policies/" + policyID
-		if policy := api.policies[name]; policy != nil && policy.Spec != nil && len(policy.Spec.Rules) > 0 {
-			return Evaluation{Enforced: policy.Spec.Rules[0].Enforce, Source: name}, nil
-		}
-	}
 	name := resource + "/policies/" + policyID
 	if policy := api.policies[name]; policy != nil && policy.Spec != nil && len(policy.Spec.Rules) > 0 {
 		return Evaluation{Enforced: policy.Spec.Rules[0].Enforce, Source: name}, nil
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		name = ancestors[i] + "/policies/" + policyID
+		if policy := api.policies[name]; policy != nil && policy.Spec != nil && len(policy.Spec.Rules) > 0 {
+			return Evaluation{Enforced: policy.Spec.Rules[0].Enforce, Source: name}, nil
+		}
 	}
 	return Evaluation{
 		Enforced: definition.ConstraintDefault == "DENY",

@@ -1,6 +1,7 @@
 package composer
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,8 @@ type Environment struct {
 type EnvironmentConfig struct {
 	NodeCount      int             `json:"nodeCount,omitempty"`
 	SoftwareConfig *SoftwareConfig `json:"softwareConfig,omitempty"`
+	AirflowURI     string          `json:"airflowUri,omitempty"`
+	DagGcsPrefix   string          `json:"dagGcsPrefix,omitempty"`
 }
 
 // SoftwareConfig holds software-related configuration.
@@ -62,9 +65,13 @@ type API struct {
 	opMgr        *orchestrator.OperationManager
 	stateStore   composerStateStore
 	environments map[string]*Environment
+	backend      airflowBackend
 }
 
-const provisioningBackendAvailable = false
+type airflowBackend interface {
+	Provision(context.Context, string) (string, error)
+	Delete(context.Context, string) error
+}
 
 // NewAPI creates a new Composer API shim with persistence.
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
@@ -76,6 +83,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 		opMgr:        opMgr,
 		stateStore:   state.NewGuardedEntryStore(store, err),
 		environments: make(map[string]*Environment),
+		backend:      newDockerAirflowBackend(),
 	}
 	if err != nil {
 		log.Printf("[Shim: Composer] persistence degraded: %v", err)
@@ -149,12 +157,6 @@ func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "name must match parent: "+expectedPrefix+"<environmentId>")
 		return
 	}
-	if !provisioningBackendAvailable {
-		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
-			"Cloud Composer environment provisioning requires a backend that MiniSky does not implement")
-		return
-	}
-
 	name := env.Name
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
@@ -167,6 +169,12 @@ func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 	if _, exists := api.environments[name]; exists {
 		api.mu.Unlock()
 		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "environment already exists: "+name)
+		return
+	}
+	if api.backend == nil {
+		api.mu.Unlock()
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"Cloud Composer environment provisioning requires the pinned Airflow backend")
 		return
 	}
 	api.environments[name] = &env
@@ -187,14 +195,45 @@ func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		delete(api.environments, name)
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
-		// Metadata-only: resource stays in CREATING state.
-		// Real provisioning requires Docker (not available in this experimental shim).
-		return nil
+		endpoint, err := api.backend.Provision(context.Background(), name)
+		api.mu.Lock()
+		current := api.environments[name]
+		if current != nil {
+			current.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
+			if err != nil {
+				current.State = "ERROR"
+			} else {
+				current.State = "RUNNING"
+				if current.Config == nil {
+					current.Config = &EnvironmentConfig{}
+				}
+				if current.Config.SoftwareConfig == nil {
+					current.Config.SoftwareConfig = &SoftwareConfig{ImageVersion: "composer-3-airflow-2.10.5"}
+				}
+				current.Config.AirflowURI = endpoint
+				current.Config.DagGcsPrefix = "minisky://" + name + "/dags"
+			}
+		}
+		api.mu.Unlock()
+		if persistErr := api.persistState(); persistErr != nil && err == nil {
+			api.mu.Lock()
+			if current := api.environments[name]; current != nil {
+				current.State = "ERROR"
+				if current.Config != nil {
+					current.Config.AirflowURI = ""
+					current.Config.DagGcsPrefix = ""
+				}
+			}
+			api.mu.Unlock()
+			return persistErr
+		}
+		return err
 	})
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
@@ -290,13 +329,12 @@ func (api *API) patchEnvironment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "environment not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
-			"Cloud Composer environment updates require an owned Airflow backend that MiniSky does not implement")
+			"Cloud Composer environment updates require the pinned Airflow backend")
 		return
 	}
-
 	var patch map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		api.mu.Unlock()
@@ -333,6 +371,22 @@ func (api *API) patchEnvironment(w http.ResponseWriter, r *http.Request) {
 	var updated Environment
 	_ = json.Unmarshal(updatedRaw, &updated)
 	oldEnv := api.environments[name]
+	api.mu.Unlock()
+
+	project, location, _ := parseParent(r.URL.Path)
+	op, err := api.opMgr.RegisterDurable("composer#operation", "update", name, "", location)
+	if err != nil {
+		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+		return
+	}
+
+	api.mu.Lock()
+	if api.environments[name] != oldEnv {
+		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, 503, "UNAVAILABLE", "Environment changed while registering operation")
+		return
+	}
 	api.environments[name] = &updated
 	api.mu.Unlock()
 
@@ -341,17 +395,15 @@ func (api *API) patchEnvironment(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		api.environments[name] = oldEnv
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
 
-	project, location, _ := parseParent(r.URL.Path)
-	op, err := api.opMgr.RegisterDurable("composer#operation", "update", name, "", location)
-	if err != nil {
-		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+	if err := api.opMgr.FinalizeScopedDurable(op.Name, nil, 0, ""); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to persist operation result")
 		return
 	}
-	api.opMgr.MarkDone(op.Name)
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 
@@ -382,10 +434,30 @@ func (api *API) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "environment not found: "+name)
 		return
 	}
-	if !provisioningBackendAvailable {
+	if api.backend == nil {
 		api.mu.Unlock()
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
-			"Cloud Composer environment deletion requires an owned Airflow backend that MiniSky does not implement")
+			"Cloud Composer environment deletion requires the pinned Airflow backend")
+		return
+	}
+	api.mu.Unlock()
+
+	op, err := api.opMgr.RegisterDurable("composer#operation", "delete", name, "", location)
+	if err != nil {
+		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+		return
+	}
+	if err := api.backend.Delete(r.Context(), name); err != nil {
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Airflow backend deletion failed: "+err.Error())
+		return
+	}
+	api.mu.Lock()
+	env, exists = api.environments[name]
+	if !exists {
+		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "environment not found: "+name)
 		return
 	}
 	delete(api.environments, name)
@@ -394,18 +466,23 @@ func (api *API) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
 	if err := api.persistState(); err != nil {
 		// Re-add the resource since persist failed
 		api.mu.Lock()
-		api.environments[name] = env
+		restored := deepCopyEnvironment(env)
+		restored.State = "ERROR"
+		if restored.Config != nil {
+			restored.Config.AirflowURI = ""
+			restored.Config.DagGcsPrefix = ""
+		}
+		api.environments[name] = restored
 		api.mu.Unlock()
+		_ = api.opMgr.RollbackScopedRegistration(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "State persistence failed")
 		return
 	}
 
-	op, err := api.opMgr.RegisterDurable("composer#operation", "delete", name, "", location)
-	if err != nil {
-		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
+	if err := api.opMgr.FinalizeScopedDurable(op.Name, nil, 0, ""); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Failed to persist operation result")
 		return
 	}
-	api.opMgr.MarkDone(op.Name)
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 

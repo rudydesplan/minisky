@@ -117,8 +117,10 @@ type API struct {
 	stateStore gkeStore
 	clusters   map[string]*Cluster // key: project:zone:name
 	ownerships map[string]*kubeconfigOwnership
+	operations map[string]*GkeOperation
 	gatewayURL string
 	httpClient *http.Client
+	startupErr error
 }
 
 type gkeBackend interface {
@@ -135,13 +137,16 @@ type gkeBackendCreateResult struct {
 func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
-		log.Printf("[Shim: GKE] state disabled: %v", err)
-		return newAPI(opMgr, nil)
+		log.Printf("[Shim: GKE] state unavailable: %v", err)
+		api := newAPI(opMgr, nil)
+		api.startupErr = fmt.Errorf("initialize GKE state: %w", err)
+		return api
 	}
 	api, err := NewAPIWithStore(opMgr, store)
 	if err != nil {
 		log.Printf("[Shim: GKE] state rehydration failed: %v", err)
-		return newAPI(opMgr, nil)
+		api = newAPI(opMgr, store)
+		api.startupErr = err
 	}
 	return api
 }
@@ -162,6 +167,7 @@ func newAPIWithBackend(
 		backend:    backend,
 		stateStore: store,
 		clusters:   make(map[string]*Cluster),
+		operations: make(map[string]*GkeOperation),
 		gatewayURL: strings.TrimRight(gatewayURL, "/"),
 		httpClient: client,
 		ownerships: make(map[string]*kubeconfigOwnership),
@@ -212,6 +218,12 @@ func (api *API) ReadKubeconfig(project, zone, name string) ([]byte, error) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: GKE] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.startupErr != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"GKE state is unavailable: "+api.startupErr.Error())
+		return
+	}
 
 	path := r.URL.Path
 
@@ -338,14 +350,6 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 	}
 	api.clusters[key] = &cl
 	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		api.mu.Lock()
-		delete(api.clusters, key)
-		api.mu.Unlock()
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist cluster metadata: "+err.Error())
-		return
-	}
 
 	targetLink := cl.SelfLink
 	op, err := api.opMgr.RegisterDurable("container#operation", "CREATE_CLUSTER", targetLink, zone, "")
@@ -365,8 +369,36 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	gkeOp := toGkeOperation(op, "CREATE_CLUSTER", project, zone, targetLink)
+	api.mu.Lock()
+	api.operations[op.Name] = cloneGKEOperation(gkeOp)
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		delete(api.operations, op.Name)
+		if current := api.clusters[key]; current != nil {
+			current.Status = "ERROR"
+			current.StatusMessage = "operation metadata persistence failed: " + err.Error()
+			current.Endpoint = ""
+			current.MasterAuth = nil
+		}
+		api.mu.Unlock()
+		rollbackErr := api.opMgr.RollbackScopedRegistration(op.Name)
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded cluster: %w", persistErr))
+		}
+		err = errors.Join(err, rollbackErr)
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
 
-	api.opMgr.RunAsync(op.Name, func() error {
+	api.opMgr.RunAsync(op.Name, func() (workErr error) {
+		defer func() {
+			if err := api.finishGKEOperation(op.Name, workErr); err != nil {
+				workErr = errors.Join(workErr, err)
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		backendCreated := false
@@ -433,7 +465,6 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, z
 		return nil
 	})
 
-	gkeOp := toGkeOperation(op, "CREATE_CLUSTER", project, zone, targetLink)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(gkeOp)
 }
@@ -507,11 +538,6 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		cl = current
 	}
 	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist cluster metadata: "+err.Error())
-		return
-	}
 
 	op, err := api.opMgr.RegisterDurable("container#operation", "DELETE_CLUSTER", cl.SelfLink, zone, "")
 	if err != nil {
@@ -526,7 +552,33 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
+	gkeOp := toGkeOperation(op, "DELETE_CLUSTER", project, zone, cl.SelfLink)
+	api.mu.Lock()
+	api.operations[op.Name] = cloneGKEOperation(gkeOp)
+	api.mu.Unlock()
+	if err := api.persistMetadata(); err != nil {
+		api.mu.Lock()
+		delete(api.operations, op.Name)
+		if current := api.clusters[key]; current != nil {
+			current.Status = "ERROR"
+			current.StatusMessage = "operation metadata persistence failed: " + err.Error()
+		}
+		api.mu.Unlock()
+		rollbackErr := api.opMgr.RollbackScopedRegistration(op.Name)
+		if persistErr := api.persistMetadata(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist degraded cluster: %w", persistErr))
+		}
+		err = errors.Join(err, rollbackErr)
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.opMgr.RunAsync(op.Name, func() (workErr error) {
+		defer func() {
+			if err := api.finishGKEOperation(op.Name, workErr); err != nil {
+				workErr = errors.Join(workErr, err)
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		api.mu.RLock()
@@ -579,7 +631,6 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request, project, z
 
 		return nil
 	})
-	gkeOp := toGkeOperation(op, "DELETE_CLUSTER", project, zone, cl.SelfLink)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(gkeOp)
 }
@@ -627,6 +678,30 @@ func (api *API) getOperation(w http.ResponseWriter, r *http.Request, path string
 	zone := firstOf(extractSegmentAfter(path, "zones"), extractSegmentAfter(path, "locations"))
 	opName := extractSegmentAfter(path, "operations")
 
+	api.mu.RLock()
+	durable := cloneGKEOperation(api.operations[opName])
+	api.mu.RUnlock()
+	if durable != nil {
+		targetZonePrefix := fmt.Sprintf(
+			"https://container.googleapis.com/v1/projects/%s/zones/%s/", project, zone)
+		targetLocationPrefix := fmt.Sprintf(
+			"https://container.googleapis.com/v1/projects/%s/locations/%s/", project, zone)
+		if durable.Zone != zone ||
+			(!strings.HasPrefix(durable.TargetLink, targetZonePrefix) &&
+				!strings.HasPrefix(durable.TargetLink, targetLocationPrefix)) {
+			w.WriteHeader(http.StatusNotFound)
+			writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(durable)
+		return
+	}
+	if api.opMgr == nil {
+		w.WriteHeader(http.StatusNotFound)
+		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
+		return
+	}
 	op := api.opMgr.Get(opName)
 	targetZonePrefix := fmt.Sprintf(
 		"https://container.googleapis.com/v1/projects/%s/zones/%s/",
@@ -865,6 +940,57 @@ func cloneCluster(cluster *Cluster) *Cluster {
 		clone.DefaultMaxPodsConstraint = &value
 	}
 	return &clone
+}
+
+func cloneGKEOperation(operation *GkeOperation) *GkeOperation {
+	if operation == nil {
+		return nil
+	}
+	clone := *operation
+	if operation.Error != nil {
+		operationError := *operation.Error
+		clone.Error = &operationError
+	}
+	return &clone
+}
+
+func (api *API) finishGKEOperation(name string, workErr error) error {
+	api.mu.Lock()
+	operation := api.operations[name]
+	if operation != nil {
+		operation.Status = "DONE"
+		operation.EndTime = time.Now().UTC().Format(time.RFC3339)
+		if workErr != nil {
+			code := http.StatusInternalServerError
+			var coded interface{ OperationCode() int }
+			if errors.As(workErr, &coded) {
+				code = coded.OperationCode()
+			}
+			operation.Error = &orchestrator.OperationError{Code: code, Message: workErr.Error()}
+			operation.StatusMessage = workErr.Error()
+		} else {
+			operation.Error = nil
+			operation.StatusMessage = ""
+		}
+	}
+	api.mu.Unlock()
+	if operation == nil {
+		return nil
+	}
+	if err := api.persistMetadata(); err != nil {
+		message := "terminal GKE operation persistence failed: " + err.Error()
+		api.mu.Lock()
+		if current := api.operations[name]; current != nil {
+			current.Error = &orchestrator.OperationError{
+				Code: http.StatusInternalServerError, Message: message,
+			}
+			current.StatusMessage = message
+		}
+		api.mu.Unlock()
+		api.opMgr.MarkPersistenceFailure(err)
+		return fmt.Errorf("persist terminal GKE operation: %w", err)
+	}
+	return nil
 }
 
 func clusterKey(project, zone, name string) string {

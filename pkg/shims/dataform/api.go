@@ -457,10 +457,14 @@ func (api *API) updateRepository(w http.ResponseWriter, r *http.Request) {
 	updatedRaw, _ := json.Marshal(merged)
 	var updated Repository
 	_ = json.Unmarshal(updatedRaw, &updated)
+	previous := cloneRepo(existing)
 	api.repositories[name] = &updated
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
+		api.mu.Lock()
+		api.repositories[name] = previous
+		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
@@ -674,10 +678,14 @@ func (api *API) updateWorkspace(w http.ResponseWriter, r *http.Request) {
 	updatedRaw, _ := json.Marshal(merged)
 	var updated Workspace
 	_ = json.Unmarshal(updatedRaw, &updated)
+	previous := cloneWorkspace(existing)
 	api.workspaces[name] = &updated
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
+		api.mu.Lock()
+		api.workspaces[name] = previous
+		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
@@ -696,12 +704,32 @@ func (api *API) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(api.workspaces, name)
+	deletedCompilations := make(map[string]*CompilationResult)
+	for compilationName, result := range api.compilationResults {
+		if result.Workspace == name {
+			deletedCompilations[compilationName] = result
+			delete(api.compilationResults, compilationName)
+		}
+	}
+	deletedInvocations := make(map[string]*WorkflowInvocation)
+	for invocationName, invocation := range api.workflowInvocations {
+		if _, deleted := deletedCompilations[invocation.CompilationResult]; deleted {
+			deletedInvocations[invocationName] = invocation
+			delete(api.workflowInvocations, invocationName)
+		}
+	}
 	api.mu.Unlock()
 
 	if err := api.persistState(); err != nil {
 		// Re-add the resource since persist failed
 		api.mu.Lock()
 		api.workspaces[name] = ws
+		for key, result := range deletedCompilations {
+			api.compilationResults[key] = result
+		}
+		for key, invocation := range deletedInvocations {
+			api.workflowInvocations[key] = invocation
+		}
 		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "State persistence failed")
 		return

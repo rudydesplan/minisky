@@ -2,6 +2,7 @@ package compute
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -322,10 +324,38 @@ type computeNetworkBackend interface {
 
 const defaultComputeDeleteTimeout = 30 * time.Second
 
+const (
+	maxLoadBalancerCacheEntries = 64
+	maxLoadBalancerCacheBytes   = 1 << 20
+	maxLoadBalancerHeaderBytes  = 32 << 10
+	maxLoadBalancerCacheTTL     = 60 * time.Second
+)
+
+type loadBalancerCacheKey struct {
+	project        string
+	backendService string
+	policyName     string
+	policyVersion  string
+	method         string
+	host           string
+	uri            string
+}
+
+type loadBalancerCacheEntry struct {
+	status    int
+	header    http.Header
+	body      []byte
+	expiresAt time.Time
+	urlMap    string
+	path      string
+	host      string
+}
+
 type API struct {
 	mu                   sync.RWMutex
 	persistMu            sync.Mutex
 	initMu               sync.RWMutex
+	cacheMu              sync.Mutex
 	opMgr                *orchestrator.OperationManager
 	svcMgr               *orchestrator.ServiceManager
 	vpcIPAM              vpcIPAMBackend
@@ -333,6 +363,8 @@ type API struct {
 	legacyVPC            legacyVPCBackend
 	firewall             firewallBackend
 	computeNetwork       computeNetworkBackend
+	networkAuthorizer    networkHTTPAuthorizer
+	serviceMeshRouter    serviceMeshHTTPRouter
 	initializationErr    error
 	stateStore           computeMetadataStore
 	instances            map[string]*Instance   // key: project+":"+zone+":"+name
@@ -344,6 +376,10 @@ type API struct {
 	instanceGroups       map[string]*InstanceGroup  // key: project+":"+zone+":"+name
 	loadBalancers        map[string]map[string]interface{}
 	roundRobin           map[string]uint64
+	loadBalancerCache    map[loadBalancerCacheKey]loadBalancerCacheEntry
+	cacheClearedAt       time.Time
+	cacheInvalidatedAt   map[string]time.Time
+	policyInvalidatedAt  map[string]time.Time
 	httpClient           *http.Client
 	computeDeleteTimeout time.Duration
 }
@@ -362,6 +398,10 @@ func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 		log.Printf("[Shim: Compute Engine] state rehydration failed: %v", err)
 		api = newAPI(opMgr, svcMgr, store)
 		api.setInitializationError(err)
+		return api
+	}
+	if err := api.initializationError(); err != nil {
+		log.Printf("[Shim: Compute Engine] persisted metadata validation failed: %v", err)
 		return api
 	}
 	if err := api.ReconcileVPCIPAM(context.Background()); err != nil {
@@ -390,6 +430,9 @@ func newAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceMa
 		instanceGroups:       make(map[string]*InstanceGroup),
 		loadBalancers:        make(map[string]map[string]interface{}),
 		roundRobin:           make(map[string]uint64),
+		loadBalancerCache:    make(map[loadBalancerCacheKey]loadBalancerCacheEntry),
+		cacheInvalidatedAt:   make(map[string]time.Time),
+		policyInvalidatedAt:  make(map[string]time.Time),
 		httpClient:           &http.Client{Timeout: 2 * time.Second},
 		computeDeleteTimeout: defaultComputeDeleteTimeout,
 	}
@@ -1602,9 +1645,13 @@ func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path str
 			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Regional operation not found")
 			return
 		}
-		op := api.opMgr.Get(parts[7])
+		op, err := api.opMgr.GetScoped(parts[7], orchestrator.OperationScope{
+			ServiceKind: "compute#operation",
+			Project:     parts[3],
+			Location:    parts[5],
+		})
 		targetProjectPrefix := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/", parts[3])
-		if op == nil || op.Kind != "compute#operation" || op.Region != parts[5] ||
+		if err != nil || op.Kind != "compute#operation" || op.Region != parts[5] ||
 			!strings.HasPrefix(op.TargetLink, targetProjectPrefix) {
 			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Operation not found: "+parts[7])
 			return
@@ -1628,17 +1675,22 @@ func (api *API) routeOperations(w http.ResponseWriter, r *http.Request, path str
 		return
 	}
 
-	op := api.opMgr.Get(opName)
 	targetProjectPrefix := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/", project)
 	requestedZone := extractSegmentAfter(path, "zones")
+	location := requestedZone
+	op, err := api.opMgr.GetScoped(opName, orchestrator.OperationScope{
+		ServiceKind: "compute#operation",
+		Project:     project,
+		Location:    location,
+	})
 	requestedScopeValid := false
 	switch {
 	case strings.Contains(path, "/global/operations/"):
-		requestedScopeValid = op != nil && op.Zone == "" && op.Region == ""
+		requestedScopeValid = err == nil && op.Zone == "" && op.Region == "" && op.Location == ""
 	case requestedZone != "":
-		requestedScopeValid = op != nil && op.Zone == requestedZone && op.Region == ""
+		requestedScopeValid = err == nil && op.Zone == requestedZone && op.Region == ""
 	}
-	if op == nil || op.Kind != "compute#operation" || !requestedScopeValid ||
+	if err != nil || op.Kind != "compute#operation" || !requestedScopeValid ||
 		!strings.HasPrefix(op.TargetLink, targetProjectPrefix) {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, 404, "NOT_FOUND", "Operation not found: "+opName)
@@ -1726,6 +1778,77 @@ func (api *API) routeNetworks(w http.ResponseWriter, r *http.Request, path strin
 	}
 }
 
+func (api *API) updateSecurityPolicy(w http.ResponseWriter, r *http.Request, project, name string) {
+	var patch struct {
+		Description *string              `json:"description"`
+		Rules       []SecurityPolicyRule `json:"rules"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
+	if patch.Description == nil && patch.Rules == nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "At least one mutable field is required")
+		return
+	}
+
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	key := project + ":" + name
+	api.mu.RLock()
+	updated := cloneSecurityPolicy(api.securityPolicies[key])
+	api.mu.RUnlock()
+	if updated == nil {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "SecurityPolicy "+name+" not found")
+		return
+	}
+	if patch.Description != nil {
+		updated.Description = *patch.Description
+	}
+	if patch.Rules != nil {
+		updated.Rules = cloneSecurityPolicyRules(patch.Rules)
+		if err := validateSecurityPolicyRules(updated.Rules); err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+			return
+		}
+	}
+
+	op, err := api.opMgr.RegisterDurable("compute#operation", "patch", updated.SelfLink, "", "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	previous, err := api.metadataSnapshot()
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("snapshot security-policy metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	next, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("clone security-policy metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	next.SecurityPolicies[key] = cloneSecurityPolicy(updated)
+	if err := api.saveMetadataTransaction(previous, next); err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("persist security-policy update: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		message := api.compensateControlPlaneCommit(previous, next, err)
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	api.securityPolicies[key] = cloneSecurityPolicy(updated)
+	api.mu.Unlock()
+	api.invalidateLoadBalancerCacheForPolicy(project, name)
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, api.opMgr.Get(op.Name))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Security Policies (Cloud Armor)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1736,15 +1859,26 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 
 	switch r.Method {
 	case http.MethodPost:
+		if name != "" {
+			writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Unsupported security-policy route")
+			return
+		}
 		var body struct {
 			Name        string               `json:"name"`
 			Description string               `json:"description"`
 			Rules       []SecurityPolicyRule `json:"rules"`
 		}
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+			return
+		}
+		if !gceResourceName.MatchString(body.Name) {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "A valid security policy name is required")
+			return
+		}
 
 		// Always add a default allow-all rule at priority 2147483647 (GCP convention)
-		rules := body.Rules
+		rules := cloneSecurityPolicyRules(body.Rules)
 		hasDefault := false
 		for _, rule := range rules {
 			if rule.Priority == 2147483647 {
@@ -1759,6 +1893,10 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 				Description: "default allow-all rule",
 			})
 		}
+		if err := validateSecurityPolicyRules(rules); err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+			return
+		}
 
 		sp := &SecurityPolicy{
 			Kind:              "compute#securityPolicy",
@@ -1766,21 +1904,54 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 			Name:              body.Name,
 			Description:       body.Description,
 			Rules:             rules,
-			SelfLink:          fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/securityPolicies/%s", project, body.Name),
+			SelfLink:          securityPolicySelfLink(project, body.Name),
 			CreationTimestamp: time.Now().UTC().Format(time.RFC3339),
 		}
 		key := project + ":" + body.Name
-		api.mu.Lock()
-		api.securityPolicies[key] = sp
-		api.mu.Unlock()
-
-		op, err := api.opMgr.RegisterDurable("compute#operation", "insert", sp.SelfLink, "", "")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
+		api.persistMu.Lock()
+		defer api.persistMu.Unlock()
+		api.mu.RLock()
+		_, exists := api.securityPolicies[key]
+		api.mu.RUnlock()
+		if exists {
+			writeErrorStatus(w, http.StatusConflict, "ALREADY_EXISTS", "SecurityPolicy "+body.Name+" already exists")
 			return
 		}
-		api.opMgr.RunAsync(op.Name, func() error { return nil })
+		op, err := api.opMgr.RegisterDurable("compute#operation", "insert", sp.SelfLink, "", "")
+		if err != nil {
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+			return
+		}
+		previous, err := api.metadataSnapshot()
+		if err != nil {
+			message := api.failControlPlaneOperation(op.Name, fmt.Errorf("snapshot security-policy metadata: %w", err))
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
+		next, err := cloneComputeMetadata(previous)
+		if err != nil {
+			message := api.failControlPlaneOperation(op.Name, fmt.Errorf("clone security-policy metadata: %w", err))
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
+		if next.SecurityPolicies == nil {
+			next.SecurityPolicies = make(map[string]*SecurityPolicy)
+		}
+		next.SecurityPolicies[key] = cloneSecurityPolicy(sp)
+		if err := api.saveMetadataTransaction(previous, next); err != nil {
+			message := api.failControlPlaneOperation(op.Name, fmt.Errorf("persist security-policy metadata: %w", err))
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
+		if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+			message := api.compensateControlPlaneCommit(previous, next, err)
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
+		api.mu.Lock()
+		api.securityPolicies[key] = cloneSecurityPolicy(sp)
+		api.mu.Unlock()
+		op = api.opMgr.Get(op.Name)
 		w.WriteHeader(http.StatusOK)
 		writeComputeOperation(w, project, op)
 
@@ -1788,9 +1959,9 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 		if name != "" {
 			key := project + ":" + name
 			api.mu.RLock()
-			sp, ok := api.securityPolicies[key]
+			sp := cloneSecurityPolicy(api.securityPolicies[key])
 			api.mu.RUnlock()
-			if !ok {
+			if sp == nil {
 				w.WriteHeader(http.StatusNotFound)
 				writeError(w, 404, "NOT_FOUND", "SecurityPolicy "+name+" not found")
 				return
@@ -1803,10 +1974,11 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 			items := []*SecurityPolicy{}
 			for k, v := range api.securityPolicies {
 				if strings.HasPrefix(k, prefix) {
-					items = append(items, v)
+					items = append(items, cloneSecurityPolicy(v))
 				}
 			}
 			api.mu.RUnlock()
+			sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"kind":  "compute#securityPolicyList",
@@ -1814,9 +1986,206 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 			})
 		}
 
+	case http.MethodPatch:
+		if name == "" {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "A security policy name is required")
+			return
+		}
+		api.updateSecurityPolicy(w, r, project, name)
+
+	case http.MethodDelete:
+		if name == "" {
+			writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "A security policy name is required")
+			return
+		}
+		api.deleteSecurityPolicy(w, project, name)
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (api *API) deleteSecurityPolicy(w http.ResponseWriter, project, name string) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	key := project + ":" + name
+	api.mu.RLock()
+	policy := cloneSecurityPolicy(api.securityPolicies[key])
+	inUse := false
+	for lbKey, resource := range api.loadBalancers {
+		if !strings.HasPrefix(lbKey, project+":backendServices:") || resource == nil {
+			continue
+		}
+		reference, _ := resource["securityPolicy"].(string)
+		referencedName, err := securityPolicyReferenceName(reference, project)
+		if err == nil && referencedName == name {
+			inUse = true
+			break
+		}
+	}
+	api.mu.RUnlock()
+	if policy == nil {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "SecurityPolicy "+name+" not found")
+		return
+	}
+	if inUse {
+		writeErrorStatus(w, http.StatusBadRequest, "FAILED_PRECONDITION",
+			"SecurityPolicy "+name+" is referenced by a backend service")
+		return
+	}
+	op, err := api.opMgr.RegisterDurable("compute#operation", "delete", policy.SelfLink, "", "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	previous, err := api.metadataSnapshot()
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("snapshot security-policy metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	next, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("clone security-policy metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	delete(next.SecurityPolicies, key)
+	if err := api.saveMetadataTransaction(previous, next); err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("persist security-policy deletion: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		message := api.compensateControlPlaneCommit(previous, next, err)
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	delete(api.securityPolicies, key)
+	api.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, api.opMgr.Get(op.Name))
+}
+
+func securityPolicySelfLink(project, name string) string {
+	return fmt.Sprintf(
+		"https://www.googleapis.com/compute/v1/projects/%s/global/securityPolicies/%s",
+		project,
+		name,
+	)
+}
+
+func securityPolicyReferenceName(reference, project string) (string, error) {
+	if reference == "" {
+		return "", errors.New("reference is required")
+	}
+	if !strings.Contains(reference, "/") {
+		if !gceResourceName.MatchString(reference) {
+			return "", errors.New("reference has an invalid policy name")
+		}
+		return reference, nil
+	}
+	parsed, err := url.Parse(reference)
+	if err != nil {
+		return "", errors.New("reference is invalid")
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	for index := range parts {
+		if parts[index] != "projects" || index+4 >= len(parts) {
+			continue
+		}
+		if parts[index+1] != project || parts[index+2] != "global" ||
+			parts[index+3] != "securityPolicies" || parts[index+4] == "" ||
+			index+5 != len(parts) {
+			return "", errors.New("reference must target a security policy in the request project")
+		}
+		return parts[index+4], nil
+	}
+	return "", errors.New("reference must be a policy name or canonical self link")
+}
+
+func validateSecurityPolicyRules(rules []SecurityPolicyRule) error {
+	if len(rules) == 0 || len(rules) > 128 {
+		return errors.New("security policy requires between 1 and 128 rules")
+	}
+	priorities := make(map[int]struct{}, len(rules))
+	hasDefault := false
+	for _, rule := range rules {
+		if rule.Priority < 0 {
+			return errors.New("security policy rule priority must be non-negative")
+		}
+		if _, exists := priorities[rule.Priority]; exists {
+			return fmt.Errorf("security policy rule priority %d is duplicated", rule.Priority)
+		}
+		priorities[rule.Priority] = struct{}{}
+		if _, err := securityPolicyAction(rule.Action); err != nil {
+			return fmt.Errorf("security policy rule priority %d: %w", rule.Priority, err)
+		}
+		if rule.Match != nil {
+			if rule.Match.VersionedExpr != "SRC_IPS_V1" || rule.Match.Config == nil ||
+				len(rule.Match.Config.SrcIPRanges) == 0 || len(rule.Match.Config.SrcIPRanges) > 64 {
+				return fmt.Errorf("security policy rule priority %d uses an unsupported match", rule.Priority)
+			}
+			for _, value := range rule.Match.Config.SrcIPRanges {
+				if _, err := netip.ParsePrefix(value); err != nil {
+					return fmt.Errorf("security policy rule priority %d has invalid source range %q", rule.Priority, value)
+				}
+			}
+		}
+		if rule.Priority == 2147483647 {
+			if rule.Match != nil {
+				return errors.New("security policy default rule must match all requests")
+			}
+			hasDefault = true
+		}
+	}
+	if !hasDefault {
+		return errors.New("security policy requires a default rule at priority 2147483647")
+	}
+	return nil
+}
+
+func securityPolicyAction(action string) (int, error) {
+	if action == "allow" {
+		return 0, nil
+	}
+	if strings.HasPrefix(action, "deny(") && strings.HasSuffix(action, ")") {
+		code, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(action, "deny("), ")"))
+		if err == nil && (code == http.StatusForbidden || code == http.StatusNotFound || code == http.StatusBadGateway) {
+			return code, nil
+		}
+	}
+	return 0, fmt.Errorf("unsupported action %q; supported actions are allow, deny(403), deny(404), and deny(502)", action)
+}
+
+func cloneSecurityPolicy(policy *SecurityPolicy) *SecurityPolicy {
+	if policy == nil {
+		return nil
+	}
+	clone := *policy
+	clone.Rules = cloneSecurityPolicyRules(policy.Rules)
+	return &clone
+}
+
+func cloneSecurityPolicyRules(rules []SecurityPolicyRule) []SecurityPolicyRule {
+	if rules == nil {
+		return nil
+	}
+	clones := make([]SecurityPolicyRule, len(rules))
+	for index := range rules {
+		clones[index] = rules[index]
+		if rules[index].Match != nil {
+			match := *rules[index].Match
+			if match.Config != nil {
+				config := *match.Config
+				config.SrcIPRanges = append([]string(nil), match.Config.SrcIPRanges...)
+				match.Config = &config
+			}
+			clones[index].Match = &match
+		}
+	}
+	return clones
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1825,6 +2194,10 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 
 func (api *API) routeLoadBalancer(w http.ResponseWriter, r *http.Request, path string) {
 	project := extractProject(path)
+	if strings.HasSuffix(path, "/invalidateCache") {
+		api.invalidateLoadBalancerCache(w, r, project, path)
+		return
+	}
 	collection, name, valid := parseLoadBalancerPath(path)
 	if !valid {
 		w.WriteHeader(http.StatusNotFound)
@@ -1860,10 +2233,120 @@ func (api *API) routeLoadBalancer(w http.ResponseWriter, r *http.Request, path s
 	}
 }
 
+func (api *API) invalidateLoadBalancerCache(
+	w http.ResponseWriter,
+	r *http.Request,
+	project string,
+	requestPath string,
+) {
+	if r.Method != http.MethodPost {
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Cache invalidation requires POST")
+		return
+	}
+	parts := strings.Split(strings.Trim(requestPath, "/"), "/")
+	if len(parts) != 8 || parts[0] != "compute" || parts[1] != "v1" ||
+		parts[2] != "projects" || parts[3] != project || parts[4] != "global" ||
+		parts[5] != "urlMaps" || parts[6] == "" || parts[7] != "invalidateCache" {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "Unsupported cache invalidation route")
+		return
+	}
+	var request struct {
+		Path string `json:"path"`
+		Host string `json:"host"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Parse error: "+err.Error())
+		return
+	}
+	if !supportedCacheInvalidationPath(request.Path) ||
+		(request.Host != "" && !supportedCacheInvalidationHost(request.Host)) {
+		writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"Only an absolute path with an optional trailing wildcard and an optional exact host are supported")
+		return
+	}
+	urlMapName := parts[6]
+	api.mu.RLock()
+	urlMap := api.loadBalancers[loadBalancerKey(project, "urlMaps", urlMapName)]
+	api.mu.RUnlock()
+	if urlMap == nil {
+		writeErrorStatus(w, http.StatusNotFound, "NOT_FOUND", "URL map "+urlMapName+" not found")
+		return
+	}
+	target := loadBalancerSelfLink(project, "urlMaps", urlMapName)
+	op, err := api.opMgr.RegisterDurable("compute#operation", "invalidateCache", target, "", "")
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist operation metadata: "+err.Error())
+		return
+	}
+	api.cacheMu.Lock()
+	api.cacheInvalidatedAt[project+":"+urlMapName] = time.Now()
+	for key, entry := range api.loadBalancerCache {
+		if key.project == project && entry.urlMap == urlMapName &&
+			(request.Host == "" || entry.host == normalizedRequestHost(request.Host)) &&
+			cacheInvalidationPathMatches(request.Path, entry.path) {
+			delete(api.loadBalancerCache, key)
+		}
+	}
+	api.cacheMu.Unlock()
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		api.setInitializationError(err)
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	writeComputeOperation(w, project, api.opMgr.Get(op.Name))
+}
+
+func supportedCacheInvalidationPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.ContainsAny(path, "?#") &&
+		!strings.Contains(path[:max(0, len(path)-1)], "*")
+}
+
+func supportedCacheInvalidationHost(host string) bool {
+	return host != "" && !strings.ContainsAny(host, "/*:") && supportedURLMapHost(host)
+}
+
+func cacheInvalidationPathMatches(pattern, path string) bool {
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(path, strings.TrimSuffix(pattern, "*"))
+	}
+	return path == pattern
+}
+
 type loadBalancerBackend struct {
 	target      *url.URL
 	healthPath  string
 	description string
+}
+
+type resolvedLoadBalancerRoute struct {
+	backends       []loadBalancerBackend
+	backendService string
+	urlMap         string
+	policyName     string
+	policyVersion  string
+	policy         *SecurityPolicy
+	cdnEnabled     bool
+}
+
+type networkHTTPAuthorizer interface {
+	AuthorizeHTTP(project, location, sourceIP, host, method, path string) (matched, allowed bool, policy string, err error)
+}
+
+type serviceMeshHTTPRouter interface {
+	RouteHTTP(project, location, host, path string) (matched bool, destination, route string, err error)
+}
+
+// OnPostBoot wires optional cross-service request-path providers after every
+// shim has been instantiated. Missing providers preserve the existing Compute
+// proxy behavior.
+func (api *API) OnPostBoot(ctx *registry.Context) {
+	if authorizer, ok := ctx.GetShim("networksecurity.googleapis.com").(networkHTTPAuthorizer); ok {
+		api.networkAuthorizer = authorizer
+	}
+	if router, ok := ctx.GetShim("networkservices.googleapis.com").(serviceMeshHTTPRouter); ok {
+		api.serviceMeshRouter = router
+	}
 }
 
 func (api *API) proxyLoadBalancerRequest(
@@ -1873,16 +2356,75 @@ func (api *API) proxyLoadBalancerRequest(
 	forwardingRuleName string,
 	proxyPath string,
 ) {
-	backends, backendService, err := api.resolveLoadBalancerBackends(
-		project, forwardingRuleName, r.Host, proxyPath,
+	host := normalizedRequestHost(r.Host)
+	if api.networkAuthorizer != nil {
+		sourceIP := r.RemoteAddr
+		if parsed, _, splitErr := net.SplitHostPort(sourceIP); splitErr == nil {
+			sourceIP = parsed
+		}
+		matched, allowed, _, authorizeErr := api.networkAuthorizer.AuthorizeHTTP(
+			project, "global", sourceIP, host, r.Method, proxyPath,
+		)
+		if authorizeErr != nil {
+			writeLoadBalancerUnavailable(w, "authorization policy evaluation failed: "+authorizeErr.Error())
+			return
+		}
+		if matched && !allowed {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, "request denied by authorization policy\n")
+			return
+		}
+	}
+
+	backendOverride := ""
+	if api.serviceMeshRouter != nil {
+		matched, destination, _, routeErr := api.serviceMeshRouter.RouteHTTP(
+			project, "global", host, proxyPath,
+		)
+		if routeErr != nil {
+			writeLoadBalancerUnavailable(w, "service mesh route evaluation failed: "+routeErr.Error())
+			return
+		}
+		if matched {
+			var destinationErr error
+			backendOverride, destinationErr = localBackendServiceName(project, destination)
+			if destinationErr != nil {
+				writeLoadBalancerUnavailable(w, "service mesh destination is unavailable: "+destinationErr.Error())
+				return
+			}
+		}
+	}
+
+	route, err := api.resolveLoadBalancerBackends(
+		project, forwardingRuleName, r.Host, proxyPath, backendOverride,
 	)
 	if err != nil {
 		writeLoadBalancerUnavailable(w, err.Error())
 		return
 	}
+	allowed, denyStatus, err := evaluateSecurityPolicy(r, route.policy)
+	if err != nil {
+		writeLoadBalancerUnavailable(w, "security policy evaluation failed: "+err.Error())
+		return
+	}
+	if !allowed {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(denyStatus)
+		_, _ = io.WriteString(w, "request denied by security policy\n")
+		return
+	}
 
-	healthy := make([]loadBalancerBackend, 0, len(backends))
-	for _, backend := range backends {
+	cacheKey, cacheableRequest := loadBalancerRequestCacheKey(
+		r, project, route.backendService, route.policyName, route.policyVersion, proxyPath,
+	)
+	if route.cdnEnabled && cacheableRequest && api.serveLoadBalancerCache(w, cacheKey) {
+		return
+	}
+	cacheStartedAt := time.Now()
+
+	healthy := make([]loadBalancerBackend, 0, len(route.backends))
+	for _, backend := range route.backends {
 		if api.backendIsHealthy(r, backend) {
 			healthy = append(healthy, backend)
 		}
@@ -1890,14 +2432,14 @@ func (api *API) proxyLoadBalancerRequest(
 	if len(healthy) == 0 {
 		writeLoadBalancerUnavailable(w, fmt.Sprintf(
 			"backend service %q has no healthy resolvable backends",
-			backendService,
+			route.backendService,
 		))
 		return
 	}
 
 	api.mu.Lock()
-	cursor := api.roundRobin[loadBalancerKey(project, "backendServices", backendService)]
-	api.roundRobin[loadBalancerKey(project, "backendServices", backendService)] = cursor + 1
+	cursor := api.roundRobin[loadBalancerKey(project, "backendServices", route.backendService)]
+	api.roundRobin[loadBalancerKey(project, "backendServices", route.backendService)] = cursor + 1
 	api.mu.Unlock()
 	backend := healthy[cursor%uint64(len(healthy))]
 
@@ -1912,7 +2454,15 @@ func (api *API) proxyLoadBalancerRequest(
 			proxyErr,
 		))
 	}
-	proxy.ServeHTTP(w, outbound)
+	if !route.cdnEnabled || !cacheableRequest {
+		proxy.ServeHTTP(w, outbound)
+		return
+	}
+	capture := newLoadBalancerCacheCapture(w)
+	proxy.ServeHTTP(capture, outbound)
+	api.storeLoadBalancerCache(
+		cacheKey, route.urlMap, proxyPath, normalizedRequestHost(r.Host), cacheStartedAt, capture,
+	)
 }
 
 func (api *API) resolveLoadBalancerBackends(
@@ -1920,40 +2470,63 @@ func (api *API) resolveLoadBalancerBackends(
 	forwardingRuleName string,
 	host string,
 	requestPath string,
-) ([]loadBalancerBackend, string, error) {
+	backendOverride string,
+) (*resolvedLoadBalancerRoute, error) {
 	api.mu.RLock()
 	forwardingRule := api.loadBalancers[loadBalancerKey(project, "forwardingRules", forwardingRuleName)]
 	if forwardingRule == nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("forwarding rule %q was not found", forwardingRuleName)
+		return nil, fmt.Errorf("forwarding rule %q was not found", forwardingRuleName)
 	}
 	targetProxyName := resourceReferenceName(forwardingRule["target"])
 	targetProxy := api.loadBalancers[loadBalancerKey(project, "targetHttpProxies", targetProxyName)]
 	if targetProxy == nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("forwarding rule %q does not resolve to a target HTTP proxy", forwardingRuleName)
+		return nil, fmt.Errorf("forwarding rule %q does not resolve to a target HTTP proxy", forwardingRuleName)
 	}
 	urlMapName := resourceReferenceName(targetProxy["urlMap"])
 	urlMap := api.loadBalancers[loadBalancerKey(project, "urlMaps", urlMapName)]
 	if urlMap == nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("target HTTP proxy %q does not resolve to a URL map", targetProxyName)
+		return nil, fmt.Errorf("target HTTP proxy %q does not resolve to a URL map", targetProxyName)
 	}
 	backendServiceName, routeErr := resolveURLMapService(urlMap, host, requestPath)
 	if routeErr != nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("URL map %q cannot route request: %w", urlMapName, routeErr)
+		return nil, fmt.Errorf("URL map %q cannot route request: %w", urlMapName, routeErr)
+	}
+	if backendOverride != "" {
+		backendServiceName = backendOverride
 	}
 	backendService := api.loadBalancers[loadBalancerKey(project, "backendServices", backendServiceName)]
 	if backendService == nil {
 		api.mu.RUnlock()
-		return nil, "", fmt.Errorf("URL map %q does not resolve to a default backend service", urlMapName)
+		if backendOverride != "" {
+			return nil, fmt.Errorf("service mesh route resolves to missing backend service %q", backendServiceName)
+		}
+		return nil, fmt.Errorf("URL map %q does not resolve to a default backend service", urlMapName)
 	}
 	if protocol, _ := backendService["protocol"].(string); protocol != "" &&
 		!strings.EqualFold(protocol, "HTTP") && !strings.EqualFold(protocol, "HTTPS") {
 		api.mu.RUnlock()
-		return nil, backendServiceName, fmt.Errorf("backend service %q uses unsupported protocol %q", backendServiceName, protocol)
+		return nil, fmt.Errorf("backend service %q uses unsupported protocol %q", backendServiceName, protocol)
 	}
+	policyName := ""
+	var policy *SecurityPolicy
+	if reference, _ := backendService["securityPolicy"].(string); reference != "" {
+		var policyErr error
+		policyName, policyErr = securityPolicyReferenceName(reference, project)
+		if policyErr != nil {
+			api.mu.RUnlock()
+			return nil, fmt.Errorf("backend service %q has invalid security policy: %w", backendServiceName, policyErr)
+		}
+		policy = cloneSecurityPolicy(api.securityPolicies[project+":"+policyName])
+		if policy == nil {
+			api.mu.RUnlock()
+			return nil, fmt.Errorf("backend service %q references missing security policy %q", backendServiceName, policyName)
+		}
+	}
+	cdnEnabled, _ := backendService["enableCDN"].(bool)
 	rawBackends, hasBackends := backendService["backends"].([]interface{})
 	portName, _ := backendService["portName"].(string)
 	rawHealthChecks, _ := backendService["healthChecks"].([]interface{})
@@ -1961,10 +2534,10 @@ func (api *API) resolveLoadBalancerBackends(
 	api.mu.RUnlock()
 
 	if healthErr != nil {
-		return nil, backendServiceName, healthErr
+		return nil, healthErr
 	}
 	if !hasBackends || len(rawBackends) == 0 {
-		return nil, backendServiceName, fmt.Errorf("backend service %q has no backends", backendServiceName)
+		return nil, fmt.Errorf("backend service %q has no backends", backendServiceName)
 	}
 
 	backends := make([]loadBalancerBackend, 0, len(rawBackends))
@@ -1978,13 +2551,339 @@ func (api *API) resolveLoadBalancerBackends(
 		backends = append(backends, resolved...)
 	}
 	if len(backends) == 0 {
-		return nil, backendServiceName, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"backend service %q has only unsupported backends (%s); supported forms require an explicit HTTP(S) 'url' or a Compute 'instance' plus 'port'",
 			backendServiceName,
 			strings.Join(unsupported, "; "),
 		)
 	}
-	return backends, backendServiceName, nil
+	return &resolvedLoadBalancerRoute{
+		backends:       backends,
+		backendService: backendServiceName,
+		urlMap:         urlMapName,
+		policyName:     policyName,
+		policyVersion:  securityPolicyCacheVersion(policy),
+		policy:         policy,
+		cdnEnabled:     cdnEnabled,
+	}, nil
+}
+
+func localBackendServiceName(project, reference string) (string, error) {
+	if reference == "" {
+		return "", errors.New("destination serviceName is empty")
+	}
+	if !strings.Contains(reference, "/") {
+		if !validComputeResourceName(reference) {
+			return "", fmt.Errorf("invalid backend service name %q", reference)
+		}
+		return reference, nil
+	}
+	parts := strings.Split(strings.Trim(reference, "/"), "/")
+	if len(parts) == 5 && parts[0] == "projects" && parts[2] == "global" &&
+		parts[3] == "backendServices" && parts[1] == project && validComputeResourceName(parts[4]) {
+		return parts[4], nil
+	}
+	if len(parts) == 6 && parts[0] == "projects" && parts[2] == "locations" &&
+		parts[3] == "global" && parts[4] == "backendServices" &&
+		parts[1] == project && validComputeResourceName(parts[5]) {
+		return parts[5], nil
+	}
+	return "", fmt.Errorf("destination %q is not a global Compute backend service in project %q", reference, project)
+}
+
+func validComputeResourceName(value string) bool {
+	if value == "" || len(value) > 63 {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' ||
+			character == '-' && index > 0 && index < len(value)-1 {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// evaluateSecurityPolicy implements only ordered source-CIDR allow/deny rules.
+// It does not emulate CEL, WAF signatures, rate limiting, redirects, or adaptive protection.
+func evaluateSecurityPolicy(r *http.Request, policy *SecurityPolicy) (bool, int, error) {
+	if policy == nil {
+		return true, 0, nil
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = strings.Trim(r.RemoteAddr, "[]")
+	}
+	source, err := netip.ParseAddr(host)
+	if err != nil {
+		return false, 0, errors.New("request source address is unavailable")
+	}
+	rules := cloneSecurityPolicyRules(policy.Rules)
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Priority < rules[j].Priority })
+	for _, rule := range rules {
+		matches := rule.Match == nil
+		if rule.Match != nil {
+			if rule.Match.VersionedExpr != "SRC_IPS_V1" || rule.Match.Config == nil {
+				return false, 0, fmt.Errorf("rule priority %d uses an unsupported match", rule.Priority)
+			}
+			for _, value := range rule.Match.Config.SrcIPRanges {
+				prefix, parseErr := netip.ParsePrefix(value)
+				if parseErr != nil {
+					return false, 0, fmt.Errorf("rule priority %d has an invalid source range", rule.Priority)
+				}
+				if prefix.Contains(source) {
+					matches = true
+					break
+				}
+			}
+		}
+		if !matches {
+			continue
+		}
+		denyStatus, actionErr := securityPolicyAction(rule.Action)
+		if actionErr != nil {
+			return false, 0, actionErr
+		}
+		if denyStatus == 0 {
+			return true, 0, nil
+		}
+		return false, denyStatus, nil
+	}
+	return false, 0, errors.New("security policy has no matching default rule")
+}
+
+type loadBalancerCacheCapture struct {
+	target   http.ResponseWriter
+	status   int
+	body     []byte
+	overflow bool
+}
+
+func newLoadBalancerCacheCapture(target http.ResponseWriter) *loadBalancerCacheCapture {
+	return &loadBalancerCacheCapture{target: target}
+}
+
+func (capture *loadBalancerCacheCapture) Header() http.Header {
+	return capture.target.Header()
+}
+
+func (capture *loadBalancerCacheCapture) Unwrap() http.ResponseWriter {
+	return capture.target
+}
+
+func (capture *loadBalancerCacheCapture) WriteHeader(status int) {
+	if capture.status == 0 {
+		capture.status = status
+	}
+	capture.target.WriteHeader(status)
+}
+
+func (capture *loadBalancerCacheCapture) Write(body []byte) (int, error) {
+	if capture.status == 0 {
+		capture.status = http.StatusOK
+	}
+	if !capture.overflow {
+		if len(capture.body)+len(body) <= maxLoadBalancerCacheBytes {
+			capture.body = append(capture.body, body...)
+		} else {
+			capture.body = nil
+			capture.overflow = true
+		}
+	}
+	return capture.target.Write(body)
+}
+
+// loadBalancerRequestCacheKey gates the bounded, transient in-process CDN subset.
+// It is not a shared edge cache and does not emulate Cloud CDN revalidation or cache modes.
+func loadBalancerRequestCacheKey(
+	r *http.Request,
+	project string,
+	backendService string,
+	policyName string,
+	policyVersion string,
+	proxyPath string,
+) (loadBalancerCacheKey, bool) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead ||
+		r.ContentLength > 0 || len(r.TransferEncoding) != 0 ||
+		r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" ||
+		r.Header.Get("Range") != "" || r.Header.Get("If-None-Match") != "" ||
+		r.Header.Get("If-Modified-Since") != "" ||
+		headerContainsCacheDirective(r.Header.Get("Cache-Control"), "no-cache") ||
+		headerContainsCacheDirective(r.Header.Get("Cache-Control"), "no-store") ||
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Pragma")), "no-cache") {
+		return loadBalancerCacheKey{}, false
+	}
+	uri := proxyPath
+	if r.URL.RawQuery != "" {
+		uri += "?" + r.URL.RawQuery
+	}
+	return loadBalancerCacheKey{
+		project:        project,
+		backendService: backendService,
+		policyName:     policyName,
+		policyVersion:  policyVersion,
+		method:         r.Method,
+		host:           normalizedRequestHost(r.Host),
+		uri:            uri,
+	}, true
+}
+
+func normalizedRequestHost(host string) string {
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
+func headerContainsCacheDirective(value, wanted string) bool {
+	for _, directive := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(strings.SplitN(directive, "=", 2)[0]), wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func (api *API) serveLoadBalancerCache(w http.ResponseWriter, key loadBalancerCacheKey) bool {
+	now := time.Now()
+	api.cacheMu.Lock()
+	entry, ok := api.loadBalancerCache[key]
+	if ok && !entry.expiresAt.After(now) {
+		delete(api.loadBalancerCache, key)
+		ok = false
+	}
+	api.cacheMu.Unlock()
+	if !ok {
+		return false
+	}
+	copyHTTPHeader(w.Header(), entry.header)
+	w.WriteHeader(entry.status)
+	if key.method != http.MethodHead {
+		_, _ = w.Write(entry.body)
+	}
+	return true
+}
+
+func (api *API) storeLoadBalancerCache(
+	key loadBalancerCacheKey,
+	urlMap string,
+	path string,
+	host string,
+	startedAt time.Time,
+	capture *loadBalancerCacheCapture,
+) {
+	if capture.status != http.StatusOK || capture.overflow ||
+		httpHeaderSize(capture.Header()) > maxLoadBalancerHeaderBytes ||
+		capture.Header().Get("Set-Cookie") != "" || capture.Header().Get("Vary") != "" ||
+		capture.Header().Get("Content-Range") != "" {
+		return
+	}
+	ttl, ok := boundedCacheTTL(capture.Header().Get("Cache-Control"))
+	if !ok {
+		return
+	}
+	entry := loadBalancerCacheEntry{
+		status:    capture.status,
+		header:    capture.Header().Clone(),
+		body:      append([]byte(nil), capture.body...),
+		expiresAt: time.Now().Add(ttl),
+		urlMap:    urlMap,
+		path:      path,
+		host:      host,
+	}
+	api.cacheMu.Lock()
+	if api.cacheClearedAt.After(startedAt) ||
+		api.cacheInvalidatedAt[key.project+":"+urlMap].After(startedAt) ||
+		api.policyInvalidatedAt[key.project+":"+key.policyName].After(startedAt) {
+		api.cacheMu.Unlock()
+		return
+	}
+	if len(api.loadBalancerCache) < maxLoadBalancerCacheEntries {
+		api.loadBalancerCache[key] = entry
+	}
+	api.cacheMu.Unlock()
+}
+
+func httpHeaderSize(header http.Header) int {
+	size := 0
+	for key, values := range header {
+		size += len(key)
+		for _, value := range values {
+			size += len(value)
+		}
+	}
+	return size
+}
+
+func boundedCacheTTL(value string) (time.Duration, bool) {
+	public := false
+	seconds := -1
+	for _, rawDirective := range strings.Split(value, ",") {
+		directive := strings.TrimSpace(strings.ToLower(rawDirective))
+		switch {
+		case directive == "public":
+			public = true
+		case directive == "private" || directive == "no-store" || directive == "no-cache":
+			return 0, false
+		case strings.HasPrefix(directive, "s-maxage="):
+			parsed, err := strconv.Atoi(strings.TrimPrefix(directive, "s-maxage="))
+			if err != nil {
+				return 0, false
+			}
+			seconds = parsed
+		case strings.HasPrefix(directive, "max-age=") && seconds < 0:
+			parsed, err := strconv.Atoi(strings.TrimPrefix(directive, "max-age="))
+			if err != nil {
+				return 0, false
+			}
+			seconds = parsed
+		}
+	}
+	if !public || seconds <= 0 {
+		return 0, false
+	}
+	maxSeconds := int(maxLoadBalancerCacheTTL / time.Second)
+	if seconds > maxSeconds {
+		return maxLoadBalancerCacheTTL, true
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+func copyHTTPHeader(destination, source http.Header) {
+	for key := range destination {
+		destination.Del(key)
+	}
+	for key, values := range source {
+		destination[key] = append([]string(nil), values...)
+	}
+}
+
+func (api *API) invalidateLoadBalancerCacheForPolicy(project, policy string) {
+	api.cacheMu.Lock()
+	api.policyInvalidatedAt[project+":"+policy] = time.Now()
+	for key := range api.loadBalancerCache {
+		if key.project == project && key.policyName == policy {
+			delete(api.loadBalancerCache, key)
+		}
+	}
+	api.cacheMu.Unlock()
+}
+
+func securityPolicyCacheVersion(policy *SecurityPolicy) string {
+	if policy == nil {
+		return ""
+	}
+	payload, _ := json.Marshal(policy)
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func (api *API) invalidateAllLoadBalancerCache() {
+	api.cacheMu.Lock()
+	api.cacheClearedAt = time.Now()
+	clear(api.loadBalancerCache)
+	api.cacheMu.Unlock()
 }
 
 func (api *API) resolveHealthPathLocked(project string, references []interface{}) (string, error) {
@@ -2536,12 +3435,33 @@ func (api *API) createLoadBalancerResource(
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Field 'name' is required")
 		return
 	}
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
 	if collection.canonical == "urlMaps" {
 		if err := api.validateURLMap(project, resource); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
 				"invalid URL map routing configuration: "+err.Error())
 			return
+		}
+	}
+	if collection.canonical == "backendServices" {
+		if reference, _ := resource["securityPolicy"].(string); reference != "" {
+			policyName, err := securityPolicyReferenceName(reference, project)
+			if err != nil {
+				writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+					"invalid backend security policy: "+err.Error())
+				return
+			}
+			api.mu.RLock()
+			policy := api.securityPolicies[project+":"+policyName]
+			api.mu.RUnlock()
+			if policy == nil {
+				writeErrorStatus(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+					"backend security policy was not found")
+				return
+			}
+			resource["securityPolicy"] = securityPolicySelfLink(project, policyName)
 		}
 	}
 
@@ -2553,21 +3473,15 @@ func (api *API) createLoadBalancerResource(
 	resource["selfLink"] = selfLink
 	resource["creationTimestamp"] = time.Now().UTC().Format(time.RFC3339)
 
-	api.mu.Lock()
+	api.mu.RLock()
 	if _, exists := api.loadBalancers[key]; exists {
-		api.mu.Unlock()
+		api.mu.RUnlock()
 		w.WriteHeader(http.StatusConflict)
 		writeError(w, http.StatusConflict, "ALREADY_EXISTS",
 			fmt.Sprintf("%s %q already exists", collection.resourceKind, name))
 		return
 	}
-	api.loadBalancers[key] = resource
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist load-balancer metadata: "+err.Error())
-		return
-	}
+	api.mu.RUnlock()
 
 	op, err := api.opMgr.RegisterDurable("compute#operation", "insert", selfLink, "", "")
 	if err != nil {
@@ -2575,9 +3489,38 @@ func (api *API) createLoadBalancerResource(
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	previous, err := api.metadataSnapshot()
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("snapshot load-balancer metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	next, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("clone load-balancer metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if next.LoadBalancers == nil {
+		next.LoadBalancers = make(map[string]map[string]interface{})
+	}
+	next.LoadBalancers[key] = resource
+	if err := api.saveMetadataTransaction(previous, next); err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("persist load-balancer metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		message := api.compensateControlPlaneCommit(previous, next, err)
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	api.loadBalancers[key] = next.LoadBalancers[key]
+	api.mu.Unlock()
+	api.invalidateAllLoadBalancerCache()
 	w.WriteHeader(http.StatusOK)
-	writeComputeOperation(w, project, op)
-	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	writeComputeOperation(w, project, api.opMgr.Get(op.Name))
 }
 
 func (api *API) getLoadBalancerResource(
@@ -2633,21 +3576,15 @@ func (api *API) deleteLoadBalancerResource(
 	name string,
 ) {
 	key := loadBalancerKey(project, collection.canonical, name)
-	api.mu.Lock()
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+	api.mu.RLock()
 	_, ok := api.loadBalancers[key]
-	if ok {
-		delete(api.loadBalancers, key)
-	}
-	api.mu.Unlock()
+	api.mu.RUnlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		writeError(w, http.StatusNotFound, "NOT_FOUND",
 			fmt.Sprintf("%s %q not found", collection.resourceKind, name))
-		return
-	}
-	if err := api.persistMetadata(); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeError(w, 500, "INTERNAL", "persist load-balancer deletion: "+err.Error())
 		return
 	}
 
@@ -2658,9 +3595,35 @@ func (api *API) deleteLoadBalancerResource(
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
+	previous, err := api.metadataSnapshot()
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("snapshot load-balancer metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	next, err := cloneComputeMetadata(previous)
+	if err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("clone load-balancer metadata: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	delete(next.LoadBalancers, key)
+	if err := api.saveMetadataTransaction(previous, next); err != nil {
+		message := api.failControlPlaneOperation(op.Name, fmt.Errorf("persist load-balancer deletion: %w", err))
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		message := api.compensateControlPlaneCommit(previous, next, err)
+		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+		return
+	}
+	api.mu.Lock()
+	delete(api.loadBalancers, key)
+	api.mu.Unlock()
+	api.invalidateAllLoadBalancerCache()
 	w.WriteHeader(http.StatusOK)
-	writeComputeOperation(w, project, op)
-	api.opMgr.RunAsync(op.Name, func() error { return nil })
+	writeComputeOperation(w, project, api.opMgr.Get(op.Name))
 }
 
 func parseLoadBalancerPath(path string) (loadBalancerCollection, string, bool) {
@@ -2903,7 +3866,7 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	previous, err := api.firewallMetadataSnapshot()
+	previous, err := api.metadataSnapshot()
 	if err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
@@ -2919,7 +3882,7 @@ func (api *API) createFirewall(w http.ResponseWriter, r *http.Request, project s
 		snapshot.Firewalls = make(map[string]*FirewallRule)
 	}
 	snapshot.Firewalls[key] = cloneFirewallRule(&body)
-	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall metadata: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -3020,7 +3983,7 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	previous, err := api.firewallMetadataSnapshot()
+	previous, err := api.metadataSnapshot()
 	if err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
@@ -3033,7 +3996,7 @@ func (api *API) patchFirewall(w http.ResponseWriter, r *http.Request, project, n
 		return
 	}
 	snapshot.Firewalls[key] = cloneFirewallRule(fw)
-	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall update: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -3082,7 +4045,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
 	}
-	previous, err := api.firewallMetadataSnapshot()
+	previous, err := api.metadataSnapshot()
 	if err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("snapshot firewall metadata: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
@@ -3095,7 +4058,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 		return
 	}
 	delete(snapshot.Firewalls, key)
-	if err := api.saveFirewallMetadataTransaction(previous, snapshot); err != nil {
+	if err := api.saveMetadataTransaction(previous, snapshot); err != nil {
 		message := api.failFirewallOperation(op.Name, fmt.Errorf("persist firewall deletion: %w", err))
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -3117,7 +4080,7 @@ func (api *API) deleteFirewall(w http.ResponseWriter, project, name string) {
 	writeComputeOperation(w, project, op)
 }
 
-func (api *API) firewallMetadataSnapshot() (computeMetadata, error) {
+func (api *API) metadataSnapshot() (computeMetadata, error) {
 	api.mu.RLock()
 	payload, err := api.marshalMetadataLocked()
 	api.mu.RUnlock()
@@ -3131,18 +4094,18 @@ func (api *API) firewallMetadataSnapshot() (computeMetadata, error) {
 	return snapshot, nil
 }
 
-func (api *API) saveFirewallMetadata(snapshot computeMetadata) error {
+func (api *API) saveMetadata(snapshot computeMetadata) error {
 	if api.stateStore == nil {
 		return nil
 	}
 	return api.stateStore.Save(computeStateEntry, snapshot)
 }
 
-func (api *API) saveFirewallMetadataTransaction(previous, next computeMetadata) error {
+func (api *API) saveMetadataTransaction(previous, next computeMetadata) error {
 	if api.stateStore == nil {
 		return nil
 	}
-	saveErr := api.saveFirewallMetadata(next)
+	saveErr := api.saveMetadata(next)
 	if saveErr == nil {
 		return nil
 	}
@@ -3156,7 +4119,7 @@ func (api *API) saveFirewallMetadataTransaction(previous, next computeMetadata) 
 	case errors.Is(loadErr, state.ErrNotFound) && computeMetadataEmpty(previous):
 		return saveErr
 	default:
-		ambiguous := fmt.Errorf("Compute firewall save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
+		ambiguous := fmt.Errorf("Compute metadata save outcome is ambiguous: save: %w; read back: %v", saveErr, loadErr)
 		api.setInitializationError(ambiguous)
 		return ambiguous
 	}
@@ -3188,7 +4151,7 @@ func (api *API) rollbackFirewallMutation(
 ) error {
 	api.persistMu.Lock()
 	defer api.persistMu.Unlock()
-	current, err := api.firewallMetadataSnapshot()
+	current, err := api.metadataSnapshot()
 	if err != nil {
 		combined := fmt.Errorf("firewall mutation failed: %w; snapshot rollback failed: %v", mutationErr, err)
 		api.setInitializationError(combined)
@@ -3205,7 +4168,7 @@ func (api *API) rollbackFirewallMutation(
 	} else {
 		snapshot.Firewalls[key] = cloneFirewallRule(previousRule)
 	}
-	if err := api.saveFirewallMetadataTransaction(current, snapshot); err != nil {
+	if err := api.saveMetadataTransaction(current, snapshot); err != nil {
 		combined := fmt.Errorf("firewall mutation failed: %w; persist rollback failed: %v", mutationErr, err)
 		api.setInitializationError(combined)
 		return combined
@@ -3232,6 +4195,29 @@ func (api *API) failFirewallOperation(operationName string, mutationErr error) s
 		return combined.Error()
 	}
 	return mutationErr.Error()
+}
+
+func (api *API) failControlPlaneOperation(operationName string, mutationErr error) string {
+	if err := api.opMgr.FinalizeDurable(operationName, http.StatusInternalServerError, mutationErr.Error()); err != nil {
+		combined := fmt.Errorf("%w; persist failed operation: %v", mutationErr, err)
+		api.setInitializationError(combined)
+		return combined.Error()
+	}
+	return mutationErr.Error()
+}
+
+func (api *API) compensateControlPlaneCommit(previous, committed computeMetadata, operationErr error) string {
+	if rollbackErr := api.saveMetadataTransaction(committed, previous); rollbackErr != nil {
+		combined := fmt.Errorf(
+			"persist terminal operation: %w; compensate Compute metadata: %v",
+			operationErr,
+			rollbackErr,
+		)
+		api.setInitializationError(combined)
+		return combined.Error()
+	}
+	api.setInitializationError(operationErr)
+	return operationErr.Error()
 }
 
 func cloneFirewallRule(rule *FirewallRule) *FirewallRule {
@@ -3269,6 +4255,7 @@ func computeMetadataEmpty(metadata computeMetadata) bool {
 	return len(metadata.Instances) == 0 &&
 		len(metadata.Networks) == 0 &&
 		len(metadata.Subnetworks) == 0 &&
+		len(metadata.SecurityPolicies) == 0 &&
 		len(metadata.Firewalls) == 0 &&
 		len(metadata.InstanceGroups) == 0 &&
 		len(metadata.LoadBalancers) == 0

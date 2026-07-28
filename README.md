@@ -6,8 +6,15 @@
 
 MiniSky provides a local gateway for custom Go shims and selected Docker-backed
 emulators. Core services (Compute, Storage, BigQuery, Pub/Sub, Cloud SQL, IAM)
-have verified Terraform and SDK slices. Phase 18–25 services are package-local
-prototypes with bounded Go evidence but incomplete promotion evidence. Once
+have verified Terraform and SDK slices. Phase 18–25 services remain default-off
+experimental surfaces with locally passing package, race, strict-IAM, and
+machine-readable evidence gates. All six Phase 18–25 guarded
+generated-client, restart, and cleanup workflows now pass locally, including
+Kafka/Airflow, the Phase 20 pinned PostgreSQL, Valkey, and Storage backends, and
+the later isolated local gateway/backend boundaries. All six corresponding
+GitHub Actions jobs passed on commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`
+in [run 30285572232](https://github.com/rudydesplan/minisky/actions/runs/30285572232);
+the complete native release-equivalent gate remains a promotion prerequisite. Once
 dependencies and required images are available locally, verified workflows can
 run offline; first use may pull lazily loaded emulator images.
 
@@ -19,10 +26,12 @@ run offline; first use may pull lazily loaded emulator images.
 
 ## ✨ Features
 
-- **🚀 71 Registry-Verified Domains**: The exact catalog count and machine-readable
-  compatibility rows are checked by registry tests. Core services have verified
-  Terraform/SDK slices; experimental services remain default-off.
+<!-- BEGIN GENERATED REGISTRY COUNT -->
+- **🚀 71 Registry-Verified Domains**: The exact catalog count and generated
+  compatibility rows come from `registry.Services()`. Phase 18–25
+  inventory entries remain experimental and default-off.
   See [Service Compatibility](docs/service-compatibility.md).
+<!-- END GENERATED REGISTRY COUNT -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
   and operational views.
 - **🛠️ Terraform Gates**: The pinned Google provider is tested only for resources
@@ -35,11 +44,11 @@ run offline; first use may pull lazily loaded emulator images.
 
 ### Phase 18–25 Services (Experimental)
 
-Phase 18–25 services remain registered for manifest and package-level
-development, but are classified as **experimental**, not Standard or
-implemented. Their data-driven Go gate covers public routing, restart evidence,
-scoped operations, pagination, event delivery, cancellation, and loopback
-safety. It does not prove Terraform/provider or external-backend lifecycles.
+<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
+**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+
+Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+<!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
 `501 UNIMPLEMENTED` with the opt-in and evidence status. To inspect the existing
@@ -52,15 +61,76 @@ MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1 minisky start
 This switch enables all Phase 18–25 prototypes for that process. It does not
 promote their compatibility status or establish provider/backend evidence.
 
-Run the offline evidence gate with `make test-phase18-25-evidence`. Its
-machine-readable inventory is `pkg/evidence/phase18_25.json`.
+Run the offline evidence gate with `make test-phase18-25-evidence`. Per-service
+package evidence lives in `pkg/evidence/phase18_25.json`; the six batch matrices
+in `pkg/evidence/batch_gates.json` separately qualify package, generated-client,
+restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 
-The newly integrated Pub/Sub Lite, Service Management/Control, Speech-to-Text,
-Text-to-Speech, Natural Language, Dialogflow CX, Vector Search/Model Registry,
-Certificate Authority Service, and Binary Authorization packages remain
-experimental. Their unsupported execution boundaries return 501 rather than
-simulated success. Cloud CDN/Armor remains part of the existing Compute domain
-and has no separate registration; enforcement/data-plane parity is unsupported.
+The complete Go race suite, documentation truth checks, and package/strict-IAM
+evidence pass locally. All six Phase 18–25 generated-client
+workflows passed create, restart, terminal observation, delete, and cleanup locally.
+Phase 19 additionally passed exact-owned Kafka protocol and Airflow DAG
+execution with container and anonymous-volume cleanup. Phase 20 passed AlloyDB,
+Filestore, Identity Platform, Redis-domain Valkey, Storage Transfer, canonical
+Storage upload and transfer custom actions, and exact-owned pinned backend
+cleanup. Phase 21–22 passed telemetry, API Gateway, Service Directory,
+Service Management/Control, Binary Authorization, Cloud Deploy, strict-error,
+loopback routing, and exact-owned network cleanup. Phase 23 passed bounded
+translation, Vision, and Language behavior; explicit Speech/TTS and semantic
+boundaries; GCP-shaped errors; project isolation; sensitive-data absence; and
+control-plane/network cleanup. Phase 24–25 passed security/network resource
+lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
+GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
+restart truth, and cleanup. All six external generated-client jobs passed on
+commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its
+Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. On commit
+`d657e4b0b77a34ddb615124db2d82da810238502`,
+[run 30287887431](https://github.com/rudydesplan/minisky/actions/runs/30287887431)
+passed the Phase 19 Kafka/Airflow backend gate, corrected GoReleaser validation,
+Linux AMD64 release snapshot, both native Linux package jobs, and the native
+Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs. Two bounded Phase 18
+provider gates now cover default-off `google_workflows_workflow` and
+`google_eventarc_trigger` control-plane lifecycles. Both pass apply, restart,
+no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
+canonical import, while provider 7.41.0 does not support Workflows import. The
+Eventarc gate persists one filter, workflow destination, and Pub/Sub transport
+topic but does not claim event delivery or transport provisioning. No other
+Phase 18 Terraform compatibility is claimed. Separate heavy Phase 19 gates pass
+`google_composer_environment` and `google_managed_kafka_cluster` lifecycles and
+canonical imports against digest-pinned exact-owned backends. Managed Kafka
+capacity/subnet are metadata and its loopback broker is plaintext; neither gate
+claims real GCP networking/TLS or managed-service parity.
+A bounded Phase 20 `google_filestore_instance` gate covers persisted metadata
+and traversal-protected profile-local files only; it does not provide NFS or
+VPC semantics.
+A second Phase 20 gate covers only Identity Platform project authorized-domain
+metadata, including canonical singleton initialization, import, and reset;
+it does not claim authentication or production Firebase security.
+A third Phase 20 gate proves one bounded local GCS-to-GCS Storage Transfer job,
+including restart, import, repeat execution, and durable soft deletion.
+The AlloyDB gate couples one metadata-only cluster to one `PRIMARY` instance,
+proves real SQL persistence through the pinned exact-owned PostgreSQL backend,
+and passes restart, no-drift, canonical imports, ordered destroy, and cleanup.
+It does not claim VPC, HA, encryption, backup, capacity, user, or production
+AlloyDB parity.
+A Phase 21 provider gate proves the complete Service Directory
+namespace/service/endpoint metadata hierarchy, including restart, zero drift,
+canonical imports, child-first destroy, durable 404s, and empty-list cleanup.
+Endpoint addresses and ports remain opaque registration metadata; MiniSky does
+not claim Service Directory DNS, routing, health checking, or network resolution.
+A Phase 23 provider gate proves one metadata-only Document AI
+`OCR_PROCESSOR`, including restart, zero drift, canonical import
+reconciliation, LRO-backed delete, durable 404, and empty-list cleanup. It does
+not claim document processing quality, model inference, external artifacts, or
+sensitive-document handling.
+A Phase 24 provider gate proves one project-scoped boolean Organization Policy,
+including a real bounded local advisory decision, restart, zero drift, canonical
+import reconciliation, delete, durable 404, empty-list cleanup, and fallback to
+the seeded constraint default. This is local simulation, not production
+enforcement, IAM, organization hierarchy, or compliance.
+Unsupported methods return canonical 501
+responses rather than simulated success; Cloud CDN/Armor remains within the
+Compute domain and does not claim full GCP data-plane parity.
 
 ## 📋 Prerequisites
 Install the tools required by the slices you use:
@@ -413,12 +483,14 @@ GCP package/version mutation, and registry blob snapshots remain unsupported.
 
 ### Phase 11 — Developer experience and distribution
 
-**Status (2026-07-25): local tooling slice implemented.** Doctor, safe fixes,
+**Status (2026-07-27): CI-verified tooling slice.** Doctor, safe fixes,
 gateway-first delivery/artifact commands, Make targets, and release smoke
-validation are present. GoReleaser v2 configuration, a native macOS ARM64
-snapshot, `version`, and `doctor bigquery` passed locally. Native amd64 and
-arm64 deb/rpm build → install → smoke → uninstall validation passed in
-read-only CI on 2026-07-25. Homebrew, Scoop, deb, and rpm are not published.
+validation are present. On commit `d657e4b0b77a34ddb615124db2d82da810238502`,
+CI installed pinned GoReleaser 2.17.0, passed static distribution validation,
+and built the Linux AMD64 release snapshot. Native AMD64 and ARM64 deb/rpm
+build → install → smoke → uninstall plus Linux ARM64, macOS ARM64, and Windows
+AMD64 CGO conformance passed in the same read-only run. Homebrew, Scoop, deb,
+and rpm are not published.
 
 - Expand `minisky doctor` to Docker, gateway ports, disk space, DuckDB, Kind,
   Buildpacks, emulator images, and platform dependencies.

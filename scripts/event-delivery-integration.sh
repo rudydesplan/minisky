@@ -108,6 +108,16 @@ owned_containers() {
     --filter "label=minisky.profile=${profile}" 2>/dev/null || true
 }
 
+repair_owned_container_permissions() {
+  local container
+  while IFS= read -r container; do
+    if [[ -n "${container}" ]]; then
+      docker exec "${container}" sh -c \
+        'if [ -d /data ]; then chmod -R a+rwX /data; fi' >/dev/null 2>&1 || true
+    fi
+  done < <(owned_containers)
+}
+
 owned_container_names() {
   docker ps -a --format '{{.Names}}' \
     --filter "label=managed-by=minisky" \
@@ -136,6 +146,8 @@ cleanup() {
     done < <(owned_container_names)
   fi
 
+  repair_owned_container_permissions
+
   if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
     kill -TERM "${daemon_pid}" 2>/dev/null || true
     wait "${daemon_pid}" 2>/dev/null || true
@@ -146,7 +158,9 @@ cleanup() {
   fi
 
   while IFS= read -r container; do
-    [[ -n "${container}" ]] && docker rm -f "${container}" >/dev/null 2>&1 || true
+    if [[ -n "${container}" ]]; then
+      docker rm -f "${container}" >/dev/null 2>&1 || true
+    fi
   done < <(owned_containers)
 
   network_manager="$(docker network inspect --format '{{index .Labels "managed-by"}}' minisky-net 2>/dev/null || true)"
@@ -174,7 +188,7 @@ cleanup() {
     cleanup_failed=1
   fi
 
-  rm -rf "${work_dir}"
+  rm -rf "${work_dir}" || cleanup_failed=1
   rmdir "${lock_dir}" 2>/dev/null || cleanup_failed=1
   if (( cleanup_failed != 0 )); then
     status=1

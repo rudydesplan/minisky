@@ -191,6 +191,66 @@ func TestRevokePersistsWithoutExposingKeyMaterial(t *testing.T) {
 	}
 }
 
+func TestRevokeCertificateRequestUpdatesPersistedDecisionPath(t *testing.T) {
+	store := &memoryStore{}
+	api, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := api.Issue(
+		"projects/p/locations/us/caPools/local", "revoked-http", testCSR(t, "revoked.local"), time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/"+certificate.Name+":revoke",
+		strings.NewReader(`{"reason":"KEY_COMPROMISE"}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var revoked Certificate
+	if err := json.Unmarshal(response.Body.Bytes(), &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked.Revoked || revoked.RevocationReason != "KEY_COMPROMISE" {
+		t.Fatalf("revoked certificate = %#v", revoked)
+	}
+
+	restarted, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := restarted.Get(certificate.Name); !ok || !got.Revoked {
+		t.Fatalf("persisted certificate = %#v, ok=%v", got, ok)
+	}
+}
+
+func TestRevokeCertificateRejectsUnsupportedReason(t *testing.T) {
+	api, err := NewAPIWithStore(nil, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := api.Issue(
+		"projects/p/locations/us/caPools/local", "invalid-reason", testCSR(t, "revoked.local"), time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/"+certificate.Name+":revoke",
+		strings.NewReader(`{"reason":"NOT_A_REASON"}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got, ok := api.Get(certificate.Name); !ok || got.Revoked {
+		t.Fatalf("certificate = %#v, ok=%v", got, ok)
+	}
+}
+
 func TestCorruptPersistedCertificateIsRejected(t *testing.T) {
 	store := &memoryStore{}
 	store.payload, _ = json.Marshal(metadata{Certificates: map[string]*Certificate{

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 const dataprocStateEntry = "dataproc/metadata"
 
 func init() {
-	state.MustRegisterEntryValidator(dataprocStateEntry, state.StrictEntryValidator[dataprocMetadata](nil))
+	state.MustRegisterEntryValidator(dataprocStateEntry, state.StrictEntryValidator(validateDataprocMetadata))
 	registry.Register("dataproc.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -133,6 +134,7 @@ type API struct {
 	initErr         error
 	clusters        map[string]*Cluster // key: project:region:clusterName
 	jobs            map[string]*Job     // key: project:region:jobId
+	runtimes        map[string]*dataprocRuntimeIntent
 	operationRunner func(string, func() error)
 	jobRunner       func(func())
 	afterAdmission  func()
@@ -154,8 +156,13 @@ type dataprocContextualDeleter interface {
 }
 
 type dataprocMetadata struct {
-	Clusters map[string]*Cluster `json:"clusters"`
-	Jobs     map[string]*Job     `json:"jobs"`
+	Clusters map[string]*Cluster               `json:"clusters"`
+	Jobs     map[string]*Job                   `json:"jobs"`
+	Runtimes map[string]*dataprocRuntimeIntent `json:"runtimes,omitempty"`
+}
+
+type dataprocRuntimeIntent struct {
+	ContainerNames []string `json:"containerNames"`
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
@@ -187,7 +194,13 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, svcMgr dataprocServic
 		}
 		return nil, fmt.Errorf("load Dataproc metadata: %w", err)
 	}
+	if err := normalizeDataprocMetadata(&persisted, false); err != nil {
+		return nil, fmt.Errorf("load Dataproc metadata: %w", err)
+	}
 	previous := cloneDataprocMetadata(persisted)
+	if err := api.reconcileDataprocRuntimes(&persisted); err != nil {
+		return nil, fmt.Errorf("reconcile Dataproc backends: %w", err)
+	}
 	if err := normalizeDataprocMetadata(&persisted, true); err != nil {
 		return nil, fmt.Errorf("load Dataproc metadata: %w", err)
 	}
@@ -208,6 +221,7 @@ func newAPI(opMgr *orchestrator.OperationManager, svcMgr dataprocServiceManager,
 		store:    store,
 		clusters: make(map[string]*Cluster),
 		jobs:     make(map[string]*Job),
+		runtimes: make(map[string]*dataprocRuntimeIntent),
 	}
 	if opMgr != nil {
 		api.operationRunner = opMgr.RunAsync
@@ -356,6 +370,9 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request, project, r
 
 	snapshot := cloneDataprocMetadata(previous)
 	snapshot.Clusters[key] = cloneCluster(cl)
+	snapshot.Runtimes[key] = &dataprocRuntimeIntent{
+		ContainerNames: dataprocClusterContainerNames(project, region, body.ClusterName, cfg),
+	}
 	if api.rejectDegradedMutation(w) {
 		api.mutationMu.Unlock()
 		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "Dataproc persistence became unavailable")
@@ -858,13 +875,35 @@ func clusterKey(project, region, name string) string { return project + ":" + re
 func jobKey(project, region, id string) string       { return project + ":" + region + ":" + id }
 
 func dataprocDockerName(project, region, cluster, role string, index int) string {
-	identity := config.GetProfile() + "\x00" + clusterKey(project, region, cluster)
+	return dataprocDockerNameForProfile(config.GetProfile(), project, region, cluster, role, index)
+}
+
+func dataprocDockerNameForProfile(profile, project, region, cluster, role string, index int) string {
+	identity := profile + "\x00" + clusterKey(project, region, cluster)
 	sum := sha256.Sum256([]byte(identity))
 	name := fmt.Sprintf("minisky-dataproc-%x-%s", sum[:8], role)
 	if role == "w" {
 		name += fmt.Sprintf("-%d", index)
 	}
 	return name
+}
+
+func dataprocClusterContainerNames(project, region, cluster string, cfg ClusterConfig) []string {
+	return dataprocClusterContainerNamesForProfile(config.GetProfile(), project, region, cluster, cfg)
+}
+
+func dataprocClusterContainerNamesForProfile(profile, project, region, cluster string, cfg ClusterConfig) []string {
+	workers := 2
+	if cfg.WorkerConfig != nil {
+		workers = cfg.WorkerConfig.NumInstances
+	}
+	names := make([]string, 0, 1+workers)
+	names = append(names, dataprocDockerNameForProfile(profile, project, region, cluster, "m", 0))
+	for index := 0; index < workers; index++ {
+		names = append(names,
+			dataprocDockerNameForProfile(profile, project, region, cluster, "w", index))
+	}
+	return names
 }
 
 func extractSegmentAfter(path, keyword string) string {
@@ -877,6 +916,89 @@ func extractSegmentAfter(path, keyword string) string {
 	return ""
 }
 
+func validateDataprocMetadata(context state.EntryValidationContext, metadata *dataprocMetadata) error {
+	if context.Store != nil && len(metadata.Runtimes) != 0 {
+		return errors.New("Docker runtime cleanup intents cannot be imported")
+	}
+	for key, cluster := range metadata.Clusters {
+		if cluster == nil {
+			return fmt.Errorf("cluster %q is null", key)
+		}
+	}
+	for key, job := range metadata.Jobs {
+		if job == nil {
+			return fmt.Errorf("job %q is null", key)
+		}
+	}
+	profile := context.Profile
+	if profile == "" {
+		profile = config.GetProfile()
+	}
+	return validateDataprocRuntimeIntents(profile, metadata)
+}
+
+func validateDataprocRuntimeIntents(profile string, metadata *dataprocMetadata) error {
+	for key, runtime := range metadata.Runtimes {
+		cluster := metadata.Clusters[key]
+		if runtime == nil || cluster == nil {
+			return fmt.Errorf("runtime %q references missing cluster", key)
+		}
+		prefix := cluster.ProjectId + ":"
+		suffix := ":" + cluster.ClusterName
+		if cluster.ProjectId == "" || cluster.ClusterName == "" ||
+			!strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+			return fmt.Errorf("runtime %q has invalid cluster identity", key)
+		}
+		region := strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix)
+		if region == "" || key != clusterKey(cluster.ProjectId, region, cluster.ClusterName) {
+			return fmt.Errorf("runtime %q has invalid cluster scope", key)
+		}
+		expected := dataprocClusterContainerNamesForProfile(
+			profile, cluster.ProjectId, region, cluster.ClusterName, cluster.Config)
+		if len(runtime.ContainerNames) != len(expected) {
+			return fmt.Errorf("runtime %q has invalid container ownership", key)
+		}
+		for index := range expected {
+			if runtime.ContainerNames[index] != expected[index] {
+				return fmt.Errorf("runtime %q has invalid container ownership", key)
+			}
+		}
+	}
+	return nil
+}
+
+func (api *API) reconcileDataprocRuntimes(metadata *dataprocMetadata) error {
+	if len(metadata.Runtimes) == 0 {
+		return nil
+	}
+	if api.svcMgr == nil {
+		return errors.New("Docker backend is unavailable for exact-owned cleanup")
+	}
+	keys := make([]string, 0, len(metadata.Runtimes))
+	for key := range metadata.Runtimes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		runtime := metadata.Runtimes[key]
+		for _, name := range runtime.ContainerNames {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			var err error
+			if contextual, ok := api.svcMgr.(dataprocContextualDeleter); ok {
+				err = contextual.DeleteComputeVMContext(ctx, name)
+			} else {
+				err = api.svcMgr.DeleteComputeVM(name)
+			}
+			cancel()
+			if err != nil {
+				return fmt.Errorf("clean runtime %q container %q: %w", key, name, err)
+			}
+		}
+		delete(metadata.Runtimes, key)
+	}
+	return nil
+}
+
 func writeError(w http.ResponseWriter, code int, status, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -886,7 +1008,11 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 }
 
 func (api *API) snapshotLocked() dataprocMetadata {
-	payload, _ := json.Marshal(dataprocMetadata{Clusters: api.clusters, Jobs: api.jobs})
+	payload, _ := json.Marshal(dataprocMetadata{
+		Clusters: api.clusters,
+		Jobs:     api.jobs,
+		Runtimes: api.runtimes,
+	})
 	var snapshot dataprocMetadata
 	_ = json.Unmarshal(payload, &snapshot)
 	_ = normalizeDataprocMetadata(&snapshot, false)
@@ -938,6 +1064,7 @@ func (api *API) replaceMetadata(metadata dataprocMetadata) {
 	api.mu.Lock()
 	api.clusters = metadata.Clusters
 	api.jobs = metadata.Jobs
+	api.runtimes = metadata.Runtimes
 	api.mu.Unlock()
 }
 
@@ -1009,6 +1136,7 @@ func (api *API) deleteClusterMetadata(key string) error {
 	api.mu.RUnlock()
 	snapshot := cloneDataprocMetadata(previous)
 	delete(snapshot.Clusters, key)
+	delete(snapshot.Runtimes, key)
 	if err := api.PersistenceError(); err != nil {
 		return fmt.Errorf("Dataproc persistence unavailable before deletion outcome save: %w", err)
 	}
@@ -1067,6 +1195,9 @@ func normalizeDataprocMetadata(metadata *dataprocMetadata, restarting bool) erro
 	if metadata.Jobs == nil {
 		metadata.Jobs = make(map[string]*Job)
 	}
+	if metadata.Runtimes == nil {
+		metadata.Runtimes = make(map[string]*dataprocRuntimeIntent)
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	for key, cluster := range metadata.Clusters {
 		if cluster == nil {
@@ -1089,6 +1220,9 @@ func normalizeDataprocMetadata(metadata *dataprocMetadata, restarting bool) erro
 			}
 		}
 	}
+	if err := validateDataprocRuntimeIntents(config.GetProfile(), metadata); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1107,7 +1241,7 @@ func dataprocMetadataEqual(left, right dataprocMetadata) bool {
 }
 
 func dataprocMetadataEmpty(metadata dataprocMetadata) bool {
-	return len(metadata.Clusters) == 0 && len(metadata.Jobs) == 0
+	return len(metadata.Clusters) == 0 && len(metadata.Jobs) == 0 && len(metadata.Runtimes) == 0
 }
 
 func cloneCluster(cluster *Cluster) *Cluster {
@@ -1132,11 +1266,19 @@ func cloneJob(job *Job) *Job {
 
 func (api *API) PersistenceError() error {
 	api.mu.RLock()
+	err := api.initErr
+	api.mu.RUnlock()
+	if api.opMgr != nil {
+		err = errors.Join(err, api.opMgr.PersistenceError())
+	}
+	return err
+}
+
+func (api *API) initializationError() error {
+	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return api.initErr
 }
-
-func (api *API) initializationError() error { return api.PersistenceError() }
 
 func (api *API) rejectDegradedMutation(w http.ResponseWriter) bool {
 	if api.PersistenceError() == nil {

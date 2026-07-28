@@ -30,22 +30,40 @@ work="$(mktemp -d)"
 profile="phase15-$$"
 pid=""
 
+owned_containers() {
+  docker ps -aq \
+    --filter "label=managed-by=minisky" \
+    --filter "label=minisky.profile=${profile}" 2>/dev/null || true
+}
+
+repair_owned_container_permissions() {
+  local container
+  while IFS= read -r container; do
+    if [[ -n "${container}" ]]; then
+      docker exec "${container}" sh -c \
+        'if [ -d /data ]; then chmod -R a+rwX /data; fi' >/dev/null 2>&1 || true
+    fi
+  done < <(owned_containers)
+}
+
 cleanup() {
-  status=$?
+  local status=$?
+  local container
   trap - EXIT INT TERM
+  repair_owned_container_permissions
   if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
     kill -TERM "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
   fi
   while IFS= read -r container; do
-    [[ -n "${container}" ]] && docker rm -f "${container}" >/dev/null 2>&1 || true
-  done < <(docker ps -aq \
-    --filter "label=managed-by=minisky" \
-    --filter "label=minisky.profile=${profile}" 2>/dev/null || true)
+    if [[ -n "${container}" ]]; then
+      docker rm -f "${container}" >/dev/null 2>&1 || true
+    fi
+  done < <(owned_containers)
   if [[ "$(docker network inspect --format '{{ index .Labels "managed-by" }}:{{ index .Labels "minisky.profile" }}' minisky-net 2>/dev/null || true)" == "minisky:${profile}" ]]; then
     docker network rm minisky-net >/dev/null 2>&1 || true
   fi
-  rm -rf "${work}"
+  rm -rf "${work}" || true
   exit "${status}"
 }
 trap cleanup EXIT INT TERM

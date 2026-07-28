@@ -2,13 +2,17 @@ package batch
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -76,18 +80,319 @@ func TestCreateJobMissingTaskGroups(t *testing.T) {
 	}
 }
 
-func TestCreateExecutableJobReturns501WithoutFakeSuccess(t *testing.T) {
+func TestCreateExecutableJobRunsAndCapturesTerminalState(t *testing.T) {
+	runner := &fakeContainerRunner{
+		result: containerResult{ExitCode: 0, Output: "hello from batch\n"},
+	}
 	api := newTestAPI()
-	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"img"}}]}}]}`
+	api.runner = runner
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox:1.36","entrypoint":"/bin/sh","commands":["-c","echo hello"]}}]},"taskCount":"1","parallelism":"1"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/jobs?jobId=j1", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	waitForJobState(t, api, "projects/test/locations/us-central1/jobs/j1", "SUCCEEDED")
+
+	runner.mu.Lock()
+	workload := runner.workload
+	cleaned := runner.cleaned
+	runner.mu.Unlock()
+	if workload.ImageURI != "busybox:1.36" || workload.Entrypoint != "/bin/sh" ||
+		strings.Join(workload.Commands, " ") != "-c echo hello" {
+		t.Fatalf("workload = %#v", workload)
+	}
+	if workload.Ownership.ContainerName == "" ||
+		workload.Ownership.Labels["minisky.service"] != "batch" ||
+		workload.Ownership.Labels["minisky.job"] != "projects/test/locations/us-central1/jobs/j1" {
+		t.Fatalf("ownership = %#v", workload.Ownership)
+	}
+	if cleaned.ContainerName != workload.Ownership.ContainerName {
+		t.Fatalf("cleaned ownership = %#v, workload ownership = %#v", cleaned, workload.Ownership)
+	}
+
+	api.mu.RLock()
+	job := deepCopyJob(api.jobs["projects/test/locations/us-central1/jobs/j1"])
+	_, runtimeRetained := api.runtimes[job.Name]
+	api.mu.RUnlock()
+	if runtimeRetained {
+		t.Fatal("terminal job retained Docker ownership intent after cleanup")
+	}
+	if job.Status == nil || job.Status.State != "SUCCEEDED" || len(job.Status.StatusEvents) == 0 {
+		t.Fatalf("terminal job = %#v", job)
+	}
+	var event struct {
+		Type          string `json:"type"`
+		TaskState     string `json:"taskState"`
+		TaskExecution struct {
+			ExitCode int `json:"exitCode"`
+		} `json:"taskExecution"`
+	}
+	if err := json.Unmarshal(job.Status.StatusEvents[len(job.Status.StatusEvents)-1], &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "JOB_STATE_CHANGED" || event.TaskState != "SUCCEEDED" || event.TaskExecution.ExitCode != 0 {
+		t.Fatalf("terminal event = %#v", event)
+	}
+}
+
+func TestCreateExecutableJobFailureAndUnsupportedBoundaries(t *testing.T) {
+	runner := &fakeContainerRunner{
+		result: containerResult{ExitCode: 23, Output: "boom"},
+	}
+	api := newTestAPI()
+	api.runner = runner
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox:1.36"}}]}}]}`
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=failed", bytes.NewBufferString(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("create status = %d: %s", w.Code, w.Body.String())
+	}
+	waitForJobState(t, api, "projects/test/locations/us-central1/jobs/failed", "FAILED")
+
+	for name, requestBody := range map[string]string{
+		"multiple tasks":     `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox"}}]},"taskCount":"2"}]}`,
+		"multiple runnables": `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox"}},{"container":{"imageUri":"busybox"}}]}}]}`,
+		"missing image":      `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{}}]}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+				"/v1/projects/test/locations/us-central1/jobs?jobId=unsupported-"+strings.ReplaceAll(name, " ", "-"),
+				bytes.NewBufferString(requestBody)))
+			if response.Code != http.StatusNotImplemented {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestExecutableJobRunningStateSaveFailureFailsClosedAndCleans(t *testing.T) {
+	store := &nthFailBatchStore{data: make(map[string][]byte), failAt: 2}
+	runner := &fakeContainerRunner{}
+	api := newTestAPI()
+	api.stateStore = store
+	api.runner = runner
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox:1.36"}}]}}]}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=save-failure", bytes.NewBufferString(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create status = %d: %s", response.Code, response.Body.String())
+	}
+	name := "projects/test/locations/us-central1/jobs/save-failure"
+	waitForJobState(t, api, name, "FAILED")
+	select {
+	case <-runner.cleanedCh():
+	case <-time.After(2 * time.Second):
+		t.Fatal("RUNNING persistence failure did not clean ownership intent")
+	}
+	api.mu.RLock()
+	_, runtimeExists := api.runtimes[name]
+	api.mu.RUnlock()
+	if runtimeExists {
+		t.Fatal("RUNNING persistence failure retained cleaned runtime")
+	}
+	if api.opMgr.PersistenceError() == nil {
+		t.Fatal("async persistence failure did not leave sticky degradation")
+	}
+}
+
+func TestExecutableJobCancellationStopsAndCleansOwnedContainer(t *testing.T) {
+	runner := &fakeContainerRunner{
+		started: make(chan struct{}),
+		block:   make(chan struct{}),
+	}
+	api := newTestAPI()
+	api.runner = runner
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox:1.36"}}]}}]}`
+	create := httptest.NewRecorder()
+	api.ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=cancel-me", bytes.NewBufferString(body)))
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	<-runner.started
+
+	cancel := httptest.NewRecorder()
+	api.ServeHTTP(cancel, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs/cancel-me:cancel", bytes.NewBufferString(`{}`)))
+	if cancel.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d: %s", cancel.Code, cancel.Body.String())
+	}
+	waitForJobState(t, api, "projects/test/locations/us-central1/jobs/cancel-me", "CANCELLED")
+	select {
+	case <-runner.cleanedCh():
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled job did not clean its owned container")
+	}
+}
+
+func TestDeleteRunningExecutableJobWaitsForOwnedCleanup(t *testing.T) {
+	runner := &fakeContainerRunner{
+		started: make(chan struct{}),
+		block:   make(chan struct{}),
+	}
+	defer close(runner.block)
+	api := newTestAPI()
+	api.runner = runner
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox:1.36"}}]}}]}`
+	create := httptest.NewRecorder()
+	api.ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=delete-running", bytes.NewBufferString(body)))
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	<-runner.started
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
+		"/v1/projects/test/locations/us-central1/jobs/delete-running", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status = %d: %s", response.Code, response.Body.String())
+	}
+	select {
+	case <-runner.cleanedCh():
+	default:
+		t.Fatal("delete returned before exact-owned container cleanup")
+	}
+	name := "projects/test/locations/us-central1/jobs/delete-running"
+	api.mu.RLock()
+	_, jobExists := api.jobs[name]
+	_, runtimeExists := api.runtimes[name]
+	api.mu.RUnlock()
+	if jobExists || runtimeExists {
+		t.Fatalf("delete retained job=%t runtime=%t", jobExists, runtimeExists)
+	}
+}
+
+func TestExecutableJobUnavailableFailsBeforeMutation(t *testing.T) {
+	api := newTestAPI()
+	api.runner = &fakeContainerRunner{checkErr: errors.New("docker unavailable")}
+	body := `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox"}}]}}]}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=no-docker", bytes.NewBufferString(body)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
 	}
 	if len(api.jobs) != 0 {
-		t.Fatal("unsupported executable job must not be stored")
+		t.Fatal("unavailable Docker backend mutated jobs")
 	}
+}
+
+func TestRestartCleansOwnedContainerAndFailsInterruptedExecutableJob(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	name := "projects/p/locations/l/jobs/interrupted"
+	ownership := containerOwnership{
+		ContainerName: "minisky-batch-owned",
+		Labels: map[string]string{
+			"minisky.owner":   "true",
+			"minisky.service": "batch",
+			"minisky.job":     name,
+		},
+	}
+	if err := store.Save(batchStateEntry, batchMetadata{
+		Jobs: map[string]*Job{name: {
+			Name: name, TaskGroups: []TaskGroup{{TaskSpec: &TaskSpec{}}},
+			Status: &JobStatus{State: "RUNNING"},
+		}},
+		Runtimes: map[string]*batchRuntimeIntent{name: {Ownership: ownership}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeContainerRunner{}
+	api := newTestAPI()
+	api.stateStore = store
+	api.runner = runner
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.jobs[name].Status.State; got != "FAILED" {
+		t.Fatalf("restart state = %q, want FAILED", got)
+	}
+	if _, ok := api.runtimes[name]; ok {
+		t.Fatal("restart retained cleaned ownership intent")
+	}
+	runner.mu.Lock()
+	cleaned := runner.cleaned
+	runner.mu.Unlock()
+	if cleaned.ContainerName != ownership.ContainerName {
+		t.Fatalf("cleaned = %#v", cleaned)
+	}
+	var durable batchMetadata
+	if err := store.Load(batchStateEntry, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if durable.Jobs[name].Status.State != "FAILED" || len(durable.Runtimes) != 0 {
+		t.Fatalf("durable restart state = %#v", durable)
+	}
+}
+
+func TestBatchImportRejectsRuntimeCleanupIntent(t *testing.T) {
+	name := "projects/p/locations/l/jobs/imported"
+	metadata := batchMetadata{
+		Jobs: map[string]*Job{name: {
+			Name: name, TaskGroups: []TaskGroup{{TaskSpec: &TaskSpec{}}},
+			Status: &JobStatus{State: "RUNNING"},
+		}},
+		Runtimes: map[string]*batchRuntimeIntent{name: {
+			Ownership: containerOwnership{
+				ContainerName: "user-controlled",
+				Labels: map[string]string{
+					"minisky.owner": "true", "minisky.service": "batch", "minisky.job": name,
+				},
+			},
+		}},
+	}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(state.Snapshot{
+		Format: state.SnapshotFormat, Version: state.Version,
+		Entries: map[string]json.RawMessage{batchStateEntry: raw},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.New(t.TempDir(), "import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Import(bytes.NewReader(snapshot)); err == nil {
+		t.Fatal("import accepted a Docker cleanup intent")
+	}
+}
+
+func TestDockerExecutableJobIntegration(t *testing.T) {
+	image := os.Getenv("MINISKY_BATCH_DOCKER_TEST_IMAGE")
+	if image == "" {
+		t.Skip("set MINISKY_BATCH_DOCKER_TEST_IMAGE to an available image for Docker integration")
+	}
+	runner := dockerCLIRunner{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := runner.Check(ctx)
+	cancel()
+	if err != nil {
+		t.Skipf("Docker unavailable: %v", err)
+	}
+	api := newTestAPI()
+	api.runner = runner
+	body := fmt.Sprintf(
+		`{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":%q,"commands":["true"]}}]}}]}`,
+		image,
+	)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/jobs?jobId=docker-integration",
+		bytes.NewBufferString(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create status = %d: %s", response.Code, response.Body.String())
+	}
+	waitForJobState(t, api, "projects/test/locations/us-central1/jobs/docker-integration", "SUCCEEDED")
 }
 
 func TestCancelJobReturnsLROAndPersistsCancelledState(t *testing.T) {
@@ -107,6 +412,10 @@ func TestCancelJobReturnsLROAndPersistsCancelledState(t *testing.T) {
 	}
 	if operation["done"] != true {
 		t.Fatalf("operation = %#v", operation)
+	}
+	result, _ := operation["response"].(map[string]any)
+	if result["@type"] != "type.googleapis.com/google.cloud.batch.v1.Job" {
+		t.Fatalf("cancel response = %#v", result)
 	}
 	if api.jobs[name].Status.State != "CANCELLED" {
 		t.Fatalf("state = %s", api.jobs[name].Status.State)
@@ -250,6 +559,10 @@ func TestDeleteJob(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["done"] != true {
 		t.Fatal("expected LRO done=true for delete")
+	}
+	result, _ := resp["response"].(map[string]any)
+	if result["@type"] != "type.googleapis.com/google.protobuf.Empty" {
+		t.Fatalf("delete response = %#v", result)
 	}
 	name, _ := resp["name"].(string)
 	if name == "" {
@@ -478,6 +791,119 @@ func TestConcurrentAccess(t *testing.T) {
 type mockStore struct {
 	mu   sync.Mutex
 	data map[string][]byte
+}
+
+type nthFailBatchStore struct {
+	mu     sync.Mutex
+	data   map[string][]byte
+	saves  int
+	failAt int
+}
+
+func (s *nthFailBatchStore) Load(name string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.data[name]
+	if !ok {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (s *nthFailBatchStore) Save(name string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saves++
+	if s.saves == s.failAt {
+		return errors.New("injected save failure")
+	}
+	raw, err := json.Marshal(value)
+	if err == nil {
+		s.data[name] = raw
+	}
+	return err
+}
+
+type fakeContainerRunner struct {
+	mu          sync.Mutex
+	checkErr    error
+	runErr      error
+	result      containerResult
+	workload    containerWorkload
+	cleaned     containerOwnership
+	started     chan struct{}
+	block       chan struct{}
+	cleanedDone chan struct{}
+}
+
+func (f *fakeContainerRunner) Check(context.Context) error {
+	return f.checkErr
+}
+
+func (f *fakeContainerRunner) Run(ctx context.Context, workload containerWorkload) (containerResult, error) {
+	f.mu.Lock()
+	f.workload = workload
+	started := f.started
+	block := f.block
+	result, err := f.result, f.runErr
+	f.mu.Unlock()
+	if started != nil {
+		close(started)
+	}
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return containerResult{}, ctx.Err()
+		case <-block:
+		}
+	}
+	return result, err
+}
+
+func (f *fakeContainerRunner) Cleanup(_ context.Context, ownership containerOwnership) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleaned = ownership
+	if f.cleanedDone == nil {
+		f.cleanedDone = make(chan struct{})
+	}
+	select {
+	case <-f.cleanedDone:
+	default:
+		close(f.cleanedDone)
+	}
+	return nil
+}
+
+func (f *fakeContainerRunner) cleanedCh() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cleanedDone == nil {
+		f.cleanedDone = make(chan struct{})
+	}
+	return f.cleanedDone
+}
+
+func waitForJobState(t *testing.T, api *API, name, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		api.mu.RLock()
+		job := api.jobs[name]
+		got := ""
+		if job != nil && job.Status != nil {
+			got = job.Status.State
+		}
+		api.mu.RUnlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	api.mu.RLock()
+	job := deepCopyJob(api.jobs[name])
+	api.mu.RUnlock()
+	t.Fatalf("timed out waiting for %s: %#v", want, job)
 }
 
 func (m *mockStore) Load(name string, target any) error {

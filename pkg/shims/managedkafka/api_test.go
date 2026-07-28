@@ -2,14 +2,18 @@ package managedkafka
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
 )
 
@@ -19,24 +23,26 @@ import (
 
 func TestCreateCluster(t *testing.T) {
 	api := newTestAPI()
-	body := `{"capacity":{"vcpuCount":"3","memoryBytes":"3221225472"},"gcpConfig":{"accessConfig":{"networkConfigs":[{"subnet":"projects/test/regions/us-central1/subnetworks/default"}]}}}`
+	api.backend = &fakeKafkaBackend{bootstrap: "127.0.0.1:19092"}
+	body := `{"capacityConfig":{"vcpuCount":"3","memoryBytes":"3221225472"},"gcpConfig":{"accessConfig":{"networkConfigs":[{"subnet":"projects/test/regions/us-central1/subnetworks/default"}]}}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/clusters?clusterId=my-cluster", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
-	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), `"status":"UNIMPLEMENTED"`) {
-		t.Fatalf("expected canonical 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	waitForClusterState(t, api, "projects/test/locations/us-central1/clusters/my-cluster", "ACTIVE")
 	api.mu.RLock()
 	cluster := api.clusters["projects/test/locations/us-central1/clusters/my-cluster"]
 	api.mu.RUnlock()
-	if cluster != nil {
-		t.Fatal("unsupported create mutated cluster state")
+	if cluster == nil || cluster.BootstrapAddress != "127.0.0.1:19092" {
+		t.Fatalf("missing executable broker address: %+v", cluster)
 	}
 }
 
 func TestCreateClusterMissingClusterId(t *testing.T) {
 	api := newTestAPI()
-	body := `{"capacity":{"vcpuCount":"3"}}`
+	body := `{"capacityConfig":{"vcpuCount":"3"}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/clusters", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
@@ -486,6 +492,261 @@ func TestGetOperationNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateClusterMetadataSaveFailureRollsBackDurableOperation(t *testing.T) {
+	operationStore := &mockStore{data: make(map[string][]byte)}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("metadata save failed")},
+	}
+	api := &API{
+		opMgr:      opMgr,
+		stateStore: metadataStore,
+		clusters:   make(map[string]*Cluster),
+		topics:     make(map[string]*Topic),
+		backend:    &fakeKafkaBackend{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/clusters?clusterId=save-fails",
+		bytes.NewBufferString(`{}`))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(api.opMgr.List()) != 0 {
+		t.Fatalf("failed create left an in-memory operation: %+v", api.opMgr.List())
+	}
+	restarted, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.List()) != 0 {
+		t.Fatalf("failed create left a durable operation: %+v", restarted.List())
+	}
+}
+
+func TestPatchClusterOperationRegistrationFailureDoesNotMutate(t *testing.T) {
+	operationStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("operation save failed")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{data: make(map[string][]byte)}
+	name := "projects/test/locations/us-central1/clusters/c1"
+	api := &API{
+		opMgr:      opMgr,
+		stateStore: metadataStore,
+		clusters: map[string]*Cluster{name: {
+			Name:       name,
+			CreateTime: "2024-01-01T00:00:00Z",
+			UpdateTime: "2024-01-01T00:00:00Z",
+			State:      "ACTIVE",
+			Labels:     map[string]string{"env": "dev"},
+		}},
+		topics:  make(map[string]*Topic),
+		backend: &fakeKafkaBackend{},
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/clusters/c1?updateMask=labels",
+		bytes.NewBufferString(`{"labels":{"env":"prod"}}`))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	get := httptest.NewRecorder()
+	api.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/clusters/c1", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("cluster was not externally visible after failed patch: %d: %s", get.Code, get.Body.String())
+	}
+	var cluster Cluster
+	if err := json.Unmarshal(get.Body.Bytes(), &cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Labels["env"] != "dev" || cluster.UpdateTime != "2024-01-01T00:00:00Z" {
+		t.Fatalf("operation registration failure mutated cluster: %+v", &cluster)
+	}
+	if metadataStore.saveCalls != 0 {
+		t.Fatalf("operation registration failure persisted metadata %d times", metadataStore.saveCalls)
+	}
+}
+
+func TestDeleteClusterOperationRegistrationFailureDoesNotMutateBackend(t *testing.T) {
+	operationStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("operation save failed")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{data: make(map[string][]byte)}
+	backend := &fakeKafkaBackend{}
+	name := "projects/test/locations/us-central1/clusters/c1"
+	topicName := name + "/topics/t1"
+	api := &API{
+		opMgr:      opMgr,
+		stateStore: metadataStore,
+		clusters:   map[string]*Cluster{name: {Name: name, State: "ACTIVE"}},
+		topics:     map[string]*Topic{topicName: {Name: topicName}},
+		backend:    backend,
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/clusters/c1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	getCluster := httptest.NewRecorder()
+	api.ServeHTTP(getCluster, httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/clusters/c1", nil))
+	if getCluster.Code != http.StatusOK {
+		t.Fatalf("operation registration failure hid cluster: %d: %s", getCluster.Code, getCluster.Body.String())
+	}
+	getTopic := httptest.NewRecorder()
+	api.ServeHTTP(getTopic, httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/clusters/c1/topics/t1", nil))
+	if getTopic.Code != http.StatusOK {
+		t.Fatalf("operation registration failure hid topic: %d: %s", getTopic.Code, getTopic.Body.String())
+	}
+	if backend.deleteCalls != 0 {
+		t.Fatalf("operation registration failure deleted backend %d times", backend.deleteCalls)
+	}
+	if metadataStore.saveCalls != 0 {
+		t.Fatalf("operation registration failure persisted metadata %d times", metadataStore.saveCalls)
+	}
+}
+
+func TestClusterMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMetadataTruth(t *testing.T) {
+	const name = "projects/test/locations/us-central1/clusters/c1"
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		wantExists bool
+		wantLabel  string
+	}{
+		{
+			name:       "patch",
+			method:     http.MethodPatch,
+			body:       `{"labels":{"env":"prod"}}`,
+			wantExists: true,
+			wantLabel:  "prod",
+		},
+		{
+			name:       "delete",
+			method:     http.MethodDelete,
+			wantExists: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operationStore := &mockStore{
+				data:       make(map[string][]byte),
+				failOnSave: map[int]error{2: errors.New("terminal operation save failed")},
+			}
+			opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadataStore := &mockStore{data: make(map[string][]byte)}
+			topicName := name + "/topics/t1"
+			api := &API{
+				opMgr:      opMgr,
+				stateStore: metadataStore,
+				clusters: map[string]*Cluster{name: {
+					Name:       name,
+					CreateTime: "2024-01-01T00:00:00Z",
+					UpdateTime: "2024-01-01T00:00:00Z",
+					State:      "ACTIVE",
+					Labels:     map[string]string{"env": "dev"},
+				}},
+				topics:  map[string]*Topic{topicName: {Name: topicName}},
+				backend: &fakeKafkaBackend{},
+			}
+
+			path := "/v1/projects/test/locations/us-central1/clusters/c1"
+			if test.method == http.MethodPatch {
+				path += "?updateMask=labels"
+			}
+			req := httptest.NewRequest(test.method, path, bytes.NewBufferString(test.body))
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), `"done":true`) {
+				t.Fatalf("terminal persistence failure fabricated success: %s", w.Body.String())
+			}
+			var response struct {
+				Error struct {
+					Status string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Error.Status != "UNAVAILABLE" {
+				t.Fatalf("error status = %q, want UNAVAILABLE", response.Error.Status)
+			}
+
+			operations := opMgr.List()
+			if len(operations) != 1 {
+				t.Fatalf("operations = %+v, want one reconciled operation", operations)
+			}
+			inProcess := operations[0]
+			if !inProcess.Done || inProcess.Error == nil ||
+				!strings.Contains(inProcess.Error.Message, "interrupted by MiniSky restart") {
+				t.Fatalf("in-process operation was not reconciled: %+v", inProcess)
+			}
+
+			restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			durable := restartedOps.Get(inProcess.Name)
+			if durable == nil || !durable.Done || durable.Error == nil ||
+				durable.Error.Message != inProcess.Error.Message {
+				t.Fatalf("operation truth diverged across restart: in-process=%+v restarted=%+v", inProcess, durable)
+			}
+
+			restarted := &API{
+				opMgr:      orchestrator.NewOperationManager(),
+				stateStore: metadataStore,
+				clusters:   make(map[string]*Cluster),
+				topics:     make(map[string]*Topic),
+			}
+			if err := restarted.loadState(); err != nil {
+				t.Fatal(err)
+			}
+			restarted.mu.RLock()
+			cluster, exists := restarted.clusters[name]
+			_, topicExists := restarted.topics[topicName]
+			restarted.mu.RUnlock()
+			if exists != test.wantExists {
+				t.Fatalf("persisted cluster existence = %v, want %v", exists, test.wantExists)
+			}
+			if exists && cluster.Labels["env"] != test.wantLabel {
+				t.Fatalf("persisted labels = %v, want env=%q", cluster.Labels, test.wantLabel)
+			}
+			if test.method == http.MethodDelete && topicExists {
+				t.Fatal("persisted cluster deletion retained a child topic")
+			}
+		})
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Persistence Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -501,10 +762,11 @@ func TestPersistAndReload(t *testing.T) {
 
 	api.mu.Lock()
 	api.clusters["projects/p/locations/l/clusters/c1"] = &Cluster{
-		Name:       "projects/p/locations/l/clusters/c1",
-		CreateTime: "2024-06-01T00:00:00Z",
-		State:      "ACTIVE",
-		Capacity:   &Capacity{VcpuCount: "3"},
+		Name:             "projects/p/locations/l/clusters/c1",
+		CreateTime:       "2024-06-01T00:00:00Z",
+		State:            "ACTIVE",
+		Capacity:         &Capacity{VcpuCount: "3"},
+		BootstrapAddress: "127.0.0.1:19092",
 	}
 	api.topics["projects/p/locations/l/clusters/c1/topics/t1"] = &Topic{
 		Name:           "projects/p/locations/l/clusters/c1/topics/t1",
@@ -521,6 +783,7 @@ func TestPersistAndReload(t *testing.T) {
 		stateStore: store,
 		clusters:   make(map[string]*Cluster),
 		topics:     make(map[string]*Topic),
+		backend:    &fakeKafkaBackend{bootstrap: "127.0.0.1:19092"},
 	}
 	if err := api2.loadState(); err != nil {
 		t.Fatalf("load failed: %v", err)
@@ -534,8 +797,11 @@ func TestPersistAndReload(t *testing.T) {
 	if cluster.Capacity == nil || cluster.Capacity.VcpuCount != "3" {
 		t.Fatal("capacity lost after reload")
 	}
-	if cluster.State != "FAILED" {
-		t.Fatalf("rehydrated cluster must not claim a live broker backend, got %q", cluster.State)
+	if cluster.State != "ACTIVE" {
+		t.Fatalf("rehydrated exact-owned broker must be active, got %q", cluster.State)
+	}
+	if cluster.BootstrapAddress != "127.0.0.1:19092" {
+		t.Fatalf("rehydrated cluster has broker address %q", cluster.BootstrapAddress)
 	}
 	topic, ok := api2.topics["projects/p/locations/l/clusters/c1/topics/t1"]
 	if !ok {
@@ -556,7 +822,7 @@ func TestConcurrentCreateAndGet(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			body := `{"capacity":{"vcpuCount":"3"}}`
+			body := `{"capacityConfig":{"vcpuCount":"3"}}`
 			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v1/projects/test/locations/us-central1/clusters?clusterId=c-%d", idx), bytes.NewBufferString(body))
 			w := httptest.NewRecorder()
 			api.ServeHTTP(w, req)
@@ -587,8 +853,49 @@ func TestConcurrentCreateAndGet(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type mockStore struct {
-	mu   sync.Mutex
-	data map[string][]byte
+	mu         sync.Mutex
+	data       map[string][]byte
+	failOnSave map[int]error
+	saveCalls  int
+}
+
+type fakeKafkaBackend struct {
+	bootstrap   string
+	deleteCalls int
+}
+
+func (b *fakeKafkaBackend) Provision(context.Context, string) (string, error) {
+	return b.bootstrap, nil
+}
+func (b *fakeKafkaBackend) Delete(context.Context, string) error {
+	b.deleteCalls++
+	return nil
+}
+func (b *fakeKafkaBackend) CreateTopic(context.Context, string, *Topic) error {
+	return nil
+}
+func (b *fakeKafkaBackend) UpdateTopic(context.Context, string, *Topic) error {
+	return nil
+}
+func (b *fakeKafkaBackend) DeleteTopic(context.Context, string, string) error {
+	return nil
+}
+
+func waitForClusterState(t *testing.T, api *API, name, want string) {
+	t.Helper()
+	for i := 0; i < 5000; i++ {
+		api.mu.RLock()
+		state := ""
+		if cluster := api.clusters[name]; cluster != nil {
+			state = cluster.State
+		}
+		api.mu.RUnlock()
+		if state == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("cluster did not reach %s", want)
 }
 
 func (m *mockStore) Load(name string, target any) error {
@@ -604,6 +911,10 @@ func (m *mockStore) Load(name string, target any) error {
 func (m *mockStore) Save(name string, value any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.saveCalls++
+	if err := m.failOnSave[m.saveCalls]; err != nil {
+		return err
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err

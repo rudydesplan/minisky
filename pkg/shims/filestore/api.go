@@ -47,7 +47,34 @@ type Instance struct {
 // FileShare represents a file share configuration.
 type FileShare struct {
 	Name       string `json:"name"`
-	CapacityGb int64  `json:"capacityGb,string,omitempty"`
+	CapacityGb int64  `json:"capacityGb,omitempty"`
+}
+
+func (share *FileShare) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Name       string          `json:"name"`
+		CapacityGb json.RawMessage `json:"capacityGb"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	share.Name = wire.Name
+	if len(wire.CapacityGb) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(wire.CapacityGb, &share.CapacityGb); err == nil {
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(wire.CapacityGb, &value); err != nil {
+		return err
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return err
+	}
+	share.CapacityGb = parsed
+	return nil
 }
 
 // Network represents a network configuration.

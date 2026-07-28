@@ -180,7 +180,7 @@ func newAPI(opMgr *orchestrator.OperationManager, sm appEngineServiceManager, se
 		deletions:  make(map[string]appEngineDeletion),
 	}
 	if opMgr != nil {
-		api.operationRunner = opMgr.RunAsync
+		api.operationRunner = api.runOperationAsync
 	}
 	return api
 }
@@ -395,12 +395,12 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	if api.rejectDegradedMutation(w) {
 		api.mutationMu.Unlock()
-		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "App Engine persistence became unavailable")
+		api.failOperation(op.Name, http.StatusServiceUnavailable, "App Engine persistence became unavailable")
 		return
 	}
 	if err := api.commitMetadata(previous, snapshot); err != nil {
 		api.mutationMu.Unlock()
-		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "App Engine metadata was not persisted")
+		api.failOperation(op.Name, http.StatusInternalServerError, "App Engine metadata was not persisted")
 		writeAppEngineError(w, http.StatusInternalServerError, "INTERNAL", "failed to persist App Engine version metadata")
 		return
 	}
@@ -462,7 +462,7 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 			api.pushLog(req.Project, "ERROR", req.Service, fmt.Sprintf("Deployment failed for version %s: %v", req.Version, err))
 			return err
 		}
-		if err := api.setVersionState(req.Project, req.Service, req.Version, "SERVING"); err != nil {
+		if err := api.activateVersion(req.Project, req.Service, req.Version); err != nil {
 			return err
 		}
 		api.pushLog(req.Project, "INFO", req.Service, fmt.Sprintf("Version %s deployed successfully", req.Version))
@@ -473,6 +473,68 @@ func (api *API) handleDirectDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(op)
+}
+
+func (api *API) runOperation(name string, work func() error) {
+	api.runOperationWithPauses(name, work, func(time.Duration) {})
+}
+
+func (api *API) runOperationAsync(name string, work func() error) {
+	go api.runOperationWithPauses(name, work, time.Sleep)
+}
+
+func (api *API) runOperationWithPauses(name string, work func() error, pause func(time.Duration)) {
+	pause(800 * time.Millisecond)
+	if !api.advanceOperation(name, 5, orchestrator.StatusRunning) {
+		return
+	}
+	pause(1200 * time.Millisecond)
+	if !api.advanceOperation(name, 25, orchestrator.StatusRunning) {
+		return
+	}
+	pause(500 * time.Millisecond)
+	if err := work(); err != nil {
+		code := http.StatusInternalServerError
+		var coded interface{ OperationCode() int }
+		if errors.As(err, &coded) {
+			code = coded.OperationCode()
+		}
+		api.failOperation(name, code, err.Error())
+		return
+	}
+	if !api.advanceOperation(name, 85, orchestrator.StatusRunning) {
+		return
+	}
+	pause(500 * time.Millisecond)
+	api.advanceOperation(name, 100, orchestrator.StatusDone)
+}
+
+func (api *API) failOperation(name string, code int, message string) {
+	if err := api.opMgr.FailDurable(name, code, message); err != nil {
+		api.degrade(fmt.Errorf("persist failed App Engine operation: %w", err))
+	}
+}
+
+func (api *API) advanceOperation(name string, progress int, status orchestrator.OperationStatus) bool {
+	if err := api.opMgr.AdvanceDurable(name, progress, status); err != nil {
+		api.degrade(fmt.Errorf("persist App Engine operation transition: %w", err))
+		return false
+	}
+	return true
+}
+
+func (api *API) activateVersion(appID, serviceID, versionID string) error {
+	if err := api.setVersionState(appID, serviceID, versionID, "SERVING"); err != nil {
+		if api.svcMgr == nil {
+			return err
+		}
+		identity := appEngineIdentity(appID, serviceID, versionID)
+		if cleanupErr := api.svcMgr.DeleteServerlessVM(identity); cleanupErr != nil {
+			return errors.Join(err, fmt.Errorf("compensate App Engine backend: %w", cleanupErr))
+		}
+		return err
+	}
+	return nil
 }
 
 func (api *API) handleOperations(w http.ResponseWriter, r *http.Request) {

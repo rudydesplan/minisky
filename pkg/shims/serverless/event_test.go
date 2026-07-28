@@ -62,6 +62,16 @@ func TestTriggerMatchesEventTypeAndExactResource(t *testing.T) {
 			want:      true,
 		},
 		{
+			name: "legacy storage trigger matches canonical event",
+			trigger: &EventTrigger{
+				EventType: "google.storage.object.finalize",
+				Resource:  "projects/_/buckets/photos",
+			},
+			eventType: "google.cloud.storage.object.v1.finalized",
+			resource:  "photos",
+			want:      true,
+		},
+		{
 			name: "eventarc trigger name is not source",
 			trigger: &EventTrigger{
 				Trigger: "photos",

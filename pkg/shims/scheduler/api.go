@@ -517,7 +517,7 @@ func (api *API) runJob(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	if !api.startJobExecution(job) {
+	if !api.startJobExecution(job.Name) {
 		schedulerError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Scheduler is shutting down")
 		return
 	}
@@ -599,8 +599,9 @@ func (api *API) scheduleJobLocked(job *Job) error {
 		return nil
 	}
 
+	name := job.Name
 	id, err := api.cron.AddFunc(job.Schedule, func() {
-		api.startJobExecution(job)
+		api.startJobExecution(name)
 	})
 
 	if err != nil {
@@ -613,9 +614,14 @@ func (api *API) scheduleJobLocked(job *Job) error {
 	return nil
 }
 
-func (api *API) startJobExecution(job *Job) bool {
+func (api *API) startJobExecution(name string) bool {
 	api.mu.Lock()
 	if api.closed {
+		api.mu.Unlock()
+		return false
+	}
+	job := cloneJob(api.jobs[name])
+	if job == nil {
 		api.mu.Unlock()
 		return false
 	}
@@ -658,19 +664,13 @@ func (api *API) executeJob(ctx context.Context, job *Job) {
 		err = fmt.Errorf("job has no delivery target")
 	}
 
-	api.mu.Lock()
-	job.LastAttemptTime = startTime.Format(time.RFC3339Nano)
-	job.LastAttemptStatus = statusCode
-	if err != nil {
-		job.Status = &Status{Code: 13, Message: err.Error()}
-		job.LastAttemptError = err.Error()
-	} else {
-		job.Status = &Status{Code: 0, Message: "Success"}
-		job.LastAttemptError = ""
+	recorded, persistErr := api.recordExecutionOutcome(job.Name, startTime, statusCode, err)
+	if persistErr != nil {
+		log.Printf("[Shim: Cloud Scheduler] persist execution metadata: %v", persistErr)
+		return
 	}
-	api.mu.Unlock()
-	if err := api.persistMetadata(); err != nil {
-		log.Printf("[Shim: Cloud Scheduler] persist execution metadata: %v", err)
+	if !recorded {
+		applyExecutionOutcome(job, startTime, statusCode, err)
 	}
 
 	if err != nil {
@@ -678,6 +678,45 @@ func (api *API) executeJob(ctx context.Context, job *Job) {
 	} else {
 		api.pushLog(project, "INFO", job.Name, "Job finished successfully")
 	}
+}
+
+func (api *API) recordExecutionOutcome(
+	name string,
+	startTime time.Time,
+	statusCode int,
+	deliveryErr error,
+) (bool, error) {
+	api.persistMu.Lock()
+	defer api.persistMu.Unlock()
+
+	previous := api.snapshotJobs()
+	next := cloneJobs(previous)
+	job := next[name]
+	if job == nil {
+		return false, nil
+	}
+	applyExecutionOutcome(job, startTime, statusCode, deliveryErr)
+	if err := api.saveJobsTransaction(previous, next); err != nil {
+		return false, err
+	}
+	api.mu.Lock()
+	if api.jobs[name] != nil {
+		api.jobs[name] = cloneJob(job)
+	}
+	api.mu.Unlock()
+	return true, nil
+}
+
+func applyExecutionOutcome(job *Job, startTime time.Time, statusCode int, deliveryErr error) {
+	job.LastAttemptTime = startTime.Format(time.RFC3339Nano)
+	job.LastAttemptStatus = statusCode
+	if deliveryErr != nil {
+		job.Status = &Status{Code: 13, Message: deliveryErr.Error()}
+		job.LastAttemptError = deliveryErr.Error()
+		return
+	}
+	job.Status = &Status{Code: 0, Message: "Success"}
+	job.LastAttemptError = ""
 }
 
 func (api *API) executeHttp(ctx context.Context, target *HttpTarget) (int, error) {

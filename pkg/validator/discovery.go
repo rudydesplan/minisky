@@ -688,8 +688,7 @@ var embeddedRules = []ServiceSchema{
 	// Phase 20
 	{Domain: "alloydb.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/clusters", ContentType: "application/json",
-			RequiredQuery: []string{"clusterId"},
-			RequiredBody:  []BodyField{{Path: "network", Type: "string", Message: "field 'network' is required for clusters.create"}}},
+			RequiredQuery: []string{"clusterId"}},
 	}},
 	{Domain: "identityplatform.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v2/projects/*/tenants", ContentType: "application/json",
@@ -767,15 +766,32 @@ var embeddedRules = []ServiceSchema{
 		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/authorizationPolicies", ContentType: "application/json",
 			RequiredQuery: []string{"authorizationPolicyId"},
 			RequiredBody:  []BodyField{{Path: "name", Type: "string", Message: "field 'name' is required for authorizationPolicies.create"}}},
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/authorizationPolicies:evaluate", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "project", Type: "string", Message: "field 'project' is required for authorizationPolicies.evaluate"},
+				{Path: "location", Type: "string", Message: "field 'location' is required for authorizationPolicies.evaluate"},
+			}},
 	}},
 	{Domain: "accesscontextmanager.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v1/accessPolicies", ContentType: "application/json",
 			RequiredBody: []BodyField{{Path: "title", Type: "string", Message: "field 'title' is required for accessPolicies.create"}}},
+		{HTTPMethod: "POST", PathGlob: "/v1/accessPolicies/*:checkAccess", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "project", Type: "string", Message: "field 'project' is required for accessPolicies.checkAccess"},
+				{Path: "service", Type: "string", Message: "field 'service' is required for accessPolicies.checkAccess"},
+			}},
 	}},
 	{Domain: "networkservices.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/meshes", ContentType: "application/json",
 			RequiredQuery: []string{"meshId"},
 			RequiredBody:  []BodyField{{Path: "name", Type: "string", Message: "field 'name' is required for meshes.create"}}},
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/httpRoutes:resolve", ContentType: "application/json",
+			RequiredBody: []BodyField{
+				{Path: "project", Type: "string", Message: "field 'project' is required for httpRoutes.resolve"},
+				{Path: "location", Type: "string", Message: "field 'location' is required for httpRoutes.resolve"},
+				{Path: "host", Type: "string", Message: "field 'host' is required for httpRoutes.resolve"},
+				{Path: "path", Type: "string", Message: "field 'path' is required for httpRoutes.resolve"},
+			}},
 	}},
 	{Domain: "dialogflow.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "POST", PathGlob: "/v3/projects/*/locations/*/agents", ContentType: "application/json",
@@ -791,6 +807,8 @@ var embeddedRules = []ServiceSchema{
 				{Path: "pemCsr", Type: "string", Message: "field 'pemCsr' is required for certificates.create"},
 				{Path: "lifetime", Type: "string", Message: "field 'lifetime' is required for certificates.create"},
 			}},
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/locations/*/caPools/*/certificates/*:revoke", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "reason", Type: "string", Message: "field 'reason' is required for certificates.revoke"}}},
 	}},
 	{Domain: "binaryauthorization.googleapis.com", Methods: []MethodSchema{
 		{HTTPMethod: "PUT", PathGlob: "/v1/projects/*/policy", ContentType: "application/json",
@@ -798,5 +816,7 @@ var embeddedRules = []ServiceSchema{
 				{Path: "name", Type: "string", Message: "field 'name' is required for policy.update"},
 				{Path: "defaultAdmissionRule", Type: "object", Message: "field 'defaultAdmissionRule' is required for policy.update"},
 			}},
+		{HTTPMethod: "POST", PathGlob: "/v1/projects/*/policy:evaluate", ContentType: "application/json",
+			RequiredBody: []BodyField{{Path: "image", Type: "string", Message: "field 'image' is required for policy.evaluate"}}},
 	}},
 }

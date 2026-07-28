@@ -3,6 +3,8 @@ package language
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -57,6 +59,11 @@ func (api *API) analyze(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
 	if request.Document == nil {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'document' is required")
 		return
@@ -84,6 +91,10 @@ func (api *API) analyze(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(request.Document.Content) > 100_000 {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'document.content' exceeds the 100000-byte local limit")
+		return
+	}
+	if request.EncodingType != "" {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'encodingType' is not implemented")
 		return
 	}
 	writeError(w, 501, "UNIMPLEMENTED", "semantic language analysis is not implemented; no scores or labels were generated")

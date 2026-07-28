@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -86,6 +87,25 @@ func (api *API) persistState() error {
 		TenantConfigs:   tenantConfigSnap,
 		TenantSeq:       tenantSeq,
 	})
+}
+
+func (api *API) reconcileProjectConfig(name string, intended *ProjectConfig) (*ProjectConfig, bool, error) {
+	var metadata identityPlatformMetadata
+	if err := api.stateStore.Load(identityPlatformStateEntry, &metadata); err != nil {
+		if !isNotFound(err) {
+			return nil, false, err
+		}
+		metadata.ProjectConfigs = nil
+	}
+	durable := cloneProjectConfig(metadata.ProjectConfigs[name])
+	api.mu.Lock()
+	if durable == nil {
+		delete(api.projectConfigs, name)
+	} else {
+		api.projectConfigs[name] = cloneProjectConfig(durable)
+	}
+	api.mu.Unlock()
+	return durable, reflect.DeepEqual(durable, intended), nil
 }
 
 func (api *API) loadState() error {

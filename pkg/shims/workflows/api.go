@@ -214,10 +214,13 @@ func (api *API) createWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
-	api.opMgr.RunAsync(op.Name, func() error {
+	go func() {
 		time.Sleep(50 * time.Millisecond)
-		return nil
-	})
+		response := typedResponse("type.googleapis.com/google.cloud.workflows.v1.Workflow", &wf)
+		if err := api.opMgr.FinalizeScopedDurable(op.Name, response, 0, ""); err != nil {
+			log.Printf("[Workflows] finalize create operation: %v", err)
+		}
+	}()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -310,6 +313,11 @@ func (api *API) patchWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "workflow not found: "+name)
 		return
 	}
+	if code, status, err := validateWorkflowUpdateMask(updateMask); err != nil {
+		api.mu.Unlock()
+		writeError(w, code, status, err.Error())
+		return
+	}
 
 	var patch map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
@@ -371,7 +379,7 @@ func (api *API) patchWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
-	response, _ := json.Marshal(&updated)
+	response := typedResponse("type.googleapis.com/google.cloud.workflows.v1.Workflow", &updated)
 	_ = api.opMgr.FinalizeScopedDurable(op.Name, response, 0, "")
 
 	w.WriteHeader(http.StatusOK)
@@ -419,7 +427,8 @@ func (api *API) deleteWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "UNAVAILABLE", "State persistence failed")
 		return
 	}
-	_ = api.opMgr.FinalizeScopedDurable(op.Name, json.RawMessage(`{}`), 0, "")
+	_ = api.opMgr.FinalizeScopedDurable(op.Name,
+		json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`), 0, "")
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
@@ -748,4 +757,38 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 			"details": []any{},
 		},
 	})
+}
+
+func typedResponse(typeURL string, value any) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	var response map[string]any
+	_ = json.Unmarshal(raw, &response)
+	response["@type"] = typeURL
+	raw, _ = json.Marshal(response)
+	return raw
+}
+
+func validateWorkflowUpdateMask(mask string) (int, string, error) {
+	if mask == "" {
+		return 0, "", nil
+	}
+	supported := map[string]bool{
+		"description": true, "labels": true, "serviceAccount": true, "sourceContents": true,
+	}
+	recognizedUnsupported := map[string]bool{
+		"callLogLevel": true, "userEnvVars": true, "cryptoKeyName": true, "deletionProtection": true,
+	}
+	for _, field := range strings.Split(mask, ",") {
+		field = strings.TrimSpace(field)
+		switch {
+		case supported[field]:
+		case recognizedUnsupported[field]:
+			return http.StatusNotImplemented, "UNIMPLEMENTED",
+				fmt.Errorf("workflow field %q is recognized but not implemented", field)
+		default:
+			return http.StatusBadRequest, "INVALID_ARGUMENT",
+				fmt.Errorf("workflow field %q is immutable or unknown", field)
+		}
+	}
+	return 0, "", nil
 }

@@ -3,7 +3,9 @@ package aiplatform
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,7 +20,12 @@ import (
 	"minisky/pkg/state"
 )
 
-const stateEntry = "aiplatform/metadata"
+const (
+	stateEntry          = "aiplatform/metadata"
+	maxIndexes          = 1000
+	maxModels           = 1000
+	maxStoredOperations = 2000
+)
 
 func init() {
 	state.MustRegisterEntryValidator(stateEntry, state.StrictEntryValidator(validateMetadata))
@@ -197,7 +204,8 @@ func (api *API) createIndex(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	if len(index.Metadata) != 0 || index.MetadataSchemaURI != "" || index.IndexUpdateMethod != "" {
-		writeError(w, 501, "UNIMPLEMENTED", "vector index configuration is not implemented")
+		writeError(w, 501, "UNIMPLEMENTED",
+			"fields 'metadata', 'metadataSchemaUri', and 'indexUpdateMethod' are not implemented")
 		return
 	}
 	parent := strings.TrimSuffix(path, "/indexes")
@@ -208,6 +216,11 @@ func (api *API) createIndex(w http.ResponseWriter, r *http.Request, path string)
 	api.mutateMu.Lock()
 	defer api.mutateMu.Unlock()
 	api.mu.Lock()
+	if len(api.indexes) >= maxIndexes || len(api.ops) >= maxStoredOperations {
+		api.mu.Unlock()
+		writeError(w, 429, "RESOURCE_EXHAUSTED", "index or operation state limit reached")
+		return
+	}
 	api.seq++
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	index.Name = fmt.Sprintf("%s/indexes/index-%d", parent, api.seq)
@@ -287,6 +300,11 @@ func (api *API) uploadModel(w http.ResponseWriter, r *http.Request, parent strin
 	api.mutateMu.Lock()
 	defer api.mutateMu.Unlock()
 	api.mu.Lock()
+	if len(api.models) >= maxModels || len(api.ops) >= maxStoredOperations {
+		api.mu.Unlock()
+		writeError(w, 429, "RESOURCE_EXHAUSTED", "model or operation state limit reached")
+		return
+	}
 	api.seq++
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	request.Model.Name = fmt.Sprintf("%s/models/model-%d", parent, api.seq)
@@ -334,15 +352,23 @@ func (api *API) deleteResource(w http.ResponseWriter, name string, index bool) {
 	var previous any
 	if index {
 		previous = api.indexes[name]
-		delete(api.indexes, name)
 	} else {
 		previous = api.models[name]
-		delete(api.models, name)
 	}
 	if previous == nil {
 		api.mu.Unlock()
 		writeError(w, 404, "NOT_FOUND", "resource not found")
 		return
+	}
+	if len(api.ops) >= maxStoredOperations {
+		api.mu.Unlock()
+		writeError(w, 429, "RESOURCE_EXHAUSTED", "operation state limit reached")
+		return
+	}
+	if index {
+		delete(api.indexes, name)
+	} else {
+		delete(api.models, name)
 	}
 	parent := name[:strings.LastIndex(name, "/")]
 	parent = parent[:strings.LastIndex(parent, "/")]
@@ -460,6 +486,15 @@ func (api *API) persist() error {
 }
 
 func validateMetadata(_ state.EntryValidationContext, saved *metadata) error {
+	if len(saved.Indexes) > maxIndexes {
+		return fmt.Errorf("indexes exceed local limit of %d", maxIndexes)
+	}
+	if len(saved.Models) > maxModels {
+		return fmt.Errorf("models exceed local limit of %d", maxModels)
+	}
+	if len(saved.Operations) > maxStoredOperations {
+		return fmt.Errorf("operations exceed local limit of %d", maxStoredOperations)
+	}
 	if err := state.ValidateResourceMaps(*saved); err != nil {
 		return err
 	}
@@ -476,6 +511,11 @@ func decodeBounded(w http.ResponseWriter, r *http.Request, target any) bool {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return false
 	}

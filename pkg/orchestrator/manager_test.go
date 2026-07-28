@@ -3,13 +3,16 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -18,6 +21,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"minisky/pkg/config"
+	"minisky/pkg/state"
 )
 
 func TestWaitUntilHTTPReadyAcceptsAnyHTTPResponse(t *testing.T) {
@@ -26,6 +32,309 @@ func TestWaitUntilHTTPReadyAcceptsAnyHTTPResponse(t *testing.T) {
 
 	if err := waitUntilHTTPReady(server.URL, time.Second); err != nil {
 		t.Fatalf("wait for HTTP response: %v", err)
+	}
+}
+
+func TestWaitUntilRedisReadyRequiresProtocolResponse(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	attempts := make(chan int, 1)
+	go func() {
+		count := 0
+		for count < 2 {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			count++
+			if count == 1 {
+				_ = connection.Close()
+				continue
+			}
+			request := make([]byte, len("*1\r\n$4\r\nPING\r\n"))
+			_, readErr := io.ReadFull(connection, request)
+			if readErr == nil && string(request) == "*1\r\n$4\r\nPING\r\n" {
+				_, _ = connection.Write([]byte("+PONG\r\n"))
+			}
+			_ = connection.Close()
+		}
+		attempts <- count
+	}()
+
+	if err := waitUntilRedisReady(context.Background(), listener.Addr().String(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if count := <-attempts; count != 2 {
+		t.Fatalf("connection attempts = %d, want 2", count)
+	}
+}
+
+func TestWaitUntilRedisReadyHonorsContextCancellation(t *testing.T) {
+	contextCanceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	err := waitUntilRedisReady(contextCanceled, "127.0.0.1:1", time.Minute)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancellation took %v", elapsed)
+	}
+}
+
+func TestWaitUntilPostgresReadyRequiresProtocolReadyMessage(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	attempts := make(chan int, 1)
+	go func() {
+		for count := 1; count <= 2; count++ {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			var length uint32
+			if err := binary.Read(connection, binary.BigEndian, &length); err == nil && length >= 8 {
+				request := make([]byte, length-4)
+				_, _ = io.ReadFull(connection, request)
+			}
+			if count == 1 {
+				_, _ = connection.Write([]byte{'E', 0, 0, 0, 5, 0})
+			} else {
+				_, _ = connection.Write([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 0})
+				_, _ = connection.Write([]byte{'Z', 0, 0, 0, 5, 'I'})
+			}
+			_ = connection.Close()
+			if count == 2 {
+				attempts <- count
+			}
+		}
+	}()
+	if err := waitUntilPostgresReady(context.Background(), listener.Addr().String(), 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-attempts; got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestAlloyDBLabelsContainCompleteImmutableIdentity(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "alloy-profile")
+	identity := AlloyDBIdentity{Project: "p", Location: "l", Cluster: "c", Instance: "i"}
+	labels := alloyDBLabels(identity)
+	want := map[string]string{
+		"managed-by":       "minisky",
+		"minisky.profile":  "alloy-profile",
+		"minisky.service":  "alloydb",
+		"minisky.project":  "p",
+		"minisky.location": "l",
+		"minisky.cluster":  "c",
+		"minisky.instance": "i",
+	}
+	if !exactLabels(labels, want) {
+		t.Fatalf("labels = %#v, want %#v", labels, want)
+	}
+}
+
+func TestAlloyDBEndpointUsesDynamicLoopbackPortWithoutURLScheme(t *testing.T) {
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return dockerResponse(http.StatusOK,
+			`{"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}}}`), nil
+	})}}
+	endpoint, err := manager.alloyDBEndpoint(context.Background(), "owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "127.0.0.1:49152" {
+		t.Fatalf("endpoint = %q", endpoint)
+	}
+	if alloyDBPostgresImage != "postgres:15.8-bookworm" {
+		t.Fatalf("AlloyDB image is not pinned: %q", alloyDBPostgresImage)
+	}
+}
+
+func TestDeleteAlloyDBRefusesAmbiguousOwnershipBeforeMutation(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "active")
+	identity := AlloyDBIdentity{Project: "p", Location: "l", Cluster: "c", Instance: "i"}
+	mutated := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			mutated = true
+		}
+		return dockerResponse(http.StatusOK,
+			`{"State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"active","minisky.service":"alloydb","minisky.project":"p","minisky.location":"l","minisky.cluster":"other","minisky.instance":"i"}}}`), nil
+	})}}
+	if err := manager.DeleteAlloyDB(context.Background(), identity); err == nil {
+		t.Fatal("ambiguous ownership deletion succeeded")
+	}
+	if mutated {
+		t.Fatal("ambiguous ownership reached Docker mutation")
+	}
+}
+
+func TestWaitBuildContainerReturnsOwnedExitCodeAndBoundedLogs(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-wait")
+	const resource = "projects/demo/builds/build-1"
+	labels := `{"managed-by":"minisky","minisky.profile":"build-wait","minisky.service":"cloudbuild","minisky.resource":"` + resource + `"}`
+	logs := dockerLogFrame(1, "stdout\n") + dockerLogFrame(2, "stderr\n")
+	var requests []string
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests = append(requests, request.Method+" "+request.URL.Path)
+		switch request.Method + " " + request.URL.Path {
+		case "GET /containers/build-step/json":
+			return dockerResponse(http.StatusOK,
+				`{"Id":"container-id","State":{"Status":"running","Running":true},"Config":{"Labels":`+labels+`}}`), nil
+		case "POST /containers/container-id/wait":
+			return dockerResponse(http.StatusOK, `{"StatusCode":0}`), nil
+		case "GET /containers/container-id/json":
+			return dockerResponse(http.StatusOK,
+				`{"Id":"container-id","State":{"Status":"exited","Running":false,"ExitCode":0},"Config":{"Labels":`+labels+`}}`), nil
+		case "GET /containers/container-id/logs":
+			return dockerResponse(http.StatusOK, logs), nil
+		default:
+			return nil, fmt.Errorf("unexpected Docker request %s %s", request.Method, request.URL.String())
+		}
+	})}}
+
+	result, err := manager.WaitBuildContainer(context.Background(), "build-step", resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 || result.Logs != "stdout\nstderr\n" {
+		t.Fatalf("result = %#v", result)
+	}
+	want := []string{
+		"GET /containers/build-step/json",
+		"POST /containers/container-id/wait",
+		"GET /containers/container-id/json",
+		"GET /containers/container-id/logs",
+	}
+	if !slices.Equal(requests, want) {
+		t.Fatalf("Docker requests = %#v, want %#v", requests, want)
+	}
+}
+
+func TestWaitBuildContainerCancellationCleansOnlyExactOwnedContainer(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-cancel")
+	const resource = "projects/demo/builds/build-2"
+	labels := `{"managed-by":"minisky","minisky.profile":"build-cancel","minisky.service":"cloudbuild","minisky.resource":"` + resource + `"}`
+	var removed atomic.Bool
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.Method + " " + request.URL.Path {
+		case "GET /containers/build-step/json":
+			return dockerResponse(http.StatusOK,
+				`{"Id":"container-id","State":{"Status":"running","Running":true},"Config":{"Labels":`+labels+`}}`), nil
+		case "POST /containers/container-id/wait":
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		case "POST /containers/build-step/stop":
+			return dockerResponse(http.StatusNoContent, ""), nil
+		case "DELETE /containers/build-step":
+			removed.Store(true)
+			return dockerResponse(http.StatusNoContent, ""), nil
+		default:
+			return nil, fmt.Errorf("unexpected Docker request %s %s", request.Method, request.URL.String())
+		}
+	})}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := manager.WaitBuildContainer(ctx, "build-step", resource)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline exceeded", err)
+	}
+	if !removed.Load() {
+		t.Fatal("canceled build container was not removed")
+	}
+}
+
+func TestWaitBuildContainerCancellationRefusesReplacementOwnership(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-replaced")
+	const resource = "projects/demo/builds/build-replaced"
+	var inspects atomic.Int32
+	var destructive atomic.Bool
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.Method + " " + request.URL.Path {
+		case "GET /containers/build-step/json":
+			if inspects.Add(1) == 1 {
+				return dockerResponse(http.StatusOK,
+					`{"Id":"original-id","State":{"Status":"running","Running":true},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"build-replaced","minisky.service":"cloudbuild","minisky.resource":"`+resource+`"}}}`), nil
+			}
+			return dockerResponse(http.StatusOK,
+				`{"Id":"replacement-id","State":{"Status":"running","Running":true},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"cloudbuild","minisky.resource":"`+resource+`"}}}`), nil
+		case "POST /containers/original-id/wait":
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		default:
+			if request.Method == http.MethodPost || request.Method == http.MethodDelete {
+				destructive.Store(true)
+			}
+			return nil, fmt.Errorf("unexpected Docker request %s %s", request.Method, request.URL.String())
+		}
+	})}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := manager.WaitBuildContainer(ctx, "build-step", resource)
+	if !errors.Is(err, context.DeadlineExceeded) ||
+		!errors.Is(err, ErrDockerOwnershipConflict) {
+		t.Fatalf("error = %v, want deadline and ownership conflict", err)
+	}
+	if destructive.Load() {
+		t.Fatal("replacement container reached destructive cleanup")
+	}
+}
+
+func TestWaitBuildContainerRefusesUnownedContainerWithoutMutation(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-owner")
+	var mutated atomic.Bool
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			mutated.Store(true)
+		}
+		return dockerResponse(http.StatusOK,
+			`{"Id":"container-id","State":{"Status":"running","Running":true},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"cloudbuild","minisky.resource":"projects/demo/builds/build-3"}}}`), nil
+	})}}
+
+	_, err := manager.WaitBuildContainer(
+		context.Background(), "build-step", "projects/demo/builds/build-3")
+	if !errors.Is(err, ErrDockerOwnershipConflict) {
+		t.Fatalf("error = %v, want ownership conflict", err)
+	}
+	if mutated.Load() {
+		t.Fatal("unowned build container reached Docker mutation")
+	}
+}
+
+func TestWaitBuildContainerDoesNotTreatCreatedAsSuccessfulExit(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "build-created")
+	const resource = "projects/demo/builds/build-4"
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return dockerResponse(http.StatusOK,
+			`{"Id":"container-id","State":{"Status":"created","Running":false,"ExitCode":0},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"build-created","minisky.service":"cloudbuild","minisky.resource":"`+resource+`"}}}`), nil
+	})}}
+
+	result, err := manager.WaitBuildContainer(context.Background(), "build-step", resource)
+	if err == nil || result.ExitCode != 0 || !strings.Contains(err.Error(), "not terminal") {
+		t.Fatalf("result=%#v error=%v", result, err)
+	}
+}
+
+func TestReadDockerLogStreamBoundsOutput(t *testing.T) {
+	payload := strings.Repeat("x", maxBuildLogBytes+128)
+	logs, truncated, err := readDockerLogStream(
+		strings.NewReader(dockerLogFrame(1, payload)), maxBuildLogBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != maxBuildLogBytes || !truncated {
+		t.Fatalf("log bytes=%d truncated=%t", len(logs), truncated)
 	}
 }
 
@@ -173,6 +482,11 @@ func TestCleanupProfileSweepsOnlyExactOwnedDockerResources(t *testing.T) {
 			}
 			return dockerResponse(http.StatusOK, `{"VolumesDeleted":["redis","sql"]}`), nil
 		case request.Method == http.MethodDelete:
+			if strings.HasPrefix(request.URL.Path, "/containers/") {
+				if request.URL.Query().Get("force") != "true" || request.URL.Query().Get("v") != "true" {
+					t.Fatalf("container deletion did not remove anonymous volumes: %s", request.URL.RawQuery)
+				}
+			}
 			deleted = append(deleted, request.URL.Path)
 			return dockerResponse(http.StatusNoContent, ""), nil
 		default:
@@ -274,10 +588,25 @@ func TestTeardownClosesBodiesAndJoinsDockerStatusFailures(t *testing.T) {
 
 func TestTeardownDeletesCapturedContainerAndNetworkIDs(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "teardown")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
 	var mutations []string
 	manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
 	manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch {
+		case request.Method == http.MethodGet &&
+			(strings.Contains(request.URL.Path, "minisky-storage-") ||
+				strings.Contains(request.URL.Path, "minisky-pubsub-")):
+			domain := "storage.googleapis.com"
+			service := "storage"
+			if strings.Contains(request.URL.Path, "minisky-pubsub-") {
+				domain = "pubsub.googleapis.com"
+				service = "pubsub"
+			}
+			labels, _ := json.Marshal(durableEmulatorLabels(domain))
+			source := filepath.Join(config.GetRuntimeDir(), service)
+			return dockerResponse(http.StatusOK,
+				`{"Id":"container/id","State":{"Status":"running"},"Config":{"Labels":`+string(labels)+`},`+
+					`"Mounts":[{"Type":"bind","Source":`+fmt.Sprintf("%q", source)+`,"Destination":"/data","RW":true}]}`), nil
 		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/containers/"):
 			return dockerResponse(http.StatusOK,
 				`{"Id":"container/id","State":{"Status":"running"},"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"teardown"}}}`), nil
@@ -386,7 +715,7 @@ func TestEmulatorVolumesUseProfileScopedRuntimePaths(t *testing.T) {
 	t.Setenv("MINISKY_STATE_DIR", root)
 	t.Setenv("MINISKY_PROFILE", "restart")
 
-	for _, service := range []string{"datastore", "firestore"} {
+	for _, service := range []string{"datastore", "firestore", "storage", "pubsub"} {
 		got, err := resolveEmulatorVolume(service+".googleapis.com", "./data/"+service+":/data")
 		if err != nil {
 			t.Fatal(err)
@@ -395,6 +724,441 @@ func TestEmulatorVolumesUseProfileScopedRuntimePaths(t *testing.T) {
 		if got != want {
 			t.Fatalf("%s volume = %q, want %q", service, got, want)
 		}
+	}
+}
+
+func TestDurableEmulatorConfigScopesIdentityDataAndCommands(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "team-a")
+
+	tests := []struct {
+		domain  string
+		base    config.EmulatorConfig
+		service string
+		wantArg string
+	}{
+		{
+			domain: "storage.googleapis.com",
+			base: config.EmulatorConfig{
+				Name: "minisky-gcs", Image: "storage@sha256:test", Port: "4443/tcp",
+				Cmd: []string{"-scheme", "http"},
+			},
+			service: "storage",
+			wantArg: "-filesystem-root",
+		},
+		{
+			domain: "pubsub.googleapis.com",
+			base: config.EmulatorConfig{
+				Name: "minisky-pubsub", Image: "pubsub@sha256:test", Port: "8085/tcp",
+				Cmd: []string{"gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085"},
+			},
+			service: "pubsub",
+			wantArg: "--data-dir",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.service, func(t *testing.T) {
+			first, labels, err := durableEmulatorConfig(test.domain, test.base, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.Name == test.base.Name || !strings.HasPrefix(first.Name, "minisky-"+test.service+"-") {
+				t.Fatalf("profile container name = %q", first.Name)
+			}
+			if first.Volume != filepath.Join(root, "profiles", "team-a", "runtime", test.service)+":/data" {
+				t.Fatalf("profile volume = %q", first.Volume)
+			}
+			if !exactLabels(labels, map[string]string{
+				"managed-by":      "minisky",
+				"minisky.profile": "team-a",
+				"minisky.service": test.domain,
+			}) {
+				t.Fatalf("labels = %#v", labels)
+			}
+			if !slices.Contains(first.Cmd, test.wantArg+"=/data") {
+				t.Fatalf("command = %#v, missing %q", first.Cmd, test.wantArg)
+			}
+
+			t.Setenv("MINISKY_PROFILE", "team-b")
+			second, _, err := durableEmulatorConfig(test.domain, test.base, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Name == first.Name || second.Volume == first.Volume {
+				t.Fatalf("profiles share runtime identity: %#v %#v", first, second)
+			}
+			t.Setenv("MINISKY_PROFILE", "team-a")
+		})
+	}
+}
+
+func TestDurableEmulatorConfigRejectsAmbiguousPersistenceFlags(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "emulator-flags")
+	tests := []struct {
+		domain string
+		cmd    []string
+	}{
+		{domain: "storage.googleapis.com", cmd: []string{"-backend", "memory"}},
+		{domain: "storage.googleapis.com", cmd: []string{"-filesystem-root=/shared"}},
+		{domain: "pubsub.googleapis.com", cmd: []string{"--data-dir", "/shared"}},
+	}
+	for _, test := range tests {
+		t.Run(test.domain+"/"+strings.Join(test.cmd, "_"), func(t *testing.T) {
+			_, _, err := durableEmulatorConfig(test.domain,
+				config.EmulatorConfig{Name: "global", Image: "image", Port: "8085/tcp", Cmd: test.cmd}, nil)
+			if !errors.Is(err, ErrDockerConfiguration) {
+				t.Fatalf("configuration error = %v, want Docker configuration failure", err)
+			}
+		})
+	}
+}
+
+func TestEnsureDurableEmulatorCreatesOnceAndReconcilesExactMount(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "emulator-create")
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	port := strings.TrimPrefix(upstream.URL, "http://127.0.0.1:")
+	base := config.EmulatorConfig{
+		Name: "global", Image: "example/storage@sha256:test", Port: "4443/tcp",
+		Cmd: []string{"-scheme", "http"},
+	}
+	expected, labels, err := durableEmulatorConfig("storage.googleapis.com", base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLabels, _ := json.Marshal(labels)
+	created := false
+	createCalls := 0
+	startCalls := 0
+	var createPayload struct {
+		Cmd        []string          `json:"Cmd"`
+		Labels     map[string]string `json:"Labels"`
+		HostConfig struct {
+			NetworkMode string   `json:"NetworkMode"`
+			Binds       []string `json:"Binds"`
+		} `json:"HostConfig"`
+	}
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/containers/"+expected.Name+"/json":
+			if !created {
+				return dockerResponse(http.StatusNotFound, `{}`), nil
+			}
+			return dockerResponse(http.StatusOK, `{
+				"State":{"Status":"running"},
+				"Config":{"Labels":`+string(encodedLabels)+`},
+				"Mounts":[{"Type":"bind","Source":`+fmt.Sprintf("%q", strings.TrimSuffix(expected.Volume, ":/data"))+`,"Destination":"/data","RW":true}],
+				"NetworkSettings":{"Ports":{"4443/tcp":[{"HostIp":"127.0.0.1","HostPort":"`+port+`"}]}}
+			}`), nil
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/images/"):
+			return dockerResponse(http.StatusOK, `{}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/containers/create":
+			createCalls++
+			created = true
+			if request.URL.Query().Get("name") != expected.Name {
+				t.Fatalf("create name = %q, want %q", request.URL.Query().Get("name"), expected.Name)
+			}
+			if err := json.NewDecoder(request.Body).Decode(&createPayload); err != nil {
+				t.Fatal(err)
+			}
+			return dockerResponse(http.StatusCreated, `{}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/containers/"+expected.Name+"/start":
+			startCalls++
+			return dockerResponse(http.StatusNoContent, `{}`), nil
+		default:
+			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}}
+
+	for i := 0; i < 2; i++ {
+		got, err := manager.ensureDurableEmulatorRunning(
+			context.Background(), "storage.googleapis.com", base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != upstream.URL {
+			t.Fatalf("endpoint = %q, want %q", got, upstream.URL)
+		}
+	}
+	if createCalls != 1 || startCalls != 1 {
+		t.Fatalf("create calls=%d start calls=%d, want one each", createCalls, startCalls)
+	}
+	if !exactLabels(createPayload.Labels, labels) ||
+		createPayload.HostConfig.NetworkMode != "bridge" ||
+		!reflect.DeepEqual(createPayload.HostConfig.Binds, []string{expected.Volume}) {
+		t.Fatalf("create payload = %#v", createPayload)
+	}
+}
+
+func TestEnsureDurableEmulatorAllowsVendorLabelsButRejectsOwnershipAndMountMismatch(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "emulator-owner")
+	base := config.EmulatorConfig{Name: "global", Image: "image", Port: "4443/tcp"}
+	expected, labels, err := durableEmulatorConfig("storage.googleapis.com", base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLabels, _ := json.Marshal(labels)
+	source := strings.TrimSuffix(expected.Volume, ":/data")
+
+	tests := []struct {
+		name      string
+		labels    string
+		source    string
+		wantError bool
+	}{
+		{
+			name:   "unrelated OCI label is allowed",
+			labels: strings.TrimSuffix(string(encodedLabels), "}") + `,"org.opencontainers.image.version":"1.52.3"}`,
+			source: source,
+		},
+		{
+			name:      "missing manager",
+			labels:    `{"minisky.profile":"emulator-owner","minisky.service":"storage.googleapis.com"}`,
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "mismatched manager",
+			labels:    strings.Replace(string(encodedLabels), `"managed-by":"minisky"`, `"managed-by":"other"`, 1),
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "missing profile",
+			labels:    `{"managed-by":"minisky","minisky.service":"storage.googleapis.com"}`,
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "mismatched profile",
+			labels:    strings.Replace(string(encodedLabels), "emulator-owner", "other", 1),
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "missing service",
+			labels:    `{"managed-by":"minisky","minisky.profile":"emulator-owner"}`,
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "mismatched service",
+			labels:    strings.Replace(string(encodedLabels), "storage.googleapis.com", "pubsub.googleapis.com", 1),
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "conflicting MiniSky prefix",
+			labels:    strings.TrimSuffix(string(encodedLabels), "}") + `,"minisky.profile.shadow":"other"}`,
+			source:    source,
+			wantError: true,
+		},
+		{
+			name:      "other mount",
+			labels:    string(encodedLabels),
+			source:    filepath.Join(root, "shared"),
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutated := false
+			manager := &ServiceManager{
+				emulatorReady: func(string, time.Duration) error { return nil },
+				dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					if request.Method != http.MethodGet {
+						mutated = true
+					}
+					return dockerResponse(http.StatusOK, `{
+						"State":{"Status":"running"},
+						"Config":{"Labels":`+test.labels+`},
+						"Mounts":[{"Type":"bind","Source":`+fmt.Sprintf("%q", test.source)+`,"Destination":"/data","RW":true}],
+						"NetworkSettings":{"Ports":{"4443/tcp":[{"HostIp":"127.0.0.1","HostPort":"49154"}]}}
+					}`), nil
+				})},
+			}
+			_, err := manager.ensureDurableEmulatorRunning(
+				context.Background(), "storage.googleapis.com", base)
+			if (err != nil) != test.wantError {
+				t.Fatalf("ensure error = %v, wantError=%t", err, test.wantError)
+			}
+			if mutated {
+				t.Fatal("ambiguous emulator reached Docker mutation")
+			}
+		})
+	}
+}
+
+func TestEnsureDurableEmulatorFailsClosedOnReadiness(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "emulator-readiness")
+	base := config.EmulatorConfig{Name: "global", Image: "image", Port: "4443/tcp"}
+	expected, labels, err := durableEmulatorConfig("storage.googleapis.com", base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLabels, _ := json.Marshal(labels)
+	source := strings.TrimSuffix(expected.Volume, ":/data")
+	manager := &ServiceManager{
+		emulatorReady: func(string, time.Duration) error {
+			return errors.New("protocol unavailable")
+		},
+		dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet {
+				t.Fatalf("readiness failure reached mutation %s %s", request.Method, request.URL)
+			}
+			return dockerResponse(http.StatusOK, `{
+				"Id":"immutable",
+				"State":{"Status":"running"},
+				"Config":{"Labels":`+string(encodedLabels)+`},
+				"Mounts":[{"Type":"bind","Source":`+fmt.Sprintf("%q", source)+`,"Destination":"/data","RW":true}],
+				"NetworkSettings":{"Ports":{"4443/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}}
+			}`), nil
+		})},
+	}
+	if _, err := manager.ensureDurableEmulatorRunning(
+		context.Background(), "storage.googleapis.com", base); err == nil ||
+		!strings.Contains(err.Error(), "readiness") {
+		t.Fatalf("readiness error = %v", err)
+	}
+}
+
+func TestEnsureDurableEmulatorRestartsExistingExactOwnedContainer(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "emulator-reconcile")
+	base := config.EmulatorConfig{Name: "global", Image: "image", Port: "8085/tcp"}
+	expected, labels, err := durableEmulatorConfig("pubsub.googleapis.com", base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLabels, _ := json.Marshal(labels)
+	source := strings.TrimSuffix(expected.Volume, ":/data")
+	running := false
+	starts := 0
+	manager := &ServiceManager{
+		emulatorReady: func(string, time.Duration) error { return nil },
+		dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			switch {
+			case request.Method == http.MethodGet:
+				status := "exited"
+				if running {
+					status = "running"
+				}
+				return dockerResponse(http.StatusOK, `{
+					"Id":"existing",
+					"State":{"Status":"`+status+`"},
+					"Config":{"Labels":`+string(encodedLabels)+`},
+					"Mounts":[{"Type":"bind","Source":`+fmt.Sprintf("%q", source)+`,"Destination":"/data","RW":true}],
+					"NetworkSettings":{"Ports":{"8085/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}}
+				}`), nil
+			case request.Method == http.MethodPost &&
+				request.URL.Path == "/containers/"+expected.Name+"/start":
+				starts++
+				running = true
+				return dockerResponse(http.StatusNoContent, ""), nil
+			default:
+				t.Fatalf("existing emulator reconciliation mutated Docker via %s %s", request.Method, request.URL)
+				return nil, nil
+			}
+		})},
+	}
+	endpoint, err := manager.ensureDurableEmulatorRunning(
+		context.Background(), "pubsub.googleapis.com", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "http://127.0.0.1:49153" || starts != 1 {
+		t.Fatalf("endpoint=%q starts=%d", endpoint, starts)
+	}
+}
+
+func TestRemoveDurableEmulatorRequiresExactOwnershipBeforeCleanup(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "emulator-cleanup")
+	mutated := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			mutated = true
+		}
+		return dockerResponse(http.StatusOK, `{
+			"Id":"foreign",
+			"State":{"Status":"running"},
+			"Config":{"Labels":{"managed-by":"minisky","minisky.profile":"other","minisky.service":"pubsub.googleapis.com"}},
+			"Mounts":[{"Type":"bind","Source":"/tmp/other","Destination":"/data","RW":true}]
+		}`), nil
+	})}}
+	err := manager.removeDurableEmulatorContainer(context.Background(), "pubsub.googleapis.com",
+		config.EmulatorConfig{Name: "global", Image: "image", Port: "8085/tcp"})
+	if !errors.Is(err, ErrDockerOwnershipConflict) {
+		t.Fatalf("cleanup error = %v, want ownership conflict", err)
+	}
+	if mutated {
+		t.Fatal("ownership mismatch reached destructive cleanup")
+	}
+}
+
+func TestDurableEmulatorMountCreationFailurePrecedesDocker(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MINISKY_STATE_DIR", blocker)
+	t.Setenv("MINISKY_PROFILE", "emulator-mount")
+	dockerCalled := false
+	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		dockerCalled = true
+		return dockerResponse(http.StatusOK, `{}`), nil
+	})}}
+	_, err := manager.ensureDurableEmulatorRunning(context.Background(), "pubsub.googleapis.com",
+		config.EmulatorConfig{Name: "global", Image: "image", Port: "8085/tcp"})
+	if err == nil {
+		t.Fatal("mount creation failure was ignored")
+	}
+	if dockerCalled {
+		t.Fatal("mount creation failure reached Docker")
+	}
+}
+
+func TestDurableEmulatorRuntimeDataIsExcludedFromMetadataExport(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "emulator-export")
+	emulator, _, err := durableEmulatorConfig("storage.googleapis.com",
+		config.EmulatorConfig{Name: "global", Image: "image", Port: "4443/tcp"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := strings.TrimSuffix(emulator.Volume, ":/data")
+	if err := os.WriteFile(filepath.Join(runtimeDir, "object-data"),
+		[]byte("docker-only-object-payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.New(root, "emulator-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("test/metadata", map[string]string{"kind": "portable-marker"}); err != nil {
+		t.Fatal(err)
+	}
+	var exported bytes.Buffer
+	if err := store.Export(&exported); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(exported.String(), "portable-marker") {
+		t.Fatalf("metadata missing from export: %s", exported.String())
+	}
+	if strings.Contains(exported.String(), "docker-only-object-payload") {
+		t.Fatalf("runtime emulator data leaked into metadata export: %s", exported.String())
 	}
 }
 
@@ -1179,4 +1943,12 @@ func dockerResponse(code int, body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewBufferString(body)),
 	}
+}
+
+func dockerLogFrame(stream byte, payload string) string {
+	frame := make([]byte, 8+len(payload))
+	frame[0] = stream
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(payload)))
+	copy(frame[8:], payload)
+	return string(frame)
 }

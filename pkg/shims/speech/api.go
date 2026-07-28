@@ -4,6 +4,8 @@ package speech
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -56,8 +58,22 @@ func (api *API) recognize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
 	if request.Config == nil || request.Config.LanguageCode == "" {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'config.languageCode' is required")
+		return
+	}
+	if request.Config.Model != "" {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'config.model' is not implemented")
+		return
+	}
+	if request.Config.Encoding != "" || request.Config.SampleRateHertz != 0 {
+		writeError(w, 501, "UNIMPLEMENTED",
+			"fields 'config.encoding' and 'config.sampleRateHertz' are not implemented")
 		return
 	}
 	if request.Audio == nil {

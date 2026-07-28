@@ -3,7 +3,9 @@ package dialogflowcx
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,7 +18,10 @@ import (
 	"minisky/pkg/state"
 )
 
-const stateEntry = "dialogflowcx/metadata"
+const (
+	stateEntry = "dialogflowcx/metadata"
+	maxAgents  = 1000
+)
 
 func init() {
 	state.MustRegisterEntryValidator(stateEntry, state.StrictEntryValidator(validateMetadata))
@@ -116,6 +121,10 @@ func (api *API) createAgent(w http.ResponseWriter, r *http.Request, path string)
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
+	if !dialogJSONEOF(decoder) {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
 	if agent.Name != "" {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'name' is output only")
 		return
@@ -140,6 +149,11 @@ func (api *API) createAgent(w http.ResponseWriter, r *http.Request, path string)
 	api.mutateMu.Lock()
 	defer api.mutateMu.Unlock()
 	api.mu.Lock()
+	if len(api.agents) >= maxAgents {
+		api.mu.Unlock()
+		writeError(w, 429, "RESOURCE_EXHAUSTED", "agent state limit reached")
+		return
+	}
 	api.seq++
 	agent.Name = fmt.Sprintf("%s/agents/agent-%d", parent, api.seq)
 	agent.CreateTime = time.Now().UTC().Format(time.RFC3339Nano)
@@ -252,17 +266,47 @@ func (api *API) detectIntent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
 		return
 	}
+	if !dialogJSONEOF(decoder) {
+		writeError(w, 400, "INVALID_ARGUMENT", "invalid request body")
+		return
+	}
 	if body.QueryInput == nil || body.QueryInput.LanguageCode == "" {
 		writeError(w, 400, "INVALID_ARGUMENT", "field 'queryInput.languageCode' is required")
 		return
 	}
-	if body.QueryInput.Text == nil || body.QueryInput.Text.Text == "" {
-		if len(body.QueryInput.Audio) != 0 || len(body.QueryInput.Event) != 0 ||
-			len(body.QueryInput.Intent) != 0 || len(body.QueryInput.Dtmf) != 0 {
-			writeError(w, 501, "UNIMPLEMENTED", "non-text query input is not implemented")
-		} else {
-			writeError(w, 400, "INVALID_ARGUMENT", "field 'queryInput' must contain an input modality")
+	modalities := 0
+	if body.QueryInput.Text != nil {
+		modalities++
+	}
+	for _, raw := range []json.RawMessage{
+		body.QueryInput.Audio, body.QueryInput.Event, body.QueryInput.Intent, body.QueryInput.Dtmf,
+	} {
+		if len(raw) != 0 {
+			modalities++
 		}
+	}
+	if modalities != 1 {
+		writeError(w, 400, "INVALID_ARGUMENT", "field 'queryInput' must contain exactly one input modality")
+		return
+	}
+	if len(body.QueryInput.Audio) != 0 {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'queryInput.audio' is not implemented")
+		return
+	}
+	if len(body.QueryInput.Event) != 0 {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'queryInput.event' is not implemented")
+		return
+	}
+	if len(body.QueryInput.Intent) != 0 {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'queryInput.intent' is not implemented")
+		return
+	}
+	if len(body.QueryInput.Dtmf) != 0 {
+		writeError(w, 501, "UNIMPLEMENTED", "field 'queryInput.dtmf' is not implemented")
+		return
+	}
+	if body.QueryInput.Text.Text == "" {
+		writeError(w, 400, "INVALID_ARGUMENT", "field 'queryInput.text.text' is required")
 		return
 	}
 	if len(body.QueryInput.Text.Text) > 4096 {
@@ -286,6 +330,9 @@ func (api *API) persist() error {
 }
 
 func validateMetadata(_ state.EntryValidationContext, saved *metadata) error {
+	if len(saved.Agents) > maxAgents {
+		return fmt.Errorf("agents exceed local limit of %d", maxAgents)
+	}
 	return state.ValidateResourceMaps(*saved)
 }
 
@@ -302,6 +349,11 @@ func clone(agent *Agent) *Agent {
 	var result Agent
 	_ = json.Unmarshal(raw, &result)
 	return &result
+}
+
+func dialogJSONEOF(decoder *json.Decoder) bool {
+	var trailing any
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

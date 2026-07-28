@@ -2,7 +2,9 @@ package alloydb
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,8 +12,32 @@ import (
 	"sync"
 	"testing"
 
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
 )
+
+type fakeBackend struct {
+	endpoint       string
+	exists         bool
+	provisionCalls int
+	deleteCalls    int
+	provisionErr   error
+	deleteErr      error
+}
+
+func (backend *fakeBackend) Provision(context.Context, orchestrator.AlloyDBIdentity) (string, bool, error) {
+	backend.provisionCalls++
+	return backend.endpoint, true, backend.provisionErr
+}
+
+func (backend *fakeBackend) Reconcile(context.Context, orchestrator.AlloyDBIdentity) (string, bool, error) {
+	return backend.endpoint, backend.exists, backend.provisionErr
+}
+
+func (backend *fakeBackend) Delete(context.Context, orchestrator.AlloyDBIdentity) error {
+	backend.deleteCalls++
+	return backend.deleteErr
+}
 
 func TestCreateCluster(t *testing.T) {
 	api := newTestAPI()
@@ -46,6 +72,146 @@ func TestCreateInstanceIsCanonicalUnsupportedBeforeMutation(t *testing.T) {
 	api.mu.RUnlock()
 	if count != 0 {
 		t.Fatalf("cluster state mutated: %d entries", count)
+	}
+}
+
+func TestClusterToPrimaryInstanceLifecycleUsesBackend(t *testing.T) {
+	backend := &fakeBackend{endpoint: "127.0.0.1:49152", exists: true}
+	api := newTestAPI()
+	api.backend = backend
+
+	clusterRequest := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/clusters?clusterId=c1",
+		bytes.NewBufferString(`{"networkConfig":{"network":"projects/test/global/networks/default"},"databaseVersion":"POSTGRES_15"}`))
+	clusterResponse := httptest.NewRecorder()
+	api.ServeHTTP(clusterResponse, clusterRequest)
+	if clusterResponse.Code != http.StatusOK {
+		t.Fatalf("create cluster = %d: %s", clusterResponse.Code, clusterResponse.Body.String())
+	}
+	cluster := api.clusters["projects/test/locations/us-central1/clusters/c1"]
+	if cluster.NetworkConfig == nil || cluster.NetworkConfig.Network == "" || cluster.ClusterType != "PRIMARY" {
+		t.Fatalf("provider-shaped cluster defaults = %#v", cluster)
+	}
+
+	instanceRequest := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/clusters/c1/instances?instanceId=primary",
+		bytes.NewBufferString(`{"instanceType":"PRIMARY","displayName":"Primary"}`))
+	instanceResponse := httptest.NewRecorder()
+	api.ServeHTTP(instanceResponse, instanceRequest)
+	if instanceResponse.Code != http.StatusOK {
+		t.Fatalf("create instance = %d: %s", instanceResponse.Code, instanceResponse.Body.String())
+	}
+	if backend.provisionCalls != 1 {
+		t.Fatalf("provision calls = %d, want 1", backend.provisionCalls)
+	}
+
+	getRequest := httptest.NewRequest(http.MethodGet,
+		"/v1/projects/test/locations/us-central1/clusters/c1/instances/primary", nil)
+	getResponse := httptest.NewRecorder()
+	api.ServeHTTP(getResponse, getRequest)
+	var instance Instance
+	if err := json.Unmarshal(getResponse.Body.Bytes(), &instance); err != nil {
+		t.Fatal(err)
+	}
+	if instance.State != "READY" || instance.IPAddress != "127.0.0.1" || instance.PublicIPAddress != "" {
+		t.Fatalf("instance endpoint fields = %#v", instance)
+	}
+	if strings.Contains(getResponse.Body.String(), "49152") {
+		t.Fatalf("ephemeral Docker port leaked into AlloyDB resource: %s", getResponse.Body.String())
+	}
+
+	deleteRequest := httptest.NewRequest(http.MethodDelete,
+		"/v1/projects/test/locations/us-central1/clusters/c1/instances/primary", nil)
+	deleteResponse := httptest.NewRecorder()
+	api.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusOK || backend.deleteCalls != 1 {
+		t.Fatalf("delete = %d calls=%d: %s", deleteResponse.Code, backend.deleteCalls, deleteResponse.Body.String())
+	}
+}
+
+func TestInstanceProvisionFailureCleansBackendAndMetadata(t *testing.T) {
+	backend := &fakeBackend{endpoint: "127.0.0.1:49152", provisionErr: errors.New("startup failed")}
+	api := newTestAPI()
+	api.backend = backend
+	api.clusters["projects/test/locations/us-central1/clusters/c1"] = &Cluster{
+		Name: "projects/test/locations/us-central1/clusters/c1", State: "READY",
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/clusters/c1/instances?instanceId=primary",
+		bytes.NewBufferString(`{"instanceType":"PRIMARY"}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"error"`) {
+		t.Fatalf("create failure = %d: %s", response.Code, response.Body.String())
+	}
+	if backend.deleteCalls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", backend.deleteCalls)
+	}
+	if len(api.instances) != 0 {
+		t.Fatalf("failed instance metadata retained: %#v", api.instances)
+	}
+}
+
+func TestInstanceCleanupFailureRetainsRecoveryIntent(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	backend := &fakeBackend{
+		endpoint:     "127.0.0.1:49152",
+		provisionErr: errors.New("startup failed"),
+		deleteErr:    errors.New("Docker unavailable"),
+	}
+	api := &API{
+		opMgr: orchestrator.NewOperationManager(), backend: backend, stateStore: store,
+		clusters: map[string]*Cluster{"projects/test/locations/us-central1/clusters/c1": {
+			Name: "projects/test/locations/us-central1/clusters/c1", State: "READY",
+		}},
+		instances: make(map[string]*Instance),
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/clusters/c1/instances?instanceId=primary",
+		bytes.NewBufferString(`{"instanceType":"PRIMARY"}`))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	name := "projects/test/locations/us-central1/clusters/c1/instances/primary"
+	if instance := api.instances[name]; instance == nil || instance.State != "ERROR" {
+		t.Fatalf("cleanup recovery intent = %#v", instance)
+	}
+	var persisted alloydbMetadata
+	if err := store.Load(alloydbStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if instance := persisted.Instances[name]; instance == nil || instance.State != "ERROR" {
+		t.Fatalf("persisted cleanup recovery intent = %#v", instance)
+	}
+}
+
+func TestRestartReconcilesWithoutProvisioningDuplicate(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	backend := &fakeBackend{endpoint: "127.0.0.1:55432", exists: true}
+	name := "projects/p/locations/l/clusters/c/instances/i"
+	api := &API{
+		opMgr: orchestrator.NewOperationManager(), backend: backend, stateStore: store,
+		clusters: map[string]*Cluster{"projects/p/locations/l/clusters/c": {
+			Name: "projects/p/locations/l/clusters/c", State: "READY",
+		}},
+		instances: map[string]*Instance{name: {Name: name, State: "READY", IPAddress: "127.0.0.1"}},
+	}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &API{
+		opMgr: orchestrator.NewOperationManager(), backend: backend, stateStore: store,
+		clusters: make(map[string]*Cluster), instances: make(map[string]*Instance),
+	}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.reconcileBackends()
+	if backend.provisionCalls != 0 {
+		t.Fatalf("restart provisioned duplicate backend %d times", backend.provisionCalls)
+	}
+	if got := restarted.instances[name]; got == nil || got.State != "READY" ||
+		got.backendEndpoint != backend.endpoint || got.IPAddress != "127.0.0.1" {
+		t.Fatalf("reconciled instance = %#v", got)
 	}
 }
 

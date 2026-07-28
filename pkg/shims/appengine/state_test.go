@@ -46,8 +46,12 @@ func TestAppEngineMetadataSurvivesRestartWithoutBackendReplay(t *testing.T) {
 		t.Fatalf("deploy status = %d, body = %s", response.Code, response.Body.String())
 	}
 
+	restartedManager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	restartedBackend := &appEngineBackendSpy{}
-	restarted, err := NewAPIWithStore(manager, restartedBackend, nil, nil, store)
+	restarted, err := NewAPIWithStore(restartedManager, restartedBackend, nil, nil, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +67,80 @@ func TestAppEngineMetadataSurvivesRestartWithoutBackendReplay(t *testing.T) {
 	}
 	if restartedBackend.provisions != 0 || restartedBackend.deletes != 0 {
 		t.Fatalf("restart replayed backend calls: %#v", restartedBackend)
+	}
+	var operation *orchestrator.Operation
+	for _, candidate := range restartedManager.List() {
+		if candidate.Kind == "appengine#operation" {
+			operation = candidate
+			break
+		}
+	}
+	if operation == nil || !operation.Done || operation.Error == nil {
+		t.Fatalf("restarted operation = %#v, want terminal interruption", operation)
+	}
+}
+
+func TestAppEngineOperationOutcomeSurvivesRestart(t *testing.T) {
+	store, err := state.New(t.TempDir(), "operation-outcome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(manager, nil, nil, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := manager.RegisterDurable(
+		"appengine#operation", "CREATE", "apps/test/services/default/versions/v1", "", "us-central1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.runOperation(operation.Name, func() error { return nil })
+
+	restarted, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := restarted.Get(operation.Name)
+	if got == nil || !got.Done || got.Status != orchestrator.StatusDone || got.Error != nil {
+		t.Fatalf("restarted operation = %#v, want durable success", got)
+	}
+}
+
+func TestAppEngineOperationOutcomeSaveFailureDegradesControlPlane(t *testing.T) {
+	store := newAppEngineFailingStore()
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(manager, nil, nil, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := manager.RegisterDurable(
+		"appengine#operation", "CREATE", "apps/test/services/default/versions/v1", "", "us-central1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.failAt = 5 // registration, two RUNNING states, 85%, then terminal DONE
+	api.runOperation(operation.Name, func() error { return nil })
+
+	if api.PersistenceError() == nil {
+		t.Fatal("terminal operation save failure did not degrade App Engine")
+	}
+	response := appEngineRequest(api, http.MethodGet, "/v1/projects/test/operations/"+operation.Name, "")
+	assertAppEngineError(t, response, http.StatusServiceUnavailable, "UNAVAILABLE")
+
+	restarted, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := restarted.Get(operation.Name)
+	if got == nil || !got.Done || got.Error == nil {
+		t.Fatalf("restarted operation = %#v, want terminal interruption", got)
 	}
 }
 
@@ -82,6 +160,29 @@ func TestAppEngineSaveFailureReturnsGCPErrorAndRollsBack(t *testing.T) {
 	if exists {
 		t.Fatal("failed save left app in memory")
 	}
+}
+
+func TestAppEngineMetadataAndOperationCompensationFailureDegradesControlPlane(t *testing.T) {
+	store := newAppEngineFailingStore()
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(manager, nil, nil, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.failAtSaves = map[int]bool{
+		2: true, // version metadata admission
+		3: true, // terminal failure compensation
+	}
+	response := appEngineDeployRequest(api, "test")
+	assertAppEngineError(t, response, http.StatusInternalServerError, "INTERNAL")
+	if api.PersistenceError() == nil {
+		t.Fatal("ambiguous operation compensation did not degrade App Engine")
+	}
+	blocked := appEngineRequest(api, http.MethodGet, "/v1/projects/test/apps", "")
+	assertAppEngineError(t, blocked, http.StatusServiceUnavailable, "UNAVAILABLE")
 }
 
 func TestAppEngineMissingAppGetIsPureNotFound(t *testing.T) {
@@ -234,6 +335,29 @@ func TestAppEngineServingSaveFailureIsSticky(t *testing.T) {
 				t.Fatal("SERVING save failure did not degrade API")
 			}
 		})
+	}
+}
+
+func TestAppEngineServingSaveFailureCompensatesOwnedBackend(t *testing.T) {
+	store := newAppEngineFailingStore()
+	store.entries[appEngineStateEntry] = mustAppEngineJSON(t, appEngineMetadata{
+		Versions: map[string]map[string]map[string]*Version{
+			"test": {"default": {"v1": {Id: "v1", State: "STOPPED"}}},
+		},
+	})
+	backend := &appEngineBackendSpy{}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.fail = true
+	if err := api.activateVersion("test", "default", "v1"); err == nil {
+		t.Fatal("SERVING save failure was ignored")
+	}
+	want := appEngineIdentity("test", "default", "v1")
+	if backend.deletes != 1 || backend.lastDeleted != want {
+		t.Fatalf("backend compensation = deletes:%d identity:%#v, want 1 %#v",
+			backend.deletes, backend.lastDeleted, want)
 	}
 }
 
@@ -453,9 +577,10 @@ func TestAppEngineMetadataIsProfileScoped(t *testing.T) {
 }
 
 type appEngineBackendSpy struct {
-	provisions int
-	deletes    int
-	deleteErr  error
+	provisions  int
+	deletes     int
+	deleteErr   error
+	lastDeleted orchestrator.ServerlessIdentity
 }
 
 func (backend *appEngineBackendSpy) ProvisionServerlessVM(orchestrator.ServerlessIdentity, string, []string) (string, error) {
@@ -463,8 +588,9 @@ func (backend *appEngineBackendSpy) ProvisionServerlessVM(orchestrator.Serverles
 	return "", nil
 }
 
-func (backend *appEngineBackendSpy) DeleteServerlessVM(orchestrator.ServerlessIdentity) error {
+func (backend *appEngineBackendSpy) DeleteServerlessVM(identity orchestrator.ServerlessIdentity) error {
 	backend.deletes++
+	backend.lastDeleted = identity
 	return backend.deleteErr
 }
 
@@ -475,6 +601,7 @@ type appEngineFailingStore struct {
 	failAfterCommit bool
 	loadErr         error
 	failAt          int
+	failAtSaves     map[int]bool
 	saves           int
 }
 
@@ -516,7 +643,7 @@ func (store *appEngineFailingStore) Save(name string, value any) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.saves++
-	if store.fail || store.saves == store.failAt {
+	if store.fail || store.saves == store.failAt || store.failAtSaves[store.saves] {
 		return errors.New("injected save failure")
 	}
 	payload, err := json.Marshal(value)

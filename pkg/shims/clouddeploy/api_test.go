@@ -276,13 +276,17 @@ func TestCreateReleaseParentNotFound(t *testing.T) {
 }
 
 func TestCreateRollout(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
 	api := newTestAPI()
 	api.mu.Lock()
 	api.pipelines["projects/test/locations/us-central1/deliveryPipelines/mypipe"] = &DeliveryPipeline{Name: "projects/test/locations/us-central1/deliveryPipelines/mypipe"}
 	api.releases["projects/test/locations/us-central1/deliveryPipelines/mypipe/releases/rel1"] = &Release{Name: "projects/test/locations/us-central1/deliveryPipelines/mypipe/releases/rel1"}
 	api.mu.Unlock()
 
-	body := `{"targetId":"prod"}`
+	body := `{"targetId":"prod","image":"example.test/app@sha256:abc","localTarget":"` + target.URL + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/deliveryPipelines/mypipe/releases/rel1/rollouts?rolloutId=roll1", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
@@ -381,6 +385,10 @@ func TestConcurrentPipelineCreation(t *testing.T) {
 }
 
 func TestFullHierarchy(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
 	api := newTestAPI()
 
 	// Create pipeline
@@ -402,7 +410,7 @@ func TestFullHierarchy(t *testing.T) {
 	}
 
 	// Create rollout
-	body = `{"targetId":"dev"}`
+	body = `{"targetId":"dev","image":"example.test/app@sha256:abc","localTarget":"` + target.URL + `"}`
 	req = httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/deliveryPipelines/pipe1/releases/rel1/rollouts?rolloutId=roll1", bytes.NewBufferString(body))
 	w = httptest.NewRecorder()
 	api.ServeHTTP(w, req)

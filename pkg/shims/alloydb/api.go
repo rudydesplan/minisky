@@ -1,10 +1,13 @@
 package alloydb
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,7 +23,7 @@ import (
 
 func init() {
 	registry.Register("alloydb.googleapis.com", func(ctx *registry.Context) http.Handler {
-		return NewAPI(ctx.OpMgr)
+		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
 }
 
@@ -36,9 +39,60 @@ type Cluster struct {
 	UpdateTime      string            `json:"updateTime,omitempty"`
 	State           string            `json:"state,omitempty"`
 	DatabaseVersion string            `json:"databaseVersion,omitempty"`
+	ClusterType     string            `json:"clusterType,omitempty"`
 	Network         string            `json:"network,omitempty"`
+	NetworkConfig   *NetworkConfig    `json:"networkConfig,omitempty"`
 	DisplayName     string            `json:"displayName,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
+}
+
+type NetworkConfig struct {
+	Network string `json:"network,omitempty"`
+}
+
+// Instance represents the bounded fields supported from
+// google.cloud.alloydb.v1.Instance.
+type Instance struct {
+	Name            string            `json:"name"`
+	DisplayName     string            `json:"displayName,omitempty"`
+	UID             string            `json:"uid,omitempty"`
+	CreateTime      string            `json:"createTime,omitempty"`
+	UpdateTime      string            `json:"updateTime,omitempty"`
+	State           string            `json:"state,omitempty"`
+	InstanceType    string            `json:"instanceType,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	IPAddress       string            `json:"ipAddress,omitempty"`
+	PublicIPAddress string            `json:"publicIpAddress,omitempty"`
+	backendEndpoint string
+}
+
+type alloydbBackend interface {
+	Provision(context.Context, orchestrator.AlloyDBIdentity) (string, bool, error)
+	Reconcile(context.Context, orchestrator.AlloyDBIdentity) (string, bool, error)
+	Delete(context.Context, orchestrator.AlloyDBIdentity) error
+}
+
+type serviceManagerBackend struct{ manager *orchestrator.ServiceManager }
+
+func (backend serviceManagerBackend) Provision(ctx context.Context, identity orchestrator.AlloyDBIdentity) (string, bool, error) {
+	if backend.manager == nil {
+		return "", false, fmt.Errorf("AlloyDB backend is unavailable")
+	}
+	return backend.manager.ProvisionAlloyDB(ctx, identity)
+}
+
+func (backend serviceManagerBackend) Reconcile(ctx context.Context, identity orchestrator.AlloyDBIdentity) (string, bool, error) {
+	if backend.manager == nil {
+		return "", false, fmt.Errorf("AlloyDB backend is unavailable")
+	}
+	return backend.manager.ReconcileAlloyDB(ctx, identity)
+}
+
+func (backend serviceManagerBackend) Delete(ctx context.Context, identity orchestrator.AlloyDBIdentity) error {
+	if backend.manager == nil {
+		return fmt.Errorf("AlloyDB backend is unavailable")
+	}
+	return backend.manager.DeleteAlloyDB(ctx, identity)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,14 +104,14 @@ type API struct {
 	mu         sync.RWMutex
 	persistMu  sync.Mutex
 	opMgr      *orchestrator.OperationManager
+	backend    alloydbBackend
 	stateStore alloydbStateStore
 	clusters   map[string]*Cluster
+	instances  map[string]*Instance
 }
 
-var provisioningBackendAvailable bool
-
 // NewAPI creates a new AlloyDB API shim with persistence.
-func NewAPI(opMgr *orchestrator.OperationManager) *API {
+func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
 	if opMgr == nil {
 		opMgr = orchestrator.NewOperationManager()
 	}
@@ -66,6 +120,10 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 		opMgr:      opMgr,
 		stateStore: state.NewGuardedEntryStore(store, err),
 		clusters:   make(map[string]*Cluster),
+		instances:  make(map[string]*Instance),
+	}
+	if svcMgr != nil {
+		api.backend = serviceManagerBackend{manager: svcMgr}
 	}
 	if err != nil {
 		log.Printf("[Shim: AlloyDB] persistence degraded: %v", err)
@@ -73,15 +131,18 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: AlloyDB] state rehydration failed: %v", err)
+		return api
 	}
+	api.reconcileBackends()
 	return api
 }
 
 // newTestAPI creates an in-memory API for testing (no persistence).
 func newTestAPI() *API {
 	return &API{
-		opMgr:    orchestrator.NewOperationManager(),
-		clusters: make(map[string]*Cluster),
+		opMgr:     orchestrator.NewOperationManager(),
+		clusters:  make(map[string]*Cluster),
+		instances: make(map[string]*Instance),
 	}
 }
 
@@ -94,8 +155,13 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(r.URL.Path, "/operations/") && r.Method == http.MethodGet:
 		api.getOperation(w, r)
 	case strings.HasSuffix(r.URL.Path, "/instances") && r.Method == http.MethodPost:
-		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
-			"AlloyDB instance provisioning is unavailable because MiniSky has no exact-owned AlloyDB backend")
+		api.createInstance(w, r)
+	case strings.HasSuffix(r.URL.Path, "/instances") && r.Method == http.MethodGet:
+		api.listInstances(w, r)
+	case strings.Contains(r.URL.Path, "/instances/") && r.Method == http.MethodGet:
+		api.getInstance(w, r)
+	case strings.Contains(r.URL.Path, "/instances/") && r.Method == http.MethodDelete:
+		api.deleteInstance(w, r)
 	case strings.HasSuffix(r.URL.Path, "/clusters") && r.Method == http.MethodPost:
 		api.createCluster(w, r)
 	case strings.HasSuffix(r.URL.Path, "/clusters") && r.Method == http.MethodGet:
@@ -136,11 +202,17 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if cluster.Network == "" && cluster.NetworkConfig != nil {
+		cluster.Network = cluster.NetworkConfig.Network
+	}
 	if cluster.Network == "" {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "network is required")
 		return
 	}
-	if !provisioningBackendAvailable {
+	if cluster.NetworkConfig == nil {
+		cluster.NetworkConfig = &NetworkConfig{Network: cluster.Network}
+	}
+	if api.backend == nil {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"AlloyDB cluster provisioning requires a backend that MiniSky does not implement")
 		return
@@ -153,7 +225,10 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 	cluster.UID = generateUUID()
 	cluster.CreateTime = now
 	cluster.UpdateTime = now
-	cluster.State = "CREATING"
+	cluster.State = "READY"
+	if cluster.ClusterType == "" {
+		cluster.ClusterType = "PRIMARY"
+	}
 
 	api.mu.Lock()
 	if _, exists := api.clusters[name]; exists {
@@ -179,22 +254,20 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		delete(api.clusters, name)
 		api.mu.Unlock()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "state persistence failed")
+		_ = api.opMgr.RemoveDurable(op.Name)
 		writeError(w, 503, "UNAVAILABLE", "Service temporarily unavailable: state persistence failed")
 		return
 	}
 
-	api.opMgr.RunAsync(op.Name, func() error {
-		// Metadata-only: resource stays in CREATING state.
-		// Real provisioning requires Docker (not available in this experimental shim).
-		return nil
-	})
+	api.opMgr.MarkDone(op.Name)
 
 	opName := fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, op.Name)
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"name": opName,
-		"done": false,
+		"done": true,
 		"metadata": map[string]any{
 			"@type":      "type.googleapis.com/google.cloud.alloydb.v1.OperationMetadata",
 			"createTime": now,
@@ -202,7 +275,208 @@ func (api *API) createCluster(w http.ResponseWriter, r *http.Request) {
 			"verb":       "create",
 			"apiVersion": "v1",
 		},
+		"response": deepCopyCluster(&cluster),
 	})
+}
+
+func (api *API) createInstance(w http.ResponseWriter, r *http.Request) {
+	if api.backend == nil {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"AlloyDB instance provisioning requires an exact-owned Docker backend")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	identity, ok := parseInstanceIdentity(r.URL.Path, r.URL.Query().Get("instanceId"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "instanceId and cluster parent are required")
+		return
+	}
+	var instance Instance
+	if err := json.NewDecoder(r.Body).Decode(&instance); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON: "+err.Error())
+		return
+	}
+	if instance.InstanceType != "PRIMARY" {
+		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"only PRIMARY AlloyDB instances have a bounded local backend")
+		return
+	}
+	clusterName := fmt.Sprintf("projects/%s/locations/%s/clusters/%s",
+		identity.Project, identity.Location, identity.Cluster)
+	name := identityName(identity)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	api.mu.Lock()
+	cluster := api.clusters[clusterName]
+	if cluster == nil || cluster.State != "READY" {
+		api.mu.Unlock()
+		writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", "parent cluster is not ready")
+		return
+	}
+	if _, exists := api.instances[name]; exists {
+		api.mu.Unlock()
+		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "instance already exists: "+identity.Instance)
+		return
+	}
+	instance.Name = name
+	instance.UID = generateUUID()
+	instance.CreateTime = now
+	instance.UpdateTime = now
+	instance.State = "CREATING"
+	api.instances[name] = &instance
+	api.mu.Unlock()
+
+	op, err := api.opMgr.RegisterDurable("alloydb#operation", "create", name, "", identity.Location)
+	if err != nil {
+		api.removeInstance(name)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "failed to register operation")
+		return
+	}
+	if err := api.persistState(); err != nil {
+		api.removeInstance(name)
+		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "state persistence failed")
+		_ = api.opMgr.RemoveDurable(op.Name)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "state persistence failed")
+		return
+	}
+
+	endpoint, created, provisionErr := api.backend.Provision(r.Context(), identity)
+	if provisionErr != nil {
+		var cleanupErr error
+		if created {
+			cleanupErr = api.cleanupBackend(identity)
+			provisionErr = errors.Join(provisionErr, cleanupErr)
+		}
+		if cleanupErr != nil {
+			api.setInstanceState(name, "ERROR")
+		} else {
+			api.removeInstance(name)
+		}
+		if persistErr := api.persistState(); persistErr != nil {
+			api.opMgr.MarkPersistenceFailure(persistErr)
+			provisionErr = fmt.Errorf("%w; persist rollback: %v", provisionErr, persistErr)
+		}
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, provisionErr.Error())
+		writeOperation(w, identity.Project, identity.Location, op.Name, name, "create", true,
+			map[string]any{"code": http.StatusInternalServerError, "message": provisionErr.Error()})
+		return
+	}
+
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil || host != "127.0.0.1" {
+		cleanupErr := api.cleanupBackend(identity)
+		if cleanupErr != nil {
+			api.setInstanceState(name, "ERROR")
+		} else {
+			api.removeInstance(name)
+		}
+		_ = api.persistState()
+		message := fmt.Sprintf("backend returned invalid loopback endpoint %q", endpoint)
+		if cleanupErr != nil {
+			message += ": cleanup failed: " + cleanupErr.Error()
+		}
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, message)
+		writeOperation(w, identity.Project, identity.Location, op.Name, name, "create", true,
+			map[string]any{"code": http.StatusInternalServerError, "message": message})
+		return
+	}
+	api.mu.Lock()
+	instance.State = "READY"
+	instance.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
+	instance.IPAddress = host
+	instance.backendEndpoint = endpoint
+	api.mu.Unlock()
+	if err := api.persistState(); err != nil {
+		cleanupErr := api.cleanupBackend(identity)
+		api.removeInstance(name)
+		api.opMgr.MarkPersistenceFailure(err)
+		message := "state persistence failed after backend creation"
+		if cleanupErr != nil {
+			message += ": cleanup failed: " + cleanupErr.Error()
+		}
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, message)
+		writeOperation(w, identity.Project, identity.Location, op.Name, name, "create", true,
+			map[string]any{"code": http.StatusInternalServerError, "message": message})
+		return
+	}
+	api.opMgr.MarkDone(op.Name)
+	writeOperation(w, identity.Project, identity.Location, op.Name, name, "create", true, nil)
+}
+
+func (api *API) getInstance(w http.ResponseWriter, r *http.Request) {
+	name := parseInstanceName(r.URL.Path)
+	api.mu.RLock()
+	instance := deepCopyInstance(api.instances[name])
+	api.mu.RUnlock()
+	if instance == nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "instance not found: "+name)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(instance)
+}
+
+func (api *API) listInstances(w http.ResponseWriter, r *http.Request) {
+	parent := parseClusterName(r.URL.Path)
+	prefix := parent + "/instances/"
+	api.mu.RLock()
+	instances := make([]*Instance, 0)
+	for name, instance := range api.instances {
+		if strings.HasPrefix(name, prefix) {
+			instances = append(instances, deepCopyInstance(instance))
+		}
+	}
+	api.mu.RUnlock()
+	_ = json.NewEncoder(w).Encode(map[string]any{"instances": instances})
+}
+
+func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request) {
+	name := parseInstanceName(r.URL.Path)
+	identity, ok := parseIdentityFromName(name)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid instance name")
+		return
+	}
+	api.mu.Lock()
+	instance := api.instances[name]
+	if instance == nil {
+		api.mu.Unlock()
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "instance not found: "+name)
+		return
+	}
+	previousState := instance.State
+	instance.State = "DELETING"
+	api.mu.Unlock()
+	op, err := api.opMgr.RegisterDurable("alloydb#operation", "delete", name, "", identity.Location)
+	if err != nil {
+		api.setInstanceState(name, previousState)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "failed to register operation")
+		return
+	}
+	if err := api.persistState(); err != nil {
+		api.setInstanceState(name, previousState)
+		_ = api.opMgr.FailDurable(op.Name, http.StatusServiceUnavailable, "state persistence failed")
+		_ = api.opMgr.RemoveDurable(op.Name)
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "state persistence failed")
+		return
+	}
+	if err := api.backend.Delete(r.Context(), identity); err != nil {
+		api.setInstanceState(name, "ERROR")
+		_ = api.persistState()
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, err.Error())
+		writeOperation(w, identity.Project, identity.Location, op.Name, name, "delete", true,
+			map[string]any{"code": http.StatusInternalServerError, "message": err.Error()})
+		return
+	}
+	api.removeInstance(name)
+	if err := api.persistState(); err != nil {
+		api.opMgr.MarkPersistenceFailure(err)
+		_ = api.opMgr.FailDurable(op.Name, http.StatusInternalServerError, "state persistence failed after backend deletion")
+		writeOperation(w, identity.Project, identity.Location, op.Name, name, "delete", true,
+			map[string]any{"code": http.StatusInternalServerError, "message": "state persistence failed after backend deletion"})
+		return
+	}
+	api.opMgr.MarkDone(op.Name)
+	writeOperation(w, identity.Project, identity.Location, op.Name, name, "delete", true, nil)
 }
 
 func (api *API) getCluster(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +643,14 @@ func (api *API) deleteCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "cluster not found: "+name)
 		return
 	}
+	for instanceName := range api.instances {
+		if strings.HasPrefix(instanceName, name+"/instances/") {
+			api.mu.Unlock()
+			writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION",
+				"cluster still has instances")
+			return
+		}
+	}
 	delete(api.clusters, name)
 	api.mu.Unlock()
 
@@ -432,6 +714,80 @@ func parseClusterName(path string) string {
 	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s", project, location, clusterID)
 }
 
+func parseInstanceIdentity(path, instanceID string) (orchestrator.AlloyDBIdentity, bool) {
+	identity := orchestrator.AlloyDBIdentity{
+		Project:  extractAfter(path, "projects"),
+		Location: extractAfter(path, "locations"),
+		Cluster:  extractAfter(path, "clusters"),
+		Instance: instanceID,
+	}
+	return identity, identity.Project != "" && identity.Location != "" &&
+		identity.Cluster != "" && identity.Instance != ""
+}
+
+func parseIdentityFromName(name string) (orchestrator.AlloyDBIdentity, bool) {
+	return parseInstanceIdentity(name, extractAfter(name, "instances"))
+}
+
+func identityName(identity orchestrator.AlloyDBIdentity) string {
+	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s/instances/%s",
+		identity.Project, identity.Location, identity.Cluster, identity.Instance)
+}
+
+func parseInstanceName(path string) string {
+	identity, _ := parseInstanceIdentity(path, extractAfter(path, "instances"))
+	return identityName(identity)
+}
+
+func (api *API) removeInstance(name string) {
+	api.mu.Lock()
+	delete(api.instances, name)
+	api.mu.Unlock()
+}
+
+func (api *API) setInstanceState(name, state string) {
+	api.mu.Lock()
+	if instance := api.instances[name]; instance != nil {
+		instance.State = state
+		instance.UpdateTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	api.mu.Unlock()
+}
+
+func (api *API) cleanupBackend(identity orchestrator.AlloyDBIdentity) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return api.backend.Delete(ctx, identity)
+}
+
+func writeOperation(
+	w http.ResponseWriter,
+	project, location, operationName, target, verb string,
+	done bool,
+	operationError map[string]any,
+) {
+	response := map[string]any{
+		"name": fmt.Sprintf("projects/%s/locations/%s/operations/%s", project, location, operationName),
+		"done": done,
+		"metadata": map[string]any{
+			"@type":      "type.googleapis.com/google.cloud.alloydb.v1.OperationMetadata",
+			"target":     target,
+			"verb":       verb,
+			"apiVersion": "v1",
+		},
+	}
+	if operationError != nil {
+		operationError["details"] = []any{}
+		response["error"] = operationError
+	} else if verb != "delete" {
+		response["response"] = map[string]any{
+			"@type": "type.googleapis.com/google.cloud.alloydb.v1.Instance",
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 func extractAfter(path, segment string) string {
 	parts := strings.Split(path, "/")
 	for i, part := range parts {
@@ -449,6 +805,17 @@ func generateUUID() string {
 	buf[8] = (buf[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+func deepCopyInstance(instance *Instance) *Instance {
+	if instance == nil {
+		return nil
+	}
+	raw, _ := json.Marshal(instance)
+	var clone Instance
+	_ = json.Unmarshal(raw, &clone)
+	clone.backendEndpoint = instance.backendEndpoint
+	return &clone
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

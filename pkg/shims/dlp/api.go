@@ -347,6 +347,11 @@ func (api *API) inspectContent(w http.ResponseWriter, r *http.Request) {
 	if len(body.InspectConfig.InfoTypes) == 0 {
 		body.InspectConfig = defaultInspectConfig()
 	}
+	if unsupported := unsupportedInfoType(body.InspectConfig); unsupported != "" {
+		gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"info type is not supported by the bounded local detector: "+unsupported)
+		return
+	}
 
 	findings := inspectValue(body.Item.Value, body.InspectConfig)
 
@@ -368,7 +373,7 @@ func (api *API) deidentifyContent(w http.ResponseWriter, r *http.Request) {
 			InfoTypeTransformations struct {
 				Transformations []struct {
 					PrimitiveTransformation struct {
-						ReplaceConfig struct {
+						ReplaceConfig *struct {
 							NewValue struct {
 								StringValue string `json:"stringValue"`
 							} `json:"newValue"`
@@ -382,23 +387,27 @@ func (api *API) deidentifyContent(w http.ResponseWriter, r *http.Request) {
 		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON: "+err.Error())
 		return
 	}
-	if len(body.InspectConfig.InfoTypes) == 0 &&
-		len(body.DeidentifyConfig.InfoTypeTransformations.Transformations) == 0 {
-		json.NewEncoder(w).Encode(map[string]any{
-			"item": map[string]any{"value": "[REDACTED]"},
-			"overview": map[string]any{
-				"transformedBytes": strconv.Itoa(len(body.Item.Value)), "transformationSummaries": []any{},
-			},
-		})
+	if body.Item.Value == "" {
+		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "item.value is required")
 		return
 	}
 	if len(body.InspectConfig.InfoTypes) == 0 {
 		body.InspectConfig = defaultInspectConfig()
 	}
+	if unsupported := unsupportedInfoType(body.InspectConfig); unsupported != "" {
+		gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"info type is not supported by the bounded local detector: "+unsupported)
+		return
+	}
 
 	replacement := "[REDACTED]"
 	transformations := body.DeidentifyConfig.InfoTypeTransformations.Transformations
 	if len(transformations) > 0 {
+		if len(transformations) != 1 || transformations[0].PrimitiveTransformation.ReplaceConfig == nil {
+			gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+				"only one replaceConfig transformation is supported")
+			return
+		}
 		replacement = transformations[0].PrimitiveTransformation.ReplaceConfig.NewValue.StringValue
 	}
 	value, transformedBytes := transformValue(body.Item.Value, body.InspectConfig, replacement)
@@ -428,6 +437,15 @@ func defaultInspectConfig() inspectConfig {
 	}{Name: "EMAIL_ADDRESS"})
 	config.IncludeQuote = true
 	return config
+}
+
+func unsupportedInfoType(config inspectConfig) string {
+	for _, infoType := range config.InfoTypes {
+		if _, supported := boundedDetectors[infoType.Name]; !supported {
+			return infoType.Name
+		}
+	}
+	return ""
 }
 
 type detectedValue struct {

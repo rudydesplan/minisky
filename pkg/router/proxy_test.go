@@ -45,6 +45,71 @@ func gzipJSONBody(t *testing.T, body string) *bytes.Reader {
 	return bytes.NewReader(compressed.Bytes())
 }
 
+func TestSpannerTerraformCompatibilityListsNoEmulatorBackups(t *testing.T) {
+	backendCalls := 0
+	handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		backendCalls++
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"code":12}`))
+	}))
+	request := httptest.NewRequest(http.MethodGet,
+		"/v1/projects/local-dev-project/instances/minisky-terraform/backups", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content type=%q", response.Header().Get("Content-Type"))
+	}
+	var result struct {
+		Backups []json.RawMessage `json:"backups"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Backups == nil || len(result.Backups) != 0 {
+		t.Fatalf("backups=%v, want empty array", result.Backups)
+	}
+	if backendCalls != 0 {
+		t.Fatalf("backend calls=%d, want 0", backendCalls)
+	}
+}
+
+func TestSpannerTerraformCompatibilityPreservesLifecycleRequests(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"delete database", http.MethodDelete, "/v1/projects/p/instances/i/databases/d"},
+		{"delete instance", http.MethodDelete, "/v1/projects/p/instances/i"},
+		{"poll operation", http.MethodGet, "/v1/projects/p/instances/i/operations/o"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var method, requestPath string
+			handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				method = request.Method
+				requestPath = request.URL.Path
+				_, _ = w.Write([]byte(`{"name":"operations/o","done":true}`))
+			}))
+			request := httptest.NewRequest(test.method, test.path, nil)
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if method != test.method || requestPath != test.path {
+				t.Fatalf("backend request=%s %s, want %s %s", method, requestPath, test.method, test.path)
+			}
+			if response.Body.String() != `{"name":"operations/o","done":true}` {
+				t.Fatalf("body=%s", response.Body.String())
+			}
+		})
+	}
+}
+
 func TestRouterDecodesBoundedGzipJSONBeforeValidationAndDispatch(t *testing.T) {
 	const body = `{"name":"java-smoke"}`
 	var received []byte
@@ -142,15 +207,33 @@ type authorizationCheck struct {
 	permission string
 }
 
+type perimeterEvaluation struct {
+	project string
+	service string
+}
+
+type recordingPerimeterEvaluator struct {
+	configured bool
+	allowed    bool
+	calls      []perimeterEvaluation
+}
+
+func (e *recordingPerimeterEvaluator) EvaluateServicePerimeter(project, service, _, _ string) (bool, bool) {
+	e.calls = append(e.calls, perimeterEvaluation{project: project, service: service})
+	return e.configured, e.allowed
+}
+
 type resourcePermission struct {
 	resource   string
 	permission string
 }
 
 type recordingAuthorizer struct {
-	issuer  *localsecurity.Issuer
-	allowed map[resourcePermission]bool
-	checks  []authorizationCheck
+	issuer           *localsecurity.Issuer
+	allowedPrincipal string
+	inheritProject   bool
+	allowed          map[resourcePermission]bool
+	checks           []authorizationCheck
 }
 
 func (a *recordingAuthorizer) EnforcementEnabled() bool { return true }
@@ -158,7 +241,21 @@ func (a *recordingAuthorizer) Authorize(resource, principal, permission string) 
 	a.checks = append(a.checks, authorizationCheck{
 		resource: resource, principal: principal, permission: permission,
 	})
-	return a.allowed[resourcePermission{resource: resource, permission: permission}]
+	if a.allowedPrincipal != "" && principal != a.allowedPrincipal {
+		return false
+	}
+	if a.allowed[resourcePermission{resource: resource, permission: permission}] {
+		return true
+	}
+	if a.inheritProject {
+		parts := strings.Split(resource, "/")
+		if len(parts) >= 2 {
+			return a.allowed[resourcePermission{
+				resource: strings.Join(parts[:2], "/"), permission: permission,
+			}]
+		}
+	}
+	return false
 }
 func (a *recordingAuthorizer) VerifyLocalToken(token, audience, scope string) (localsecurity.Claims, error) {
 	return a.issuer.Verify(token, localsecurity.VerifyOptions{Audience: audience, RequiredScope: scope})
@@ -175,6 +272,100 @@ func (a testAuthorizer) VerifyLocalToken(token, audience, scope string) (localse
 type testProjects map[string]bool
 
 func (p testProjects) Exists(id string) bool { return p[id] }
+
+func TestIAMServiceAccountReadAuthorizesExactAccountResource(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/v1/projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com",
+		nil,
+	)
+	permission, resource := routePermission("iam.googleapis.com", request)
+	if permission != "iam.serviceAccounts.get" {
+		t.Fatalf("permission = %q", permission)
+	}
+	const want = "projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com"
+	if resource != want {
+		t.Fatalf("resource = %q, want %q", resource, want)
+	}
+}
+
+func TestSpannerBackupsCompatibilityRunsAfterStrictIAM(t *testing.T) {
+	const (
+		project             = "local-dev-project"
+		authorizedPrincipal = "user:alice@example.com"
+	)
+	permission, resource := routePermission("spanner.googleapis.com", httptest.NewRequest(
+		http.MethodGet,
+		"/v1/projects/local-dev-project/instances/minisky-terraform/backups",
+		nil,
+	))
+	instanceResource := "projects/" + project + "/instances/minisky-terraform"
+	if permission != "spanner.backups.list" || resource != instanceResource {
+		t.Fatalf("permission=%q resource=%q", permission, resource)
+	}
+
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	for _, test := range []struct {
+		name, principal, policyResource string
+		wantStatus                      int
+	}{
+		{"instance binding", authorizedPrincipal, instanceResource, http.StatusOK},
+		{"inherited project binding", authorizedPrincipal, "projects/" + project, http.StatusOK},
+		{"unauthorized principal", "user:bob@example.com", "projects/" + project, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer := &recordingAuthorizer{
+				issuer:           issuer,
+				allowedPrincipal: authorizedPrincipal,
+				inheritProject:   true,
+				allowed: map[resourcePermission]bool{{
+					resource: test.policyResource, permission: "spanner.backups.list",
+				}: true},
+			}
+			dispatches := 0
+			handler := wrapSpannerEmulatorProxy(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("backup list reached unsupported emulator method")
+			}))
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim("spanner.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dispatches++
+				handler.ServeHTTP(w, r)
+			}))
+			router.ConfigureSecurity(authorizer, nil, false, "gateway")
+
+			token, _, err := issuer.Issue(localsecurity.TokenRequest{
+				Subject: test.principal, Audience: "gateway",
+				Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet,
+				"http://localhost/_minisky/spanner/v1/projects/local-dev-project/instances/minisky-terraform/backups",
+				nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			wantDispatches := 0
+			if test.wantStatus == http.StatusOK {
+				wantDispatches = 1
+			}
+			if dispatches != wantDispatches {
+				t.Fatalf("dispatches=%d want=%d", dispatches, wantDispatches)
+			}
+			if len(authorizer.checks) != 1 || authorizer.checks[0].resource != instanceResource {
+				t.Fatalf("authorization checks=%+v, want exact instance resource", authorizer.checks)
+			}
+			if test.wantStatus == http.StatusOK && !strings.Contains(response.Body.String(), `"backups":[]`) {
+				t.Fatalf("body=%s", response.Body.String())
+			}
+		})
+	}
+}
 
 type countingReplayShim struct {
 	api       *bigquery.API
@@ -275,6 +466,136 @@ func TestExperimentalGatePrecedesStrictIAMAndValidation(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("opted-in strict response=%d, want normal 401 policy; body=%s",
 			response.Code, response.Body.String())
+	}
+}
+
+func TestGatewayServicePerimeterDecisionPrecedesDispatch(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured bool
+		allowed    bool
+		wantStatus int
+		wantCalls  int
+	}{
+		{name: "explicit deny", configured: true, allowed: false, wantStatus: http.StatusForbidden, wantCalls: 1},
+		{name: "explicit allow", configured: true, allowed: true, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "no policy", configured: false, allowed: true, wantStatus: http.StatusNoContent, wantCalls: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dispatched := 0
+			evaluator := &recordingPerimeterEvaluator{configured: test.configured, allowed: test.allowed}
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatched++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			proxy.ConfigureServicePerimeters(evaluator)
+
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"http://127.0.0.1/_minisky/storage/storage/v1/b/projects/demo/buckets",
+				nil,
+			)
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if len(evaluator.calls) != test.wantCalls {
+				t.Fatalf("perimeter calls=%d want=%d", len(evaluator.calls), test.wantCalls)
+			}
+			if len(evaluator.calls) == 1 {
+				if got := evaluator.calls[0]; got.project != "projects/demo" || got.service != "storage.googleapis.com" {
+					t.Fatalf("perimeter evaluation=%+v", got)
+				}
+			}
+			wantDispatches := 0
+			if test.wantStatus == http.StatusNoContent {
+				wantDispatches = 1
+			}
+			if dispatched != wantDispatches {
+				t.Fatalf("dispatches=%d status=%d", dispatched, response.Code)
+			}
+			if test.wantStatus == http.StatusForbidden {
+				body := response.Body.String()
+				if !strings.Contains(body, `"code":403`) ||
+					!strings.Contains(body, `"status":"PERMISSION_DENIED"`) ||
+					strings.Contains(strings.ToLower(body), "perimeter") {
+					t.Fatalf("non-canonical or policy-leaking denial: %s", body)
+				}
+			}
+		})
+	}
+}
+
+func TestStrictIAMPrecedesServicePerimeterEnforcement(t *testing.T) {
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	evaluator := &recordingPerimeterEvaluator{configured: true, allowed: false}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("denied request reached shim")
+	}))
+	proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: true}, nil, false, "gateway")
+	proxy.ConfigureServicePerimeters(evaluator)
+
+	requestURL := "http://127.0.0.1/_minisky/storage/storage/v1/b?project=demo"
+	unauthenticated := httptest.NewRecorder()
+	proxy.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, requestURL, nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status=%d body=%s", unauthenticated.Code, unauthenticated.Body.String())
+	}
+	if len(evaluator.calls) != 0 {
+		t.Fatalf("perimeter ran before IAM: %+v", evaluator.calls)
+	}
+
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "user:phase24@example.com",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/devstorage.full_control"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, requestURL, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("authenticated perimeter status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(evaluator.calls) != 1 {
+		t.Fatalf("perimeter calls=%d want=1", len(evaluator.calls))
+	}
+}
+
+func TestDefaultOffExperimentalGatePrecedesServicePerimeterEvaluation(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "")
+	evaluator := &recordingPerimeterEvaluator{configured: true, allowed: false}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim(
+		"aiplatform.googleapis.com",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("disabled experimental shim dispatched")
+		}),
+	)
+	proxy.ConfigureServicePerimeters(evaluator)
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1/_minisky/aiplatform/v1/projects/demo/locations/us/indexes",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusNotImplemented, response.Body.String())
+	}
+	if len(evaluator.calls) != 0 {
+		t.Fatalf("perimeter evaluated before experimental gate: %+v", evaluator.calls)
 	}
 }
 
@@ -421,6 +742,125 @@ func TestEveryExperimentalDomainPublicGatewayEvidence(t *testing.T) {
 					strings.Contains(response.Body.String(), "experimental and disabled")) {
 					t.Fatalf("allowed request did not reach opted-in service: status=%d body=%s",
 						response.Code, response.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestExperimentalDecisionActionsPublicGatewayStrictIAM(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "experimental-decision-actions")
+	tests := []struct {
+		name, domain, path, body, project, permission string
+		allowStatus                                   int
+	}{
+		{
+			name: "private ca revoke", domain: "privateca.googleapis.com",
+			path:        "/v1/projects/demo/locations/us-central1/caPools/pool/certificates/cert:revoke",
+			body:        `{"reason":"KEY_COMPROMISE"}`,
+			project:     "demo",
+			permission:  "privateca.certificates.revoke",
+			allowStatus: http.StatusNotFound,
+		},
+		{
+			name: "binary authorization evaluate", domain: "binaryauthorization.googleapis.com",
+			path:        "/v1/projects/demo/policy:evaluate",
+			body:        `{"image":"us-docker.pkg.dev/demo/releases/app@sha256:abc"}`,
+			project:     "demo",
+			permission:  "binaryauthorization.policy.evaluate",
+			allowStatus: http.StatusOK,
+		},
+		{
+			name: "access context check", domain: "accesscontextmanager.googleapis.com",
+			path:        "/v1/accessPolicies/1:checkAccess",
+			body:        `{"project":"projects/demo","service":"storage.googleapis.com"}`,
+			project:     "demo",
+			permission:  "accesscontextmanager.accessPolicies.get",
+			allowStatus: http.StatusOK,
+		},
+		{
+			name: "network security evaluate", domain: "networksecurity.googleapis.com",
+			path:        "/v1/projects/demo/locations/global/authorizationPolicies:evaluate",
+			body:        `{"project":"demo","location":"global"}`,
+			project:     "demo",
+			permission:  "networksecurity.authorizationPolicies.get",
+			allowStatus: http.StatusOK,
+		},
+		{
+			name: "service mesh resolve", domain: "networkservices.googleapis.com",
+			path:        "/v1/projects/demo/locations/global/httpRoutes:resolve",
+			body:        `{"project":"demo","location":"global","host":"api.local","path":"/v1/items"}`,
+			project:     "demo",
+			permission:  "networkservices.httpRoutes.get",
+			allowStatus: http.StatusOK,
+		},
+	}
+	newRouter := func(domain string, handler http.Handler) *ProxyRouter {
+		proxy := NewProxyRouterWithManager(nil)
+		proxy.RegisterShim(domain, registry.RuntimeHandler(domain, handler, false))
+		return proxy
+	}
+
+	t.Setenv(registry.ExperimentalServicesEnv, "")
+	disabledHandlers, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	for _, test := range tests {
+		request := httptest.NewRequest(http.MethodPost,
+			"http://127.0.0.1/_minisky/"+test.domain+test.path, strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		newRouter(test.domain, disabledHandlers[test.domain]).ServeHTTP(response, request)
+		if response.Code != http.StatusNotImplemented ||
+			!strings.Contains(response.Body.String(), "experimental and disabled") {
+			t.Fatalf("%s default-off status=%d body=%s", test.name, response.Code, response.Body.String())
+		}
+	}
+
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	enabledHandlers, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: "user:decisions@example.com", Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		for _, allow := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/allow-%t", test.name, allow), func(t *testing.T) {
+				permission := resourcePermission{
+					resource: "projects/" + test.project, permission: test.permission,
+				}
+				allowed := map[resourcePermission]bool{}
+				if allow {
+					allowed[permission] = true
+				}
+				authorizer := &recordingAuthorizer{issuer: issuer, allowed: allowed}
+				proxy := newRouter(test.domain, enabledHandlers[test.domain])
+				proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+				request := httptest.NewRequest(http.MethodPost,
+					"http://127.0.0.1/_minisky/"+test.domain+test.path,
+					strings.NewReader(test.body))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Authorization", "Bearer "+token)
+				if !strings.Contains(test.path, "/projects/") {
+					request.Header.Set("X-Goog-User-Project", test.project)
+				}
+				response := httptest.NewRecorder()
+				proxy.ServeHTTP(response, request)
+				if !allow && response.Code != http.StatusForbidden {
+					t.Fatalf("deny status=%d, want 403; body=%s", response.Code, response.Body.String())
+				}
+				if allow && response.Code != test.allowStatus {
+					t.Fatalf("allow status=%d, want %d; body=%s",
+						response.Code, test.allowStatus, response.Body.String())
+				}
+				if len(authorizer.checks) != 1 ||
+					authorizer.checks[0].resource != permission.resource ||
+					authorizer.checks[0].permission != permission.permission {
+					t.Fatalf("authorization checks=%+v, want resource=%s permission=%s",
+						authorizer.checks, permission.resource, permission.permission)
 				}
 			})
 		}
@@ -1299,29 +1739,36 @@ func TestManifestImplementedDomainsHaveStrictIAMMappings(t *testing.T) {
 
 func TestNewExperimentalDomainsHaveStrictIAMDispatch(t *testing.T) {
 	tests := []struct {
-		domain, method, path, permission string
+		domain, method, path, project, permission string
 	}{
-		{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/indexes", "aiplatform.indexes.create"},
-		{"binaryauthorization.googleapis.com", http.MethodPut, "/v1/projects/demo/policy", "binaryauthorization.policy.update"},
-		{"dialogflow.googleapis.com", http.MethodPost, "/v3/projects/demo/locations/us/agents", "dialogflow.agents.create"},
-		{"language.googleapis.com", http.MethodPost, "/v1/documents:analyzeSentiment", "language.documents.analyzeSentiment"},
-		{"privateca.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/caPools/pool/certificates", "privateca.certificates.create"},
-		{"pubsublite.googleapis.com", http.MethodGet, "/v1/admin/projects/demo/locations/us/topics", "pubsublite.topics.list"},
-		{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/example.test:check", "servicecontrol.services.check"},
-		{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/example.test/configs", "servicemanagement.services.update"},
-		{"speech.googleapis.com", http.MethodPost, "/v1/speech:recognize", "speech.recognizers.recognize"},
-		{"texttospeech.googleapis.com", http.MethodPost, "/v1/text:synthesize", "texttospeech.synthesizers.synthesize"},
+		{"accesscontextmanager.googleapis.com", http.MethodGet, "/v1/accessPolicies", "demo", "accesscontextmanager.accessPolicies.list"},
+		{"aiplatform.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/indexes", "", "aiplatform.indexes.create"},
+		{"binaryauthorization.googleapis.com", http.MethodPut, "/v1/projects/demo/policy", "", "binaryauthorization.policy.update"},
+		{"dialogflow.googleapis.com", http.MethodPost, "/v3/projects/demo/locations/us/agents", "", "dialogflow.agents.create"},
+		{"language.googleapis.com", http.MethodPost, "/v1/documents:analyzeSentiment", "demo", "language.documents.analyzeSentiment"},
+		{"privateca.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/caPools/pool/certificates", "", "privateca.certificates.create"},
+		{"pubsublite.googleapis.com", http.MethodGet, "/v1/admin/projects/demo/locations/us/topics", "", "pubsublite.topics.list"},
+		{"servicecontrol.googleapis.com", http.MethodPost, "/v1/services/example.test:check", "demo", "servicecontrol.services.check"},
+		{"servicemanagement.googleapis.com", http.MethodPost, "/v1/services/example.test/configs", "demo", "servicemanagement.services.update"},
+		{"speech.googleapis.com", http.MethodPost, "/v1/speech:recognize", "demo", "speech.recognizers.recognize"},
+		{"storagetransfer.googleapis.com", http.MethodGet, "/v1/transferJobs", "demo", "storagetransfer.transferJobs.list"},
+		{"texttospeech.googleapis.com", http.MethodPost, "/v1/text:synthesize", "demo", "texttospeech.synthesizers.synthesize"},
 	}
 	for _, test := range tests {
 		t.Run(test.domain, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			if test.project != "" {
+				request.Header.Set("X-Goog-User-Project", test.project)
+			}
 			permission, resource := routePermission(
 				test.domain,
-				httptest.NewRequest(test.method, test.path, nil),
+				request,
 			)
 			if permission != test.permission {
 				t.Fatalf("permission=%q, want %q", permission, test.permission)
 			}
-			if strings.Contains(test.path, "/projects/demo") && resource != "projects/demo" {
+			if (strings.Contains(test.path, "/projects/demo") || test.project == "demo") &&
+				resource != "projects/demo" {
 				t.Fatalf("resource=%q, want projects/demo", resource)
 			}
 		})
@@ -1393,6 +1840,57 @@ func TestStrictIAMRouteClassificationSemanticsAndDenials(t *testing.T) {
 	}
 }
 
+func TestExperimentalImplementedCustomMethodsDispatchThroughGateway(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+
+	tests := []struct {
+		name, domain, path string
+	}{
+		{
+			name:   "Batch cancel",
+			domain: "batch.googleapis.com",
+			path:   "/v1/projects/demo/locations/us/jobs/job:cancel",
+		},
+		{
+			name:   "Storage Transfer run",
+			domain: "storagetransfer.googleapis.com",
+			path:   "/v1/transferJobs/1:run",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := NewProxyRouterWithManager(nil)
+			router.RegisterShim(test.domain, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			request := httptest.NewRequest(http.MethodPost, "https://"+test.domain+test.path, strings.NewReader(`{}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("status=%d, want dispatch status %d; body=%s",
+					response.Code, http.StatusNoContent, response.Body.String())
+			}
+		})
+	}
+
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("batch.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("unsupported custom method reached handler")
+	}))
+	request := httptest.NewRequest(http.MethodPost,
+		"https://batch.googleapis.com/v1/projects/demo/locations/us/jobs/job:explode", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotImplemented ||
+		!strings.Contains(response.Body.String(), `"status":"UNIMPLEMENTED"`) {
+		t.Fatalf("unsupported status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestStrictIAMResourceRoutesExhaustEveryOperation(t *testing.T) {
 	for domain, routes := range strictIAMResourceRoutes {
 		for _, route := range routes {
@@ -1450,6 +1948,7 @@ func TestStrictIAMExecutableCustomRouteTable(t *testing.T) {
 	tests := []struct {
 		name, domain, method, path, permission string
 	}{
+		{"Batch cancel", "batch.googleapis.com", http.MethodPost, "/v1/projects/demo/locations/us/jobs/job:cancel", "batch.jobs.delete"},
 		{"bigtable read rows", "bigtable.googleapis.com", http.MethodPost, "/v2/projects/demo/instances/i/tables/t:readRows", "bigtable.tables.readRows"},
 		{"bigquery query by job", "bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/demo/queries/job", "bigquery.jobs.get"},
 		{"bigquery job results", "bigquery.googleapis.com", http.MethodGet, "/bigquery/v2/projects/demo/jobs/job/results", "bigquery.jobs.get"},
@@ -1474,6 +1973,7 @@ func TestStrictIAMExecutableCustomRouteTable(t *testing.T) {
 		{"cloudbuild trigger run", "cloudbuild.googleapis.com", http.MethodPost, "/v1/projects/demo/triggers/t:run", "cloudbuild.builds.create"},
 		{"dataproc submit", "dataproc.googleapis.com", http.MethodPost, "/v1/projects/demo/regions/us/jobs:submit", "dataproc.jobs.submit"},
 		{"iam credentials token", "iamcredentials.googleapis.com", http.MethodPost, "/v1/projects/-/serviceAccounts/a@example.test:generateAccessToken", "iam.serviceAccounts.getAccessToken"},
+		{"Storage Transfer run", "storagetransfer.googleapis.com", http.MethodPost, "/v1/transferJobs/1:run", "storagetransfer.jobs.run"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -179,6 +179,250 @@ resource "google_compute_instance" "phase16" {
   }
 }
 
+# This first Phase-18 provider slice is deliberately limited to persisted
+# Workflows metadata. Executions and Eventarc delivery remain generated-client
+# evidence, not Terraform-managed resources.
+resource "google_workflows_workflow" "phase18" {
+  count = local.use_minisky && var.enable_phase18_workflows_resource ? 1 : 0
+
+  name                = var.phase18_workflow_name
+  region              = var.region
+  description         = "MiniSky Phase-18 Terraform lifecycle evidence"
+  source_contents     = <<-YAML
+    - return_result:
+        return: "minisky-phase18"
+  YAML
+  deletion_protection = false
+
+  timeouts {
+    create = "2m"
+    update = "2m"
+    delete = "2m"
+  }
+}
+
+# This dependent Phase-18 provider slice exercises Eventarc trigger
+# control-plane metadata only: one event-type filter, a persisted Workflows
+# destination, and explicit Pub/Sub transport metadata. The gate does not
+# publish events or claim that MiniSky provisions a real Eventarc transport.
+resource "google_eventarc_trigger" "phase18" {
+  count = local.use_minisky && var.enable_phase18_eventarc_resource && var.enable_phase18_workflows_resource ? 1 : 0
+
+  name     = var.phase18_eventarc_trigger_name
+  location = var.region
+
+  event_data_content_type = "application/json"
+  labels = {
+    goog-terraform-provisioned = "true"
+  }
+
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.storage.object.v1.finalized"
+  }
+
+  destination {
+    workflow = google_workflows_workflow.phase18[0].id
+  }
+
+  transport {
+    pubsub {
+      topic = "projects/${var.project_id}/topics/${var.phase18_eventarc_transport_topic}"
+    }
+  }
+
+  timeouts {
+    create = "2m"
+    update = "2m"
+    delete = "2m"
+  }
+}
+
+# This heavy opt-in fixture claims only exact-owned local Airflow backend
+# lifecycle plus persisted Composer environment metadata.
+resource "google_composer_environment" "phase19" {
+  count = local.use_minisky && var.enable_phase19_composer_resource ? 1 : 0
+
+  name   = var.phase19_composer_environment_name
+  region = var.region
+
+  labels = {
+    goog-terraform-provisioned = "true"
+  }
+
+  timeouts {
+    create = "5m"
+    update = "2m"
+    delete = "2m"
+  }
+}
+
+# This heavy opt-in fixture treats capacity and subnet as persisted control-plane
+# metadata only. The executable local broker is exact-owned, loopback plaintext
+# Kafka; MiniSky does not emulate GCP VPC attachment or managed TLS.
+resource "google_managed_kafka_cluster" "phase19" {
+  count = local.use_minisky && var.enable_phase19_managed_kafka_resource ? 1 : 0
+
+  cluster_id = var.phase19_managed_kafka_cluster_id
+  location   = var.region
+
+  capacity_config {
+    vcpu_count   = 3
+    memory_bytes = 3221225472
+  }
+
+  gcp_config {
+    access_config {
+      network_configs {
+        subnet = "projects/${var.project_id}/regions/${var.region}/subnetworks/minisky-metadata-only"
+      }
+    }
+  }
+
+  labels = {
+    goog-terraform-provisioned = "true"
+  }
+
+  timeouts {
+    create = "5m"
+    update = "2m"
+    delete = "2m"
+  }
+}
+
+# This opt-in fixture maps the provider's mandatory share onto MiniSky's
+# traversal-protected profile filesystem. Its network is opaque metadata only:
+# no NFS server, mount protocol, VPC attachment, or address allocation is claimed.
+resource "google_filestore_instance" "phase20" {
+  count = local.use_minisky && var.enable_phase20_filestore_resource ? 1 : 0
+
+  name     = var.phase20_filestore_instance_name
+  location = "${var.region}-a"
+  tier     = "BASIC_HDD"
+
+  file_shares {
+    capacity_gb = 1024
+    name        = "minisky"
+  }
+
+  networks {
+    network = "minisky-metadata-only"
+    modes   = ["MODE_IPV4"]
+  }
+
+  labels = {
+    goog-terraform-provisioned = "true"
+  }
+
+  timeouts {
+    create = "2m"
+    update = "2m"
+    delete = "2m"
+  }
+}
+
+# Project config is a singleton that the provider cannot delete. This bounded
+# fixture exercises authorized-domain metadata only; the gate explicitly resets
+# it before removing Terraform state.
+resource "google_identity_platform_config" "phase20" {
+  count = local.use_minisky && var.enable_phase20_identity_platform_config ? 1 : 0
+
+  authorized_domains = var.phase20_identity_platform_authorized_domains
+}
+
+# This bounded job copies only between isolated local Storage-emulator buckets.
+# Cloud credentials, external sources, agents, scheduling, and cloud networking
+# are outside this fixture.
+resource "google_storage_transfer_job" "phase20" {
+  count = local.use_minisky && var.enable_phase20_storage_transfer_job ? 1 : 0
+
+  description = "MiniSky bounded local GCS-to-GCS transfer"
+  project     = var.project_id
+  status      = "ENABLED"
+
+  transfer_spec {
+    gcs_data_source {
+      bucket_name = var.phase20_storage_transfer_source_bucket
+    }
+    gcs_data_sink {
+      bucket_name = var.phase20_storage_transfer_sink_bucket
+    }
+  }
+}
+
+resource "google_alloydb_cluster" "phase20" {
+  count = local.use_minisky && var.enable_phase20_alloydb_resources ? 1 : 0
+
+  cluster_id          = var.phase20_alloydb_cluster_id
+  location            = var.region
+  deletion_protection = false
+
+  network_config {
+    network = "projects/${var.project_id}/global/networks/minisky-metadata-only"
+  }
+}
+
+resource "google_alloydb_instance" "phase20" {
+  count = local.use_minisky && var.enable_phase20_alloydb_resources ? 1 : 0
+
+  cluster       = google_alloydb_cluster.phase20[0].name
+  instance_id   = var.phase20_alloydb_instance_id
+  instance_type = "PRIMARY"
+}
+
+resource "google_service_directory_namespace" "phase21" {
+  count = local.use_minisky && var.enable_phase21_service_directory_resources ? 1 : 0
+
+  namespace_id = var.phase21_service_directory_namespace_id
+  location     = var.region
+  labels = {
+    purpose = "metadata-only"
+  }
+}
+
+resource "google_service_directory_service" "phase21" {
+  count = local.use_minisky && var.enable_phase21_service_directory_resources ? 1 : 0
+
+  service_id = var.phase21_service_directory_service_id
+  namespace  = google_service_directory_namespace.phase21[0].name
+  metadata = {
+    protocol = "opaque"
+  }
+}
+
+resource "google_service_directory_endpoint" "phase21" {
+  count = local.use_minisky && var.enable_phase21_service_directory_resources ? 1 : 0
+
+  endpoint_id = var.phase21_service_directory_endpoint_id
+  service     = google_service_directory_service.phase21[0].name
+  address     = "127.0.0.1"
+  port        = 8080
+  metadata = {
+    resolution = "unsupported"
+  }
+}
+
+resource "google_document_ai_processor" "phase23" {
+  count = local.use_minisky && var.enable_phase23_document_ai_processor ? 1 : 0
+
+  location     = var.region
+  display_name = var.phase23_document_ai_processor_display_name
+  type         = "OCR_PROCESSOR"
+}
+
+resource "google_org_policy_policy" "phase24" {
+  count = local.use_minisky && var.enable_phase24_org_policy ? 1 : 0
+
+  name   = "projects/${var.project_id}/policies/compute.disableSerialPortAccess"
+  parent = "projects/${var.project_id}"
+
+  spec {
+    rules {
+      enforce = "TRUE"
+    }
+  }
+}
+
 # The repository metadata is served by MiniSky while pushed image manifests and
 # blobs live in the profile-owned Registry v2 backend.
 resource "google_artifact_registry_repository" "phase10" {
@@ -368,4 +612,12 @@ resource "google_service_account_iam_member" "phase13_delegation" {
   service_account_id = each.value.target_key == null ? google_service_account.phase13_target[0].name : google_service_account.phase13_delegate[each.value.target_key].name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = google_service_account.phase13_delegate[each.value.source_key].member
+}
+
+resource "google_service_account_iam_member" "phase13_target_reader" {
+  count = local.phase13_wif_enabled ? 1 : 0
+
+  service_account_id = google_service_account.phase13_target[0].name
+  role               = "roles/iam.serviceAccountViewer"
+  member             = google_service_account.phase13_target[0].member
 }

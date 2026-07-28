@@ -263,6 +263,7 @@ tf_targets=(
   -target=google_service_account.phase13_target
   -target=google_service_account_iam_member.phase13_federated_caller
   -target=google_service_account_iam_member.phase13_delegation
+  -target=google_service_account_iam_member.phase13_target_reader
 )
 tf_vars=(
   -var=enable_phase13_wif_resources=true
@@ -294,6 +295,7 @@ assert_get_value "${target_url}" email "${target_email}"
 federated_principal="principal://iam.googleapis.com/${pool_name}/subject/${subject}"
 assert_policy_binding "${delegate_url}" roles/iam.workloadIdentityUser "${federated_principal}"
 assert_policy_binding "${target_url}" roles/iam.serviceAccountTokenCreator "serviceAccount:${delegate_email}"
+assert_policy_binding "${target_url}" roles/iam.serviceAccountViewer "serviceAccount:${target_email}"
 project_policy_url="${gateway}/_minisky/iam/v1/projects/${project_id}"
 if [[ "${enterprise_controls}" == "1" ]]; then
   project_policy_status="$(curl --silent --show-error --output "${work_dir}/project-policy-set.json" --write-out '%{http_code}' \

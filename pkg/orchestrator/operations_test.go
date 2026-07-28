@@ -195,6 +195,140 @@ func TestScopedOperationPollingRejectsWrongServiceParentAndTarget(t *testing.T) 
 	}
 }
 
+func TestOperationPathScope(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		path         string
+		wantName     string
+		wantProject  string
+		wantLocation string
+	}{
+		{
+			name:         "service project location operation",
+			path:         "/v1/projects/project-a/locations/us-central1/operations/op-1",
+			wantName:     "projects/project-a/locations/us-central1/operations/op-1",
+			wantProject:  "project-a",
+			wantLocation: "us-central1",
+		},
+		{
+			name:         "canonical name without service prefix",
+			path:         "projects/project-a/locations/us-central1/operations/op-1",
+			wantName:     "projects/project-a/locations/us-central1/operations/op-1",
+			wantProject:  "project-a",
+			wantLocation: "us-central1",
+		},
+		{
+			name:         "regional operation",
+			path:         "/v1/projects/project-a/regions/us-central1/operations/op-1",
+			wantName:     "projects/project-a/regions/us-central1/operations/op-1",
+			wantProject:  "project-a",
+			wantLocation: "us-central1",
+		},
+		{
+			name:         "zonal operation",
+			path:         "/v1/projects/project-a/zones/us-central1-a/operations/op-1",
+			wantName:     "projects/project-a/zones/us-central1-a/operations/op-1",
+			wantProject:  "project-a",
+			wantLocation: "us-central1-a",
+		},
+		{
+			name:        "project global operation",
+			path:        "/v1/projects/project-a/operations/op-1",
+			wantName:    "projects/project-a/operations/op-1",
+			wantProject: "project-a",
+		},
+		{
+			name:         "location operation without project",
+			path:         "/v1/locations/us-central1/operations/op-1",
+			wantName:     "operations/op-1",
+			wantLocation: "us-central1",
+		},
+		{
+			name:     "global operation",
+			path:     "/v1/operations/op-1",
+			wantName: "operations/op-1",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			name, project, location := operationPathScope(test.path)
+			if name != test.wantName || project != test.wantProject || location != test.wantLocation {
+				t.Fatalf("operationPathScope(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					test.path, name, project, location,
+					test.wantName, test.wantProject, test.wantLocation)
+			}
+		})
+	}
+}
+
+func TestOperationPathScopeRejectsMalformedPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "empty", path: ""},
+		{name: "slashes only", path: "///"},
+		{name: "missing operation name", path: "/v1/projects/project-a/locations/us/operations"},
+		{name: "empty project", path: "/v1/projects//locations/us/operations/op-1"},
+		{name: "empty location", path: "/v1/projects/project-a/locations//operations/op-1"},
+		{name: "empty operation name", path: "/v1/projects/project-a/locations/us/operations/"},
+		{name: "extra segment before operations", path: "/v1/projects/project-a/locations/us/resources/r/operations/op-1"},
+		{name: "extra segment after operation name", path: "/v1/projects/project-a/locations/us/operations/op-1/extra"},
+		{name: "wrong collection", path: "/v1/projects/project-a/locations/us/tasks/op-1"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			name, project, location := operationPathScope(test.path)
+			if name != "" || project != "" || location != "" {
+				t.Fatalf("operationPathScope(%q) = (%q, %q, %q), want rejection",
+					test.path, name, project, location)
+			}
+		})
+	}
+}
+
+func TestPollScopedRejectsCrossScopeLegacyOperationPaths(t *testing.T) {
+	t.Parallel()
+
+	manager := NewOperationManager()
+	op := manager.Register(
+		"workflows#operation",
+		"create",
+		"projects/project-a/locations/us-central1/workflows/flow",
+		"",
+		"",
+	)
+	correctPath := "/v1/projects/project-a/locations/us-central1/operations/" + op.Name
+	if got, err := manager.PollScoped(correctPath, "workflows#operation"); err != nil || got == nil {
+		t.Fatalf("PollScoped(correct path) = (%+v, %v)", got, err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "omitted project and location", path: "/v1/operations/" + op.Name},
+		{name: "omitted location", path: "/v1/projects/project-a/operations/" + op.Name},
+		{name: "wrong project", path: "/v1/projects/project-b/locations/us-central1/operations/" + op.Name},
+		{name: "wrong location", path: "/v1/projects/project-a/locations/europe-west1/operations/" + op.Name},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := manager.PollScoped(test.path, "workflows#operation")
+			if !errors.Is(err, ErrOperationNotFound) || got != nil {
+				t.Fatalf("PollScoped(%q) = (%+v, %v), want nil NOT_FOUND", test.path, got, err)
+			}
+		})
+	}
+}
+
 func TestScopedOperationPersistsTerminalResponseAndError(t *testing.T) {
 	store := &injectedOperationStore{}
 	manager, err := NewOperationManagerWithStore(store)

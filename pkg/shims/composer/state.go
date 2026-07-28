@@ -62,6 +62,10 @@ func (api *API) loadState() error {
 		for name, environment := range meta.Environments {
 			restored := deepCopyEnvironment(environment)
 			restored.State = "ERROR"
+			if restored.Config != nil {
+				restored.Config.AirflowURI = ""
+				restored.Config.DagGcsPrefix = ""
+			}
 			api.environments[name] = restored
 		}
 	}

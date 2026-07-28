@@ -2,34 +2,86 @@ package dataflow
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"minisky/pkg/state"
 )
 
-func TestCreateJob(t *testing.T) {
+func TestCreateJobRunsBoundedPipelineToCompletion(t *testing.T) {
+	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
 	api := newTestAPI()
-	body := `{"name":"my-batch-job","type":"JOB_TYPE_BATCH","environment":{"tempStoragePrefix":"gs://bucket/tmp"}}`
+	api.runner = runner
+	body := `{"name":"my-batch-job","type":"JOB_TYPE_BATCH","steps":[{"name":"create","kind":"Create","properties":{"elements":["a","b"]}},{"name":"count","kind":"Count"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1b3/projects/test-project/locations/us-central1/jobs", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
 
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var created Job
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.CurrentState != "JOB_STATE_PENDING" {
+		t.Fatalf("unexpected create response: %+v", created)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not started")
+	}
+	waitForJobState(t, api, created.ID, "JOB_STATE_RUNNING")
+	close(runner.release)
+	waitForJobState(t, api, created.ID, "JOB_STATE_DONE")
+}
+
+func TestCreateJobRejectsUnsupportedPipelineBeforeMutation(t *testing.T) {
+	api := newTestAPI()
+	body := `{"name":"streaming","type":"JOB_TYPE_STREAMING","steps":[{"name":"read","kind":"Create"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1b3/projects/p/locations/l/jobs", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte(`"status":"UNIMPLEMENTED"`)) {
-		t.Fatalf("expected UNIMPLEMENTED error, got %s", w.Body.String())
+	if len(api.jobs) != 0 {
+		t.Fatal("unsupported pipeline mutated state")
 	}
-	api.mu.RLock()
-	defer api.mu.RUnlock()
-	if len(api.jobs) != 0 || api.nextID != 1 {
-		t.Fatalf("unsupported create mutated state: jobs=%d nextID=%d", len(api.jobs), api.nextID)
+}
+
+func TestCancelStopsRunningLocalJobWithoutTerminalOverwrite(t *testing.T) {
+	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
+	api := newTestAPI()
+	api.runner = runner
+	create := httptest.NewRequest(http.MethodPost, "/v1b3/projects/p/locations/l/jobs",
+		bytes.NewBufferString(`{"name":"cancel-me","type":"JOB_TYPE_BATCH","steps":[{"name":"create","kind":"Create","properties":{"elements":["a"]}}]}`))
+	createResponse := httptest.NewRecorder()
+	api.ServeHTTP(createResponse, create)
+	var job Job
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
 	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not started")
+	}
+	cancel := httptest.NewRequest(http.MethodPut, "/v1b3/projects/p/locations/l/jobs/"+job.ID,
+		bytes.NewBufferString(`{"requestedState":"JOB_STATE_CANCELLED"}`))
+	cancelResponse := httptest.NewRecorder()
+	api.ServeHTTP(cancelResponse, cancel)
+	if cancelResponse.Code != http.StatusOK {
+		t.Fatalf("cancel: expected 200, got %d: %s", cancelResponse.Code, cancelResponse.Body.String())
+	}
+	waitForJobState(t, api, job.ID, "JOB_STATE_CANCELLED")
 }
 
 func TestGetJob(t *testing.T) {
@@ -299,6 +351,37 @@ func TestConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+type blockingRunner struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRunner) Run(ctx context.Context, _ *Job) error {
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitForJobState(t *testing.T, api *API, id, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		api.mu.RLock()
+		state := api.jobs[id].CurrentState
+		api.mu.RUnlock()
+		if state == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("job %s did not reach %s", id, want)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

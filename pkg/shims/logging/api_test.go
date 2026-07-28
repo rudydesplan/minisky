@@ -296,6 +296,227 @@ func TestLoggingListOrderingAndBounds(t *testing.T) {
 	}
 }
 
+func TestLoggingEntriesPaginationIsDeterministicAndScoped(t *testing.T) {
+	api, err := NewAPIWithStore(nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := loggingRequest(api, http.MethodPost, "/v2/entries:write", `{"entries":[
+		{"insertId":"b","timestamp":"2026-07-26T08:00:00Z","severity":"ERROR","logName":"projects/p/logs/app"},
+		{"insertId":"a","timestamp":"2026-07-26T08:00:00Z","severity":"ERROR","logName":"projects/p/logs/app"},
+		{"insertId":"c","timestamp":"2026-07-26T08:01:00Z","severity":"ERROR","logName":"projects/p/logs/app"}
+	]}`)
+	if write.Code != http.StatusOK {
+		t.Fatalf("write=%d %s", write.Code, write.Body.String())
+	}
+
+	requestBody := `{"resourceNames":["projects/p"],"filter":"severity>=ERROR","orderBy":"timestamp desc","pageSize":1}`
+	first := loggingRequest(api, http.MethodPost, "/v2/entries:list", requestBody)
+	var firstPage struct {
+		Entries       []LogEntry `json:"entries"`
+		NextPageToken string     `json:"nextPageToken"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if first.Code != http.StatusOK || len(firstPage.Entries) != 1 ||
+		firstPage.Entries[0].InsertId != "c" || firstPage.NextPageToken == "" {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := loggingRequest(api, http.MethodPost, "/v2/entries:list",
+		`{"resourceNames":["projects/p"],"filter":"severity>=ERROR","orderBy":"timestamp desc","pageSize":1,"pageToken":`+
+			fmt.Sprintf("%q", firstPage.NextPageToken)+`}`)
+	var secondPage struct {
+		Entries       []LogEntry `json:"entries"`
+		NextPageToken string     `json:"nextPageToken"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPage); err != nil {
+		t.Fatal(err)
+	}
+	if second.Code != http.StatusOK || len(secondPage.Entries) != 1 ||
+		secondPage.Entries[0].InsertId != "b" || secondPage.NextPageToken == "" {
+		t.Fatalf("second page status=%d body=%s", second.Code, second.Body.String())
+	}
+
+	for name, body := range map[string]string{
+		"malformed":    `{"pageSize":1,"pageToken":"not-a-token"}`,
+		"parent":       `{"resourceNames":["projects/other"],"filter":"severity>=ERROR","orderBy":"timestamp desc","pageSize":1,"pageToken":` + fmt.Sprintf("%q", firstPage.NextPageToken) + `}`,
+		"filter":       `{"resourceNames":["projects/p"],"filter":"severity>=WARNING","orderBy":"timestamp desc","pageSize":1,"pageToken":` + fmt.Sprintf("%q", firstPage.NextPageToken) + `}`,
+		"order":        `{"resourceNames":["projects/p"],"filter":"severity>=ERROR","orderBy":"timestamp asc","pageSize":1,"pageToken":` + fmt.Sprintf("%q", firstPage.NextPageToken) + `}`,
+		"pageSizeLow":  `{"pageSize":-1}`,
+		"pageSizeHigh": `{"pageSize":1001}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertLoggingError(t, loggingRequest(api, http.MethodPost, "/v2/entries:list", body),
+				http.StatusBadRequest, "INVALID_ARGUMENT")
+		})
+	}
+
+	staleToken := firstPage.NextPageToken
+	changed := loggingRequest(api, http.MethodPost, "/v2/entries:write",
+		`{"entries":[{"insertId":"d","timestamp":"2026-07-26T08:02:00Z","severity":"ERROR","logName":"projects/p/logs/app"}]}`)
+	if changed.Code != http.StatusOK {
+		t.Fatalf("change=%d %s", changed.Code, changed.Body.String())
+	}
+	stale := loggingRequest(api, http.MethodPost, "/v2/entries:list",
+		`{"resourceNames":["projects/p"],"filter":"severity>=ERROR","orderBy":"timestamp desc","pageSize":1,"pageToken":`+
+			fmt.Sprintf("%q", staleToken)+`}`)
+	assertLoggingError(t, stale, http.StatusBadRequest, "INVALID_ARGUMENT")
+}
+
+func TestLoggingSinkPaginationIsDeterministicAndScoped(t *testing.T) {
+	api, err := NewAPIWithStore(nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"bravo", "alpha", "charlie"} {
+		response := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+			fmt.Sprintf(`{"name":%q,"destination":"file://%s"}`, name, name))
+		if response.Code != http.StatusOK {
+			t.Fatalf("create %s=%d %s", name, response.Code, response.Body.String())
+		}
+	}
+
+	const filterQuery = `filter=in_scope%28%22DEFAULT%22%29`
+	first := loggingRequest(api, http.MethodGet, "/v2/projects/p/sinks?pageSize=1&"+filterQuery, "")
+	var page struct {
+		Sinks         []LogSink `json:"sinks"`
+		NextPageToken string    `json:"nextPageToken"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if first.Code != http.StatusOK || len(page.Sinks) != 1 ||
+		page.Sinks[0].Name != "alpha" || page.NextPageToken == "" {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := loggingRequest(api, http.MethodGet,
+		"/v2/projects/p/sinks?pageSize=1&"+filterQuery+"&pageToken="+page.NextPageToken, "")
+	var secondPage struct {
+		Sinks []LogSink `json:"sinks"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPage); err != nil {
+		t.Fatal(err)
+	}
+	if second.Code != http.StatusOK || len(secondPage.Sinks) != 1 || secondPage.Sinks[0].Name != "bravo" {
+		t.Fatalf("second page status=%d body=%s", second.Code, second.Body.String())
+	}
+
+	for name, path := range map[string]string{
+		"malformed":    "/v2/projects/p/sinks?pageSize=1&pageToken=not-a-token",
+		"parent":       "/v2/projects/other/sinks?pageSize=1&" + filterQuery + "&pageToken=" + page.NextPageToken,
+		"filter":       "/v2/projects/p/sinks?pageSize=1&pageToken=" + page.NextPageToken,
+		"pageSizeLow":  "/v2/projects/p/sinks?pageSize=-1",
+		"pageSizeHigh": "/v2/projects/p/sinks?pageSize=1001",
+		"pageSizeText": "/v2/projects/p/sinks?pageSize=many",
+		"order":        "/v2/projects/p/sinks?orderBy=name",
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertLoggingError(t, loggingRequest(api, http.MethodGet, path, ""),
+				http.StatusBadRequest, "INVALID_ARGUMENT")
+		})
+	}
+	unsupportedFilter := loggingRequest(api, http.MethodGet,
+		`/v2/projects/p/sinks?filter=in_scope%28%22ANCESTOR%22%29`, "")
+	assertLoggingError(t, unsupportedFilter, http.StatusNotImplemented, "UNIMPLEMENTED")
+	crossService := loggingRequest(api, http.MethodPost, "/v2/entries:list",
+		`{"pageSize":1,"pageToken":`+fmt.Sprintf("%q", page.NextPageToken)+`}`)
+	assertLoggingError(t, crossService, http.StatusBadRequest, "INVALID_ARGUMENT")
+
+	staleToken := page.NextPageToken
+	created := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+		`{"name":"delta","destination":"file://delta"}`)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create delta=%d %s", created.Code, created.Body.String())
+	}
+	assertLoggingError(t, loggingRequest(api, http.MethodGet,
+		"/v2/projects/p/sinks?pageSize=1&"+filterQuery+"&pageToken="+staleToken, ""),
+		http.StatusBadRequest, "INVALID_ARGUMENT")
+}
+
+func TestLoggingSinkPatchUsesExactUpdateMaskAndSurvivesRestart(t *testing.T) {
+	store, err := state.New(t.TempDir(), "sink-update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := loggingRequest(api, http.MethodPost, "/v2/projects/p/sinks",
+		`{"name":"errors","destination":"file://before","filter":"severity>=ERROR","description":"before"}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create=%d %s", create.Code, create.Body.String())
+	}
+	patch := loggingRequest(api, http.MethodPatch,
+		"/v2/projects/p/sinks/errors?updateMask=filter,description",
+		`{"name":"ignored","destination":"file://ignored","filter":"severity>=WARNING"}`)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("patch=%d %s", patch.Code, patch.Body.String())
+	}
+	var updated LogSink
+	if err := json.Unmarshal(patch.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "errors" || updated.Destination != "file://before" ||
+		updated.Filter != "severity>=WARNING" || updated.Description != "" {
+		t.Fatalf("updated=%#v", updated)
+	}
+
+	restarted, err := NewAPIWithStore(store, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := loggingRequest(restarted, http.MethodGet, "/v2/projects/p/sinks/errors", "")
+	var persisted LogSink
+	if err := json.Unmarshal(get.Body.Bytes(), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if get.Code != http.StatusOK || !reflect.DeepEqual(persisted, updated) {
+		t.Fatalf("persisted status=%d sink=%#v want=%#v", get.Code, persisted, updated)
+	}
+	defaultMask := loggingRequest(restarted, http.MethodPatch, "/v2/projects/p/sinks/errors",
+		`{"destination":"file://default","filter":"","description":"ignored"}`)
+	if defaultMask.Code != http.StatusOK {
+		t.Fatalf("default mask patch=%d %s", defaultMask.Code, defaultMask.Body.String())
+	}
+	var defaultUpdated LogSink
+	if err := json.Unmarshal(defaultMask.Body.Bytes(), &defaultUpdated); err != nil {
+		t.Fatal(err)
+	}
+	if defaultUpdated.Destination != "file://default" || defaultUpdated.Filter != "" ||
+		defaultUpdated.Description != "" {
+		t.Fatalf("default update mask result=%#v", defaultUpdated)
+	}
+	for name, path := range map[string]string{
+		"immutable": "/v2/projects/p/sinks/errors?updateMask=name",
+		"unknown":   "/v2/projects/p/sinks/errors?updateMask=writerIdentity",
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := loggingRequest(restarted, http.MethodPatch, path, `{}`)
+			assertLoggingError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+		})
+	}
+}
+
+func TestLoggingSinkPatchSaveFailureRollsBack(t *testing.T) {
+	store := &toggleLoggingStore{}
+	api := newAPI(store, nil)
+	api.sinks["p:errors"] = LogSink{
+		Name: "errors", Destination: "file://before", Description: "before",
+	}
+	store.fail = true
+	response := loggingRequest(api, http.MethodPatch,
+		"/v2/projects/p/sinks/errors?updateMask=destination,description",
+		`{"destination":"file://after","description":"after"}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("patch=%d %s", response.Code, response.Body.String())
+	}
+	if sink := api.sinks["p:errors"]; sink.Destination != "file://before" || sink.Description != "before" {
+		t.Fatalf("failed patch did not roll back: %#v", sink)
+	}
+}
+
 func TestLoggingNormalizesTimestampsBeforeOrdering(t *testing.T) {
 	api, err := NewAPIWithStore(nil, "", nil)
 	if err != nil {
@@ -433,10 +654,8 @@ func TestLoggingSinkRoutesAndDestinationsAreCanonical(t *testing.T) {
 			fmt.Sprintf(`{"name":"bad","destination":%q}`, destination))
 		assertLoggingError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
 	}
-	for _, method := range []string{http.MethodPatch, http.MethodPut} {
-		response := loggingRequest(api, method, "/v2/projects/p/sinks/name", `{}`)
-		assertLoggingError(t, response, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
-	}
+	response := loggingRequest(api, http.MethodPut, "/v2/projects/p/sinks/name", `{}`)
+	assertLoggingError(t, response, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
 }
 
 func TestLoggingSaveFailureRollsBackAndRetryPublishesOnce(t *testing.T) {

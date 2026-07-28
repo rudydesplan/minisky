@@ -15,7 +15,7 @@ import (
 	"minisky/pkg/config"
 )
 
-func TestRedisVolumeSurvivesOwnedContainerRestart(t *testing.T) {
+func TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup(t *testing.T) {
 	if os.Getenv("MINISKY_DOCKER_REDIS_INTEGRATION") != "1" {
 		t.Skip("set MINISKY_DOCKER_REDIS_INTEGRATION=1 to run")
 	}
@@ -36,7 +36,8 @@ func TestRedisVolumeSurvivesOwnedContainerRestart(t *testing.T) {
 		manager.Teardown(context.Background())
 	})
 
-	endpoint, err := manager.ProvisionRedis(ctx, resourceID, config.GetImageRegistry().Memorystore.Redis.DefaultImage)
+	valkeyImage := config.GetImageRegistry().Memorystore.Valkey.DefaultImage
+	endpoint, err := manager.ProvisionRedis(ctx, resourceID, valkeyImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestRedisVolumeSurvivesOwnedContainerRestart(t *testing.T) {
 		t.Fatalf("remove Redis container status = %d", response.StatusCode)
 	}
 
-	endpoint, err = manager.ProvisionRedis(ctx, resourceID, config.GetImageRegistry().Memorystore.Redis.DefaultImage)
+	endpoint, err = manager.ProvisionRedis(ctx, resourceID, valkeyImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +71,9 @@ func TestRedisVolumeSurvivesOwnedContainerRestart(t *testing.T) {
 	}
 	if value != "persisted" {
 		t.Fatalf("GET after restart = %q", value)
+	}
+	if err := manager.DeleteRedis(ctx, resourceID); err != nil {
+		t.Fatalf("cleanup owned Valkey backend: %v", err)
 	}
 }
 

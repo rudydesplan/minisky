@@ -304,6 +304,9 @@ func (om *OperationManager) PollScoped(path, serviceKind string) (*Operation, er
 	if err != nil {
 		return nil, err
 	}
+	if op.Project != project || op.Location != location {
+		return nil, ErrOperationNotFound
+	}
 	op.Name = name
 	return op, nil
 }
@@ -890,27 +893,34 @@ func resourceParentScope(resource string) (project, location string) {
 }
 
 func operationPathScope(path string) (name, project, location string) {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	projectIndex := -1
-	for index, part := range parts {
-		if index+1 >= len(parts) {
-			break
-		}
-		switch part {
-		case "projects":
-			project = parts[index+1]
-			projectIndex = index
-		case "locations", "regions", "zones":
-			location = parts[index+1]
-		case "operations":
-			start := index
-			if projectIndex >= 0 {
-				start = projectIndex
-			}
-			name = strings.Join(parts[start:index+2], "/")
+	path = strings.TrimPrefix(path, "/")
+	if path == "" || strings.HasSuffix(path, "/") {
+		return "", "", ""
+	}
+	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		if part == "" {
+			return "", "", ""
 		}
 	}
-	return name, project, location
+
+	if len(parts) > 0 && parts[0] != "projects" && parts[0] != "locations" && parts[0] != "operations" {
+		parts = parts[1:]
+	}
+	switch {
+	case len(parts) == 6 &&
+		parts[0] == "projects" &&
+		(parts[2] == "locations" || parts[2] == "regions" || parts[2] == "zones") &&
+		parts[4] == "operations":
+		return strings.Join(parts, "/"), parts[1], parts[3]
+	case len(parts) == 4 && parts[0] == "projects" && parts[2] == "operations":
+		return strings.Join(parts, "/"), parts[1], ""
+	case len(parts) == 4 && parts[0] == "locations" && parts[2] == "operations":
+		return strings.Join(parts[2:], "/"), "", parts[1]
+	case len(parts) == 2 && parts[0] == "operations":
+		return strings.Join(parts, "/"), "", ""
+	}
+	return "", "", ""
 }
 
 func interruptOperation(op *Operation) {

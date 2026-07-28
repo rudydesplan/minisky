@@ -2,31 +2,54 @@ package composer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"minisky/pkg/orchestrator"
 	"minisky/pkg/state"
 )
 
 func TestCreateEnvironment(t *testing.T) {
 	api := newTestAPI()
+	api.backend = &fakeAirflowBackend{endpoint: "http://127.0.0.1:18080"}
 	body := `{"name":"projects/test/locations/us-central1/environments/my-env","config":{"nodeCount":3,"softwareConfig":{"imageVersion":"composer-2.0.0-airflow-2.2.3"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
-	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), `"status":"UNIMPLEMENTED"`) {
-		t.Fatalf("expected canonical 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	waitForEnvironmentState(t, api, "projects/test/locations/us-central1/environments/my-env", "RUNNING")
 	api.mu.RLock()
-	env := api.environments["projects/test/locations/us-central1/environments/my-env"]
+	env := deepCopyEnvironment(api.environments["projects/test/locations/us-central1/environments/my-env"])
 	api.mu.RUnlock()
-	if env != nil {
-		t.Fatal("unsupported create mutated environment state")
+	if env.Config == nil || env.Config.AirflowURI != "http://127.0.0.1:18080" {
+		t.Fatalf("missing executable Airflow endpoint: %+v", env.Config)
+	}
+}
+
+func TestCreateEnvironmentProvidesReadableConfigForMinimalProviderRequest(t *testing.T) {
+	api := newTestAPI()
+	api.backend = &fakeAirflowBackend{endpoint: "http://127.0.0.1:18080"}
+	name := "projects/test/locations/us-central1/environments/provider"
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/environments",
+		bytes.NewBufferString(`{"name":"`+name+`","labels":{"goog-terraform-provisioned":"true"}}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	waitForEnvironmentState(t, api, name, "RUNNING")
+	if got := api.environments[name].Config; got == nil || got.SoftwareConfig == nil || got.SoftwareConfig.ImageVersion == "" {
+		t.Fatalf("minimal provider response has unreadable config: %#v", got)
 	}
 }
 
@@ -54,6 +77,7 @@ func TestCreateEnvironmentInvalidName(t *testing.T) {
 
 func TestCreateEnvironmentDuplicate(t *testing.T) {
 	api := newTestAPI()
+	api.backend = &fakeAirflowBackend{}
 	api.mu.Lock()
 	api.environments["projects/test/locations/us-central1/environments/dup"] = &Environment{
 		Name: "projects/test/locations/us-central1/environments/dup",
@@ -65,8 +89,8 @@ func TestCreateEnvironmentDuplicate(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	api.ServeHTTP(w, req)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -301,6 +325,244 @@ func TestGetOperationNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateEnvironmentMetadataSaveFailureRollsBackDurableOperation(t *testing.T) {
+	operationStore := &mockStore{data: make(map[string][]byte)}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("metadata save failed")},
+	}
+	api := &API{
+		opMgr:        opMgr,
+		stateStore:   metadataStore,
+		environments: make(map[string]*Environment),
+		backend:      &fakeAirflowBackend{},
+	}
+
+	body := `{"name":"projects/test/locations/us-central1/environments/save-fails"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/us-central1/environments", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(api.opMgr.List()) != 0 {
+		t.Fatalf("failed create left an in-memory operation: %+v", api.opMgr.List())
+	}
+	restarted, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.List()) != 0 {
+		t.Fatalf("failed create left a durable operation: %+v", restarted.List())
+	}
+}
+
+func TestPatchEnvironmentOperationRegistrationFailureDoesNotMutate(t *testing.T) {
+	operationStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("operation save failed")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{data: make(map[string][]byte)}
+	name := "projects/test/locations/us-central1/environments/e1"
+	api := &API{
+		opMgr:      opMgr,
+		stateStore: metadataStore,
+		environments: map[string]*Environment{name: {
+			Name:       name,
+			CreateTime: "2024-01-01T00:00:00Z",
+			UpdateTime: "2024-01-01T00:00:00Z",
+			State:      "RUNNING",
+			Labels:     map[string]string{"env": "dev"},
+		}},
+		backend: &fakeAirflowBackend{},
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/projects/test/locations/us-central1/environments/e1?updateMask=labels",
+		bytes.NewBufferString(`{"labels":{"env":"prod"}}`))
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	get := httptest.NewRecorder()
+	api.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments/e1", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("environment was not externally visible after failed patch: %d: %s", get.Code, get.Body.String())
+	}
+	var environment Environment
+	if err := json.Unmarshal(get.Body.Bytes(), &environment); err != nil {
+		t.Fatal(err)
+	}
+	if environment.Labels["env"] != "dev" || environment.UpdateTime != "2024-01-01T00:00:00Z" {
+		t.Fatalf("operation registration failure mutated environment: %+v", &environment)
+	}
+	if metadataStore.saveCalls != 0 {
+		t.Fatalf("operation registration failure persisted metadata %d times", metadataStore.saveCalls)
+	}
+}
+
+func TestDeleteEnvironmentOperationRegistrationFailureDoesNotMutateBackend(t *testing.T) {
+	operationStore := &mockStore{
+		data:       make(map[string][]byte),
+		failOnSave: map[int]error{1: errors.New("operation save failed")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &mockStore{data: make(map[string][]byte)}
+	backend := &fakeAirflowBackend{}
+	name := "projects/test/locations/us-central1/environments/e1"
+	api := &API{
+		opMgr:        opMgr,
+		stateStore:   metadataStore,
+		environments: map[string]*Environment{name: {Name: name, State: "RUNNING"}},
+		backend:      backend,
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/test/locations/us-central1/environments/e1", nil)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	get := httptest.NewRecorder()
+	api.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/projects/test/locations/us-central1/environments/e1", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("operation registration failure hid environment: %d: %s", get.Code, get.Body.String())
+	}
+	if backend.deleteCalls != 0 {
+		t.Fatalf("operation registration failure deleted backend %d times", backend.deleteCalls)
+	}
+	if metadataStore.saveCalls != 0 {
+		t.Fatalf("operation registration failure persisted metadata %d times", metadataStore.saveCalls)
+	}
+}
+
+func TestEnvironmentMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMetadataTruth(t *testing.T) {
+	const name = "projects/test/locations/us-central1/environments/e1"
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		wantExists bool
+		wantLabel  string
+	}{
+		{
+			name:       "patch",
+			method:     http.MethodPatch,
+			body:       `{"labels":{"env":"prod"}}`,
+			wantExists: true,
+			wantLabel:  "prod",
+		},
+		{
+			name:       "delete",
+			method:     http.MethodDelete,
+			wantExists: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operationStore := &mockStore{
+				data:       make(map[string][]byte),
+				failOnSave: map[int]error{2: errors.New("terminal operation save failed")},
+			}
+			opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadataStore := &mockStore{data: make(map[string][]byte)}
+			api := &API{
+				opMgr:      opMgr,
+				stateStore: metadataStore,
+				environments: map[string]*Environment{name: {
+					Name:       name,
+					CreateTime: "2024-01-01T00:00:00Z",
+					UpdateTime: "2024-01-01T00:00:00Z",
+					State:      "RUNNING",
+					Labels:     map[string]string{"env": "dev"},
+				}},
+				backend: &fakeAirflowBackend{},
+			}
+
+			path := "/v1/projects/test/locations/us-central1/environments/e1"
+			if test.method == http.MethodPatch {
+				path += "?updateMask=labels"
+			}
+			req := httptest.NewRequest(test.method, path, bytes.NewBufferString(test.body))
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), `"done":true`) {
+				t.Fatalf("terminal persistence failure fabricated success: %s", w.Body.String())
+			}
+			var response struct {
+				Error struct {
+					Status string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Error.Status != "UNAVAILABLE" {
+				t.Fatalf("error status = %q, want UNAVAILABLE", response.Error.Status)
+			}
+
+			operations := opMgr.List()
+			if len(operations) != 1 {
+				t.Fatalf("operations = %+v, want one reconciled operation", operations)
+			}
+			inProcess := operations[0]
+			if !inProcess.Done || inProcess.Error == nil ||
+				!strings.Contains(inProcess.Error.Message, "interrupted by MiniSky restart") {
+				t.Fatalf("in-process operation was not reconciled: %+v", inProcess)
+			}
+
+			restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			durable := restartedOps.Get(inProcess.Name)
+			if durable == nil || !durable.Done || durable.Error == nil ||
+				durable.Error.Message != inProcess.Error.Message {
+				t.Fatalf("operation truth diverged across restart: in-process=%+v restarted=%+v", inProcess, durable)
+			}
+
+			restarted := &API{
+				opMgr:        orchestrator.NewOperationManager(),
+				stateStore:   metadataStore,
+				environments: make(map[string]*Environment),
+			}
+			if err := restarted.loadState(); err != nil {
+				t.Fatal(err)
+			}
+			restarted.mu.RLock()
+			environment, exists := restarted.environments[name]
+			restarted.mu.RUnlock()
+			if exists != test.wantExists {
+				t.Fatalf("persisted environment existence = %v, want %v", exists, test.wantExists)
+			}
+			if exists && environment.Labels["env"] != test.wantLabel {
+				t.Fatalf("persisted labels = %v, want env=%q", environment.Labels, test.wantLabel)
+			}
+		})
+	}
+}
+
 func TestPersistAndReload(t *testing.T) {
 	store := &mockStore{data: make(map[string][]byte)}
 	api := &API{
@@ -317,7 +579,8 @@ func TestPersistAndReload(t *testing.T) {
 		UpdateTime: "2024-06-01T00:00:00Z",
 		State:      "RUNNING",
 		Config: &EnvironmentConfig{
-			NodeCount: 5,
+			NodeCount:  5,
+			AirflowURI: "http://127.0.0.1:18080",
 		},
 	}
 	api.mu.Unlock()
@@ -349,6 +612,9 @@ func TestPersistAndReload(t *testing.T) {
 	}
 	if env.State != "ERROR" {
 		t.Fatalf("rehydrated environment must not claim a running backend, got %q", env.State)
+	}
+	if env.Config.AirflowURI != "" {
+		t.Fatalf("rehydrated environment exposed stale Airflow endpoint %q", env.Config.AirflowURI)
 	}
 }
 
@@ -392,8 +658,41 @@ func TestConcurrentCreateAndGet(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type mockStore struct {
-	mu   sync.Mutex
-	data map[string][]byte
+	mu         sync.Mutex
+	data       map[string][]byte
+	failOnSave map[int]error
+	saveCalls  int
+}
+
+type fakeAirflowBackend struct {
+	endpoint    string
+	deleteCalls int
+}
+
+func (b *fakeAirflowBackend) Provision(context.Context, string) (string, error) {
+	return b.endpoint, nil
+}
+
+func (b *fakeAirflowBackend) Delete(context.Context, string) error {
+	b.deleteCalls++
+	return nil
+}
+
+func waitForEnvironmentState(t *testing.T, api *API, name, want string) {
+	t.Helper()
+	for i := 0; i < 5000; i++ {
+		api.mu.RLock()
+		state := ""
+		if environment := api.environments[name]; environment != nil {
+			state = environment.State
+		}
+		api.mu.RUnlock()
+		if state == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("environment did not reach %s", want)
 }
 
 func (m *mockStore) Load(name string, target any) error {
@@ -409,6 +708,10 @@ func (m *mockStore) Load(name string, target any) error {
 func (m *mockStore) Save(name string, value any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.saveCalls++
+	if err := m.failOnSave[m.saveCalls]; err != nil {
+		return err
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err

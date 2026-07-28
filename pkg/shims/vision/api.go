@@ -98,6 +98,11 @@ func (api *API) annotate(w http.ResponseWriter, r *http.Request) {
 			gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 			return
 		}
+		if len(imgReq.ImageContext) != 0 {
+			gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+				"field 'requests.imageContext' is not implemented")
+			return
+		}
 		if len(imgReq.Features) == 0 {
 			gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "field 'requests.features' is required")
 			return

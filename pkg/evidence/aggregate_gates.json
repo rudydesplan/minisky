@@ -8,5 +8,8 @@
   {"name":"workflow-ssrf","package":"pkg/shims/workflows","tests":["TestValidateCallURLEnforcesLoopbackOnlySSRFBoundary"],"methodNote":"rejects credentials, metadata, external hosts, ports, and schemes"},
   {"name":"api-gateway-loopback","package":"pkg/shims/apigateway","tests":["TestApiConfigHierarchyAndLoopbackProxy","TestApiConfigRejectsSSRFAndUnsupportedMode"],"methodNote":"loopback proxy succeeds; metadata and unsupported transports fail closed"},
   {"name":"unsupported-backends","package":"pkg/shims/pubsublite","tests":["TestDeferredHandlerNeverAcknowledgesMutations"],"methodNote":"no Docker success is claimed for explicit unsupported prototypes"},
+  {"name":"phase18-generated-clients","package":"sdk-smoke/phase18-25","tests":["TestGeneratedClientsUseFullDomainCanonicalPaths","TestGeneratedBatchRunnableAndTerminalExitCode"],"methodNote":"generated Google clients use canonical full-domain paths and preserve the digest-pinned Batch runnable and terminal exit-code shape"},
+  {"name":"phase18-batch-restart","package":"pkg/shims/batch","tests":["TestRestartCleansOwnedContainerAndFailsInterruptedExecutableJob"],"methodNote":"restart cleans exact-owned Batch containers, persists interruption, and never replays runnable work"},
+  {"name":"phase18-batch-execution","package":"pkg/shims/batch","tests":["TestCreateExecutableJobRunsAndCapturesTerminalState","TestDockerExecutableJobIntegration"],"methodNote":"bounded Batch runnables capture durable SUCCEEDED and exit-zero state; Docker execution remains environment-gated"},
   {"name":"terraform-truth","package":"pkg/evidence","tests":["TestRegistryCountDocsAndTerraformClaimsStayAligned"],"methodNote":"experimental inventory declares no Terraform claim and tracked HCL has no experimental endpoints"}
 ]

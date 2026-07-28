@@ -55,8 +55,10 @@ type Instance struct {
 	LocationId            string             `json:"locationId"`
 	AlternativeLocationId string             `json:"alternativeLocationId,omitempty"`
 	AuthorizedNetwork     string             `json:"authorizedNetwork,omitempty"`
+	ConnectMode           string             `json:"connectMode,omitempty"`
 	PersistenceConfig     *PersistenceConfig `json:"persistenceConfig,omitempty"`
 	RedisVersion          string             `json:"redisVersion,omitempty"`
+	TransitEncryptionMode string             `json:"transitEncryptionMode,omitempty"`
 	BackendID             string             `json:"-"`
 }
 
@@ -269,6 +271,16 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	if instance.Tier != "BASIC" && instance.Tier != "STANDARD_HA" {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "tier must be BASIC or STANDARD_HA")
+		return
+	}
+	if instance.TransitEncryptionMode != "" && instance.TransitEncryptionMode != "DISABLED" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"transitEncryptionMode must be DISABLED because the local Valkey backend does not support TLS")
+		return
+	}
+	if instance.ConnectMode != "" && instance.ConnectMode != "DIRECT_PEERING" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"connectMode must be DIRECT_PEERING because the local Valkey backend does not implement private service access")
 		return
 	}
 	if instance.RedisVersion == "" {
@@ -492,12 +504,12 @@ func redisImage(version string) string {
 	registry := config.GetImageRegistry()
 	target := strings.TrimPrefix(version, "REDIS_")
 	target = strings.ReplaceAll(target, "_", ".")
-	for _, version := range registry.Memorystore.Redis.Versions {
+	for _, version := range registry.Memorystore.Valkey.Versions {
 		if strings.HasPrefix(version.Version, target) {
 			return version.Image
 		}
 	}
-	return registry.Memorystore.Redis.DefaultImage
+	return registry.Memorystore.Valkey.DefaultImage
 }
 
 func parseLoopbackEndpoint(endpoint string) (string, int, error) {
