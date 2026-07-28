@@ -283,6 +283,77 @@ func TestPhase25BinaryAuthorizationPlanExitBehavior(t *testing.T) {
 	}
 }
 
+func TestPhase25BinaryAuthorizationTerraformWrapperCannotMaskPlanExit(t *testing.T) {
+	source := readShellScript(t, "phase25-binary-authorization-terraform-integration.sh")
+	for _, test := range []struct {
+		name       string
+		installBin bool
+		wantExit   int
+		wantOutput string
+	}{
+		{
+			name:       "detailed plan exit is preserved",
+			installBin: true,
+			wantExit:   2,
+		},
+		{
+			name:       "missing real binary fails closed",
+			wantExit:   1,
+			wantOutput: "terraform-bin",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			temp := t.TempDir()
+			wrapperDir := filepath.Join(temp, "wrapper")
+			cliDir := filepath.Join(temp, "cli")
+			for _, directory := range []string{wrapperDir, cliDir} {
+				if err := os.Mkdir(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(
+				filepath.Join(wrapperDir, "terraform"),
+				[]byte("#!/usr/bin/env bash\nexit 0\n"),
+				0o700,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if test.installBin {
+				if err := os.WriteFile(
+					filepath.Join(cliDir, "terraform-bin"),
+					[]byte("#!/usr/bin/env bash\nexit 2\n"),
+					0o700,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			harness := strings.Join([]string{
+				"set -Eeuo pipefail",
+				`terraform_dir="/terraform"`,
+				`terraform_log="${TEST_TEMP}/terraform.log"`,
+				shellFunction(t, source, "run_logged"),
+				shellFunction(t, source, "tf"),
+				"tf plan -detailed-exitcode",
+			}, "\n")
+			command := exec.Command("bash", "-c", harness)
+			command.Env = append(
+				withoutEnvironment(os.Environ(), "PATH", "TERRAFORM_CLI_PATH"),
+				"PATH="+wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"TERRAFORM_CLI_PATH="+cliDir,
+				"TEST_TEMP="+temp,
+			)
+			output, err := command.CombinedOutput()
+			exit, ok := err.(*exec.ExitError)
+			if !ok || exit.ExitCode() != test.wantExit {
+				t.Fatalf("wrapped plan exit=%v, want %d\n%s", err, test.wantExit, output)
+			}
+			if test.wantOutput != "" && !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("wrapped plan failure is not actionable:\n%s", output)
+			}
+		})
+	}
+}
+
 func TestPhase25BinaryAuthorizationImportOrderingBehavior(t *testing.T) {
 	source := readShellScript(t, "phase25-binary-authorization-terraform-integration.sh")
 	log := filepath.Join(t.TempDir(), "calls.log")

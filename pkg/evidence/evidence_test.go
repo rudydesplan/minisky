@@ -1811,8 +1811,12 @@ func TestPhase19ComposerTerraformGateStaticContract(t *testing.T) {
 			"MINISKY_ENABLE_EXPERIMENTAL_SERVICES=1",
 			"plan -detailed-exitcode", "state rm", " import ", "destroy",
 			"airflow dags trigger",
-			"apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79",
+			"pkg/config/images.json", "{{.Config.Image}}", "{{json .RepoDigests}}",
 			"does not claim Cloud Composer parity",
+		},
+		"pkg/config/images.json": {
+			`"composer"`,
+			`"airflow_image": "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"`,
 		},
 	}
 	for path, wants := range contracts {

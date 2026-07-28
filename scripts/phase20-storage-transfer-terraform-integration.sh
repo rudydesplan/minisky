@@ -8,7 +8,7 @@ phase_lock="${TMPDIR:-/tmp}/minisky-phase20-storage-transfer-terraform.lock"
 shared_lock_acquired=0
 phase_lock_acquired=0
 baseline_ready=0
-root=""; work=""; home=""; state=""; tfdata=""; tfstate=""
+root=""; work=""; owned_work=""; home=""; state=""; tfdata=""; tfstate=""
 profile="phase20-transfer-tf-$$"; project="phase20-transfer-tf-$$"; source_bucket="phase20-source-$$"; sink_bucket="phase20-sink-$$"
 pid=""; watchdog=""; gateway=""; job=""
 baseline_containers=""; baseline_volumes=""; baseline_networks=""
@@ -27,6 +27,30 @@ capture_new_resources(){
       printf '%s\n' "${resource}" >>"${output}"
     fi
   done <"${current}"
+}
+remove_owned_work_directory(){
+  if [[ -z "${owned_work}" || "${work}" != "${owned_work}" || ! -d "${work}" || -L "${work}" ||
+    "${state}" != "${work}/state" || "${profile}" != phase20-transfer-tf-* ]]; then
+    echo "Refusing Storage Transfer cleanup outside the exact owned work/profile root." >&2
+    return 1
+  fi
+  python3 - "${work}" "${state}" "${profile}" <<'PY' || {
+import os
+import sys
+
+work, state, profile = sys.argv[1:]
+work_real = os.path.realpath(work)
+state_real = os.path.realpath(state)
+profile_real = os.path.realpath(os.path.join(state, "profiles", profile))
+if state_real != os.path.join(work_real, "state"):
+    raise SystemExit(1)
+if os.path.commonpath((work_real, profile_real)) != work_real:
+    raise SystemExit(1)
+PY
+    echo "Refusing Storage Transfer cleanup after path containment validation failed." >&2
+    return 1
+  }
+  rm -rf -- "${work}"
 }
 cleanup(){
   local status=$? cleanup_failed=0 resource
@@ -67,7 +91,7 @@ cleanup(){
     fi
   fi
   if [[ -n "${work}" ]]; then
-    rm -rf "${work}" || cleanup_failed=1
+    remove_owned_work_directory || cleanup_failed=1
   fi
   if [[ "${phase_lock_acquired}" == "1" ]]; then
     rmdir "${phase_lock}" 2>/dev/null || cleanup_failed=1
@@ -97,6 +121,7 @@ fi
 phase_lock_acquired=1
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
+owned_work="${work}"
 home="${work}/home"; state="${work}/state"; tfdata="${work}/tf"; tfstate="${work}/terraform.tfstate"
 mkdir -p "${home}" "${state}" "${tfdata}"
 baseline_containers="${work}/baseline-containers"

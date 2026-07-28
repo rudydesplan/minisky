@@ -186,7 +186,15 @@ run_logged() {
   return "${PIPESTATUS[0]}"
 }
 tf() {
-  run_logged terraform -chdir="${terraform_dir}" "$@"
+  local terraform_cli="terraform"
+  if [[ -n "${TERRAFORM_CLI_PATH:-}" ]]; then
+    terraform_cli="${TERRAFORM_CLI_PATH}/terraform-bin"
+    if [[ ! -x "${terraform_cli}" ]]; then
+      echo "TERRAFORM_CLI_PATH does not contain an executable terraform-bin." >&2
+      return 1
+    fi
+  fi
+  run_logged "${terraform_cli}" -chdir="${terraform_dir}" "$@"
 }
 assert_provider_contract() {
   local schema="${work}/provider-schema.json" version="${work}/terraform-version.json"

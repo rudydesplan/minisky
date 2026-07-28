@@ -653,6 +653,57 @@ func TestReloadReconcilesExactOwnedAirflowBackendWithoutProvisioning(t *testing.
 	}
 }
 
+func TestReloadFailsClosedWithoutHealthyExactOwnedAirflowBackend(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		owned     bool
+		reconcile error
+	}{
+		{name: "missing", owned: false},
+		{name: "wrong-owned", reconcile: errors.New("container exists but is not owned")},
+		{name: "unhealthy", owned: true, reconcile: errors.New("Airflow readiness failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &mockStore{data: make(map[string][]byte)}
+			name := "projects/p/locations/l/environments/e1"
+			if err := store.Save(composerStateEntry, composerMetadata{Environments: map[string]*Environment{
+				name: {
+					Name:  name,
+					State: "RUNNING",
+					Config: &EnvironmentConfig{
+						AirflowURI:   "http://stale.invalid",
+						DagGcsPrefix: "minisky://stale/dags",
+					},
+				},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			backend := &fakeAirflowBackend{endpoint: "http://127.0.0.1:18080", owned: test.owned, reconcileErr: test.reconcile}
+			api := &API{
+				opMgr:        orchestrator.NewOperationManager(),
+				stateStore:   store,
+				environments: make(map[string]*Environment),
+				backend:      backend,
+			}
+
+			if err := api.loadState(); err != nil {
+				t.Fatal(err)
+			}
+			environment := api.environments[name]
+			if environment == nil || environment.State != "ERROR" {
+				t.Fatalf("rehydrated environment = %+v, want fail-closed ERROR", environment)
+			}
+			if environment.Config == nil || environment.Config.AirflowURI != "" || environment.Config.DagGcsPrefix != "" {
+				t.Fatalf("fail-closed environment retained stale backend endpoints: %+v", environment.Config)
+			}
+			if backend.provisionCalls != 0 || backend.reconcileCalls != 1 {
+				t.Fatalf("restart provision calls = %d, reconcile calls = %d; want 0 and 1",
+					backend.provisionCalls, backend.reconcileCalls)
+			}
+		})
+	}
+}
+
 func TestReloadGivesEachAirflowResourceAFairReconcileBudget(t *testing.T) {
 	store := &mockStore{data: make(map[string][]byte)}
 	environments := make(map[string]*Environment)
@@ -733,6 +784,7 @@ type mockStore struct {
 type fakeAirflowBackend struct {
 	endpoint       string
 	owned          bool
+	reconcileErr   error
 	provisionCalls int
 	reconcileCalls int
 	deleteCalls    int
@@ -759,7 +811,7 @@ func (b *fakeAirflowBackend) Provision(context.Context, string) (string, error) 
 
 func (b *fakeAirflowBackend) Reconcile(context.Context, string) (string, bool, error) {
 	b.reconcileCalls++
-	return b.endpoint, b.owned, nil
+	return b.endpoint, b.owned, b.reconcileErr
 }
 
 func (b *fakeAirflowBackend) Delete(context.Context, string) error {

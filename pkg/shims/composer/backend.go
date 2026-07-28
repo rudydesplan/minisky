@@ -19,10 +19,12 @@ import (
 	"minisky/pkg/orchestrator"
 )
 
-const airflowImage = "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
 const airflowDockerService = "composer-airflow"
 
-var airflowIdentifier = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var (
+	airflowImage      = config.GetImageRegistry().Composer.AirflowImage
+	airflowIdentifier = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+)
 
 type unavailableAirflowBackend struct{}
 

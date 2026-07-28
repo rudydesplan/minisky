@@ -846,7 +846,17 @@ func TestTeardownDeletesCapturedContainerAndNetworkIDs(t *testing.T) {
 				domain = "pubsub.googleapis.com"
 				service = "pubsub"
 			}
-			labels, _ := json.Marshal(durableEmulatorLabels(domain))
+			expectedLabels := durableEmulatorLabels(domain)
+			if domain == "storage.googleapis.com" {
+				hostUser, err := currentDockerUser()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if hostUser != "" {
+					expectedLabels["minisky.runtime-user"] = hostUser
+				}
+			}
+			labels, _ := json.Marshal(expectedLabels)
 			source := filepath.Join(config.GetRuntimeDir(), service)
 			return dockerResponse(http.StatusOK,
 				`{"Id":"container/id","State":{"Status":"running"},"Config":{"Labels":`+string(labels)+`},`+
@@ -1014,11 +1024,15 @@ func TestDurableEmulatorConfigScopesIdentityDataAndCommands(t *testing.T) {
 			if first.Volume != filepath.Join(root, "profiles", "team-a", "runtime", test.service)+":/data" {
 				t.Fatalf("profile volume = %q", first.Volume)
 			}
-			if !exactLabels(labels, map[string]string{
+			expectedLabels := map[string]string{
 				"managed-by":      "minisky",
 				"minisky.profile": "team-a",
 				"minisky.service": test.domain,
-			}) {
+			}
+			if test.domain == "storage.googleapis.com" && first.User != "" {
+				expectedLabels["minisky.runtime-user"] = first.User
+			}
+			if !exactLabels(labels, expectedLabels) {
 				t.Fatalf("labels = %#v", labels)
 			}
 			if !slices.Contains(first.Cmd, test.wantArg+"=/data") {
@@ -1035,6 +1049,38 @@ func TestDurableEmulatorConfigScopesIdentityDataAndCommands(t *testing.T) {
 			}
 			t.Setenv("MINISKY_PROFILE", "team-a")
 		})
+	}
+}
+
+func TestStorageDurableEmulatorRunsAsHostIdentity(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "storage-owner")
+
+	storage, _, err := durableEmulatorConfig("storage.googleapis.com", config.EmulatorConfig{
+		Name: "global", Image: "storage@sha256:test", Port: "4443/tcp",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := currentDockerUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want == "" {
+		t.Skip("host Docker user mapping is not supported on this platform")
+	}
+	if storage.User != want {
+		t.Fatalf("storage container user = %q, want host identity %q", storage.User, want)
+	}
+
+	pubsub, _, err := durableEmulatorConfig("pubsub.googleapis.com", config.EmulatorConfig{
+		Name: "global", Image: "pubsub@sha256:test", Port: "8085/tcp",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pubsub.User != "" {
+		t.Fatalf("unrelated Pub/Sub container user = %q, want unchanged", pubsub.User)
 	}
 }
 
@@ -1082,6 +1128,7 @@ func TestEnsureDurableEmulatorCreatesOnceAndReconcilesExactMount(t *testing.T) {
 	var createPayload struct {
 		Cmd        []string          `json:"Cmd"`
 		Labels     map[string]string `json:"Labels"`
+		User       string            `json:"User"`
 		HostConfig struct {
 			NetworkMode string   `json:"NetworkMode"`
 			Binds       []string `json:"Binds"`
@@ -1134,6 +1181,7 @@ func TestEnsureDurableEmulatorCreatesOnceAndReconcilesExactMount(t *testing.T) {
 		t.Fatalf("create calls=%d start calls=%d, want one each", createCalls, startCalls)
 	}
 	if !exactLabels(createPayload.Labels, labels) ||
+		createPayload.User != expected.User ||
 		createPayload.HostConfig.NetworkMode != "bridge" ||
 		!reflect.DeepEqual(createPayload.HostConfig.Binds, []string{expected.Volume}) {
 		t.Fatalf("create payload = %#v", createPayload)

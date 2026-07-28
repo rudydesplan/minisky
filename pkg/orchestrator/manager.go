@@ -16,8 +16,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +98,7 @@ type ContainerConfig struct {
 	Cmd             []string
 	Volume          string
 	Env             []string
+	User            string
 }
 
 // BuildContainerResult is the terminal result of one exact-owned Cloud Build
@@ -3053,6 +3057,29 @@ func durableEmulatorLabels(domain string) map[string]string {
 	return labels
 }
 
+func currentDockerUser() (string, error) {
+	if runtime.GOOS == "windows" {
+		return "", nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("resolve host identity for Storage emulator: %w", err)
+	}
+	for name, value := range map[string]string{"uid": current.Uid, "gid": current.Gid} {
+		if _, err := strconv.ParseUint(value, 10, 32); err != nil {
+			return "", fmt.Errorf("resolve host identity for Storage emulator: invalid %s %q", name, value)
+		}
+	}
+	return current.Uid + ":" + current.Gid, nil
+}
+
+func durableEmulatorContainerUser(domain string) (string, error) {
+	if domain != "storage.googleapis.com" {
+		return "", nil
+	}
+	return currentDockerUser()
+}
+
 func durableEmulatorConfig(
 	domain string,
 	cfg config.EmulatorConfig,
@@ -3066,6 +3093,10 @@ func durableEmulatorConfig(
 		return ContainerConfig{}, nil, err
 	}
 	command := append([]string(nil), cfg.Cmd...)
+	containerUser, err := durableEmulatorContainerUser(domain)
+	if err != nil {
+		return ContainerConfig{}, nil, err
+	}
 	switch domain {
 	case "storage.googleapis.com":
 		command, err = ensureCommandFlag(command, "-backend", "filesystem")
@@ -3082,6 +3113,10 @@ func durableEmulatorConfig(
 			return ContainerConfig{}, nil, err
 		}
 	}
+	labels := durableEmulatorLabels(domain)
+	if containerUser != "" {
+		labels["minisky.runtime-user"] = containerUser
+	}
 	return ContainerConfig{
 		Name:            emulatorContainerName(domain, cfg.Name),
 		Image:           cfg.Image,
@@ -3090,7 +3125,8 @@ func durableEmulatorConfig(
 		Cmd:             command,
 		Volume:          volume,
 		Env:             append([]string(nil), env...),
-	}, durableEmulatorLabels(domain), nil
+		User:            containerUser,
+	}, labels, nil
 }
 
 func ensureCommandFlag(command []string, flagName, expected string) ([]string, error) {
@@ -3338,6 +3374,9 @@ func (sm *ServiceManager) createDurableEmulator(
 			"Binds":        []string{container.Volume},
 		},
 	}
+	if container.User != "" {
+		payload["User"] = container.User
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -3373,11 +3412,19 @@ func (sm *ServiceManager) removeDurableEmulatorContainer(
 		return fmt.Errorf("domain %q has no durable emulator contract", domain)
 	}
 	service := strings.TrimSuffix(domain, ".googleapis.com")
+	containerUser, err := durableEmulatorContainerUser(domain)
+	if err != nil {
+		return err
+	}
 	container := ContainerConfig{
 		Name:   emulatorContainerName(domain, cfg.Name),
 		Volume: filepath.Join(config.GetRuntimeDir(), service) + ":/data",
+		User:   containerUser,
 	}
 	expectedLabels := durableEmulatorLabels(domain)
+	if containerUser != "" {
+		expectedLabels["minisky.runtime-user"] = containerUser
+	}
 	inspected, found, err := sm.inspectDurableEmulator(ctx, container.Name)
 	if err != nil {
 		return fmt.Errorf("inspect %s emulator for cleanup: %w", domain, err)

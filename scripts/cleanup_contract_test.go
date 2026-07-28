@@ -110,6 +110,80 @@ exit 74
 	}
 }
 
+func TestStorageTransferCleanupUsesContainedOwnedWorkDirectory(t *testing.T) {
+	source := readShellScript(t, "phase20-storage-transfer-terraform-integration.sh")
+	cleanup := shellFunction(t, source, "cleanup")
+	if !strings.Contains(cleanup, "remove_owned_work_directory") {
+		t.Fatal("Storage Transfer cleanup does not use the contained work-directory remover")
+	}
+	if strings.Contains(cleanup, `rm -rf "${work}"`) {
+		t.Fatal("Storage Transfer cleanup still removes the mutable work path directly")
+	}
+
+	remove := shellFunction(t, source, "remove_owned_work_directory")
+	parent := t.TempDir()
+	ownedWork := filepath.Join(parent, "owned-work")
+	outside := filepath.Join(parent, "outside")
+	for _, path := range []string{
+		filepath.Join(ownedWork, "state", "profiles", "phase20-transfer-tf-test", "runtime", "storage", "source"),
+		outside,
+	} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outsideMarker := filepath.Join(outside, "must-remain")
+	if err := os.WriteFile(outsideMarker, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(owned, work, state string, wantSuccess bool) {
+		t.Helper()
+		harness := strings.Join([]string{
+			"set -Eeuo pipefail",
+			`profile="phase20-transfer-tf-test"`,
+			`owned_work="$1"`,
+			`work="$2"`,
+			`state="$3"`,
+			remove,
+			"remove_owned_work_directory",
+		}, "\n")
+		command := exec.Command("bash", "-c", harness, "cleanup-test", owned, work, state)
+		output, err := command.CombinedOutput()
+		if wantSuccess && err != nil {
+			t.Fatalf("contained cleanup failed: %v\n%s", err, output)
+		}
+		if !wantSuccess && err == nil {
+			t.Fatalf("out-of-root cleanup succeeded:\n%s", output)
+		}
+	}
+
+	run(ownedWork, outside, filepath.Join(outside, "state"), false)
+	if _, err := os.Stat(outsideMarker); err != nil {
+		t.Fatalf("out-of-root cleanup changed the sentinel: %v", err)
+	}
+
+	symlinkWork := filepath.Join(parent, "symlink-work")
+	if err := os.Mkdir(symlinkWork, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(symlinkWork, "state")); err != nil {
+		t.Fatal(err)
+	}
+	run(symlinkWork, symlinkWork, filepath.Join(symlinkWork, "state"), false)
+	if _, err := os.Stat(outsideMarker); err != nil {
+		t.Fatalf("symlinked-state cleanup changed the outside sentinel: %v", err)
+	}
+
+	run(ownedWork, ownedWork, filepath.Join(ownedWork, "state"), true)
+	if _, err := os.Stat(ownedWork); !os.IsNotExist(err) {
+		t.Fatalf("owned work directory remains after cleanup: %v", err)
+	}
+	if _, err := os.Stat(outsideMarker); err != nil {
+		t.Fatalf("contained cleanup changed the outside sentinel: %v", err)
+	}
+}
+
 func readShellScript(t *testing.T, name string) string {
 	t.Helper()
 	source, err := os.ReadFile(name)
@@ -124,7 +198,11 @@ func shellFunction(t *testing.T, source, name string) string {
 	marker := name + "() {"
 	start := strings.Index(source, marker)
 	if start < 0 {
-		t.Fatalf("%s was not found", marker)
+		marker = name + "(){"
+		start = strings.Index(source, marker)
+	}
+	if start < 0 {
+		t.Fatalf("%s function was not found", name)
 	}
 	end := strings.Index(source[start:], "\n}\n")
 	if end < 0 {

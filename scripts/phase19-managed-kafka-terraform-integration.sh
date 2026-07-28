@@ -125,6 +125,19 @@ set_vars() {
 container_id() {
   docker ps -q --filter "label=minisky.profile=${profile}" --filter "label=minisky.resource=${canonical}"
 }
+assert_pinned_image() {
+  local container=$1 actual expected
+  if ! actual="$(docker inspect --format '{{.Image}}' "${container}")"; then
+    echo "Failed to inspect Kafka container image." >&2
+    return 1
+  fi
+  if ! expected="$(docker image inspect --format '{{.Id}}' "${kafka_image}")"; then
+    echo "Failed to resolve pinned Kafka image." >&2
+    return 1
+  fi
+  [[ "${actual}" == "${expected}" ]] ||
+    { echo "Kafka image identity mismatch: container=${actual} pinned=${expected}" >&2; return 1; }
+}
 assert_cluster() {
   local response="${work}/cluster.json"
   curl --fail --silent --show-error "${gateway}/_minisky/managedkafka/v1/${canonical}" >"${response}"
@@ -141,7 +154,7 @@ assert_backend_protocol() {
   local container topic="terraform-gate" received
   container="$(container_id)"
   [[ -n "${container}" ]] || { echo "Exact-owned Kafka container missing." >&2; return 1; }
-  [[ "$(docker inspect --format '{{.Image}}' "${container}")" == "sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f" ]]
+  assert_pinned_image "${container}"
   capture_volumes "${container}"
   docker exec "${container}" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
     --create --if-not-exists --topic "${topic}" --partitions 1 --replication-factor 1 >/dev/null
