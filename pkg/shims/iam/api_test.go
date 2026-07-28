@@ -161,6 +161,86 @@ func TestServiceAccountImpersonationRolesAndResolution(t *testing.T) {
 	}
 }
 
+func TestResolveServiceAccountSkipsNilAndMalformedEntries(t *testing.T) {
+	api := newAPI(nil)
+	validKey, valid := validPersistedServiceAccount("worker")
+	valid.UniqueId = "100"
+	_, malformed := validPersistedServiceAccount("broken")
+	malformed.UniqueId = "200"
+	malformed.Email = "Broken@test-project.iam.gserviceaccount.com"
+	malformed.Name = "projects/test-project/serviceAccounts/" + malformed.Email
+	_, keyMismatch := validPersistedServiceAccount("another")
+	keyMismatch.UniqueId = "300"
+	api.serviceAccounts = map[string]*ServiceAccount{
+		"test-project:nil@test-project.iam.gserviceaccount.com": nil,
+		"test-project:" + malformed.Email:                       malformed,
+		"wrong-project:" + keyMismatch.Email:                    keyMismatch,
+		validKey:                                                valid,
+	}
+
+	for _, identifier := range []string{
+		malformed.Email,
+		malformed.UniqueId,
+		keyMismatch.Email,
+		keyMismatch.UniqueId,
+	} {
+		if email, disabled, found := api.ResolveServiceAccount(identifier); found {
+			t.Fatalf("malformed identifier %q resolved as email=%q disabled=%t", identifier, email, disabled)
+		}
+	}
+	for _, identifier := range []string{valid.Email, valid.UniqueId} {
+		if email, disabled, found := api.ResolveServiceAccount(identifier); !found || disabled || email != valid.Email {
+			t.Fatalf("valid identifier %q resolved as email=%q disabled=%t found=%t",
+				identifier, email, disabled, found)
+		}
+	}
+	duplicateKey, duplicate := validPersistedServiceAccount("duplicate")
+	duplicate.UniqueId = valid.UniqueId
+	api.serviceAccounts[duplicateKey] = duplicate
+	if email, disabled, found := api.ResolveServiceAccount(valid.UniqueId); found {
+		t.Fatalf("duplicate unique ID resolved as email=%q disabled=%t", email, disabled)
+	}
+}
+
+func TestCreateServiceAccountValidatesAccountIDBoundaries(t *testing.T) {
+	thirtyCharacters := "a" + strings.Repeat("b", 29)
+	tests := []struct {
+		name      string
+		accountID string
+		want      int
+	}{
+		{name: "five characters", accountID: "abcde", want: http.StatusBadRequest},
+		{name: "six characters", accountID: "abcdef", want: http.StatusOK},
+		{name: "thirty characters", accountID: thirtyCharacters, want: http.StatusOK},
+		{name: "thirty one characters", accountID: thirtyCharacters + "c", want: http.StatusBadRequest},
+		{name: "uppercase", accountID: "Worker", want: http.StatusBadRequest},
+		{name: "leading digit", accountID: "1worker", want: http.StatusBadRequest},
+		{name: "trailing hyphen", accountID: "worker-", want: http.StatusBadRequest},
+		{name: "colon", accountID: "worker:id", want: http.StatusBadRequest},
+		{name: "control", accountID: "worker\nid", want: http.StatusBadRequest},
+		{name: "encoded alias", accountID: "worker%2Fid", want: http.StatusBadRequest},
+		{name: "separator", accountID: "worker/id", want: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newAPI(nil)
+			body, err := json.Marshal(map[string]any{"accountId": test.accountID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(
+				http.MethodPost,
+				"/v1/projects/test-project/serviceAccounts",
+				bytes.NewReader(body),
+			))
+			if response.Code != test.want {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.want, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestServiceAccountViewerCanReadAccount(t *testing.T) {
 	api := newAPI(nil)
 	api.strict = true

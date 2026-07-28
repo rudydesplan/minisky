@@ -17,7 +17,12 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/orchestrator"
+	"minisky/pkg/registry"
+	"minisky/pkg/router"
 	localsecurity "minisky/pkg/security"
+	"minisky/pkg/shims/accesscontextmanager"
+	"minisky/pkg/shims/iam"
 	"minisky/pkg/state"
 )
 
@@ -126,6 +131,140 @@ func TestGatewayHealthReportsPersistenceDegradation(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"message":"persistence is degraded"`) ||
 		strings.Contains(response.Body.String(), sensitive) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStartupSharesDefaultOffPerimeterEvaluatorWithIAMCredentials(t *testing.T) {
+	t.Run("persisted denial and live mutation", func(t *testing.T) {
+		t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+		t.Setenv("MINISKY_PROFILE", "startup-perimeter-shared")
+		t.Setenv(registry.ExperimentalServicesEnv, "")
+		t.Setenv("MINISKY_IAM_MODE", "")
+		opMgr := orchestrator.NewOperationManager()
+		seedPersistedServicePerimeter(t, opMgr)
+
+		shims, _ := registry.BootAll(opMgr, nil)
+		if _, concrete := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API); concrete {
+			t.Fatal("default-off registry unexpectedly returned concrete Access Context Manager API")
+		}
+		createStartupTestServiceAccount(t, shims["iam.googleapis.com"].(*iam.API))
+
+		gateway := router.NewProxyRouterWithManager(nil)
+		perimeterAPI := configureStartupServicePerimeters(gateway, shims, opMgr)
+		gateway.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		gateway.RegisterShim("iamcredentials.googleapis.com", shims["iamcredentials.googleapis.com"])
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusForbidden)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusForbidden)
+
+		deleted := httptest.NewRecorder()
+		perimeterAPI.ServeHTTP(deleted, httptest.NewRequest(
+			http.MethodDelete,
+			"/v1/accessPolicies/1/servicePerimeters/prod",
+			nil,
+		))
+		if deleted.Code != http.StatusOK {
+			t.Fatalf("delete perimeter status=%d body=%s", deleted.Code, deleted.Body.String())
+		}
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusNoContent)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusOK)
+	})
+
+	t.Run("persistence failure fails closed", func(t *testing.T) {
+		t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+		t.Setenv("MINISKY_PROFILE", "startup-perimeter-degraded")
+		t.Setenv(registry.ExperimentalServicesEnv, "")
+		t.Setenv("MINISKY_IAM_MODE", "")
+		opMgr := orchestrator.NewOperationManager()
+		shims, _ := registry.BootAll(opMgr, nil)
+		createStartupTestServiceAccount(t, shims["iam.googleapis.com"].(*iam.API))
+		if err := os.WriteFile(filepath.Join(config.GetProfileDir(), "state.json"), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		gateway := router.NewProxyRouterWithManager(nil)
+		perimeterAPI := configureStartupServicePerimeters(gateway, shims, opMgr)
+		if perimeterAPI.PersistenceError() == nil {
+			t.Fatal("corrupt persisted perimeter state did not degrade evaluator")
+		}
+		gateway.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		gateway.RegisterShim("iamcredentials.googleapis.com", shims["iamcredentials.googleapis.com"])
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusForbidden)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusForbidden)
+	})
+}
+
+func seedPersistedServicePerimeter(t *testing.T, opMgr *orchestrator.OperationManager) {
+	t.Helper()
+	api := accesscontextmanager.NewAPI(opMgr)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/accessPolicies",
+		bytes.NewBufferString(`{"parent":"organizations/1","title":"Startup test"}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create access policy status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/accessPolicies/1/servicePerimeters?servicePerimeterId=prod",
+		bytes.NewBufferString(`{"status":{"resources":["projects/project-a"],`+
+			`"restrictedServices":["storage.googleapis.com","iamcredentials.googleapis.com"]}}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create service perimeter status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func createStartupTestServiceAccount(t *testing.T, api *iam.API) {
+	t.Helper()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/project-a/serviceAccounts",
+		bytes.NewBufferString(`{"accountId":"worker"}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create service account status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func assertStartupPerimeterStatus(t *testing.T, gateway http.Handler, service string, want int) {
+	t.Helper()
+	var request *http.Request
+	switch service {
+	case "storage":
+		request = httptest.NewRequest(
+			http.MethodGet,
+			"http://localhost/_minisky/storage/v1/projects/project-a/buckets",
+			nil,
+		)
+	case "iamcredentials":
+		request = httptest.NewRequest(
+			http.MethodPost,
+			"http://localhost/_minisky/iamcredentials/v1/projects/-/serviceAccounts/"+
+				"worker@project-a.iam.gserviceaccount.com:generateAccessToken",
+			bytes.NewBufferString(`{"scope":["scope"]}`),
+		)
+	default:
+		t.Fatalf("unknown startup test service %q", service)
+	}
+	response := httptest.NewRecorder()
+	gateway.ServeHTTP(response, request)
+	if response.Code != want {
+		t.Fatalf("%s status=%d want=%d body=%s", service, response.Code, want, response.Body.String())
+	}
+	if want == http.StatusForbidden &&
+		!strings.Contains(response.Body.String(), "Request is prohibited by VPC Service Controls") {
+		t.Fatalf("%s denial body=%s", service, response.Body.String())
 	}
 }
 

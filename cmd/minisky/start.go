@@ -34,6 +34,7 @@ import (
 	"minisky/pkg/shims/compute"
 	"minisky/pkg/shims/gke"
 	"minisky/pkg/shims/iam"
+	"minisky/pkg/shims/iamcredentials"
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/shims/memorystore"
 	"minisky/pkg/shims/monitoring"
@@ -264,11 +265,7 @@ var startCmd = &cobra.Command{
 		iamAPI := shims["iam.googleapis.com"].(*iam.API)
 		projectAPI := shims["cloudresourcemanager.googleapis.com"].(*resourcemanager.API)
 		proxyRouter.ConfigureSecurity(iamAPI, projectAPI, enforceProjects, tokenAudience)
-		perimeterAPI, ok := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API)
-		if !ok {
-			perimeterAPI = accesscontextmanager.NewAPI(opMgr)
-		}
-		proxyRouter.ConfigureServicePerimeters(perimeterAPI)
+		configureStartupServicePerimeters(proxyRouter, shims, opMgr)
 		proxyRouter.ConfigureQuota(quotaLimiter, gatewayObservability.ObserveQuotaRejection)
 
 		for domain, handler := range exposedShims {
@@ -436,6 +433,22 @@ var startCmd = &cobra.Command{
 		}
 		return errors.Join(listenerErr, shutdownErr)
 	},
+}
+
+func configureStartupServicePerimeters(
+	proxyRouter *router.ProxyRouter,
+	shims map[string]http.Handler,
+	opMgr *orchestrator.OperationManager,
+) *accesscontextmanager.API {
+	perimeterAPI, ok := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API)
+	if !ok {
+		perimeterAPI = accesscontextmanager.NewAPI(opMgr)
+	}
+	proxyRouter.ConfigureServicePerimeters(perimeterAPI)
+	if credentialsAPI, ok := shims["iamcredentials.googleapis.com"].(*iamcredentials.API); ok {
+		credentialsAPI.ConfigureServicePerimeters(perimeterAPI)
+	}
+	return perimeterAPI
 }
 
 func telemetrySetupOrNoop(

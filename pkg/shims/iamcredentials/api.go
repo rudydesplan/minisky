@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"minisky/pkg/registry"
 	localsecurity "minisky/pkg/security"
+	iamshim "minisky/pkg/shims/iam"
 )
 
 type iamService interface {
@@ -21,8 +24,14 @@ type iamService interface {
 	TokenAudience() string
 }
 
+type servicePerimeterEvaluator interface {
+	EvaluateServicePerimeter(project, service, sourceIP, region string) (configured, allowed bool)
+}
+
 type API struct {
-	iam iamService
+	mu         sync.RWMutex
+	iam        iamService
+	perimeters servicePerimeterEvaluator
 }
 
 func init() {
@@ -35,12 +44,29 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 	if iam, ok := ctx.GetShim("iam.googleapis.com").(iamService); ok {
 		api.iam = iam
 	}
+	if perimeters, ok := ctx.GetShim("accesscontextmanager.googleapis.com").(servicePerimeterEvaluator); ok {
+		api.ConfigureServicePerimeters(perimeters)
+	}
+}
+
+// ConfigureServicePerimeters installs the bounded VPC Service Controls
+// evaluator selected by startup. A nil evaluator preserves default-off behavior.
+func (api *API) ConfigureServicePerimeters(evaluator interface {
+	EvaluateServicePerimeter(project, service, sourceIP, region string) (configured, allowed bool)
+}) {
+	api.mu.Lock()
+	api.perimeters = evaluator
+	api.mu.Unlock()
 }
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, ":generateAccessToken") {
 		writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Only generateAccessToken is supported")
+		return
+	}
+	if r.URL.RawPath != "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Service account aliases must not be URL-encoded")
 		return
 	}
 	targetName := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/"), ":generateAccessToken")
@@ -154,6 +180,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !api.enforceServicePerimeters(w, r, append([]string{targetEmail}, delegateEmails...)) {
+		return
+	}
 	token, expires, err := api.iam.IssueLocalToken(
 		"serviceAccount:"+targetEmail, api.iam.TokenAudience(), input.Scopes, lifetime,
 	)
@@ -200,13 +229,59 @@ func (api *API) requestPrincipal(w http.ResponseWriter, r *http.Request) (string
 	return principal, true
 }
 
+func (api *API) enforceServicePerimeters(w http.ResponseWriter, r *http.Request, emails []string) bool {
+	api.mu.RLock()
+	evaluator := api.perimeters
+	api.mu.RUnlock()
+	projects := make([]string, 0, len(emails))
+	seen := make(map[string]struct{}, len(emails))
+	for _, email := range emails {
+		project, ok := projectFromCanonicalServiceAccountEmail(email)
+		if !ok {
+			writeError(w, http.StatusForbidden, "PERMISSION_DENIED", "Request is prohibited by VPC Service Controls")
+			return false
+		}
+		if _, duplicate := seen[project]; duplicate {
+			continue
+		}
+		seen[project] = struct{}{}
+		projects = append(projects, project)
+	}
+	if evaluator == nil {
+		return true
+	}
+	sourceIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		sourceIP = r.RemoteAddr
+	}
+	denied := false
+	for _, project := range projects {
+		configured, allowed := evaluator.EvaluateServicePerimeter(
+			"projects/"+project, "iamcredentials.googleapis.com", sourceIP, "",
+		)
+		if configured && !allowed {
+			denied = true
+		}
+	}
+	if denied {
+		writeError(w, http.StatusForbidden, "PERMISSION_DENIED", "Request is prohibited by VPC Service Controls")
+		return false
+	}
+	return true
+}
+
+func projectFromCanonicalServiceAccountEmail(email string) (string, bool) {
+	_, project, ok := iamshim.ParseCanonicalServiceAccountEmail(email)
+	return project, ok
+}
+
 func parseServiceAccountName(name string) (string, bool) {
 	const prefix = "projects/-/serviceAccounts/"
 	if !strings.HasPrefix(name, prefix) {
 		return "", false
 	}
 	identifier := strings.TrimPrefix(name, prefix)
-	if identifier == "" || strings.ContainsAny(identifier, "/\\ \t\r\n") {
+	if identifier == "" || strings.ContainsAny(identifier, "/\\% \t\r\n") {
 		return "", false
 	}
 	if allDigits(identifier) {

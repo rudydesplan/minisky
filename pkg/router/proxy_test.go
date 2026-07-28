@@ -755,6 +755,36 @@ func TestGatewayServicePerimeterDecisionPrecedesDispatch(t *testing.T) {
 	}
 }
 
+func TestIAMCredentialsGatewayDefersServicePerimeterToHandler(t *testing.T) {
+	dispatched := 0
+	evaluator := &recordingPerimeterEvaluator{configured: true, allowed: false}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("iamcredentials.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatched++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	proxy.ConfigureServicePerimeters(evaluator)
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://127.0.0.1/_minisky/iamcredentials/v1/projects/-/serviceAccounts/minisky-target@local-dev-project.iam.gserviceaccount.com:generateAccessToken",
+		strings.NewReader(`{"scope":["scope"]}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatches=%d want=1", dispatched)
+	}
+	if len(evaluator.calls) != 0 {
+		t.Fatalf("router evaluated IAM Credentials perimeter: %+v", evaluator.calls)
+	}
+}
+
 func TestStrictIAMPrecedesServicePerimeterEnforcement(t *testing.T) {
 	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
 	evaluator := &recordingPerimeterEvaluator{configured: true, allowed: false}

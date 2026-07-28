@@ -348,7 +348,7 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyRouter) enforceServicePerimeter(w http.ResponseWriter, r *http.Request, service string) bool {
-	if !strings.HasSuffix(service, ".googleapis.com") {
+	if !strings.HasSuffix(service, ".googleapis.com") || service == "iamcredentials.googleapis.com" {
 		return true
 	}
 	projects := projectsFromRequest(r)

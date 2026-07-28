@@ -6,11 +6,187 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"minisky/pkg/state"
 )
+
+func TestIAMRejectsMalformedPersistedServiceAccountsWithoutReplacingPriorState(t *testing.T) {
+	validKey, valid := validPersistedServiceAccount("worker")
+	tests := []struct {
+		name     string
+		key      string
+		account  *ServiceAccount
+		mutate   func(*ServiceAccount)
+		wantText string
+	}{
+		{name: "nil entry", key: validKey, wantText: "nil"},
+		{name: "map key mismatch", key: "other-project:" + valid.Email, account: valid, wantText: "map key"},
+		{name: "name mismatch", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.Name = "projects/test-project/serviceAccounts/other@test-project.iam.gserviceaccount.com"
+		}, wantText: "name"},
+		{name: "email mismatch", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.Email = "another@test-project.iam.gserviceaccount.com"
+		}, wantText: "map key"},
+		{name: "project mismatch", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.ProjectId = "other-project"
+		}, wantText: "project"},
+		{name: "unique ID empty", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.UniqueId = ""
+		}, wantText: "unique ID"},
+		{name: "unique ID leading zero", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.UniqueId = "0123"
+		}, wantText: "unique ID"},
+		{name: "unique ID non decimal", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			account.UniqueId = "123x"
+		}, wantText: "unique ID"},
+		{name: "short local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "short")
+		}, wantText: "email"},
+		{name: "long local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "a"+strings.Repeat("b", 30))
+		}, wantText: "email"},
+		{name: "uppercase local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "Worker")
+		}, wantText: "email"},
+		{name: "colon local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "worker:id")
+		}, wantText: "email"},
+		{name: "encoded local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "worker%2Fid")
+		}, wantText: "email"},
+		{name: "separator local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "worker/id")
+		}, wantText: "email"},
+		{name: "control local part", key: validKey, account: valid, mutate: func(account *ServiceAccount) {
+			setPersistedAccountID(account, "worker\nid")
+		}, wantText: "email"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			account := cloneServiceAccount(test.account)
+			if account != nil && test.mutate != nil {
+				test.mutate(account)
+			}
+			store := &iamMetadataLoadStore{metadata: iamMetadata{
+				ServiceAccounts: map[string]*ServiceAccount{test.key: account},
+			}}
+			api := newAPI(store)
+			priorKey, prior := validPersistedServiceAccount("prior-account")
+			api.serviceAccounts[priorKey] = prior
+
+			err := api.loadMetadata()
+
+			if err == nil || !strings.Contains(err.Error(), test.wantText) {
+				t.Fatalf("load error=%v want containing %q", err, test.wantText)
+			}
+			if api.PersistenceError() == nil {
+				t.Fatal("invalid persisted account did not make load failure sticky")
+			}
+			if len(api.serviceAccounts) != 1 || !reflect.DeepEqual(api.serviceAccounts[priorKey], prior) {
+				t.Fatalf("invalid load replaced prior accounts: %#v", api.serviceAccounts)
+			}
+			if _, err := NewAPIWithStore(store); err == nil {
+				t.Fatal("constructor accepted invalid persisted account")
+			}
+		})
+	}
+}
+
+func TestIAMStateImportRejectsNilServiceAccountAndPreservesProfile(t *testing.T) {
+	store, err := state.New(t.TempDir(), "iam-import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	validKey, valid := validPersistedServiceAccount("worker")
+	prior := iamMetadata{ServiceAccounts: map[string]*ServiceAccount{validKey: valid}}
+	if err := store.Save(iamStateEntry, prior); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(iamMetadata{
+		ServiceAccounts: map[string]*ServiceAccount{validKey: nil},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(state.Snapshot{
+		Format:  state.SnapshotFormat,
+		Version: state.Version,
+		Entries: map[string]json.RawMessage{iamStateEntry: payload},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Import(bytes.NewReader(snapshot)); err == nil {
+		t.Fatal("import accepted nil IAM service account")
+	}
+	var after iamMetadata
+	if err := store.Load(iamStateEntry, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after.ServiceAccounts, prior.ServiceAccounts) {
+		t.Fatalf("failed import replaced prior state: %#v", after.ServiceAccounts)
+	}
+}
+
+func TestIAMRejectsDuplicatePersistedServiceAccountUniqueIDs(t *testing.T) {
+	firstKey, first := validPersistedServiceAccount("worker")
+	secondKey, second := validPersistedServiceAccount("another")
+	second.UniqueId = first.UniqueId
+	store := &iamMetadataLoadStore{metadata: iamMetadata{
+		ServiceAccounts: map[string]*ServiceAccount{
+			firstKey:  first,
+			secondKey: second,
+		},
+	}}
+	api := newAPI(store)
+	priorKey, prior := validPersistedServiceAccount("prior-account")
+	api.serviceAccounts[priorKey] = prior
+
+	if err := api.loadMetadata(); err == nil || !strings.Contains(err.Error(), "duplicate unique ID") {
+		t.Fatalf("load error=%v", err)
+	}
+	if len(api.serviceAccounts) != 1 || !reflect.DeepEqual(api.serviceAccounts[priorKey], prior) {
+		t.Fatalf("duplicate unique ID replaced prior state: %#v", api.serviceAccounts)
+	}
+}
+
+func TestIAMRestartPreservesValidServiceAccountIDBoundaries(t *testing.T) {
+	store, err := state.New(t.TempDir(), "iam-boundaries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountIDs := []string{"worker", "a" + strings.Repeat("b", 29)}
+	for _, accountID := range accountIDs {
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost,
+			"/v1/projects/test-project/serviceAccounts",
+			bytes.NewBufferString(`{"accountId":"`+accountID+`"}`),
+		))
+		if response.Code != http.StatusOK {
+			t.Fatalf("create %q status=%d body=%s", accountID, response.Code, response.Body.String())
+		}
+	}
+
+	restarted, err := NewAPIWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range accountIDs {
+		email := accountID + "@test-project.iam.gserviceaccount.com"
+		if got, _, found := restarted.ResolveServiceAccount(email); !found || got != email {
+			t.Fatalf("resolve %q email=%q found=%t", accountID, got, found)
+		}
+	}
+}
 
 func TestIAMMetadataSurvivesRestart(t *testing.T) {
 	store, err := state.New(t.TempDir(), "iam-profile")
@@ -22,7 +198,7 @@ func TestIAMMetadataSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	create := httptest.NewRequest(http.MethodPost, "/v1/projects/test/serviceAccounts", bytes.NewBufferString(
+	create := httptest.NewRequest(http.MethodPost, "/v1/projects/test-project/serviceAccounts", bytes.NewBufferString(
 		`{"accountId":"worker","serviceAccount":{"displayName":"Worker"}}`,
 	))
 	response := httptest.NewRecorder()
@@ -40,7 +216,8 @@ func TestIAMMetadataSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	get := httptest.NewRequest(http.MethodGet, "/v1/projects/test/serviceAccounts/worker@test.iam.gserviceaccount.com", nil)
+	get := httptest.NewRequest(http.MethodGet,
+		"/v1/projects/test-project/serviceAccounts/worker@test-project.iam.gserviceaccount.com", nil)
 	response = httptest.NewRecorder()
 	restarted.ServeHTTP(response, get)
 	if response.Code != http.StatusOK {
@@ -58,6 +235,45 @@ func TestIAMMetadataSurvivesRestart(t *testing.T) {
 	if restarted.Authorize("projects/test-project", "user:alice@example.com", "minisky.dashboard.manage") {
 		t.Fatal("persisted viewer binding elevated after restart")
 	}
+}
+
+type iamMetadataLoadStore struct {
+	metadata iamMetadata
+}
+
+func (store *iamMetadataLoadStore) Load(_ string, target any) error {
+	raw, err := json.Marshal(store.metadata)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (*iamMetadataLoadStore) Save(string, any) error { return nil }
+
+func validPersistedServiceAccount(accountID string) (string, *ServiceAccount) {
+	const project = "test-project"
+	email := accountID + "@" + project + ".iam.gserviceaccount.com"
+	return project + ":" + email, &ServiceAccount{
+		Name:      "projects/" + project + "/serviceAccounts/" + email,
+		ProjectId: project,
+		UniqueId:  "1234567890",
+		Email:     email,
+	}
+}
+
+func setPersistedAccountID(account *ServiceAccount, accountID string) {
+	const project = "test-project"
+	account.Email = accountID + "@" + project + ".iam.gserviceaccount.com"
+	account.Name = "projects/" + project + "/serviceAccounts/" + account.Email
+}
+
+func cloneServiceAccount(account *ServiceAccount) *ServiceAccount {
+	if account == nil {
+		return nil
+	}
+	clone := *account
+	return &clone
 }
 
 func TestIAMMissingStateIsEmptyAndCorruptStateIsReported(t *testing.T) {

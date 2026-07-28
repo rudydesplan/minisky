@@ -70,8 +70,8 @@ func (api *API) CheckAccess(request AccessRequest) AccessDecision {
 	return AccessDecision{Allowed: true, Reason: "not restricted by a service perimeter"}
 }
 
-// EvaluateServicePerimeter exposes the bounded persisted decision to the
-// gateway without coupling the router to this shim package.
+// EvaluateServicePerimeter exposes the bounded persisted decision to runtime
+// consumers without coupling them to this shim package.
 func (api *API) EvaluateServicePerimeter(project, service, sourceIP, region string) (bool, bool) {
 	decision := api.CheckAccess(AccessRequest{
 		Project:  project,
