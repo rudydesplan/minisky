@@ -16,7 +16,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +30,7 @@ const (
 	networkName            = "minisky-net"
 	dockerImagePullTimeout = 15 * time.Minute
 	dockerRequestTimeout   = 10 * time.Second
-	alloyDBPostgresImage   = "postgres:15.8-bookworm"
+	alloyDBPostgresImage   = "postgres:15.8-bookworm@sha256:eb3747f5d0a92195ca486d2f15d9a4ee5e9461b0332fe87fbc59069490a5c659"
 	maxBuildLogBytes       = 64 << 10
 	buildCleanupTimeout    = 30 * time.Second
 )
@@ -40,17 +44,19 @@ var ErrServerlessLifecycleInProgress = errors.New("Serverless lifecycle already 
 
 // ServiceManager handles native REST-driven lifecycle events over the Docker Unix Socket.
 type ServiceManager struct {
-	mu               sync.RWMutex
-	emulatorMu       sync.Mutex
-	serverlessMu     sync.Mutex
-	dockerClient     *http.Client
-	dockerTimeout    time.Duration
-	sockPath         string
-	portRegistry     map[string][]PortMapping   // containerName → host ports
-	fwRules          map[string][]FirewallEntry // vpcName → rules
-	serverlessActive map[ServerlessIdentity]struct{}
-	serverlessReady  func(string, time.Duration) error
-	emulatorReady    func(string, time.Duration) error
+	mu                sync.RWMutex
+	emulatorMu        sync.Mutex
+	serverlessMu      sync.Mutex
+	dockerClient      *http.Client
+	dockerTimeout     time.Duration
+	sockPath          string
+	portRegistry      map[string][]PortMapping   // containerName → host ports
+	fwRules           map[string][]FirewallEntry // vpcName → rules
+	serverlessActive  map[ServerlessIdentity]struct{}
+	serverlessReady   func(string, time.Duration) error
+	emulatorReady     func(string, time.Duration) error
+	memcachedReady    func(context.Context, string, string, time.Duration) error
+	memcacheUncertain map[string]error
 }
 
 type deadlineRoundTripper struct {
@@ -92,6 +98,7 @@ type ContainerConfig struct {
 	Cmd             []string
 	Volume          string
 	Env             []string
+	User            string
 }
 
 // BuildContainerResult is the terminal result of one exact-owned Cloud Build
@@ -146,13 +153,15 @@ func NewServiceManager() (*ServiceManager, error) {
 	}
 	log.Printf("[ServiceManager] Docker socket resolved: %s", sockPath)
 	sm := &ServiceManager{
-		sockPath:         sockPath,
-		dockerTimeout:    dockerRequestTimeout,
-		portRegistry:     make(map[string][]PortMapping),
-		fwRules:          make(map[string][]FirewallEntry),
-		serverlessActive: make(map[ServerlessIdentity]struct{}),
-		serverlessReady:  waitUntilHTTPReady,
-		emulatorReady:    waitUntilHTTPReady,
+		sockPath:          sockPath,
+		dockerTimeout:     dockerRequestTimeout,
+		portRegistry:      make(map[string][]PortMapping),
+		fwRules:           make(map[string][]FirewallEntry),
+		serverlessActive:  make(map[ServerlessIdentity]struct{}),
+		serverlessReady:   waitUntilHTTPReady,
+		emulatorReady:     waitUntilHTTPReady,
+		memcachedReady:    waitUntilMemcachedReady,
+		memcacheUncertain: make(map[string]error),
 	}
 	transport := &http.Transport{
 		DialContext: sm.dialDocker,
@@ -408,7 +417,20 @@ func (sm *ServiceManager) discoverInternalURL(config ContainerConfig) (string, e
 
 // GetContainerHostPort reads the host-bound port assigned by Docker.
 func (sm *ServiceManager) GetContainerHostPort(containerName string, containerPort string) (string, error) {
-	resp, err := sm.dockerClient.Get(fmt.Sprintf("http://localhost/containers/%s/json", containerName))
+	return sm.getContainerHostPortContext(context.Background(), containerName, containerPort)
+}
+
+func (sm *ServiceManager) getContainerHostPortContext(
+	ctx context.Context,
+	containerName string,
+	containerPort string,
+) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://localhost/containers/%s/json", containerName), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := sm.doDocker(request)
 	if err != nil {
 		return "", err
 	}
@@ -572,7 +594,7 @@ func (sm *ServiceManager) teardownDockerRequest(
 // CleanupProfile removes every Docker resource carrying MiniSky's exact active
 // profile ownership labels. It never relies on names for destructive work:
 // containers and networks use immutable IDs, while volumes use Docker's
-// server-side prune with exact ownership label filters.
+// server-side prune with exact active-profile label filters.
 func (sm *ServiceManager) CleanupProfile(ctx context.Context) error {
 	return sm.cleanupDockerResources(ctx, isOwnedDockerResource, []string{
 		"managed-by=minisky",
@@ -585,7 +607,7 @@ func (sm *ServiceManager) CleanupProfile(ctx context.Context) error {
 func (sm *ServiceManager) CleanupAllProfiles(ctx context.Context) error {
 	return sm.cleanupDockerResources(ctx, func(labels map[string]string) bool {
 		return labels["managed-by"] == "minisky" && labels["minisky.profile"] != ""
-	}, []string{"managed-by=minisky", "minisky.profile"})
+	}, nil)
 }
 
 func (sm *ServiceManager) cleanupDockerResources(
@@ -637,10 +659,63 @@ func (sm *ServiceManager) cleanupDockerResources(
 		}
 	}
 
-	if err := sm.pruneCleanupVolumes(ctx, volumeLabelFilters); err != nil {
-		failures = errors.Join(failures, fmt.Errorf("prune exactly owned profile volumes: %w", err))
+	if len(volumeLabelFilters) > 0 {
+		if err := sm.pruneCleanupVolumes(ctx, volumeLabelFilters); err != nil {
+			failures = errors.Join(failures, fmt.Errorf("prune exactly owned profile volumes: %w", err))
+		}
+		return failures
+	}
+
+	volumes, err := sm.listCleanupResources(ctx, "/volumes", func(body io.Reader) ([]cleanupResource, error) {
+		var resources struct {
+			Volumes []cleanupResource `json:"Volumes"`
+		}
+		err := json.NewDecoder(body).Decode(&resources)
+		return resources.Volumes, err
+	})
+	if err != nil {
+		failures = errors.Join(failures, fmt.Errorf("list profile volumes: %w", err))
+	} else {
+		profiles := make(map[string]struct{})
+		for _, resource := range volumes {
+			profile := resource.Labels["minisky.profile"]
+			if !owned(resource.Labels) || !validCleanupProfileLabel(profile) {
+				continue
+			}
+			profiles[profile] = struct{}{}
+		}
+		orderedProfiles := make([]string, 0, len(profiles))
+		for profile := range profiles {
+			orderedProfiles = append(orderedProfiles, profile)
+		}
+		sort.Strings(orderedProfiles)
+		for _, profile := range orderedProfiles {
+			if err := sm.pruneCleanupVolumes(ctx, []string{
+				"managed-by=minisky",
+				"minisky.profile=" + profile,
+			}); err != nil {
+				failures = errors.Join(failures, fmt.Errorf("prune exactly owned profile %q volumes: %w", profile, err))
+			}
+		}
 	}
 	return failures
+}
+
+func validCleanupProfileLabel(profile string) bool {
+	if profile == "" || profile == "." || profile == ".." {
+		return false
+	}
+	for index := 0; index < len(profile); index++ {
+		char := profile[index]
+		alphanumeric := char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9'
+		if alphanumeric {
+			continue
+		}
+		if index == 0 || char != '.' && char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func (sm *ServiceManager) pruneCleanupVolumes(ctx context.Context, labelFilters []string) (result error) {
@@ -891,7 +966,7 @@ func (sm *ServiceManager) inspectContainer(name string) (string, map[string]stri
 func (sm *ServiceManager) inspectContainerContext(ctx context.Context, name string) (string, map[string]string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("http://localhost/containers/%s/json", name), nil)
-	resp, err := sm.dockerClient.Do(req)
+	resp, err := sm.doDocker(req)
 	if err != nil {
 		return "", nil, err
 	}
@@ -980,21 +1055,7 @@ func (sm *ServiceManager) pullImageInternal(ctx context.Context, image string) e
 }
 
 func (sm *ServiceManager) ImageExistsPublic(image string) (bool, error) {
-	// Docker inspect image endpoint
-	url := fmt.Sprintf("http://localhost/images/%s/json", image)
-	resp, err := sm.dockerClient.Get(url)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
-	}
-	return false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	return sm.imageExistsContext(context.Background(), image)
 }
 
 // ProvisionComputeVM actively boots a Data Plane Docker container mimicking a GCE VM.
@@ -1117,11 +1178,11 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 			return "", fmt.Errorf("Redis container %q exists but is not owned by this profile and resource", containerName)
 		}
 		if status != "running" {
-			if err := sm.startContainer(containerName); err != nil {
+			if err := sm.startContainerContext(ctx, containerName); err != nil {
 				return "", err
 			}
 		}
-		endpoint, err := sm.redisEndpoint(containerName)
+		endpoint, err := sm.redisEndpoint(ctx, containerName)
 		if err != nil {
 			return "", err
 		}
@@ -1131,7 +1192,7 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 		return endpoint, nil
 	}
 
-	exists, err := sm.ImageExistsPublic(image)
+	exists, err := sm.imageExistsContext(ctx, image)
 	if err != nil {
 		return "", fmt.Errorf("inspect Redis image: %w", err)
 	}
@@ -1143,7 +1204,12 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 	resourceLabels := ownedDockerLabels()
 	resourceLabels["minisky.service"] = "memorystore-redis"
 	resourceLabels["minisky.resource"] = resourceID
-	volumeInspect, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	volumeInspectRequest, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
+	if err != nil {
+		return "", fmt.Errorf("build Redis volume inspect request: %w", err)
+	}
+	volumeInspect, err := sm.doDocker(volumeInspectRequest)
 	if err != nil {
 		return "", fmt.Errorf("inspect Redis volume: %w", err)
 	}
@@ -1169,7 +1235,7 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 		volumeRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 			"http://localhost/volumes/create", bytes.NewReader(volumePayload))
 		volumeRequest.Header.Set("Content-Type", "application/json")
-		volumeResponse, err := sm.dockerClient.Do(volumeRequest)
+		volumeResponse, err := sm.doDocker(volumeRequest)
 		if err != nil {
 			return "", fmt.Errorf("create Redis volume: %w", err)
 		}
@@ -1198,7 +1264,7 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 	createRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://localhost/containers/create?name="+url.QueryEscape(containerName), bytes.NewReader(encoded))
 	createRequest.Header.Set("Content-Type", "application/json")
-	createResponse, err := sm.dockerClient.Do(createRequest)
+	createResponse, err := sm.doDocker(createRequest)
 	if err != nil {
 		return "", fmt.Errorf("create Redis container: %w", err)
 	}
@@ -1207,10 +1273,10 @@ func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image 
 		body, _ := io.ReadAll(createResponse.Body)
 		return "", fmt.Errorf("create Redis container returned %d: %s", createResponse.StatusCode, body)
 	}
-	if err := sm.startContainer(containerName); err != nil {
+	if err := sm.startContainerContext(ctx, containerName); err != nil {
 		return "", err
 	}
-	endpoint, err := sm.redisEndpoint(containerName)
+	endpoint, err := sm.redisEndpoint(ctx, containerName)
 	if err != nil {
 		return "", err
 	}
@@ -1237,7 +1303,7 @@ func (sm *ServiceManager) ReconcileRedis(ctx context.Context, resourceID string)
 	if status != "running" {
 		return "", true, fmt.Errorf("owned Redis container is %s", status)
 	}
-	endpoint, err := sm.redisEndpoint(containerName)
+	endpoint, err := sm.redisEndpoint(ctx, containerName)
 	if err != nil {
 		return "", true, err
 	}
@@ -1250,7 +1316,7 @@ func (sm *ServiceManager) ReconcileRedis(ctx context.Context, resourceID string)
 // DeleteRedis removes only the exactly owned container and volume.
 func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) error {
 	containerName, volumeName := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
 		return err
 	}
@@ -1260,7 +1326,7 @@ func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) er
 		}
 		request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
 			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
-		response, err := sm.dockerClient.Do(request)
+		response, err := sm.doDocker(request)
 		if err != nil {
 			return err
 		}
@@ -1270,7 +1336,12 @@ func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) er
 		}
 	}
 
-	inspectResponse, err := sm.dockerClient.Get("http://localhost/volumes/" + url.PathEscape(volumeName))
+	inspectRequest, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
+	if err != nil {
+		return err
+	}
+	inspectResponse, err := sm.doDocker(inspectRequest)
 	if err != nil {
 		return err
 	}
@@ -1296,7 +1367,7 @@ func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) er
 	}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
 		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
-	response, err := sm.dockerClient.Do(request)
+	response, err := sm.doDocker(request)
 	if err != nil {
 		return err
 	}
@@ -1307,8 +1378,8 @@ func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) er
 	return nil
 }
 
-func (sm *ServiceManager) redisEndpoint(containerName string) (string, error) {
-	port, err := sm.GetContainerHostPort(containerName, "6379/tcp")
+func (sm *ServiceManager) redisEndpoint(ctx context.Context, containerName string) (string, error) {
+	port, err := sm.getContainerHostPortContext(ctx, containerName, "6379/tcp")
 	if err != nil {
 		return "", err
 	}
@@ -2986,6 +3057,29 @@ func durableEmulatorLabels(domain string) map[string]string {
 	return labels
 }
 
+func currentDockerUser() (string, error) {
+	if runtime.GOOS == "windows" {
+		return "", nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("resolve host identity for Storage emulator: %w", err)
+	}
+	for name, value := range map[string]string{"uid": current.Uid, "gid": current.Gid} {
+		if _, err := strconv.ParseUint(value, 10, 32); err != nil {
+			return "", fmt.Errorf("resolve host identity for Storage emulator: invalid %s %q", name, value)
+		}
+	}
+	return current.Uid + ":" + current.Gid, nil
+}
+
+func durableEmulatorContainerUser(domain string) (string, error) {
+	if domain != "storage.googleapis.com" {
+		return "", nil
+	}
+	return currentDockerUser()
+}
+
 func durableEmulatorConfig(
 	domain string,
 	cfg config.EmulatorConfig,
@@ -2999,6 +3093,10 @@ func durableEmulatorConfig(
 		return ContainerConfig{}, nil, err
 	}
 	command := append([]string(nil), cfg.Cmd...)
+	containerUser, err := durableEmulatorContainerUser(domain)
+	if err != nil {
+		return ContainerConfig{}, nil, err
+	}
 	switch domain {
 	case "storage.googleapis.com":
 		command, err = ensureCommandFlag(command, "-backend", "filesystem")
@@ -3015,6 +3113,10 @@ func durableEmulatorConfig(
 			return ContainerConfig{}, nil, err
 		}
 	}
+	labels := durableEmulatorLabels(domain)
+	if containerUser != "" {
+		labels["minisky.runtime-user"] = containerUser
+	}
 	return ContainerConfig{
 		Name:            emulatorContainerName(domain, cfg.Name),
 		Image:           cfg.Image,
@@ -3023,7 +3125,8 @@ func durableEmulatorConfig(
 		Cmd:             command,
 		Volume:          volume,
 		Env:             append([]string(nil), env...),
-	}, durableEmulatorLabels(domain), nil
+		User:            containerUser,
+	}, labels, nil
 }
 
 func ensureCommandFlag(command []string, flagName, expected string) ([]string, error) {
@@ -3271,6 +3374,9 @@ func (sm *ServiceManager) createDurableEmulator(
 			"Binds":        []string{container.Volume},
 		},
 	}
+	if container.User != "" {
+		payload["User"] = container.User
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -3306,11 +3412,19 @@ func (sm *ServiceManager) removeDurableEmulatorContainer(
 		return fmt.Errorf("domain %q has no durable emulator contract", domain)
 	}
 	service := strings.TrimSuffix(domain, ".googleapis.com")
+	containerUser, err := durableEmulatorContainerUser(domain)
+	if err != nil {
+		return err
+	}
 	container := ContainerConfig{
 		Name:   emulatorContainerName(domain, cfg.Name),
 		Volume: filepath.Join(config.GetRuntimeDir(), service) + ":/data",
+		User:   containerUser,
 	}
 	expectedLabels := durableEmulatorLabels(domain)
+	if containerUser != "" {
+		expectedLabels["minisky.runtime-user"] = containerUser
+	}
 	inspected, found, err := sm.inspectDurableEmulator(ctx, container.Name)
 	if err != nil {
 		return fmt.Errorf("inspect %s emulator for cleanup: %w", domain, err)

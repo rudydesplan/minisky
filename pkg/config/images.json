@@ -139,6 +139,8 @@
       "versions": [
         { "version": "1.6.33", "label": "Memcached 1.6.33 (Latest)", "image": "memcached:1.6.33-alpine" },
         { "version": "1.6.32", "label": "Memcached 1.6.32", "image": "memcached:1.6.32-alpine" },
+        { "version": "1.6.15", "label": "Memcached 1.6.15 (Provider API)", "image": "memcached:1.6.15-alpine" },
+        { "version": "1.5.16", "label": "Memcached 1.5.16 (Provider API)", "image": "memcached:1.5.16-alpine" },
         { "version": "1.5.22", "label": "Memcached 1.5.22 (Legacy)", "image": "memcached:1.5.22-alpine" }
       ]
     },
@@ -153,6 +155,9 @@
   },
   "cloudbuild": {
     "default_builder": "ubuntu:26.04"
+  },
+  "composer": {
+    "airflow_image": "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
   },
   "artifact_registry": {
     "image": "registry:2",

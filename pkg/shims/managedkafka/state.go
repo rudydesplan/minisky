@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -78,12 +80,25 @@ func (api *API) loadState() error {
 	}
 	if meta.Clusters != nil {
 		api.clusters = make(map[string]*Cluster, len(meta.Clusters))
-		for name, cluster := range meta.Clusters {
+		names := make([]string, 0, len(meta.Clusters))
+		for name := range meta.Clusters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			cluster := meta.Clusters[name]
 			restored := deepCopyCluster(cluster)
 			restored.State = "FAILED"
 			restored.BootstrapAddress = ""
 			if api.backend != nil {
-				if bootstrap, provisionErr := api.backend.Provision(context.Background(), name); provisionErr == nil {
+				timeout := api.reconcileTimeout
+				if timeout <= 0 {
+					timeout = 5 * time.Second
+				}
+				reconcileCtx, cancel := context.WithTimeout(context.Background(), timeout)
+				bootstrap, owned, reconcileErr := api.backend.Reconcile(reconcileCtx, name)
+				cancel()
+				if reconcileErr == nil && owned {
 					restored.State = "ACTIVE"
 					restored.BootstrapAddress = bootstrap
 				}
@@ -92,7 +107,10 @@ func (api *API) loadState() error {
 		}
 	}
 	if meta.Topics != nil {
-		api.topics = meta.Topics
+		api.topics = make(map[string]*Topic, len(meta.Topics))
+		for name, topic := range meta.Topics {
+			api.topics[name] = deepCopyTopic(topic)
+		}
 	}
 	return nil
 }

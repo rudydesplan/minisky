@@ -60,16 +60,19 @@ type SoftwareConfig struct {
 
 // API implements the Cloud Composer v1 REST shim.
 type API struct {
-	mu           sync.RWMutex
-	persistMu    sync.Mutex
-	opMgr        *orchestrator.OperationManager
-	stateStore   composerStateStore
-	environments map[string]*Environment
-	backend      airflowBackend
+	mu               sync.RWMutex
+	mutationMu       sync.Mutex
+	persistMu        sync.Mutex
+	opMgr            *orchestrator.OperationManager
+	stateStore       composerStateStore
+	environments     map[string]*Environment
+	backend          airflowBackend
+	reconcileTimeout time.Duration
 }
 
 type airflowBackend interface {
 	Provision(context.Context, string) (string, error)
+	Reconcile(context.Context, string) (string, bool, error)
 	Delete(context.Context, string) error
 }
 
@@ -91,6 +94,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: Composer] state rehydration failed: %v", err)
+		api.stateStore = state.NewGuardedEntryStore(store, err)
 	}
 	return api
 }
@@ -131,6 +135,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	project, location, ok := parseParent(r.URL.Path)
@@ -201,6 +208,8 @@ func (api *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	api.opMgr.RunAsync(op.Name, func() error {
+		api.mutationMu.Lock()
+		defer api.mutationMu.Unlock()
 		endpoint, err := api.backend.Provision(context.Background(), name)
 		api.mu.Lock()
 		current := api.environments[name]
@@ -318,6 +327,9 @@ func (api *API) listEnvironments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) patchEnvironment(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := parseEnvironmentName(r.URL.Path)
 	updateMask := r.URL.Query().Get("updateMask")
@@ -424,6 +436,9 @@ func (api *API) patchEnvironment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	name := parseEnvironmentName(r.URL.Path)
 	project, location, _ := parseParent(r.URL.Path)
 

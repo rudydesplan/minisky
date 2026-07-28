@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"minisky/pkg/config"
 	"minisky/pkg/orchestrator"
@@ -112,6 +114,7 @@ type API struct {
 	operationSeq int
 	activeRuns   map[string]int
 	totalRuns    int
+	initErr      error
 }
 
 // NewAPI creates a new Storage Transfer API shim with persistence.
@@ -123,10 +126,12 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	api := newAPI(opMgr, state.NewGuardedEntryStore(store, err))
 	if err != nil {
 		log.Printf("[Shim: StorageTransfer] persistence degraded: %v", err)
+		api.initErr = fmt.Errorf("open Storage Transfer state: %w", err)
 		return api
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: StorageTransfer] state rehydration failed: %v", err)
+		api.initErr = fmt.Errorf("load Storage Transfer state: %w", err)
 	}
 	return api
 }
@@ -155,6 +160,10 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: StorageTransfer] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.initErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Storage Transfer state is unavailable")
+		return
+	}
 
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/v1/transferOperations/") && r.Method == http.MethodGet:
@@ -317,6 +326,9 @@ func (c handlerObjectCopier) Copy(ctx context.Context, source, sink GcsData) (in
 		}
 		if size > maxTransferObject || size > maxTransferBytes-copiedBytes {
 			return copiedObjects, copiedBytes, fmt.Errorf("transfer exceeds local byte limit")
+		}
+		if source.Path != "" && !strings.HasPrefix(object.Name, source.Path) {
+			return copiedObjects, copiedBytes, fmt.Errorf("source object is outside requested prefix")
 		}
 		relative := strings.TrimPrefix(object.Name, source.Path)
 		destination := sink.Path + relative
@@ -737,7 +749,25 @@ func validateStorageTransferSpec(spec *TransferSpec) error {
 	if spec.GcsDataSource.BucketName == "" || spec.GcsDataSink.BucketName == "" {
 		return fmt.Errorf("source and sink bucketName are required")
 	}
+	if !validGCSDataPath(spec.GcsDataSource.Path) || !validGCSDataPath(spec.GcsDataSink.Path) {
+		return fmt.Errorf("GCS path must be empty or a valid slash-terminated object prefix of at most 1024 UTF-8 bytes")
+	}
 	return nil
+}
+
+func validGCSDataPath(value string) bool {
+	if value == "" {
+		return true
+	}
+	if !utf8.ValidString(value) || len(value) > 1024 || !strings.HasSuffix(value, "/") {
+		return false
+	}
+	for _, char := range value {
+		if unicode.IsControl(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeError(w http.ResponseWriter, code int, status, message string) {

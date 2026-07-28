@@ -60,12 +60,21 @@ fidelity tier, persistence model, and current implementation status.
 | dataproc.googleapis.com | Dataproc | Standard | Hybrid | ✅ | — |
 | appengine.googleapis.com | App Engine | Standard | Hybrid | ✅ | — |
 | redis.googleapis.com | Memorystore (Redis) | Standard | Hybrid | ✅ | ✅ |
+| memcache.googleapis.com | Memorystore (Memcached) | Standard | Hybrid | ✅ | Generated service gate |
 | aiplatform.googleapis.com | Vertex AI | Standard | File | — | ✅ |
 | monitoring.googleapis.com | Cloud Monitoring | Standard | File | — | ✅ |
 | logging.googleapis.com | Cloud Logging | Standard | File | — | ✅ |
 | cloudresourcemanager.googleapis.com | Resource Manager | Standard | File | — | ✅ |
 | sts.googleapis.com | Security Token Service | Standard | Static | — | — |
 | metadata.google.internal | Metadata Server | High | Static | — | — |
+
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 
 The checkmarks and guarded labels above identify only a tested slice, not an
 entire service API. Important boundaries:
@@ -92,6 +101,11 @@ entire service API. Important boundaries:
   user lifecycle is tested only through the guarded provider gate; database
   files remain container runtime data and restored instances have no stale
   endpoint.
+- Memorystore for Memcached persists bounded instance and admitted-operation
+  metadata, but not cache entries. The generated service gate above is
+  authoritative for lifecycle dimensions, local evidence status and revision
+  provenance, provider/tool entry points, and CI status. The bounded claim does
+  not include GCP networking, HA, maintenance, security, or broad API parity.
 - Cloud Tasks replays persisted nonterminal tasks once per API lifetime with the
   same task ID and retry budget. This is at-least-once: a crash between target
   acceptance and acknowledgement persistence can duplicate a delivery.
@@ -117,18 +131,12 @@ entire service API. Important boundaries:
 | firebasehosting.googleapis.com | Firebase Hosting | Passthrough | Docker | Firebase emulator |
 | firebaseio.com | Firebase RTDB | Passthrough | Docker | Firebase emulator |
 
-## Deferred Services
-
-| Domain | Reason |
-|--------|--------|
-| memcache.googleapis.com | Returns 501 UNIMPLEMENTED for all operations |
-
 ## Experimental Services
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
-**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+**Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 The Phase 18–25 domains marked `experimental` in the machine-readable
@@ -167,6 +175,10 @@ The separate Phase 19 Kafka/Airflow backend job passed on commit
 including its final exact-owned cleanup step. Bounded Terraform provider
 evidence is tracked per domain in the generated catalog below; all experimental
 domains remain default-off and do not claim Standard fidelity.
+The Binary Authorization Terraform claim is an independent Phase 24–25
+`local-passed` check with no recorded CI run URL or commit. It does not inherit
+the generated-client batch CI status and does not promote the service beyond
+experimental/default-off support.
 
 aiplatform.googleapis.com remains implemented for the existing Vertex
 prediction/configuration slice. Its newly integrated Index and Model Registry
@@ -190,7 +202,7 @@ opt-in and do not change that existing evidence claim.
 | `bigquery.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `bigtable.googleapis.com` | standard | hybrid | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `bigtableadmin.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
-| `binaryauthorization.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | project policy persistence and advisory local evaluation<br>Package tests only: `pkg/shims/binaryauthorization.TestPolicyRestartSaveFailureAndAuthorization`<br>`pkg/shims/binaryauthorization.TestEvaluateRequestUsesActivePolicy`<br>`pkg/shims/binaryauthorization.TestInvalidPersistedPolicyIsRejected` | No |
+| `binaryauthorization.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | project policy persistence and bounded local enforcement; provider 7.41.0 apply with pre-restart allow/deny observation, restart persistence/no-drift, matching-import/stale-import-reconcile/destroy-reset, plus package-proven Cloud Deploy deny, dry-run AUDIT permit, and explicit unsupported outcomes without durable audit logging or GKE/production admission security<br>Package tests only: `pkg/shims/binaryauthorization.TestPolicyRestartSaveFailureAndAuthorization`<br>`pkg/shims/binaryauthorization.TestEvaluateRequestUsesActivePolicy`<br>`pkg/shims/binaryauthorization.TestInvalidPersistedPolicyIsRejected`<br>`pkg/shims/binaryauthorization.TestUnsupportedEvaluationModesRemainExplicit`<br>`pkg/shims/binaryauthorization.TestDryRunRuleReportsDenialWithoutBlockingDeployment` | Yes |
 | `cloudasset.googleapis.com` | experimental | memory | experimental | — (not promoted) | Yes | in-memory inventory projection; no restart claim<br>Package tests only: `pkg/shims/cloudasset.TestListAssetsPagination` | No |
 | `cloudbuild.googleapis.com` | standard | hybrid | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `clouddeploy.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | delivery hierarchy metadata and loopback-only rollout<br>Package tests only: `pkg/shims/clouddeploy.TestFullHierarchy`<br>`pkg/shims/clouddeploy.TestRolloutRejectsSSRFAndUnsupportedStrategy`<br>`pkg/shims/clouddeploy.TestCloudDeployHierarchySurvivesRestart` | No |
@@ -213,7 +225,7 @@ opt-in and do not change that existing evidence claim.
 | `dlp.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | template metadata and bounded local content transforms<br>Package tests only: `pkg/shims/dlp.TestPersistAndReload` | No |
 | `dns.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `documentai.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | processor metadata and bounded processing; provider 7.41.0 apply/restart/no-drift/import/delete lifecycle without processing or inference parity<br>Package tests only: `pkg/shims/documentai.TestDocumentAICreatedProcessorSurvivesRestart`<br>`pkg/shims/documentai.TestDocumentAIDeleteOperationSurvivesRestart`<br>`pkg/shims/documentai.TestPersistAndReload`<br>`pkg/shims/documentai.TestProcessDocumentEnforcesDecodedPayloadLimit` | Yes |
-| `eventarc.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | trigger metadata and durable Pub/Sub/Storage to Workflow delivery; provider 7.41.0 apply/restart/no-drift/import/destroy lifecycle for bounded trigger metadata<br>Package tests only: `pkg/shims/eventarc.TestCreateTrigger`<br>`pkg/shims/eventarc.TestDeleteTrigger`<br>`pkg/shims/eventarc.TestPersistAndReload`<br>`pkg/shims/eventarc.TestFailedWorkflowDeliveryReplaysAfterRestart` | Yes |
+| `eventarc.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | trigger metadata with project/topic/strict-IAM-isolated delivery; commit 852d9e3 public-gateway live evidence proves deterministic post-admission interruption, same stable Workflow execution identity across restart, exact terminal result, no duplicate execution resources, and owned cleanup; this is idempotent admission/resource identity, not exactly-once external side effects, CloudEvents parity, OIDC, ordering, or transport provisioning; provider 7.41.0 apply/restart/no-drift/import/destroy remains bounded to trigger metadata<br>Package tests only: `pkg/shims/eventarc.TestCreateTrigger`<br>`pkg/shims/eventarc.TestDeleteTrigger`<br>`pkg/shims/eventarc.TestPersistAndReload`<br>`pkg/shims/eventarc.TestFailedWorkflowDeliveryReplaysAfterRestart`<br>`pkg/shims/eventarc.TestPubSubDeliveryRequiresTriggerProjectAndTransportTopic` | Yes |
 | `file.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | persisted instance metadata plus bounded profile-local share data; provider 7.41.0 apply/restart/no-drift/import/destroy lifecycle without NFS/VPC parity<br>Package tests only: `pkg/shims/filestore.TestLocalShareDataSurvivesMetadataRestart`<br>`pkg/shims/filestore.TestPersistAndReload`<br>`pkg/shims/filestore.TestLocalShareReadWriteIsBoundedAndPrivate`<br>`pkg/shims/filestore.TestShareIORejectsSymlinkTraversal` | Yes |
 | `firebasehosting.googleapis.com` | passthrough | docker | implemented | passthrough | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `firebaseio.com` | passthrough | docker | implemented | passthrough | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
@@ -225,7 +237,7 @@ opt-in and do not change that existing evidence claim.
 | `language.googleapis.com` | experimental | static | experimental | — (not promoted) | Yes | deterministic stateless analysis only<br>Package tests only: `pkg/shims/language.TestAnalyzeSentimentBoundaries` | No |
 | `logging.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `managedkafka.googleapis.com` | experimental | hybrid | experimental | — (not promoted) | Yes | persisted cluster/topic metadata plus exact-owned plaintext loopback Kafka backend; provider 7.41.0 apply/restart/no-drift/import/destroy lifecycle<br>Package tests only: `pkg/shims/managedkafka.TestPersistAndReload`<br>`pkg/shims/managedkafka.TestCreateCluster` | Yes |
-| `memcache.googleapis.com` | deferred | static | deferred | — (not promoted) | No | Memorystore for Memcached is not implemented; every request returns 501 UNIMPLEMENTED | Not inventoried |
+| `memcache.googleapis.com` | standard | hybrid | implemented | standard | No | Memcached metadata is profile-persisted; instances use exact-owned Memcached containers without durable cache contents | Not inventoried |
 | `metadata.google.internal` | high | static | implemented | high | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `monitoring.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `networksecurity.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | authorization and TLS policy metadata with advisory policy evaluation<br>Package tests only: `pkg/shims/networksecurity.TestPersistAndReload`<br>`pkg/shims/networksecurity.TestAuthorizationPolicyRequestUsesStoredDenyRule` | No |

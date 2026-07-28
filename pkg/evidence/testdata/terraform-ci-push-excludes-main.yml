@@ -1,0 +1,6 @@
+on:
+  push:
+    branches: [feature-only]
+    # branches: [main]
+  pull_request:
+  workflow_dispatch:

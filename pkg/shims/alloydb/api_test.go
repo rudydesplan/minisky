@@ -205,13 +205,48 @@ func TestRestartReconcilesWithoutProvisioningDuplicate(t *testing.T) {
 	if err := restarted.loadState(); err != nil {
 		t.Fatal(err)
 	}
-	restarted.reconcileBackends()
+	if err := restarted.reconcileBackends(); err != nil {
+		t.Fatal(err)
+	}
 	if backend.provisionCalls != 0 {
 		t.Fatalf("restart provisioned duplicate backend %d times", backend.provisionCalls)
 	}
 	if got := restarted.instances[name]; got == nil || got.State != "READY" ||
 		got.backendEndpoint != backend.endpoint || got.IPAddress != "127.0.0.1" {
 		t.Fatalf("reconciled instance = %#v", got)
+	}
+}
+
+func TestReconciliationPersistenceFailureFailsClosed(t *testing.T) {
+	name := "projects/p/locations/l/clusters/c/instances/i"
+	store := &failingReconcileStore{mockStore: mockStore{data: make(map[string][]byte)}}
+	if err := store.mockStore.Save(alloydbStateEntry, alloydbMetadata{
+		Clusters: map[string]*Cluster{"projects/p/locations/l/clusters/c": {
+			Name: "projects/p/locations/l/clusters/c", State: "READY",
+		}},
+		Instances: map[string]*Instance{name: {
+			Name: name, State: "STOPPED",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api := &API{
+		opMgr: orchestrator.NewOperationManager(),
+		backend: &fakeBackend{
+			endpoint: "127.0.0.1:55432", exists: true,
+		},
+		stateStore: store,
+		clusters:   make(map[string]*Cluster),
+		instances:  make(map[string]*Instance),
+	}
+	api.initializeState()
+	if api.initErr == nil {
+		t.Fatal("reconciliation persistence failure did not become sticky initialization error")
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/"+name, nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -549,6 +584,32 @@ func TestPersistAndReload(t *testing.T) {
 	}
 }
 
+func TestCorruptStateFailsClosedWithoutOverwritingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt-alloydb")
+	store, err := state.New(root, "corrupt-alloydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(alloydbStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+
+	api := NewAPI(orchestrator.NewOperationManager(), nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/v1/projects/test/locations/us-central1/clusters", nil))
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"status":"UNAVAILABLE"`) {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var persisted string
+	if err := store.Load(alloydbStateEntry, &persisted); err != nil || persisted != "corrupt" {
+		t.Fatalf("corrupt state changed: %q err=%v", persisted, err)
+	}
+}
+
 func TestConcurrentCreateAndGet(t *testing.T) {
 	api := newTestAPI()
 	const n = 50
@@ -591,6 +652,14 @@ func TestConcurrentCreateAndGet(t *testing.T) {
 type mockStore struct {
 	mu   sync.Mutex
 	data map[string][]byte
+}
+
+type failingReconcileStore struct {
+	mockStore
+}
+
+func (s *failingReconcileStore) Save(string, any) error {
+	return errors.New("injected reconciliation save failure")
 }
 
 func (m *mockStore) Load(name string, target any) error {

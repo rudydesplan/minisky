@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -68,6 +69,52 @@ func TestFallbackRegistryHasUsableDefaults(t *testing.T) {
 	}
 	if registry.Serverless.Builder == "" {
 		t.Error("fallback serverless builder is empty")
+	}
+	if registry.Composer.AirflowImage == "" {
+		t.Error("fallback Composer Airflow image is empty")
+	}
+}
+
+func TestComposerAirflowImageIsCanonicalDigestPinned(t *testing.T) {
+	t.Parallel()
+
+	const want = "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
+	pinnedImage := regexp.MustCompile(`^[^[:space:]@]+:[^[:space:]@]+@sha256:[0-9a-f]{64}$`)
+	for name, registry := range map[string]*ImageRegistry{
+		"embedded": loadRegistry(),
+		"fallback": fallbackRegistry(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := registry.Composer.AirflowImage; got != want {
+				t.Fatalf("Composer Airflow image = %q, want canonical reference %q", got, want)
+			}
+			if !pinnedImage.MatchString(registry.Composer.AirflowImage) {
+				t.Fatalf("Composer Airflow image is not tag-and-digest pinned: %q", registry.Composer.AirflowImage)
+			}
+		})
+	}
+}
+
+func TestEmbeddedMemcachedImagesMatchProviderVersions(t *testing.T) {
+	t.Parallel()
+	for name, registry := range map[string]*ImageRegistry{
+		"embedded": loadRegistry(),
+		"fallback": fallbackRegistry(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			images := make(map[string]string, len(registry.Memorystore.Memcached.Versions))
+			for _, version := range registry.Memorystore.Memcached.Versions {
+				images[version.Version] = version.Image
+			}
+			for version, wantImage := range map[string]string{
+				"1.5.16": "memcached:1.5.16-alpine",
+				"1.6.15": "memcached:1.6.15-alpine",
+			} {
+				if got := images[version]; got != wantImage {
+					t.Errorf("Memcached %s image = %q, want %q", version, got, wantImage)
+				}
+			}
+		})
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -25,22 +24,31 @@ import (
 	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	RequestIDHeader    = "X-MiniSky-Request-ID"
-	MaxRequestIDLength = 64
-	replayHeader       = "X-MiniSky-Internal-Replay"
-	defaultCapacity    = 1000
-	defaultReplayLimit = 64 << 10
+	RequestIDHeader            = "X-MiniSky-Request-ID"
+	MaxRequestIDLength         = 64
+	replayHeader               = "X-MiniSky-Internal-Replay"
+	defaultCapacity            = 1000
+	defaultReplayLimit         = 64 << 10
+	defaultReplayResponseLimit = 64 << 10
+	maxMetricSeries            = 256
+	serviceAttributeKey        = "minisky.service"
 )
 
 var (
-	ErrRecordNotFound  = errors.New("request record not found")
-	ErrReplayDisabled  = errors.New("request replay is disabled")
-	ErrPayloadOmitted  = errors.New("request payload was omitted because it exceeded the capture limit")
-	ErrPayloadRedacted = errors.New("request payload contained sensitive data and cannot be replayed")
+	ErrRecordNotFound         = errors.New("request record not found")
+	ErrReplayDisabled         = errors.New("request replay is disabled")
+	ErrPayloadOmitted         = errors.New("request payload was omitted because it exceeded the capture limit")
+	ErrPayloadRedacted        = errors.New("request payload contained sensitive data and cannot be replayed")
+	ErrReplayResponseTooLarge = errors.New("replay response exceeded the capture limit")
+	errOutboundRequest        = errors.New("outbound request failed")
+	errUntrustedTransport     = errors.New("custom transport is not trusted for privacy-safe instrumentation")
 )
 
 type requestIDKey struct{}
@@ -138,23 +146,27 @@ func (s *Store) find(project, requestID string) (Record, bool) {
 }
 
 type Config struct {
-	Capacity           int
-	LogWriter          io.Writer
-	ReplayEnabled      bool
-	ReplayMaxBodyBytes int64
-	TracerProvider     trace.TracerProvider
+	Capacity               int
+	LogWriter              io.Writer
+	ReplayEnabled          bool
+	ReplayMaxBodyBytes     int64
+	ReplayMaxResponseBytes int64
+	TracerProvider         trace.TracerProvider
+	KnownServices          []string
 }
 
 type Manager struct {
-	store          *Store
-	metrics        *Metrics
-	logWriter      io.Writer
-	logMu          sync.Mutex
-	replayEnabled  bool
-	replayMaxBytes int64
-	replayTarget   http.Handler
-	replayMu       sync.RWMutex
-	tracerProvider trace.TracerProvider
+	store                  *Store
+	metrics                *Metrics
+	logWriter              io.Writer
+	logMu                  sync.Mutex
+	replayEnabled          bool
+	replayMaxBytes         int64
+	replayMaxResponseBytes int64
+	replayTarget           http.Handler
+	replayMu               sync.RWMutex
+	tracerProvider         trace.TracerProvider
+	knownServices          map[string]struct{}
 }
 
 func New(config Config) *Manager {
@@ -166,17 +178,26 @@ func New(config Config) *Manager {
 	if limit <= 0 {
 		limit = defaultReplayLimit
 	}
+	responseLimit := config.ReplayMaxResponseBytes
+	if responseLimit <= 0 {
+		responseLimit = defaultReplayResponseLimit
+	}
 	provider := config.TracerProvider
 	if provider == nil {
 		provider = otel.GetTracerProvider()
 	}
+	knownServices := make(map[string]struct{}, len(config.KnownServices)+1)
+	addKnownServices(knownServices, config.KnownServices...)
+	addKnownServices(knownServices, "minisky.local")
 	return &Manager{
-		store:          NewStore(config.Capacity),
-		metrics:        NewMetrics(),
-		logWriter:      writer,
-		replayEnabled:  config.ReplayEnabled,
-		replayMaxBytes: limit,
-		tracerProvider: provider,
+		store:                  NewStore(config.Capacity),
+		metrics:                NewMetrics(config.KnownServices...),
+		logWriter:              writer,
+		replayEnabled:          config.ReplayEnabled,
+		replayMaxBytes:         limit,
+		replayMaxResponseBytes: responseLimit,
+		tracerProvider:         provider,
+		knownServices:          knownServices,
 	}
 }
 
@@ -203,6 +224,10 @@ func (m *Manager) Wrap(next http.Handler, resolve func(*http.Request) RequestLab
 		}
 		labels.Service = normalizeService(labels.Service)
 		labels.Route = NormalizeRoute(labels.Route)
+		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String(
+			serviceAttributeKey,
+			m.telemetryService(labels.Service),
+		))
 
 		var payload *replayPayload
 		var payloadErr error
@@ -241,17 +266,75 @@ func (m *Manager) Wrap(next http.Handler, resolve func(*http.Request) RequestLab
 		m.writeLog(record)
 	})
 
-	return otelhttp.NewHandler(
-		core,
+	instrumented := otelhttp.NewHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, instrumentedRequest *http.Request) {
+			original, _ := instrumentedRequest.Context().Value(originalRequestKey{}).(*http.Request)
+			if original == nil {
+				core.ServeHTTP(w, instrumentedRequest)
+				return
+			}
+			request := original.Clone(instrumentedRequest.Context())
+			request.Header = original.Header.Clone()
+			core.ServeHTTP(w, request)
+		}),
 		"minisky.gateway",
 		otelhttp.WithTracerProvider(m.tracerProvider),
+		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		)),
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			if resolve == nil {
-				return r.Method + " " + NormalizeRoute(r.URL.Path)
-			}
-			return r.Method + " " + NormalizeRoute(resolve(r).Route)
+			return r.Method + " " + NormalizeRoute(r.URL.Path)
 		}),
 	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labels := RequestLabels{Service: normalizeService(r.Host), Route: NormalizeRoute(r.URL.Path)}
+		if resolve != nil {
+			labels = resolve(r)
+		}
+		labels.Service = normalizeService(labels.Service)
+		labels.Route = NormalizeRoute(labels.Route)
+
+		safeRequest := r.Clone(context.WithValue(r.Context(), originalRequestKey{}, r))
+		safeURL := *r.URL
+		safeURL.Path = labels.Route
+		safeURL.RawPath = ""
+		safeURL.RawQuery = ""
+		safeURL.ForceQuery = false
+		safeURL.User = nil
+		safeURL.Host = "minisky.local"
+		safeURL.Opaque = ""
+		safeURL.Fragment = ""
+		safeURL.RawFragment = ""
+		safeRequest.URL = &safeURL
+		safeRequest.Host = "minisky.local"
+		safeRequest.Header = sanitizedPropagationHeaders(r.Header)
+		instrumented.ServeHTTP(w, safeRequest)
+	})
+}
+
+type originalRequestKey struct{}
+
+func sanitizedPropagationHeaders(headers http.Header) http.Header {
+	carrier := propagation.HeaderCarrier(make(http.Header))
+	if traceparent := headers.Get("traceparent"); traceparent != "" {
+		carrier.Set("traceparent", traceparent)
+	}
+	ctx := propagation.TraceContext{}.Extract(context.Background(), carrier)
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return make(http.Header)
+	}
+	sanitized := propagation.HeaderCarrier(make(http.Header))
+	propagation.TraceContext{}.Inject(ctx, sanitized)
+	return http.Header(sanitized)
+}
+
+func (m *Manager) telemetryService(service string) string {
+	service = normalizeService(service)
+	if _, ok := m.knownServices[service]; ok {
+		return service
+	}
+	return "other"
 }
 
 func sanitizeRequestID(value string) string {
@@ -309,6 +392,11 @@ var staticRouteSegments = map[string]struct{}{
 	"targetHttpProxies": {}, "forwardingRules": {}, "backendServices": {},
 }
 
+var knownAPIVersions = map[string]struct{}{
+	"v1": {}, "v2": {}, "v3": {}, "v4": {},
+	"v1alpha1": {}, "v1beta1": {}, "v1p1beta1": {}, "v2beta1": {},
+}
+
 func NormalizeRoute(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -330,14 +418,29 @@ func NormalizeRoute(path string) string {
 				continue
 			}
 		}
-		base, _, _ := strings.Cut(segment, ":")
-		if isAPIVersion(base) {
+		base, action, hasAction := strings.Cut(segment, ":")
+		if _, known := knownAPIVersions[base]; known || isAPIVersion(base) {
+			if _, known := knownAPIVersions[base]; !known {
+				base = "{version}"
+			}
+			parts[i] = base
+			if hasAction && isKnownRouteAction(action) {
+				parts[i] += ":" + action
+			}
 			continue
 		}
 		if _, ok := resourceCollections[base]; ok {
+			parts[i] = base
+			if hasAction && isKnownRouteAction(action) {
+				parts[i] += ":" + action
+			}
 			continue
 		}
 		if _, ok := staticRouteSegments[base]; ok {
+			parts[i] = base
+			if hasAction && isKnownRouteAction(action) {
+				parts[i] += ":" + action
+			}
 			continue
 		}
 		if segment != "" {
@@ -368,11 +471,18 @@ func normalizeActionSegment(segment string) string {
 	if !found {
 		return "{id}"
 	}
+	if isKnownRouteAction(action) {
+		return "{id}:" + action
+	}
+	return "{id}"
+}
+
+func isKnownRouteAction(action string) bool {
 	switch action {
 	case "publish", "run", "cancel", "getIamPolicy", "setIamPolicy", "testIamPermissions":
-		return "{id}:" + action
+		return true
 	default:
-		return "{id}"
+		return false
 	}
 }
 
@@ -405,24 +515,48 @@ type Metrics struct {
 	values           map[metricKey]metricValue
 	quotaRejections  map[quotaMetricKey]uint64
 	resourceCounters map[resourceMetricKey]func() int
+	knownServices    map[string]struct{}
 }
 
-func NewMetrics() *Metrics {
+func NewMetrics(knownServices ...string) *Metrics {
+	known := make(map[string]struct{}, len(knownServices)+1)
+	addKnownServices(known, knownServices...)
+	addKnownServices(known, "minisky.local")
 	return &Metrics{
 		values:           make(map[metricKey]metricValue),
 		quotaRejections:  make(map[quotaMetricKey]uint64),
 		resourceCounters: make(map[resourceMetricKey]func() int),
+		knownServices:    known,
 	}
+}
+
+func addKnownServices(known map[string]struct{}, services ...string) {
+	for _, service := range services {
+		if normalized := normalizeService(service); normalized != "unresolved" {
+			known[normalized] = struct{}{}
+		}
+	}
+}
+
+func (m *Metrics) normalizeService(service string) string {
+	service = normalizeService(service)
+	if _, ok := m.knownServices[service]; ok {
+		return service
+	}
+	return "other"
 }
 
 func (m *Metrics) Observe(labels RequestLabels, method string, status int, latencySeconds float64) {
 	key := metricKey{
-		service:     normalizeService(labels.Service),
+		service:     m.normalizeService(labels.Service),
 		method:      normalizeMethod(method),
 		route:       NormalizeRoute(labels.Route),
 		statusClass: fmt.Sprintf("%dxx", status/100),
 	}
 	m.mu.Lock()
+	if _, exists := m.values[key]; !exists && len(m.values) >= maxMetricSeries-1 {
+		key = metricKey{service: "other", method: "OTHER", route: "/{unmatched}", statusClass: "other"}
+	}
 	value := m.values[key]
 	value.count++
 	value.latencyCount++
@@ -438,11 +572,14 @@ func (m *Manager) ObserveQuotaRejection(labels RequestLabels, scope string) {
 		scope = "unknown"
 	}
 	key := quotaMetricKey{
-		service: normalizeService(labels.Service),
+		service: m.telemetryService(labels.Service),
 		route:   NormalizeRoute(labels.Route),
 		scope:   scope,
 	}
 	m.metrics.mu.Lock()
+	if _, exists := m.metrics.quotaRejections[key]; !exists && len(m.metrics.quotaRejections) >= maxMetricSeries-1 {
+		key = quotaMetricKey{service: "other", route: "/{unmatched}", scope: "unknown"}
+	}
 	m.metrics.quotaRejections[key]++
 	m.metrics.mu.Unlock()
 }
@@ -455,10 +592,13 @@ func (m *Manager) RegisterResourceCounter(service, resourceKind string, counter 
 		return
 	}
 	key := resourceMetricKey{
-		service:      normalizeService(service),
+		service:      m.telemetryService(service),
 		resourceKind: normalizeResourceKind(resourceKind),
 	}
 	m.metrics.mu.Lock()
+	if _, exists := m.metrics.resourceCounters[key]; !exists && len(m.metrics.resourceCounters) >= maxMetricSeries-1 {
+		key = resourceMetricKey{service: "other", resourceKind: "unknown"}
+	}
 	m.metrics.resourceCounters[key] = counter
 	m.metrics.mu.Unlock()
 }
@@ -857,27 +997,223 @@ func (m *Manager) Replay(ctx context.Context, project, requestID string) (Replay
 	request.Header = payload.headers.Clone()
 	request.Header.Set("X-MiniSky-Project", record.Project)
 	request.Header.Set(replayHeader, "1")
-	response := httptest.NewRecorder()
+	response := newBoundedReplayResponseWriter(m.replayMaxResponseBytes)
 	target.ServeHTTP(response, request)
+	if response.overflow {
+		return ReplayResult{}, ErrReplayResponseTooLarge
+	}
 	return ReplayResult{
-		Status:    response.Code,
+		Status:    response.statusCode(),
 		RequestID: response.Header().Get(RequestIDHeader),
 	}, nil
 }
 
-type instrumentedTransport struct {
-	http.RoundTripper
+type boundedReplayResponseWriter struct {
+	header   http.Header
+	status   int
+	written  int64
+	limit    int64
+	overflow bool
 }
+
+func newBoundedReplayResponseWriter(limit int64) *boundedReplayResponseWriter {
+	return &boundedReplayResponseWriter{header: make(http.Header), limit: limit}
+}
+
+func (writer *boundedReplayResponseWriter) Header() http.Header { return writer.header }
+
+func (writer *boundedReplayResponseWriter) WriteHeader(status int) {
+	if writer.status == 0 {
+		writer.status = status
+	}
+}
+
+func (writer *boundedReplayResponseWriter) Write(value []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	remaining := writer.limit - writer.written
+	if remaining <= 0 {
+		writer.overflow = true
+		return 0, ErrReplayResponseTooLarge
+	}
+	if int64(len(value)) > remaining {
+		writer.written = writer.limit
+		writer.overflow = true
+		return int(remaining), ErrReplayResponseTooLarge
+	}
+	writer.written += int64(len(value))
+	return len(value), nil
+}
+
+func (writer *boundedReplayResponseWriter) Flush() {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+}
+
+func (writer *boundedReplayResponseWriter) statusCode() int {
+	if writer.status == 0 {
+		return http.StatusOK
+	}
+	return writer.status
+}
+
+type instrumentedTransport struct{ base http.RoundTripper }
+
+// PrivacySafeTransport is the explicit opt-in boundary for custom transports.
+// Implementations attest that they do not perform telemetry on the raw request.
+type PrivacySafeTransport interface {
+	http.RoundTripper
+	MiniSkyPrivacySafeTransport()
+}
+
+// trustedTransport marks a custom transport whose implementation is known not
+// to perform its own telemetry before dispatching the request.
+type trustedTransport struct{ base http.RoundTripper }
+
+// TrustTransport explicitly opts a custom transport into MiniSky's privacy
+// boundary. Callers must not use it for telemetry-decorated transports.
+func TrustTransport(base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if _, ok := base.(*trustedTransport); ok {
+		return base
+	}
+	return &trustedTransport{base: base}
+}
+
+func (transport *trustedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport.base.RoundTrip(request)
+}
+
+func (*trustedTransport) MiniSkyPrivacySafeTransport() {}
 
 func InstrumentTransport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	switch base.(type) {
-	case *instrumentedTransport, *otelhttp.Transport:
+	switch typed := base.(type) {
+	case *instrumentedTransport:
 		return base
+	case *http.Transport:
+		return &instrumentedTransport{base: typed}
+	case PrivacySafeTransport:
+		return &instrumentedTransport{base: typed}
+	default:
+		return &instrumentedTransport{base: rejectUntrustedTransport{}}
 	}
-	return &instrumentedTransport{RoundTripper: otelhttp.NewTransport(base)}
+}
+
+type rejectUntrustedTransport struct{}
+
+func (rejectUntrustedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errUntrustedTransport
+}
+
+func (transport *instrumentedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	safeRequest := request.Clone(sanitizedOutboundContext(request.Context()))
+	safeURL := *request.URL
+	safeURL.Path = NormalizeRoute(request.URL.Path)
+	safeURL.RawPath = ""
+	safeURL.RawQuery = ""
+	safeURL.ForceQuery = false
+	safeURL.User = nil
+	safeURL.Host = "outbound.local"
+	safeURL.Opaque = ""
+	safeURL.Fragment = ""
+	safeURL.RawFragment = ""
+	safeURL.OmitHost = false
+	safeRequest.URL = &safeURL
+	safeRequest.Host = "outbound.local"
+	safeRequest.RequestURI = ""
+	safeRequest.Header = make(http.Header)
+
+	restoring := &restoringRoundTripper{
+		base:     transport.base,
+		original: request,
+	}
+	instrumented := otelhttp.NewTransport(
+		restoring,
+		otelhttp.WithPropagators(traceparentOnlyPropagator{}),
+	)
+	response, err := instrumented.RoundTrip(safeRequest)
+	if restoring.actualErr != nil {
+		return response, restoring.actualErr
+	}
+	return response, err
+}
+
+func sanitizedOutboundContext(ctx context.Context) context.Context {
+	ctx = baggage.ContextWithBaggage(ctx, baggage.Baggage{})
+	span := trace.SpanFromContext(ctx)
+	spanContext := span.SpanContext()
+	if !spanContext.IsValid() {
+		return ctx
+	}
+	sanitized := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    spanContext.TraceID(),
+		SpanID:     spanContext.SpanID(),
+		TraceFlags: spanContext.TraceFlags(),
+		Remote:     spanContext.IsRemote(),
+	})
+	return trace.ContextWithSpan(ctx, sanitizedContextSpan{
+		Span:        span,
+		spanContext: sanitized,
+	})
+}
+
+type sanitizedContextSpan struct {
+	trace.Span
+	spanContext trace.SpanContext
+}
+
+func (span sanitizedContextSpan) SpanContext() trace.SpanContext { return span.spanContext }
+
+type traceparentOnlyPropagator struct{}
+
+func (traceparentOnlyPropagator) Inject(ctx context.Context, carrier propagation.TextMapCarrier) {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.IsValid() {
+		return
+	}
+	sanitized := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    spanContext.TraceID(),
+		SpanID:     spanContext.SpanID(),
+		TraceFlags: spanContext.TraceFlags(),
+		Remote:     spanContext.IsRemote(),
+	})
+	propagation.TraceContext{}.Inject(trace.ContextWithSpanContext(ctx, sanitized), carrier)
+}
+
+func (traceparentOnlyPropagator) Extract(ctx context.Context, carrier propagation.TextMapCarrier) context.Context {
+	return propagation.TraceContext{}.Extract(ctx, carrier)
+}
+
+func (traceparentOnlyPropagator) Fields() []string { return []string{"traceparent"} }
+
+type restoringRoundTripper struct {
+	base      http.RoundTripper
+	original  *http.Request
+	actualErr error
+}
+
+func (transport *restoringRoundTripper) RoundTrip(instrumentedRequest *http.Request) (*http.Response, error) {
+	request := transport.original.Clone(instrumentedRequest.Context())
+	request.Header = transport.original.Header.Clone()
+	request.Header.Del("traceparent")
+	request.Header.Del("tracestate")
+	request.Header.Del("baggage")
+	if traceparent := instrumentedRequest.Header.Get("traceparent"); traceparent != "" {
+		request.Header.Set("traceparent", traceparent)
+	}
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		transport.actualErr = err
+		return response, errOutboundRequest
+	}
+	return response, nil
 }
 
 // Do instruments a single request while retaining every setting and behavior

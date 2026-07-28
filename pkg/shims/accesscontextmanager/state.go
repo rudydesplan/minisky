@@ -3,6 +3,7 @@ package accesscontextmanager
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"minisky/pkg/state"
 )
@@ -33,6 +34,11 @@ func (api *API) persistState() error {
 	defer api.persistMu.Unlock()
 
 	api.mu.RLock()
+	if api.persistenceErr != nil {
+		err := api.persistenceErr
+		api.mu.RUnlock()
+		return err
+	}
 	policySnap := make(map[string]*AccessPolicy, len(api.policies))
 	for k, v := range api.policies {
 		policySnap[k] = clonePolicy(v)
@@ -65,19 +71,72 @@ func (api *API) loadState() error {
 		if isNotFound(err) {
 			return nil
 		}
+		api.markPersistenceFailure(err)
 		return err
 	}
-	if meta.Policies != nil {
-		api.policies = meta.Policies
+	if err := validateACMMetadata(meta); err != nil {
+		api.markPersistenceFailure(err)
+		return err
 	}
-	if meta.Perimeters != nil {
-		api.perimeters = meta.Perimeters
+	policies := make(map[string]*AccessPolicy, len(meta.Policies))
+	for name, policy := range meta.Policies {
+		policies[name] = clonePolicy(policy)
 	}
-	if meta.Levels != nil {
-		api.levels = meta.Levels
+	perimeters := make(map[string]*ServicePerimeter, len(meta.Perimeters))
+	for name, perimeter := range meta.Perimeters {
+		perimeters[name] = clonePerimeter(perimeter)
 	}
+	levels := make(map[string]*AccessLevel, len(meta.Levels))
+	for name, level := range meta.Levels {
+		levels[name] = cloneLevel(level)
+	}
+
+	api.mu.Lock()
+	api.policies = policies
+	api.perimeters = perimeters
+	api.levels = levels
 	api.seqNum = meta.SeqNum
+	api.mu.Unlock()
 	return nil
+}
+
+func validateACMMetadata(meta acmMetadata) error {
+	if meta.SeqNum < 0 {
+		return fmt.Errorf("invalid persisted Access Context Manager sequence")
+	}
+	for name, policy := range meta.Policies {
+		if policy == nil || policy.Name != name {
+			return fmt.Errorf("invalid persisted access policy %q", name)
+		}
+	}
+	for name, perimeter := range meta.Perimeters {
+		if perimeter == nil || perimeter.Name != name {
+			return fmt.Errorf("invalid persisted service perimeter %q", name)
+		}
+	}
+	for name, level := range meta.Levels {
+		if level == nil || level.Name != name {
+			return fmt.Errorf("invalid persisted access level %q", name)
+		}
+	}
+	return nil
+}
+
+func (api *API) markPersistenceFailure(err error) {
+	if err == nil {
+		return
+	}
+	api.mu.Lock()
+	if api.persistenceErr == nil {
+		api.persistenceErr = err
+	}
+	api.mu.Unlock()
+}
+
+func (api *API) PersistenceError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.persistenceErr
 }
 
 func isNotFound(err error) bool {

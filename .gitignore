@@ -24,6 +24,11 @@ terraform/minisky-sa-key.json
 terraform/*.tfplan
 terraform/*.tfvars
 terraform/*.tfvars.json
+terraform/**/.terraform/
+terraform/**/*.tfstate
+terraform/**/*.tfstate.backup
+terraform/**/*.tfstate.*.backup
+terraform/**/*.tfplan
 
 # Go
 vendor/

@@ -97,6 +97,7 @@ type API struct {
 	instances          map[string]*Instance
 	dataRoot           string
 	removeInstanceData func(string) error
+	initErr            error
 }
 
 // NewAPI creates a new Filestore API shim with persistence.
@@ -108,10 +109,12 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	api := newAPI(opMgr, state.NewGuardedEntryStore(store, err))
 	if err != nil {
 		log.Printf("[Shim: Filestore] persistence degraded: %v", err)
+		api.initErr = fmt.Errorf("open Filestore state: %w", err)
 		return api
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: Filestore] state rehydration failed: %v", err)
+		api.initErr = fmt.Errorf("load Filestore state: %w", err)
 	}
 	return api
 }
@@ -137,6 +140,10 @@ func newTestAPI() *API {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Filestore] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.initErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Filestore state is unavailable")
+		return
+	}
 
 	switch {
 	case strings.Contains(r.URL.Path, "/operations/") && r.Method == http.MethodGet:
@@ -518,10 +525,12 @@ func (api *API) shareFilePath(instanceName, shareName, relativePath string) (str
 	instance := api.instances[instanceName]
 	found := false
 	if instance != nil {
-		for _, share := range instance.FileShares {
-			if share.Name == shareName {
-				found = true
-				break
+		if instance.State == "READY" {
+			for _, share := range instance.FileShares {
+				if share.Name == shareName {
+					found = true
+					break
+				}
 			}
 		}
 	}
@@ -551,6 +560,22 @@ func (api *API) instanceDataPath(instanceName string) string {
 func (api *API) instanceDataKey(instanceName string) string {
 	sum := sha256.Sum256([]byte(instanceName))
 	return fmt.Sprintf("%x", sum[:16])
+}
+
+func (api *API) localShareTreeReady(instanceName string, shares []FileShare) bool {
+	if len(shares) == 0 {
+		return true
+	}
+	for _, share := range shares {
+		exists, err := secureDirectoryExists(
+			api.dataRoot,
+			filepath.Join(api.instanceDataKey(instanceName), share.Name),
+		)
+		if err != nil || !exists {
+			return false
+		}
+	}
+	return true
 }
 
 func validLocalComponent(value string) bool {

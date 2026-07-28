@@ -69,6 +69,11 @@ type operationStore interface {
 // parent.
 var ErrOperationNotFound = errors.New("operation not found")
 
+// ErrOperationTerminalBarrier classifies a failure after the terminal
+// operation snapshot became durable but before its caller-side association
+// cleanup completed.
+var ErrOperationTerminalBarrier = errors.New("terminal operation barrier failed")
+
 // OperationScope is the durable identity of one service-specific operation.
 type OperationScope struct {
 	ServiceKind string
@@ -467,6 +472,71 @@ func (om *OperationManager) FinalizeScopedDurable(name string, response json.Raw
 	return om.finalizeDurable(name, response, code, message)
 }
 
+// FinalizeScopedDurableWithBarrier durably saves a hidden terminal candidate,
+// runs barrier, then publishes and notifies observers. The barrier runs while
+// operation persistence is serialized and must release every caller-owned
+// mutation lock before returning, including when it returns an error. It must
+// not call an OperationManager method that acquires persistMu.
+//
+// A save failure skips the barrier and leaves the visible operation
+// non-terminal. A barrier failure means the operation is already durably
+// terminal: the terminal candidate is published and observers are notified,
+// while the joined ErrOperationTerminalBarrier result tells the caller to
+// retain or reconcile any association the barrier could not durably clear.
+func (om *OperationManager) FinalizeScopedDurableWithBarrier(
+	name string,
+	response json.RawMessage,
+	code int,
+	message string,
+	barrier func() error,
+) error {
+	om.persistMu.Lock()
+
+	om.mu.RLock()
+	current := om.ops[name]
+	switch {
+	case current == nil:
+		om.mu.RUnlock()
+		om.persistMu.Unlock()
+		return ErrOperationNotFound
+	case !isScopedOperation(current):
+		om.mu.RUnlock()
+		om.persistMu.Unlock()
+		return ErrOperationNotFound
+	case current.Done || current.Status == StatusDone:
+		om.mu.RUnlock()
+		om.persistMu.Unlock()
+		return fmt.Errorf("operation %q is already terminal", name)
+	}
+	candidate := terminalOperationCandidate(current, response, code, message)
+	snapshot := make(map[string]*Operation, len(om.ops))
+	for operationName, operation := range om.ops {
+		snapshot[operationName] = cloneOperation(operation)
+	}
+	snapshot[name] = cloneOperation(candidate)
+	om.mu.RUnlock()
+
+	if err := om.persistOperationSnapshotLocked(snapshot); err != nil {
+		om.recordPersistenceFailure(name, false, err)
+		om.persistMu.Unlock()
+		return err
+	}
+
+	barrierErr := runOperationTerminalBarrier(barrier)
+
+	om.mu.Lock()
+	om.ops[name] = cloneOperation(candidate)
+	completed := cloneOperation(om.ops[name])
+	om.mu.Unlock()
+	om.persistMu.Unlock()
+
+	om.notifyTerminal(completed)
+	if barrierErr != nil {
+		return errors.Join(ErrOperationTerminalBarrier, barrierErr)
+	}
+	return nil
+}
+
 func (om *OperationManager) finalizeDurable(name string, response json.RawMessage, code int, message string) error {
 	om.persistMu.Lock()
 
@@ -526,6 +596,43 @@ func (om *OperationManager) finalizeDurable(name string, response json.RawMessag
 	om.persistMu.Unlock()
 	om.notifyTerminal(completed)
 	return nil
+}
+
+func terminalOperationCandidate(
+	current *Operation,
+	response json.RawMessage,
+	code int,
+	message string,
+) *Operation {
+	candidate := cloneOperation(current)
+	candidate.Status = StatusDone
+	candidate.Done = true
+	candidate.Progress = 100
+	candidate.EndTime = time.Now().UTC().Format(time.RFC3339)
+	if code != 0 {
+		if isScopedOperation(candidate) {
+			code = canonicalRPCCode(code)
+		}
+		candidate.Error = &OperationError{Code: code, Message: message}
+		candidate.Response = nil
+		return candidate
+	}
+	candidate.Error = nil
+	candidate.Response = append(json.RawMessage(nil), response...)
+	ensureScopedTerminalResponse(candidate)
+	return candidate
+}
+
+func runOperationTerminalBarrier(barrier func() error) (err error) {
+	if barrier == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("terminal operation barrier panic: %v", recovered)
+		}
+	}()
+	return barrier()
 }
 
 // RollbackScopedRegistration removes an operation created as part of a resource
@@ -752,6 +859,22 @@ func (om *OperationManager) persistLocked() error {
 	om.mu.RLock()
 	payload, err := json.Marshal(om.ops)
 	om.mu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("snapshot operations: %w", err)
+	}
+	if err := om.store.Save(operationStateEntry, json.RawMessage(payload)); err != nil {
+		return fmt.Errorf("save operations: %w", err)
+	}
+	return nil
+}
+
+// persistOperationSnapshotLocked saves an already-cloned operation snapshot.
+// The caller must hold persistMu.
+func (om *OperationManager) persistOperationSnapshotLocked(snapshot map[string]*Operation) error {
+	if om.store == nil {
+		return nil
+	}
+	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("snapshot operations: %w", err)
 	}

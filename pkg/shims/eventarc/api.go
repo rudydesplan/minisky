@@ -118,6 +118,9 @@ type API struct {
 	payloads   map[string]string
 	queue      chan deliveryWork
 	executor   WorkflowsExecutor
+
+	newDeliveryID func() (string, error)
+	afterMatch    func()
 }
 
 // NewAPI creates a new Eventarc API shim with persistence.
@@ -127,11 +130,12 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	api := &API{
-		opMgr:      opMgr,
-		stateStore: state.NewGuardedEntryStore(store, err),
-		triggers:   make(map[string]*Trigger),
-		deliveries: make(map[string]*Delivery),
-		payloads:   make(map[string]string),
+		opMgr:         opMgr,
+		stateStore:    state.NewGuardedEntryStore(store, err),
+		triggers:      make(map[string]*Trigger),
+		deliveries:    make(map[string]*Delivery),
+		payloads:      make(map[string]string),
+		newDeliveryID: secureDeliveryID,
 	}
 	if err != nil {
 		log.Printf("[Shim: Eventarc] persistence degraded: %v", err)
@@ -146,10 +150,11 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 // newTestAPI creates an in-memory API for testing (no persistence).
 func newTestAPI() *API {
 	return &API{
-		opMgr:      orchestrator.NewOperationManager(),
-		triggers:   make(map[string]*Trigger),
-		deliveries: make(map[string]*Delivery),
-		payloads:   make(map[string]string),
+		opMgr:         orchestrator.NewOperationManager(),
+		triggers:      make(map[string]*Trigger),
+		deliveries:    make(map[string]*Delivery),
+		payloads:      make(map[string]string),
+		newDeliveryID: secureDeliveryID,
 	}
 }
 
@@ -541,12 +546,14 @@ func (api *API) deleteTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(api.triggers, name)
+	removedDeliveries, removedPayloads := api.removeTriggerDeliveriesLocked(name)
 	api.mu.Unlock()
 
 	op, err := api.opMgr.RegisterScopedTargetDurable("eventarc#operation", "delete", name)
 	if err != nil {
 		api.mu.Lock()
 		api.triggers[name] = trigger
+		api.restoreDeliveriesLocked(removedDeliveries, removedPayloads)
 		api.mu.Unlock()
 		writeError(w, 503, "UNAVAILABLE", "Failed to register operation")
 		return
@@ -555,6 +562,7 @@ func (api *API) deleteTrigger(w http.ResponseWriter, r *http.Request) {
 		// Re-add the resource since persist failed
 		api.mu.Lock()
 		api.triggers[name] = trigger
+		api.restoreDeliveriesLocked(removedDeliveries, removedPayloads)
 		api.mu.Unlock()
 		api.compensateMutation(op.Name, err)
 		writeError(w, 503, "UNAVAILABLE", "State persistence failed")
@@ -566,6 +574,49 @@ func (api *API) deleteTrigger(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(orchestrator.ScopedOperationResponse(api.opMgr.Get(op.Name)))
+}
+
+func (api *API) removeTriggerDeliveriesLocked(triggerName string) (map[string]*Delivery, map[string]string) {
+	removedDeliveries := make(map[string]*Delivery)
+	candidatePayloads := make(map[string]struct{})
+	for id, delivery := range api.deliveries {
+		if delivery == nil || delivery.Trigger != triggerName {
+			continue
+		}
+		removedDeliveries[id] = delivery
+		if delivery.PayloadRef != "" {
+			candidatePayloads[delivery.PayloadRef] = struct{}{}
+		}
+		delete(api.deliveries, id)
+	}
+
+	removedPayloads := make(map[string]string)
+	for payloadID := range candidatePayloads {
+		referenced := false
+		for _, delivery := range api.deliveries {
+			if delivery != nil && delivery.PayloadRef == payloadID {
+				referenced = true
+				break
+			}
+		}
+		if referenced {
+			continue
+		}
+		if payload, ok := api.payloads[payloadID]; ok {
+			removedPayloads[payloadID] = payload
+			delete(api.payloads, payloadID)
+		}
+	}
+	return removedDeliveries, removedPayloads
+}
+
+func (api *API) restoreDeliveriesLocked(deliveries map[string]*Delivery, payloads map[string]string) {
+	for id, delivery := range deliveries {
+		api.deliveries[id] = delivery
+	}
+	for id, payload := range payloads {
+		api.payloads[id] = payload
+	}
 }
 
 func (api *API) getOperation(w http.ResponseWriter, r *http.Request) {

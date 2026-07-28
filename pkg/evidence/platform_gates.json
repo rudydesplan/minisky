@@ -1,0 +1,60 @@
+[
+  {
+    "id": "phase12-package-race-unit",
+    "phase": 12,
+    "name": "Observability package unit and race gate",
+    "check": {
+      "status": "local-passed",
+      "references": [
+        {
+          "package": "pkg/observability",
+          "tests": [
+            "TestGatewayRequestIDStatusLoggingAndPropagation",
+            "TestDiagnosticsRecordsAndReplayAreProjectScoped",
+            "TestMetricSeriesRemainBoundedUnderHostAndRouteCardinalityStress",
+            "TestReplaySafetyAndBodyPolicy",
+            "TestExporterFailureDoesNotChangeGatewayResponse",
+            "TestConcurrentTelemetryShutdownRespectsEachCallerContext"
+          ]
+        }
+      ],
+      "note": "The focused Phase 12 observability package unit and race gates passed locally in this session. They cover bounded structured access records and W3C propagation, low-cardinality metrics, project-keyed replay lookup and bounded response behavior, exporter degradation, and context-bounded telemetry shutdown."
+    }
+  },
+  {
+    "id": "phase12-guarded-integration",
+    "phase": 12,
+    "name": "Guarded loopback and OTLP integration",
+    "check": {
+      "status": "local-passed",
+      "script": "scripts/phase12-observability-integration.sh",
+      "makeTarget": "test-phase12-observability",
+      "note": "The exact guarded loopback integration passed locally in this session. It proved bounded W3C correlation, sanitized structured logs and low-cardinality metrics, bounded sanitized OTLP export inspection, exporter failure without API response changes, project-keyed replay lookup with bounded response capture, and graceful shutdown."
+    }
+  },
+  {
+    "id": "phase12-guard-self-test",
+    "phase": 12,
+    "name": "Loopback guard and diagnostics self-test",
+    "check": {
+      "status": "local-passed",
+      "script": "scripts/phase12-observability-integration-test.sh",
+      "makeTarget": "test-phase12-observability-contract",
+      "note": "The guard contract and self-test passed locally in this session. They reject unguarded execution and non-loopback or colliding listeners, validate bounded sanitized failure diagnostics, and statically require the Phase 12 CI gate."
+    }
+  },
+  {
+    "id": "phase12-ci",
+    "phase": 12,
+    "name": "Required GitHub Actions observability acceptance",
+    "check": {
+      "status": "ci-passed",
+      "workflow": ".github/workflows/ci.yml",
+      "job": "phase12-observability-integration",
+      "makeTarget": "test-phase12-observability",
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30337314745",
+      "commit": "60e82159d7fd80cf6472327b2cd14c2ae1465f23",
+      "note": "The required pull-request Phase 12 loopback observability acceptance job and its containing CI workflow completed successfully on the recorded commit on 2026-07-28; optional opt-in integration jobs were skipped by design."
+    }
+  }
+]

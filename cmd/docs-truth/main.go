@@ -1,5 +1,5 @@
-// Command docs-truth renders compatibility documentation from registry and
-// Phase 18-25 evidence metadata.
+// Command docs-truth renders compatibility and platform documentation from
+// machine-readable repository evidence.
 package main
 
 import (
@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -18,12 +20,16 @@ import (
 )
 
 const (
-	serviceCatalogStart = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
-	serviceCatalogEnd   = "<!-- END GENERATED SERVICE CATALOG -->"
-	phaseSummaryStart   = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
-	phaseSummaryEnd     = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
-	readmeCountStart    = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
-	readmeCountEnd      = "<!-- END GENERATED REGISTRY COUNT -->"
+	serviceCatalogStart  = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
+	serviceCatalogEnd    = "<!-- END GENERATED SERVICE CATALOG -->"
+	phaseSummaryStart    = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
+	phaseSummaryEnd      = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
+	readmeCountStart     = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
+	readmeCountEnd       = "<!-- END GENERATED REGISTRY COUNT -->"
+	platformSummaryStart = "<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	platformSummaryEnd   = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	memcacheSummaryStart = "<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->"
+	memcacheSummaryEnd   = "<!-- END GENERATED MEMCACHED SERVICE GATE -->"
 )
 
 func main() {
@@ -54,6 +60,22 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
+	platformGates, err := evidence.PlatformGates()
+	if err != nil {
+		return err
+	}
+	platformSummary, err := renderPhase12PlatformSummary(platformGates)
+	if err != nil {
+		return err
+	}
+	serviceGates, err := evidence.ServiceGates()
+	if err != nil {
+		return err
+	}
+	memcacheGate, err := selectMemcacheServiceGate(services, serviceGates)
+	if err != nil {
+		return err
+	}
 	catalog, err := renderServiceCatalog(services, inventory)
 	if err != nil {
 		return err
@@ -80,8 +102,29 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	updatedDocs, err = replaceMemcacheServiceGate(updatedDocs, memcacheGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
 	if err := validateHandwrittenClaims(updatedDocs); err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
+	}
+	statePath := filepath.Join(root, "docs", "state-model.md")
+	stateModel, err := os.ReadFile(statePath)
+	if err != nil {
+		return err
+	}
+	terraformPath := filepath.Join(root, "docs", "terraform-compatibility.md")
+	terraformCompatibility, err := os.ReadFile(terraformPath)
+	if err != nil {
+		return err
+	}
+	updatedTerraform, err := replaceMemcacheServiceGate(string(terraformCompatibility), memcacheGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", terraformPath, err)
+	}
+	if err := validateMemcacheClaims(updatedDocs, string(stateModel), updatedTerraform); err != nil {
+		return fmt.Errorf("Memcached documentation truth: %w", err)
 	}
 
 	readmePath := filepath.Join(root, "README.md")
@@ -89,16 +132,17 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
-	count := fmt.Sprintf(
-		"- **🚀 %d Registry-Verified Domains**: The exact catalog count and generated\n"+
-			"  compatibility rows come from `registry.Services()`. Phase 18–25\n"+
-			"  inventory entries remain experimental and default-off.\n"+
-			"  See [Service Compatibility](docs/service-compatibility.md).\n",
-		len(services),
-	)
+	count, err := renderRegistryCount(services)
+	if err != nil {
+		return err
+	}
 	updatedReadme, err := replaceGeneratedSection(
 		string(readme), readmeCountStart, readmeCountEnd, count,
 	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	updatedReadme, err = replaceMemcacheServiceGate(updatedReadme, memcacheGate)
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
@@ -108,6 +152,27 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
+	updatedReadme, err = replaceGeneratedSection(
+		updatedReadme, platformSummaryStart, platformSummaryEnd, platformSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	if err := validatePhase12Claims(updatedReadme, platformGates); err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "docs", "minisky-roadmap-completion-plan.canvas.tsx"),
+		filepath.Join(root, "docs", "adr", "0012-local-observability-and-request-replay.md"),
+	} {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := validatePhase12Claims(string(document), platformGates); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	}
 
 	targets := []struct {
 		path string
@@ -115,6 +180,7 @@ func generate(root string, check bool) error {
 	}{
 		{docsPath, []byte(updatedDocs)},
 		{readmePath, []byte(updatedReadme)},
+		{terraformPath, []byte(updatedTerraform)},
 		{filepath.Join(root, "cmd", "docs-truth", "testdata", "service-catalog.golden.md"), []byte(catalog)},
 	}
 	var drift []string
@@ -133,9 +199,371 @@ func generate(root string, check bool) error {
 	return nil
 }
 
+func selectMemcacheServiceGate(
+	services []registry.Service,
+	gates []evidence.ServiceGate,
+) (evidence.ServiceGate, error) {
+	var matches []evidence.ServiceGate
+	for _, gate := range gates {
+		if gate.Domain == "memcache.googleapis.com" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Memcached service gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	registered := false
+	for _, service := range services {
+		if service.Domain == gate.Domain {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Memcached service gate references unregistered domain %q",
+			gate.Domain,
+		)
+	}
+	if gate.ID == "" || gate.Phase != 15 || gate.ProviderVersion == "" ||
+		gate.Script == "" || gate.MakeTarget == "" ||
+		len(gate.Dimensions) == 0 {
+		return evidence.ServiceGate{}, errors.New("Memcached service gate is missing required lifecycle metadata")
+	}
+	if err := validateMemcacheLocal(gate.EvidenceCheck); err != nil {
+		return evidence.ServiceGate{}, err
+	}
+	if err := validateMemcacheCI(gate.CI); err != nil {
+		return evidence.ServiceGate{}, err
+	}
+	return gate, nil
+}
+
+func validateMemcacheLocal(check evidence.EvidenceCheck) error {
+	if err := evidence.ValidateEvidenceCheck(check); err != nil {
+		return fmt.Errorf("Memcached local evidence: %w", err)
+	}
+	switch check.Status {
+	case evidence.EvidenceLocalPassed:
+		if check.SourceCommit == "" {
+			return errors.New("Memcached immutable local evidence requires a full source commit")
+		}
+	case evidence.EvidenceLocalPassedUncommitted:
+		if check.SourceCommit != "" {
+			return errors.New("Memcached uncommitted local evidence must not include a source commit")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported Memcached local evidence status %q; want local-passed-uncommitted or local-passed",
+			check.Status,
+		)
+	}
+	return nil
+}
+
+func validateMemcacheCI(check evidence.EvidenceCheck) error {
+	if err := evidence.ValidateEvidenceCheck(check); err != nil {
+		return fmt.Errorf("Memcached CI evidence: %w", err)
+	}
+	if check.Workflow == "" || check.Job == "" {
+		return errors.New("Memcached CI evidence requires workflow and job")
+	}
+	switch check.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		if check.RunURL != "" || check.Commit != "" {
+			return errors.New("Memcached configured CI evidence must not include a run URL or commit")
+		}
+	case evidence.EvidenceCIPassed:
+		if check.RunURL == "" || check.Commit == "" {
+			return errors.New("Memcached ci-passed evidence requires an immutable run URL and commit")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported Memcached CI evidence status %q; want configured-unverified or ci-passed",
+			check.Status,
+		)
+	}
+	return nil
+}
+
+func renderMemcacheServiceGate(gate evidence.ServiceGate) (string, error) {
+	if err := validateMemcacheLocal(gate.EvidenceCheck); err != nil {
+		return "", err
+	}
+	if err := validateMemcacheCI(gate.CI); err != nil {
+		return "", err
+	}
+	dimensions := make([]string, len(gate.Dimensions))
+	for index, dimension := range gate.Dimensions {
+		dimensions[index] = "`" + dimension + "`"
+	}
+	var localStatement string
+	switch gate.Status {
+	case evidence.EvidenceLocalPassedUncommitted:
+		localStatement = fmt.Sprintf(
+			"The bounded lifecycle is `%s` in the current working tree with Google provider `%s`, "+
+				"`make %s`, and `%s`. This locally passing working-tree gate is non-promotable "+
+				"and has no immutable source revision evidence.",
+			gate.Status,
+			gate.ProviderVersion,
+			gate.MakeTarget,
+			gate.Script,
+		)
+	case evidence.EvidenceLocalPassed:
+		localStatement = fmt.Sprintf(
+			"The bounded lifecycle is `%s` at immutable source commit `%s` with Google provider `%s`, "+
+				"`make %s`, and `%s`.",
+			gate.Status,
+			gate.SourceCommit,
+			gate.ProviderVersion,
+			gate.MakeTarget,
+			gate.Script,
+		)
+	default:
+		return "", fmt.Errorf("unsupported Memcached local evidence status %q", gate.Status)
+	}
+	var ciStatement string
+	switch gate.CI.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		ciStatement = fmt.Sprintf(
+			"CI is `configured-unverified` in `%s` job `%s`; no external run URL or commit is recorded.",
+			gate.CI.Workflow,
+			gate.CI.Job,
+		)
+	case evidence.EvidenceCIPassed:
+		ciStatement = fmt.Sprintf(
+			"CI is `ci-passed` in [GitHub Actions run %s](%s) on commit `%s`.",
+			path.Base(gate.CI.RunURL),
+			gate.CI.RunURL,
+			gate.CI.Commit,
+		)
+	default:
+		return "", fmt.Errorf("unsupported Memcached CI evidence status %q", gate.CI.Status)
+	}
+	return fmt.Sprintf(
+		"**Generated Memcached service-gate truth:** %s\n\n"+
+			"Lifecycle dimensions (%d): %s.\n\n"+
+			"%s This evidence does not claim broad GCP parity or promote service fidelity.\n",
+		localStatement,
+		len(dimensions),
+		strings.Join(dimensions, ", "),
+		ciStatement,
+	), nil
+}
+
+func replaceMemcacheServiceGate(document string, gate evidence.ServiceGate) (string, error) {
+	summary, err := renderMemcacheServiceGate(gate)
+	if err != nil {
+		return "", err
+	}
+	return replaceGeneratedSection(
+		document,
+		memcacheSummaryStart,
+		memcacheSummaryEnd,
+		summary,
+	)
+}
+
+func renderRegistryCount(services []registry.Service) (string, error) {
+	counts := map[registry.SupportStatus]int{
+		registry.SupportImplemented:  0,
+		registry.SupportExperimental: 0,
+		registry.SupportDeferred:     0,
+	}
+	for _, service := range services {
+		if _, known := counts[service.Support]; !known {
+			return "", fmt.Errorf("service %s has unsupported status %q", service.Domain, service.Support)
+		}
+		counts[service.Support]++
+	}
+	return fmt.Sprintf(
+		"- **🚀 %d Registry-Verified Domains**: %d implemented, %d experimental, "+
+			"and %d deferred.\n"+
+			"  The exact counts and generated compatibility rows come from\n"+
+			"  `registry.Services()`. Phase 18–25 inventory entries remain\n"+
+			"  experimental and default-off. See [Service Compatibility](docs/service-compatibility.md).\n",
+		len(services),
+		counts[registry.SupportImplemented],
+		counts[registry.SupportExperimental],
+		counts[registry.SupportDeferred],
+	), nil
+}
+
 func validateHandwrittenClaims(document string) error {
 	if strings.Contains(document, "Terraform provider evidence remains absent") {
 		return errors.New("stale batch-wide Terraform absence claim; use generated per-domain evidence")
+	}
+	return nil
+}
+
+func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibility string) error {
+	start := strings.Index(serviceCompatibility, serviceCatalogStart)
+	end := strings.Index(serviceCompatibility, serviceCatalogEnd)
+	if start < 0 || end <= start {
+		return errors.New("generated service catalog markers are missing or out of order")
+	}
+	catalog := serviceCompatibility[start:end]
+	if count := strings.Count(catalog, "`memcache.googleapis.com`"); count != 1 {
+		return fmt.Errorf("generated service catalog contains Memcached %d times, want exactly once", count)
+	}
+	const memcacheCatalogPrefix = "| `memcache.googleapis.com` | standard | hybrid | implemented | standard | No |"
+	if !strings.Contains(catalog, memcacheCatalogPrefix) {
+		return errors.New("generated service catalog does not classify Memcached as implemented standard/hybrid and default-on")
+	}
+	for name, document := range map[string]string{
+		"service compatibility": serviceCompatibility,
+		"state model":           stateModel,
+	} {
+		for _, line := range strings.Split(document, "\n") {
+			lower := strings.ToLower(line)
+			if !strings.Contains(lower, "memcache") {
+				continue
+			}
+			if strings.Contains(lower, "501") || strings.Contains(lower, "deferred") ||
+				strings.Contains(lower, "not implemented") {
+				return fmt.Errorf("%s retains contradictory Memcached claim %q", name, strings.TrimSpace(line))
+			}
+		}
+	}
+	for _, required := range []string{
+		"Memcached metadata is profile-persisted",
+		"owned Memcached containers",
+	} {
+		if !strings.Contains(stateModel, required) {
+			return fmt.Errorf("state model is missing %q", required)
+		}
+	}
+	normalizedTerraform := strings.Join(strings.Fields(terraformCompatibility), " ")
+	for _, required := range []string{
+		"`memcache_custom_endpoint`",
+		"`google_memcache_instance`",
+		"`effective_labels` is computed by the",
+		"provider from API `labels`",
+	} {
+		if !strings.Contains(normalizedTerraform, required) {
+			return fmt.Errorf("Terraform compatibility is missing %q", required)
+		}
+	}
+	for name, document := range map[string]string{
+		"service compatibility":   serviceCompatibility,
+		"Terraform compatibility": terraformCompatibility,
+	} {
+		if strings.Count(document, memcacheSummaryStart) != 1 ||
+			strings.Count(document, memcacheSummaryEnd) != 1 {
+			return fmt.Errorf("%s must contain exactly one generated Memcached service-gate section", name)
+		}
+	}
+	for _, line := range strings.Split(terraformCompatibility, "\n") {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "memcache") &&
+			(strings.Contains(lower, "configured but unverified") ||
+				strings.Contains(lower, "not recorded as passing")) {
+			return fmt.Errorf("Terraform compatibility retains stale Memcached status: %q", strings.TrimSpace(line))
+		}
+	}
+	return nil
+}
+
+func renderPhase12PlatformSummary(gates []evidence.PlatformGate) (string, error) {
+	localPassed := 0
+	localTotal := 0
+	var ciCheck *evidence.EvidenceCheck
+	seen := make(map[string]bool, len(gates))
+	for _, gate := range gates {
+		if gate.Phase != 12 {
+			return "", fmt.Errorf("platform gate %s belongs to phase %d, want 12", gate.ID, gate.Phase)
+		}
+		if seen[gate.ID] {
+			return "", fmt.Errorf("duplicate platform gate %q", gate.ID)
+		}
+		seen[gate.ID] = true
+		if err := evidence.ValidateEvidenceCheck(gate.Check); err != nil {
+			return "", fmt.Errorf("%s: %w", gate.ID, err)
+		}
+		if gate.ID == "phase12-ci" {
+			if ciCheck != nil {
+				return "", errors.New("duplicate phase12-ci platform gate")
+			}
+			check := gate.Check
+			ciCheck = &check
+		} else {
+			localTotal++
+		}
+		switch gate.Check.Status {
+		case evidence.EvidenceLocalPassed:
+			localPassed++
+		}
+	}
+	if ciCheck == nil {
+		return "", errors.New("missing phase12-ci platform gate")
+	}
+	var ciStatement string
+	switch ciCheck.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		ciStatement = "Required pull-request/main CI and optional manual execution are configured, but no external Phase 12 pass is recorded."
+	case evidence.EvidenceCIPassed:
+		ciStatement = fmt.Sprintf(
+			"Required Phase 12 CI passed in [GitHub Actions run %s](%s) on commit `%s`.",
+			path.Base(ciCheck.RunURL), ciCheck.RunURL, ciCheck.Commit,
+		)
+	case evidence.EvidenceOptionalUnverified:
+		ciStatement = "Phase 12 CI is optional and externally unverified."
+	case evidence.EvidenceLocalPassed:
+		ciStatement = "The Phase 12 CI check is recorded only as local-passed; no external CI pass is recorded."
+	case evidence.EvidenceNotApplicable:
+		ciStatement = "Phase 12 CI is marked not-applicable by machine evidence."
+	case evidence.EvidenceAbsent:
+		ciStatement = "Phase 12 CI evidence is absent."
+	default:
+		return "", fmt.Errorf("unsupported Phase 12 CI status %q", ciCheck.Status)
+	}
+	return fmt.Sprintf(
+		"**Generated Phase 12 platform truth:** Local-only gates passed: %d/%d.\n\n"+
+			"The bounded platform diagnostics slice covers bounded W3C propagation, sanitized structured access logs, "+
+			"low-cardinality Prometheus metrics, bounded sanitized OTLP export inspection, exporter degradation without "+
+			"changing API responses, bounded replay responses, and graceful shutdown. Replay provides project-keyed "+
+			"lookup scoping, not cross-project authorization. %s\n\n"+
+			"This platform diagnostics layer is separate from the experimental Phase 21–22 service domains. A persistent "+
+			"trace backend, remote diagnostics listener, Cloud Logging parity, and RBAC replay isolation remain deferred.\n",
+		localPassed, localTotal, ciStatement,
+	), nil
+}
+
+var (
+	phase12CIPassedPattern = regexp.MustCompile(
+		`(?is)phase\s*12.{0,160}(?:ci[- ]verified|ci\s+(?:has\s+)?passed)|(?:ci[- ]verified|ci\s+(?:has\s+)?passed).{0,160}phase\s*12`,
+	)
+	phase12CIUnverifiedPattern = regexp.MustCompile(
+		`(?is)phase\s*12.{0,160}(?:no\s+external.{0,20}pass.{0,20}recorded|externally\s+unverified|configured-unverified)|(?:no\s+external.{0,20}pass.{0,20}recorded|externally\s+unverified|configured-unverified).{0,160}phase\s*12`,
+	)
+)
+
+func validatePhase12Claims(document string, gates []evidence.PlatformGate) error {
+	var ciCheck *evidence.EvidenceCheck
+	for _, gate := range gates {
+		if gate.ID == "phase12-ci" {
+			if ciCheck != nil {
+				return errors.New("duplicate phase12-ci platform gate")
+			}
+			check := gate.Check
+			ciCheck = &check
+		}
+	}
+	if ciCheck == nil {
+		return errors.New("missing phase12-ci platform gate")
+	}
+	if err := evidence.ValidateEvidenceCheck(*ciCheck); err != nil {
+		return fmt.Errorf("phase12-ci: %w", err)
+	}
+	if ciCheck.Status != evidence.EvidenceCIPassed && phase12CIPassedPattern.MatchString(document) {
+		return errors.New("Phase 12 cannot be described as CI-verified without ci-passed machine evidence")
+	}
+	if ciCheck.Status == evidence.EvidenceCIPassed && phase12CIUnverifiedPattern.MatchString(document) {
+		return errors.New("Phase 12 cannot be described as externally unverified with ci-passed machine evidence")
 	}
 	return nil
 }
@@ -275,8 +703,20 @@ func renderPhaseSummary(
 	backendCIPassed := 0
 	backendCIConfigured := 0
 	terraformChecks := 0
+	terraformCIPassed := 0
+	terraformCIConfigured := 0
+	admissionReplayTotal := 0
+	admissionReplayLocal := 0
 	for _, gate := range gates {
 		terraformChecks += len(gate.TerraformChecks)
+		for _, check := range gate.TerraformChecks {
+			if check.CI.Status == evidence.EvidenceCIPassed {
+				terraformCIPassed++
+			}
+			if check.CI.Status == evidence.EvidenceConfiguredUnverified {
+				terraformCIConfigured++
+			}
+		}
 		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
 			packageLocal++
 		}
@@ -310,6 +750,12 @@ func renderPhaseSummary(
 		if gate.BackendCI.Status == evidence.EvidenceConfiguredUnverified {
 			backendCIConfigured++
 		}
+		if gate.AdmissionReplay.Status != "" {
+			admissionReplayTotal++
+		}
+		if gate.AdmissionReplay.Status == evidence.EvidenceLocalPassed {
+			admissionReplayLocal++
+		}
 	}
 	return fmt.Sprintf(
 		"**Generated truth:** %d experimental; %d default-off; %d Terraform %s. "+
@@ -319,6 +765,8 @@ func renderPhaseSummary(
 			"configured but unverified: %d/%d. Restart gates passed locally: %d/%d; cleanup gates passed locally: %d/%d; "+
 			"CI gates passed: %d/%d; configured but unverified: %d/%d. "+
 			"Heavy backend CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Terraform CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Admission replay gates passed locally: %d/%d. "+
 			"Package and IAM passes do not promote compatibility; "+
 			"every inventoried service remains experimental until its required integration gates pass.\n",
 		experimental,
@@ -348,6 +796,12 @@ func renderPhaseSummary(
 		backendCITotal,
 		backendCIConfigured,
 		backendCITotal,
+		terraformCIPassed,
+		terraformChecks,
+		terraformCIConfigured,
+		terraformChecks,
+		admissionReplayLocal,
+		admissionReplayTotal,
 	), nil
 }
 

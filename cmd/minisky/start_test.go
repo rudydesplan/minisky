@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,7 +17,12 @@ import (
 	"time"
 
 	"minisky/pkg/config"
+	"minisky/pkg/orchestrator"
+	"minisky/pkg/registry"
+	"minisky/pkg/router"
 	localsecurity "minisky/pkg/security"
+	"minisky/pkg/shims/accesscontextmanager"
+	"minisky/pkg/shims/iam"
 	"minisky/pkg/state"
 )
 
@@ -127,6 +134,140 @@ func TestGatewayHealthReportsPersistenceDegradation(t *testing.T) {
 	}
 }
 
+func TestStartupSharesDefaultOffPerimeterEvaluatorWithIAMCredentials(t *testing.T) {
+	t.Run("persisted denial and live mutation", func(t *testing.T) {
+		t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+		t.Setenv("MINISKY_PROFILE", "startup-perimeter-shared")
+		t.Setenv(registry.ExperimentalServicesEnv, "")
+		t.Setenv("MINISKY_IAM_MODE", "")
+		opMgr := orchestrator.NewOperationManager()
+		seedPersistedServicePerimeter(t, opMgr)
+
+		shims, _ := registry.BootAll(opMgr, nil)
+		if _, concrete := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API); concrete {
+			t.Fatal("default-off registry unexpectedly returned concrete Access Context Manager API")
+		}
+		createStartupTestServiceAccount(t, shims["iam.googleapis.com"].(*iam.API))
+
+		gateway := router.NewProxyRouterWithManager(nil)
+		perimeterAPI := configureStartupServicePerimeters(gateway, shims, opMgr)
+		gateway.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		gateway.RegisterShim("iamcredentials.googleapis.com", shims["iamcredentials.googleapis.com"])
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusForbidden)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusForbidden)
+
+		deleted := httptest.NewRecorder()
+		perimeterAPI.ServeHTTP(deleted, httptest.NewRequest(
+			http.MethodDelete,
+			"/v1/accessPolicies/1/servicePerimeters/prod",
+			nil,
+		))
+		if deleted.Code != http.StatusOK {
+			t.Fatalf("delete perimeter status=%d body=%s", deleted.Code, deleted.Body.String())
+		}
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusNoContent)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusOK)
+	})
+
+	t.Run("persistence failure fails closed", func(t *testing.T) {
+		t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+		t.Setenv("MINISKY_PROFILE", "startup-perimeter-degraded")
+		t.Setenv(registry.ExperimentalServicesEnv, "")
+		t.Setenv("MINISKY_IAM_MODE", "")
+		opMgr := orchestrator.NewOperationManager()
+		shims, _ := registry.BootAll(opMgr, nil)
+		createStartupTestServiceAccount(t, shims["iam.googleapis.com"].(*iam.API))
+		if err := os.WriteFile(filepath.Join(config.GetProfileDir(), "state.json"), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		gateway := router.NewProxyRouterWithManager(nil)
+		perimeterAPI := configureStartupServicePerimeters(gateway, shims, opMgr)
+		if perimeterAPI.PersistenceError() == nil {
+			t.Fatal("corrupt persisted perimeter state did not degrade evaluator")
+		}
+		gateway.RegisterShim("storage.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		gateway.RegisterShim("iamcredentials.googleapis.com", shims["iamcredentials.googleapis.com"])
+
+		assertStartupPerimeterStatus(t, gateway, "storage", http.StatusForbidden)
+		assertStartupPerimeterStatus(t, gateway, "iamcredentials", http.StatusForbidden)
+	})
+}
+
+func seedPersistedServicePerimeter(t *testing.T, opMgr *orchestrator.OperationManager) {
+	t.Helper()
+	api := accesscontextmanager.NewAPI(opMgr)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/accessPolicies",
+		bytes.NewBufferString(`{"parent":"organizations/1","title":"Startup test"}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create access policy status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/accessPolicies/1/servicePerimeters?servicePerimeterId=prod",
+		bytes.NewBufferString(`{"status":{"resources":["projects/project-a"],`+
+			`"restrictedServices":["storage.googleapis.com","iamcredentials.googleapis.com"]}}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create service perimeter status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func createStartupTestServiceAccount(t *testing.T, api *iam.API) {
+	t.Helper()
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/project-a/serviceAccounts",
+		bytes.NewBufferString(`{"accountId":"worker"}`),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("create service account status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func assertStartupPerimeterStatus(t *testing.T, gateway http.Handler, service string, want int) {
+	t.Helper()
+	var request *http.Request
+	switch service {
+	case "storage":
+		request = httptest.NewRequest(
+			http.MethodGet,
+			"http://localhost/_minisky/storage/v1/projects/project-a/buckets",
+			nil,
+		)
+	case "iamcredentials":
+		request = httptest.NewRequest(
+			http.MethodPost,
+			"http://localhost/_minisky/iamcredentials/v1/projects/-/serviceAccounts/"+
+				"worker@project-a.iam.gserviceaccount.com:generateAccessToken",
+			bytes.NewBufferString(`{"scope":["scope"]}`),
+		)
+	default:
+		t.Fatalf("unknown startup test service %q", service)
+	}
+	response := httptest.NewRecorder()
+	gateway.ServeHTTP(response, request)
+	if response.Code != want {
+		t.Fatalf("%s status=%d want=%d body=%s", service, response.Code, want, response.Body.String())
+	}
+	if want == http.StatusForbidden &&
+		!strings.Contains(response.Body.String(), "Request is prohibited by VPC Service Controls") {
+		t.Fatalf("%s denial body=%s", service, response.Body.String())
+	}
+}
+
 func TestDaemonReadinessProofAuthenticatesListenerRole(t *testing.T) {
 	token := strings.Repeat("a", 64)
 	nonce := strings.Repeat("b", 64)
@@ -203,6 +344,82 @@ func TestNativeIntegrationDockerBypassIsNarrow(t *testing.T) {
 	}
 }
 
+func TestStartupClassifiesMemcachedDockerMutationsWhenDockerIsUnavailable(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "memcached-docker-unavailable")
+	shims, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	handler := shims["memcache.googleapis.com"]
+	if handler == nil {
+		t.Fatal("Memcached handler is not registered")
+	}
+	gateway := router.NewProxyRouterWithManager(nil)
+	gateway.RegisterShim(
+		"memcache.googleapis.com",
+		registry.RuntimeHandler("memcache.googleapis.com", handler, false),
+	)
+	for _, test := range []struct {
+		name       string
+		method     string
+		url        string
+		body       string
+		wantStatus int
+		wantRPC    string
+	}{
+		{
+			name:       "supported create reaches backend availability check",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":1,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024}}`,
+			wantStatus: http.StatusServiceUnavailable,
+			wantRPC:    "UNAVAILABLE",
+		},
+		{
+			name:       "unsupported multi-node create wins before backend availability",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":2,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024}}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "unsupported custom parameters win before backend availability",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":1,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024},"parameters":{"params":{"-m":"64"}}}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "unsupported resize wins before backend availability",
+			method:     http.MethodPatch,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache?updateMask=displayName%2C%20nodeCount%20",
+			body:       `{"displayName":"updated","nodeCount":2}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "metadata only update remains available",
+			method:     http.MethodPatch,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache?updateMask=displayName",
+			body:       `{"displayName":"updated"}`,
+			wantStatus: http.StatusNotFound,
+			wantRPC:    "NOT_FOUND",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.url, strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			gateway.ServeHTTP(response, request)
+			if response.Code != test.wantStatus ||
+				!strings.Contains(response.Body.String(), `"status":"`+test.wantRPC+`"`) {
+				t.Fatalf("status=%d body=%s, want %d %s",
+					response.Code, response.Body.String(), test.wantStatus, test.wantRPC)
+			}
+		})
+	}
+}
+
 type shutdownHandler struct {
 	http.Handler
 	called atomic.Bool
@@ -270,6 +487,34 @@ type shutdownFuncHandler struct {
 
 func (handler *shutdownFuncHandler) Shutdown(ctx context.Context) error {
 	return handler.shutdown(ctx)
+}
+
+func TestShutdownPluginsContainsLifecyclePanic(t *testing.T) {
+	persisted := false
+	err := shutdownPlugins(context.Background(), map[string]http.Handler{
+		"panic.example": &shutdownFuncHandler{
+			Handler: http.NotFoundHandler(),
+			shutdown: func(context.Context) error {
+				panic("plugin secret must not escape")
+			},
+		},
+		"persistence.example": &shutdownFuncHandler{
+			Handler: http.NotFoundHandler(),
+			shutdown: func(context.Context) error {
+				persisted = true
+				return nil
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "panic.example: plugin shutdown panicked") {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if strings.Contains(err.Error(), "plugin secret") {
+		t.Fatalf("shutdown error leaked panic value: %v", err)
+	}
+	if !persisted {
+		t.Fatal("plugin panic starved another shutdown hook")
+	}
 }
 
 func TestShutdownPluginsDoesNotStarvePersistenceBehindBlockedPlugin(t *testing.T) {
@@ -364,6 +609,25 @@ func TestTelemetryDeadlineDoesNotStarvePluginPersistence(t *testing.T) {
 	case <-persisted:
 	default:
 		t.Fatal("plugin persistence was starved by telemetry shutdown")
+	}
+}
+
+func TestTelemetrySetupFailureWarnsAndReturnsNoop(t *testing.T) {
+	previousWriter := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	sentinel := errors.New("invalid OTLP endpoint")
+	shutdown := telemetrySetupOrNoop(func(context.Context) error {
+		return errors.New("unexpected original shutdown call")
+	}, sentinel)
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("fallback shutdown: %v", err)
+	}
+	if !strings.Contains(logs.String(), "OpenTelemetry disabled after setup failure") ||
+		!strings.Contains(logs.String(), sentinel.Error()) {
+		t.Fatalf("startup warning = %q", logs.String())
 	}
 }
 

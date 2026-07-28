@@ -77,6 +77,31 @@ resource "google_redis_instance" "compatibility" {
   redis_version  = "REDIS_7_2"
 }
 
+# Provider 7.41.0 exposes memcache_custom_endpoint and emits the v1
+# projects/{project}/locations/{region}/instances lifecycle used by MiniSky.
+resource "google_memcache_instance" "compatibility" {
+  count = local.use_minisky && var.enable_memcache_resource ? 1 : 0
+
+  name         = var.memcache_instance_name
+  region       = var.region
+  display_name = "MiniSky Memcached updated"
+  node_count   = 1
+
+  node_config {
+    cpu_count      = 1
+    memory_size_mb = 1024
+  }
+
+  memcache_version    = "MEMCACHE_1_6_15"
+  deletion_protection = false
+
+  timeouts {
+    create = "3m"
+    update = "3m"
+    delete = "3m"
+  }
+}
+
 resource "google_spanner_instance" "compatibility" {
   count = local.use_minisky && var.enable_phase15_resources ? 1 : 0
 
@@ -420,6 +445,21 @@ resource "google_org_policy_policy" "phase24" {
     rules {
       enforce = "TRUE"
     }
+  }
+}
+
+# Binary Authorization policy is a project singleton. Provider 7.41.0 resets
+# it to its default ALWAYS_ALLOW policy on destroy rather than deleting it.
+resource "google_binary_authorization_policy" "phase25" {
+  count = local.use_minisky && var.enable_phase25_binary_authorization_policy ? 1 : 0
+
+  admission_whitelist_patterns {
+    name_pattern = "gcr.io/minisky-phase25/allowed/*"
+  }
+
+  default_admission_rule {
+    evaluation_mode  = "ALWAYS_DENY"
+    enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
   }
 }
 

@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/critical-integration.yml"
+      - ".github/workflows/ci.yml"
       - "cmd/minisky/**"
       - "pkg/orchestrator/**"
       - "pkg/router/**"
@@ -16,6 +17,8 @@ on:
       - "scripts/terraform-integration.sh"
       - "scripts/event-delivery-integration.sh"
       - "scripts/install-pack.sh"
+      - "scripts/memcache-integration.sh"
+      - "scripts/memcache_ci_workflow_contract_test.go"
       - "scripts/phase10-artifact-integration.sh"
       - "scripts/phase13-wif-integration.sh"
       - "scripts/phase15-emulator-integration.sh"
@@ -28,6 +31,7 @@ on:
       - "scripts/phase17-enterprise-wif-integration.sh"
       - "sdk-smoke/**"
       - "terraform/**"
+      - "terraform/memcache/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -36,6 +40,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/critical-integration.yml"
+      - ".github/workflows/ci.yml"
       - "cmd/minisky/**"
       - "pkg/orchestrator/**"
       - "pkg/router/**"
@@ -46,6 +51,8 @@ on:
       - "scripts/terraform-integration.sh"
       - "scripts/event-delivery-integration.sh"
       - "scripts/install-pack.sh"
+      - "scripts/memcache-integration.sh"
+      - "scripts/memcache_ci_workflow_contract_test.go"
       - "scripts/phase10-artifact-integration.sh"
       - "scripts/phase13-wif-integration.sh"
       - "scripts/phase15-emulator-integration.sh"
@@ -58,6 +65,7 @@ on:
       - "scripts/phase17-enterprise-wif-integration.sh"
       - "sdk-smoke/**"
       - "terraform/**"
+      - "terraform/memcache/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -476,6 +484,105 @@ jobs:
         with:
           name: critical-phase16-subnetwork-terraform-${{ github.run_id }}-${{ github.run_attempt }}
           path: critical-phase16-subnetwork-terraform.log
+          if-no-files-found: error
+          retention-days: 7
+
+  memcache-integration:
+    name: Critical Memcached SDK and Terraform lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI from lockfile
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Initialize pinned Memcached provider
+        run: terraform -chdir=terraform/memcache init -backend=false -input=false -lockfile=readonly
+
+      - name: Run hardened Memcached integration lifecycle
+        run: |
+          set -o pipefail
+          make test-memcache-integration 2>&1 | tee critical-memcache-integration.log
+
+      - name: Clean exact-owned Memcached resources
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -o pipefail
+          {
+            while IFS= read -r container; do
+              test -z "${container}" && continue
+              profile="$(docker inspect --format '{{ index .Config.Labels "minisky.profile" }}' "${container}")"
+              if [[ "${profile}" == memcache-integration-* ]]; then
+                docker rm -f -v "${container}"
+              fi
+            done < <(docker ps -aq \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.service=memorystore-memcached")
+
+            if docker network inspect minisky-net >/dev/null 2>&1; then
+              manager="$(docker network inspect --format '{{ index .Labels "managed-by" }}' minisky-net)"
+              profile="$(docker network inspect --format '{{ index .Labels "minisky.profile" }}' minisky-net)"
+              if [[ "${manager}" == "minisky" && "${profile}" == memcache-integration-* ]]; then
+                docker network rm minisky-net
+              fi
+            fi
+
+            rm -rf /tmp/minisky-memcache-integration.lock /tmp/minisky-net-integration.lock
+          } 2>&1 | tee critical-memcache-cleanup.log
+
+      - name: Capture Memcached failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            printf '%s\n' 'containers:'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            printf '%s\n' 'networks:'
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            printf '%s\n' 'volumes:'
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >critical-memcache-diagnostics.txt
+
+      - name: Retain Memcached failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-memcache-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            critical-memcache-integration.log
+            critical-memcache-cleanup.log
+            critical-memcache-diagnostics.txt
           if-no-files-found: error
           retention-days: 7
 

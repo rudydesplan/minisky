@@ -96,6 +96,18 @@ func (api *API) loadState() error {
 	if meta.Instances != nil {
 		api.instances = meta.Instances
 	}
+	changed := false
+	for name, instance := range api.instances {
+		if instance.State == "READY" && !api.localShareTreeReady(name, instance.FileShares) {
+			instance.State = "ERROR"
+			changed = true
+		}
+	}
+	if changed {
+		if err := api.persistState(); err != nil {
+			return fmt.Errorf("persist filestore data-plane reconciliation: %w", err)
+		}
+	}
 	return nil
 }
 

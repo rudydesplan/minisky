@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -75,6 +76,7 @@ type API struct {
 	mu              sync.RWMutex
 	persistMu       sync.Mutex
 	projectConfigMu sync.Mutex
+	tenantConfigMu  sync.Mutex
 	opMgr           *orchestrator.OperationManager
 	stateStore      identityPlatformStateStore
 	tenants         map[string]*Tenant
@@ -84,6 +86,7 @@ type API struct {
 	authBackend     authConfigBackend
 	authHandler     http.Handler
 	tenantSeq       int
+	initErr         error
 }
 
 // NewAPI creates a new Identity Platform API shim with persistence.
@@ -95,10 +98,12 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	api := newAPI(opMgr, state.NewGuardedEntryStore(store, err))
 	if err != nil {
 		log.Printf("[Shim: IdentityPlatform] persistence degraded: %v", err)
+		api.markUnavailable(fmt.Errorf("open Identity Platform state: %w", err))
 		return api
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: IdentityPlatform] state rehydration failed: %v", err)
+		api.markUnavailable(fmt.Errorf("load Identity Platform state: %w", err))
 	}
 	return api
 }
@@ -118,6 +123,21 @@ func newTestAPI() *API {
 	return newAPI(orchestrator.NewOperationManager(), nil)
 }
 
+func (api *API) initializationError() error {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.initErr
+}
+
+func (api *API) markUnavailable(err error) {
+	if err == nil {
+		return
+	}
+	api.mu.Lock()
+	api.initErr = errors.Join(api.initErr, err)
+	api.mu.Unlock()
+}
+
 func (api *API) OnPostBoot(ctx *registry.Context) {
 	if handler := ctx.GetShim("identitytoolkit.googleapis.com"); handler != nil {
 		api.mu.Lock()
@@ -131,6 +151,10 @@ func (api *API) OnPostBoot(ctx *registry.Context) {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: IdentityPlatform] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if api.initializationError() != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Identity Platform state is unavailable")
+		return
+	}
 
 	switch {
 	case isIdentityToolkitUserMethod(r.URL.Path) && r.Method == http.MethodPost:
@@ -193,6 +217,7 @@ func (api *API) initializeProjectConfig(w http.ResponseWriter, r *http.Request) 
 	if err := api.persistState(); err != nil {
 		durable, committed, reconcileErr := api.reconcileProjectConfig(name, config)
 		if reconcileErr != nil {
+			api.markUnavailable(errors.Join(err, reconcileErr))
 			api.mu.Lock()
 			if prior == nil {
 				delete(api.projectConfigs, name)
@@ -286,13 +311,39 @@ func (api *API) patchProjectConfig(w http.ResponseWriter, r *http.Request) {
 	api.projectConfigs[name] = updated
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
-		api.mu.Lock()
-		if prior == nil {
-			delete(api.projectConfigs, name)
-		} else {
-			api.projectConfigs[name] = prior
+		durable, committed, reconcileErr := api.reconcileProjectConfig(name, updated)
+		if reconcileErr != nil {
+			api.markUnavailable(errors.Join(err, reconcileErr))
+			rollback := cloneProjectConfig(prior)
+			if rollback == nil {
+				rollback = &ProjectConfig{Name: name}
+			}
+			rollbackErr := backend.ApplyProjectConfig(r.Context(), project, rollback)
+			api.markUnavailable(rollbackErr)
+			api.mu.Lock()
+			if prior == nil {
+				delete(api.projectConfigs, name)
+			} else {
+				api.projectConfigs[name] = prior
+			}
+			api.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence failed and durable state could not be reconciled")
+			return
 		}
-		api.mu.Unlock()
+		if committed {
+			_ = json.NewEncoder(w).Encode(durable)
+			return
+		}
+		rollback := cloneProjectConfig(durable)
+		if rollback == nil {
+			rollback = &ProjectConfig{Name: name}
+		}
+		if rollbackErr := backend.ApplyProjectConfig(r.Context(), project, rollback); rollbackErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence and Firebase Auth backend rollback failed")
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
 	}
@@ -300,6 +351,9 @@ func (api *API) patchProjectConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) getTenantConfig(w http.ResponseWriter, r *http.Request) {
+	api.tenantConfigMu.Lock()
+	defer api.tenantConfigMu.Unlock()
+
 	name := buildTenantName(r.URL.Path) + "/config"
 	api.mu.RLock()
 	config := cloneTenantConfig(api.tenantConfigs[name])
@@ -319,18 +373,22 @@ func (api *API) patchTenantConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "updateMask is required")
 		return
 	}
+	var patch TenantConfig
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid tenant config JSON")
+		return
+	}
+	api.tenantConfigMu.Lock()
+	defer api.tenantConfigMu.Unlock()
+
 	api.mu.RLock()
 	_, exists := api.tenants[tenantName]
 	current := cloneTenantConfig(api.tenantConfigs[tenantName+"/config"])
+	previous := cloneTenantConfig(current)
 	backend := api.authBackend
 	api.mu.RUnlock()
 	if !exists {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "tenant not found")
-		return
-	}
-	var patch TenantConfig
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&patch); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid tenant config JSON")
 		return
 	}
 	if current == nil {
@@ -359,9 +417,40 @@ func (api *API) patchTenantConfig(w http.ResponseWriter, r *http.Request) {
 	api.tenantConfigs[current.Name] = current
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
-		api.mu.Lock()
-		delete(api.tenantConfigs, current.Name)
-		api.mu.Unlock()
+		durable, committed, reconcileErr := api.reconcileTenantConfig(current.Name, current)
+		if reconcileErr != nil {
+			api.markUnavailable(errors.Join(err, reconcileErr))
+			rollback := cloneTenantConfig(previous)
+			if rollback == nil {
+				rollback = &TenantConfig{Name: current.Name}
+			}
+			rollbackErr := backend.ApplyTenantConfig(r.Context(), project, tenantID, rollback)
+			api.markUnavailable(rollbackErr)
+			api.mu.Lock()
+			if previous == nil {
+				delete(api.tenantConfigs, current.Name)
+			} else {
+				api.tenantConfigs[previous.Name] = previous
+			}
+			api.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence failed and durable state could not be reconciled")
+			return
+		}
+		if committed {
+			_ = json.NewEncoder(w).Encode(durable)
+			return
+		}
+		rollback := cloneTenantConfig(durable)
+		if rollback == nil {
+			rollback = &TenantConfig{Name: current.Name}
+		}
+		rollbackErr := backend.ApplyTenantConfig(r.Context(), project, tenantID, rollback)
+		if rollbackErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+				"State persistence and Firebase Auth backend rollback failed")
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
 	}

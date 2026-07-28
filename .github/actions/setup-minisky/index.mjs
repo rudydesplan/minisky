@@ -3,20 +3,23 @@ import {
   appendFileSync,
   chmodSync,
   closeSync,
-  copyFileSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
   readdirSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { arch, platform } from "node:process";
 import { execFileSync, spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 function input(name, fallback = "") {
   return (process.env[`INPUT_${name.replaceAll("-", "_").toUpperCase()}`] ?? fallback).trim();
@@ -52,21 +55,26 @@ async function download(url, destination) {
   writeFileSync(destination, payload, { mode: 0o600 });
 }
 
-function verifyChecksum(archivePath, checksumsPath, archiveName) {
-  const expectedLine = readFileSync(checksumsPath, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.endsWith(`  ${archiveName}`) || line.endsWith(` *${archiveName}`));
-  if (!expectedLine) throw new Error(`checksums.txt does not cover ${archiveName}`);
-  const expected = expectedLine.split(/\s+/)[0];
-  if (!/^[a-fA-F0-9]{64}$/.test(expected)) throw new Error(`invalid checksum for ${archiveName}`);
+export function verifyChecksum(archivePath, checksumsPath, archiveName) {
+  const matches = [];
+  for (const line of readFileSync(checksumsPath, "utf8").split(/\r?\n/)) {
+    if (line === "") continue;
+    const match = /^([a-fA-F0-9]{64}) ([ *])(.+)$/.exec(line);
+    if (!match) throw new Error("checksums.txt contains an invalid checksum entry");
+    const [, digest, , fileName] = match;
+    if (fileName === archiveName) matches.push(digest);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`checksums.txt must cover ${archiveName} exactly once`);
+  }
+  const [expected] = matches;
   const actual = createHash("sha256").update(readFileSync(archivePath)).digest("hex");
   if (actual.toLowerCase() !== expected.toLowerCase()) {
     throw new Error(`checksum mismatch for ${archiveName}`);
   }
 }
 
-function safeArchiveEntry(entry) {
+export function safeArchiveEntry(entry) {
   const normalized = entry.replaceAll("\\", "/");
   return normalized !== "" &&
     !normalized.startsWith("/") &&
@@ -74,16 +82,54 @@ function safeArchiveEntry(entry) {
     !normalized.split("/").includes("..");
 }
 
+function tarString(buffer, start, length) {
+  const end = buffer.indexOf(0, start);
+  return buffer.subarray(start, end >= start && end < start + length ? end : start + length).toString("utf8");
+}
+
+function tarSize(header) {
+  const encoded = tarString(header, 124, 12).trim();
+  if (!/^[0-7]+$/.test(encoded)) throw new Error("release archive has an invalid tar size");
+  const size = Number.parseInt(encoded, 8);
+  if (!Number.isSafeInteger(size)) throw new Error("release archive tar entry is too large");
+  return size;
+}
+
+export function validateTarGzipArchive(archive) {
+  let tar;
+  try {
+    tar = gunzipSync(archive);
+  } catch {
+    throw new Error("release archive is not a valid gzip stream");
+  }
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) return;
+    const name = tarString(header, 0, 100);
+    const prefix = tarString(header, 345, 155);
+    const fullName = prefix ? `${prefix}/${name}` : name;
+    if (!safeArchiveEntry(fullName)) throw new Error("release archive contains an unsafe path");
+    const type = String.fromCharCode(header[156]);
+    if (type !== "\0" && type !== "0" && type !== "5") {
+      throw new Error(`release archive contains a non-regular tar entry: ${fullName}`);
+    }
+    const size = tarSize(header);
+    if (type === "5" && size !== 0) {
+      throw new Error(`release archive directory contains data: ${fullName}`);
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+    if (offset > tar.length) throw new Error("release archive contains a truncated tar entry");
+  }
+  throw new Error("release archive is missing the tar end marker");
+}
+
 function extractArchive(archivePath, format, destination) {
   mkdirSync(destination, { recursive: true, mode: 0o700 });
   if (format === "tar.gz") {
-    const entries = execFileSync("tar", ["-tzf", archivePath], { encoding: "utf8" })
-      .split(/\r?\n/)
-      .filter(Boolean);
-    if (entries.some((entry) => !safeArchiveEntry(entry))) {
-      throw new Error("release archive contains an unsafe path");
-    }
-    execFileSync("tar", ["-xzf", archivePath, "-C", destination]);
+    const archive = readFileSync(archivePath);
+    validateTarGzipArchive(archive);
+    execFileSync("tar", ["-xzf", "-", "-C", destination], { input: archive });
     return;
   }
   const script = [
@@ -97,6 +143,28 @@ function extractArchive(archivePath, format, destination) {
   execFileSync("powershell", ["-NoProfile", "-Command", script]);
 }
 
+export function validateExtractedBinary(path) {
+  const info = lstatSync(path);
+  if (!info.isFile()) throw new Error("extracted MiniSky binary must be a regular file");
+  return path;
+}
+
+export function copyRegularFileNoFollow(source, destination, label, operations = {}) {
+  const open = operations.open ?? openSync;
+  const before = lstatSync(source);
+  if (!before.isFile()) throw new Error(`${label} must be a regular file`);
+  const descriptor = open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const after = fstatSync(descriptor);
+    if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
+      throw new Error(`${label} changed while opening`);
+    }
+    writeFileSync(destination, readFileSync(descriptor), { mode: 0o600, flag: "wx" });
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function findBinary(root, fileName) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
@@ -104,7 +172,7 @@ function findBinary(root, fileName) {
       const nested = findBinary(path, fileName);
       if (nested) return nested;
     } else if (entry.name === fileName) {
-      return path;
+      return validateExtractedBinary(path);
     }
   }
   return "";
@@ -135,10 +203,10 @@ async function main() {
   const suppliedBinary = input("binary");
   if (suppliedBinary) {
     const source = resolve(suppliedBinary);
-    if (!existsSync(source) || !statSync(source).isFile()) {
+    if (!existsSync(source) || !lstatSync(source).isFile()) {
       throw new Error(`supplied binary does not exist: ${source}`);
     }
-    copyFileSync(source, installedBinary);
+    copyRegularFileNoFollow(source, installedBinary, "supplied binary");
   } else {
     const repository = input("repository", "qamarudeenm/minisky");
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
@@ -161,7 +229,7 @@ async function main() {
     extractArchive(archivePath, format, extracted);
     const source = findBinary(extracted, binaryName);
     if (!source) throw new Error(`verified release archive does not contain ${binaryName}`);
-    copyFileSync(source, installedBinary);
+    copyRegularFileNoFollow(source, installedBinary, "extracted MiniSky binary");
   }
   if (platform !== "win32") chmodSync(installedBinary, 0o700);
 
@@ -233,4 +301,6 @@ async function main() {
   throw new Error(`MiniSky readiness timed out; logs:\n${readFileSync(logPath, "utf8")}`);
 }
 
-main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+}

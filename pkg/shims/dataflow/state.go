@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -78,13 +79,25 @@ func (api *API) loadState() error {
 		api.jobs = make(map[string]*Job, len(meta.Jobs))
 		for id, job := range meta.Jobs {
 			restored := deepCopyJob(job)
-			if restored.CurrentState == "JOB_STATE_PENDING" || restored.CurrentState == "JOB_STATE_RUNNING" {
-				restored.CurrentState = "JOB_STATE_STOPPED"
-			}
+			reconcileRestoredJob(restored)
 			api.jobs[id] = restored
 		}
 	}
 	return nil
+}
+
+func reconcileRestoredJob(job *Job) {
+	if job != nil && (job.CurrentState == "JOB_STATE_PENDING" || job.CurrentState == "JOB_STATE_RUNNING") {
+		stopJob(job)
+	}
+}
+
+func stopJob(job *Job) {
+	if job == nil {
+		return
+	}
+	job.CurrentState = "JOB_STATE_STOPPED"
+	job.CurrentStateTime = time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func deepCopyJob(j *Job) *Job {

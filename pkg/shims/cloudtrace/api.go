@@ -1,6 +1,7 @@
 package cloudtrace
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -104,7 +105,7 @@ func newTestAPI() *API {
 
 // ServeHTTP routes requests to the appropriate handler.
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Shim: Cloud Trace] %s %s", r.Method, r.URL.Path)
+	log.Printf("[Shim: Cloud Trace] %s %q", r.Method, r.URL.EscapedPath())
 	w.Header().Set("Content-Type", "application/json")
 
 	path := r.URL.Path
@@ -129,9 +130,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (api *API) batchWrite(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
-	project := extractProject(r.URL.Path)
-	if project == "" {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "project is required")
+	project, ok := parseBatchWriteProject(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request path must contain a canonical project")
 		return
 	}
 
@@ -152,9 +153,9 @@ func (api *API) batchWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, span := range body.Spans {
-		traceID := extractTraceId(span.Name)
-		if traceID == "" || extractProject(span.Name) != project || span.SpanId == "" {
-			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "each span must have a spanId and a name scoped to the request project")
+		spanProject, _, nameSpanID, ok := parseSpanName(span.Name)
+		if !ok || spanProject != project || nameSpanID != span.SpanId {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "each span name must match its spanId and be scoped to the request project")
 			return
 		}
 	}
@@ -166,10 +167,7 @@ func (api *API) batchWrite(w http.ResponseWriter, r *http.Request) {
 		before[key] = deepCopyTrace(trace)
 	}
 	for _, s := range body.Spans {
-		traceId := extractTraceId(s.Name)
-		if traceId == "" {
-			continue
-		}
+		_, traceId, _, _ := parseSpanName(s.Name)
 		key := project + ":" + traceId
 		trace, ok := api.traces[key]
 		if !ok {
@@ -181,7 +179,13 @@ func (api *API) batchWrite(w http.ResponseWriter, r *http.Request) {
 		}
 		// Clone span before storing
 		clone := s
-		trace.Spans = append(trace.Spans, clone)
+		canonical := make([]Span, 0, len(trace.Spans)+1)
+		for _, stored := range trace.Spans {
+			if stored.SpanId != clone.SpanId {
+				canonical = append(canonical, stored)
+			}
+		}
+		trace.Spans = append(canonical, clone)
 	}
 	api.mu.Unlock()
 
@@ -285,16 +289,70 @@ func extractProject(path string) string {
 	return ""
 }
 
-// extractTraceId extracts traceId from a span name like
-// "projects/{project}/traces/{traceId}/spans/{spanId}"
-func extractTraceId(spanName string) string {
-	parts := strings.Split(spanName, "/")
-	for i, p := range parts {
-		if p == "traces" && i+1 < len(parts) {
-			return parts[i+1]
+func parseSpanName(name string) (project, traceID, spanID string, ok bool) {
+	parts := strings.Split(name, "/")
+	if len(parts) != 6 || parts[0] != "projects" || !validProjectSegment(parts[1]) ||
+		parts[2] != "traces" || parts[4] != "spans" ||
+		!isHexID(parts[3], 32) || !isHexID(parts[5], 16) {
+		return "", "", "", false
+	}
+	return parts[1], parts[3], parts[5], true
+}
+
+func parseBatchWriteProject(r *http.Request) (string, bool) {
+	if r.URL.RawPath != "" || strings.Contains(r.URL.EscapedPath(), "%") {
+		return "", false
+	}
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != "v2" ||
+		parts[2] != "projects" || parts[4] != "traces:batchWrite" ||
+		!validProjectSegment(parts[3]) {
+		return "", false
+	}
+	return parts[3], true
+}
+
+func validProjectSegment(value string) bool {
+	if len(value) == 0 || len(value) > 63 {
+		return false
+	}
+	if isDigit(value[0]) {
+		for index := 1; index < len(value); index++ {
+			if !isDigit(value[index]) {
+				return false
+			}
+		}
+		return true
+	}
+	if !isLowerLetter(value[0]) || !isLowerAlphaNumeric(value[len(value)-1]) {
+		return false
+	}
+	for index := 1; index < len(value)-1; index++ {
+		if !isLowerAlphaNumeric(value[index]) && value[index] != '-' {
+			return false
 		}
 	}
-	return ""
+	return true
+}
+
+func isLowerAlphaNumeric(value byte) bool {
+	return isLowerLetter(value) || isDigit(value)
+}
+
+func isLowerLetter(value byte) bool {
+	return value >= 'a' && value <= 'z'
+}
+
+func isDigit(value byte) bool {
+	return value >= '0' && value <= '9'
+}
+
+func isHexID(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // extractTraceIdFromPath extracts traceId from a URL path like

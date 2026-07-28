@@ -81,6 +81,7 @@ type Interval struct {
 // API implements the Dataform v1beta1 REST shim.
 type API struct {
 	mu                  sync.RWMutex
+	mutationMu          sync.Mutex
 	persistMu           sync.Mutex
 	opMgr               *orchestrator.OperationManager
 	stateStore          dataformStateStore
@@ -105,6 +106,7 @@ func NewAPI(opMgr *orchestrator.OperationManager) *API {
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: Dataform] state rehydration failed: %v", err)
+		api.stateStore = state.NewGuardedEntryStore(store, err)
 	}
 	return api
 }
@@ -168,6 +170,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) createCompilationResult(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	repoName := buildRepoName(r.URL.Path)
 	var request struct {
@@ -216,6 +221,7 @@ func (api *API) createCompilationResult(w http.ResponseWriter, r *http.Request) 
 	if err := api.persistState(); err != nil {
 		api.mu.Lock()
 		delete(api.compilationResults, name)
+		api.nextCompilationID--
 		api.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
@@ -239,6 +245,9 @@ func (api *API) getCompilationResult(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) createWorkflowInvocation(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	repoName := buildRepoName(r.URL.Path)
 	var request struct {
@@ -283,6 +292,7 @@ func (api *API) createWorkflowInvocation(w http.ResponseWriter, r *http.Request)
 	if err := api.persistState(); err != nil {
 		api.mu.Lock()
 		delete(api.workflowInvocations, name)
+		api.nextInvocationID--
 		api.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
@@ -310,6 +320,9 @@ func (api *API) getWorkflowInvocation(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createRepository(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	project, location, ok := parseParent(r.URL.Path)
@@ -425,6 +438,9 @@ func (api *API) listRepositories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) updateRepository(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := buildRepoName(r.URL.Path)
 
@@ -473,6 +489,9 @@ func (api *API) updateRepository(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteRepository(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	name := buildRepoName(r.URL.Path)
 
 	api.mu.Lock()
@@ -537,6 +556,9 @@ func (api *API) deleteRepository(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createWorkspace(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	repoName := buildRepoName(r.URL.Path)
@@ -646,6 +668,9 @@ func (api *API) listWorkspaces(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) updateWorkspace(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	name := buildWorkspaceName(r.URL.Path)
 
@@ -694,6 +719,9 @@ func (api *API) updateWorkspace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	name := buildWorkspaceName(r.URL.Path)
 
 	api.mu.Lock()

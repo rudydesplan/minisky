@@ -3,6 +3,7 @@ package clouddeploy
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -28,6 +29,14 @@ func init() {
 
 type imagePolicyEvaluator interface {
 	EvaluateImage(project, image string) error
+}
+
+type unsupportedImagePolicyEvaluation interface {
+	PolicyEvaluationUnsupported() bool
+}
+
+type unavailableImagePolicyEvaluation interface {
+	PolicyEvaluationUnavailable() bool
 }
 
 type allowImagePolicyEvaluator struct{}
@@ -623,6 +632,18 @@ func (api *API) executeRollout(operationName, rolloutName, releaseName, image st
 		return
 	}
 	if err := api.policyEvaluator.EvaluateImage(project, image); err != nil {
+		var unavailable unavailableImagePolicyEvaluation
+		if errors.As(err, &unavailable) && unavailable.PolicyEvaluationUnavailable() {
+			api.finishRolloutExecution(operationName, rolloutName,
+				fmt.Errorf("Binary Authorization evaluator unavailable: %w", err), http.StatusServiceUnavailable)
+			return
+		}
+		var unsupported unsupportedImagePolicyEvaluation
+		if errors.As(err, &unsupported) && unsupported.PolicyEvaluationUnsupported() {
+			api.finishRolloutExecution(operationName, rolloutName,
+				fmt.Errorf("Binary Authorization evaluation unsupported: %w", err), http.StatusNotImplemented)
+			return
+		}
 		api.finishRolloutExecution(operationName, rolloutName,
 			fmt.Errorf("Binary Authorization denied image: %w", err), http.StatusForbidden)
 		return

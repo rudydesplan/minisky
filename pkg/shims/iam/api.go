@@ -1,13 +1,16 @@
 package iam
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +25,7 @@ import (
 const principalHeader = "X-MiniSky-Principal"
 
 func init() {
+	state.MustRegisterEntryValidator(iamStateEntry, validateIAMStateEntry)
 	registry.Register("iam.googleapis.com", func(ctx *registry.Context) http.Handler {
 		api := NewAPI()
 		api.opMgr = ctx.OpMgr
@@ -115,6 +119,127 @@ type iamMetadata struct {
 	WorkloadIdentityProviders map[string]*WorkloadIdentityPoolProvider `json:"workloadIdentityProviders,omitempty"`
 }
 
+func validateIAMStateEntry(_ state.EntryValidationContext, payload json.RawMessage) error {
+	var metadata iamMetadata
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&metadata); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("IAM metadata contains trailing JSON")
+	}
+	return validateIAMMetadata(&metadata)
+}
+
+func validateIAMMetadata(metadata *iamMetadata) error {
+	if metadata == nil {
+		return errors.New("IAM metadata is nil")
+	}
+	uniqueIDs := make(map[string]string, len(metadata.ServiceAccounts))
+	for key, account := range metadata.ServiceAccounts {
+		if err := validateServiceAccountEntry(key, account); err != nil {
+			return fmt.Errorf("service account %q: %w", key, err)
+		}
+		if prior, duplicate := uniqueIDs[account.UniqueId]; duplicate {
+			return fmt.Errorf("service accounts %q and %q have duplicate unique ID", prior, key)
+		}
+		uniqueIDs[account.UniqueId] = key
+	}
+	return nil
+}
+
+func validateServiceAccountEntry(key string, account *ServiceAccount) error {
+	if account == nil {
+		return errors.New("entry is nil")
+	}
+	accountID, projectID, ok := ParseCanonicalServiceAccountEmail(account.Email)
+	if !ok {
+		return errors.New("email is not canonical")
+	}
+	if account.ProjectId != projectID {
+		return errors.New("project ID does not match email")
+	}
+	if key != projectID+":"+account.Email {
+		return errors.New("map key does not match project and email")
+	}
+	wantName := "projects/" + projectID + "/serviceAccounts/" + account.Email
+	if account.Name != wantName {
+		return errors.New("name does not match project and email")
+	}
+	if accountID == "" || !validPositiveDecimal(account.UniqueId) {
+		return errors.New("unique ID is not a canonical positive decimal")
+	}
+	return nil
+}
+
+// ParseCanonicalServiceAccountEmail validates a persisted IAM service-account
+// email and returns its bounded account and project identifiers.
+func ParseCanonicalServiceAccountEmail(email string) (accountID, projectID string, ok bool) {
+	if strings.Count(email, "@") != 1 || strings.ContainsAny(email, "/\\%: \t\r\n") {
+		return "", "", false
+	}
+	accountID, domain, _ := strings.Cut(email, "@")
+	const suffix = ".iam.gserviceaccount.com"
+	projectID = strings.TrimSuffix(domain, suffix)
+	if projectID == domain || !validServiceAccountID(accountID) || !validProjectID(projectID) {
+		return "", "", false
+	}
+	return accountID, projectID, true
+}
+
+func validServiceAccountID(accountID string) bool {
+	if len(accountID) < 6 || len(accountID) > 30 {
+		return false
+	}
+	for index, character := range accountID {
+		alpha := character >= 'a' && character <= 'z'
+		numeric := character >= '0' && character <= '9'
+		if !alpha && !numeric && character != '-' {
+			return false
+		}
+		if index == 0 && !alpha {
+			return false
+		}
+		if index == len(accountID)-1 && !alpha && !numeric {
+			return false
+		}
+	}
+	return true
+}
+
+func validProjectID(projectID string) bool {
+	if validPositiveDecimal(projectID) {
+		return true
+	}
+	if len(projectID) < 6 || len(projectID) > 30 {
+		return false
+	}
+	for index, character := range projectID {
+		alpha := character >= 'a' && character <= 'z'
+		numeric := character >= '0' && character <= '9'
+		if !alpha && !numeric && character != '-' {
+			return false
+		}
+		if index == 0 && !alpha {
+			return false
+		}
+		if index == len(projectID)-1 && !alpha && !numeric {
+			return false
+		}
+	}
+	return true
+}
+
+func validPositiveDecimal(value string) bool {
+	if value == "" || value[0] == '0' {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
 func NewAPI() *API {
 	store, err := state.New(config.GetStateDir(), config.GetProfile())
 	if err != nil {
@@ -145,13 +270,29 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	if store == nil {
 		return api, nil
 	}
-	var persisted iamMetadata
-	if err := store.Load(iamStateEntry, &persisted); err != nil {
-		if errors.Is(err, state.ErrNotFound) {
-			return api, nil
-		}
-		return nil, fmt.Errorf("load IAM metadata: %w", err)
+	if err := api.loadMetadata(); err != nil {
+		return nil, err
 	}
+	return api, nil
+}
+
+func (api *API) loadMetadata() error {
+	var persisted iamMetadata
+	if err := api.store.Load(iamStateEntry, &persisted); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil
+		}
+		err = fmt.Errorf("load IAM metadata: %w", err)
+		api.markPersistenceFailure(err)
+		return err
+	}
+	if err := validateIAMMetadata(&persisted); err != nil {
+		err = fmt.Errorf("validate IAM metadata: %w", err)
+		api.markPersistenceFailure(err)
+		return err
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
 	if persisted.ServiceAccounts != nil {
 		api.serviceAccounts = persisted.ServiceAccounts
 	}
@@ -167,7 +308,7 @@ func NewAPIWithStore(store stateStore) (*API, error) {
 	if persisted.WorkloadIdentityProviders != nil {
 		api.workloadIdentityProviders = cloneWorkloadIdentityProviders(persisted.WorkloadIdentityProviders)
 	}
-	return api, nil
+	return nil
 }
 
 func newAPI(store stateStore) *API {
@@ -210,6 +351,17 @@ func (api *API) PersistenceError() error {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return api.persistenceErr
+}
+
+func (api *API) markPersistenceFailure(err error) {
+	if err == nil {
+		return
+	}
+	api.mu.Lock()
+	if api.persistenceErr == nil {
+		api.persistenceErr = err
+	}
+	api.mu.Unlock()
 }
 
 // EnforcementEnabled reports whether cross-shim mutation checks are active.
@@ -290,16 +442,24 @@ func serviceAccountPolicyAlias(resource string) string {
 func (api *API) IssueLocalToken(subject, audience string, scopes []string, lifetime time.Duration) (string, time.Time, error) {
 	api.mu.RLock()
 	disabled := false
+	found := false
 	if strings.HasPrefix(subject, "serviceAccount:") {
 		email := strings.TrimPrefix(subject, "serviceAccount:")
-		for _, account := range api.serviceAccounts {
+		for key, account := range api.serviceAccounts {
+			if validateServiceAccountEntry(key, account) != nil {
+				continue
+			}
 			if account.Email == email {
+				found = true
 				disabled = account.Disabled
 				break
 			}
 		}
 	}
 	api.mu.RUnlock()
+	if strings.HasPrefix(subject, "serviceAccount:") && !found {
+		return "", time.Time{}, errors.New("service account was not found")
+	}
 	if disabled {
 		return "", time.Time{}, errors.New("service account is disabled")
 	}
@@ -338,10 +498,23 @@ func (api *API) ResolveServiceAccount(identifier string) (email string, disabled
 	identifier = strings.TrimSpace(identifier)
 	api.mu.RLock()
 	defer api.mu.RUnlock()
-	for _, account := range api.serviceAccounts {
-		if account.Email == identifier || account.UniqueId == identifier {
+	var matched *ServiceAccount
+	for key, account := range api.serviceAccounts {
+		if validateServiceAccountEntry(key, account) != nil {
+			continue
+		}
+		if account.Email == identifier {
 			return account.Email, account.Disabled, true
 		}
+		if account.UniqueId == identifier {
+			if matched != nil {
+				return "", false, false
+			}
+			matched = account
+		}
+	}
+	if matched != nil {
+		return matched.Email, matched.Disabled, true
 	}
 	return "", false, false
 }
@@ -459,8 +632,19 @@ func (api *API) createServiceAccount(w http.ResponseWriter, r *http.Request, pro
 		writeError(w, 400, "INVALID_ARGUMENT", "Field 'accountId' is required")
 		return
 	}
+	if !validServiceAccountID(body.AccountId) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"Field 'accountId' must be a lowercase letter-leading 6-30 character identifier")
+		return
+	}
 
 	email := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", body.AccountId, project)
+	if _, canonicalProject, ok := ParseCanonicalServiceAccountEmail(email); !ok || canonicalProject != project {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "Project ID is not canonical")
+		return
+	}
 	sa := &ServiceAccount{
 		Name:           fmt.Sprintf("projects/%s/serviceAccounts/%s", project, email),
 		ProjectId:      project,

@@ -17,6 +17,7 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 	if os.Getenv("MINISKY_DOCKER_CLEANUP_INTEGRATION") != "1" {
 		t.Skip("set MINISKY_DOCKER_CLEANUP_INTEGRATION=1 to run")
 	}
+	acquireMiniSkyDockerIntegrationLock(t)
 
 	manager, err := NewServiceManager()
 	if err != nil {
@@ -67,6 +68,24 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 			}
 		})
 	}
+	cleanupVolume := func(name string) {
+		t.Helper()
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			request, _ := http.NewRequestWithContext(cleanupCtx, http.MethodDelete,
+				"http://localhost/volumes/"+url.PathEscape(name), nil)
+			response, requestErr := manager.doDocker(request)
+			if requestErr != nil {
+				t.Errorf("cleanup Docker volume %q: %v", name, requestErr)
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
+				t.Errorf("cleanup Docker volume %q returned %d", name, response.StatusCode)
+			}
+		})
+	}
 	ownedID := createAnonymousVolumeContainer(t, ctx, manager, "minisky-cleanup-owned-"+suffix, image, map[string]string{
 		"managed-by":      "minisky",
 		"minisky.profile": profile,
@@ -80,6 +99,37 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 
 	ownedVolume := anonymousVolumeForContainer(t, ctx, manager, ownedID)
 	unrelatedVolume := anonymousVolumeForContainer(t, ctx, manager, unrelatedID)
+	ownedNamedVolume := "minisky-cleanup-owned-volume-" + suffix
+	emptyProfileVolume := "minisky-cleanup-empty-profile-" + suffix
+	mismatchedVolume := "minisky-cleanup-mismatched-" + suffix
+	activeOwnedVolume := "minisky-cleanup-active-owned-" + suffix
+	for name, labels := range map[string]map[string]string{
+		ownedNamedVolume: {
+			"managed-by":      "minisky",
+			"minisky.profile": profile,
+		},
+		emptyProfileVolume: {
+			"managed-by":      "minisky",
+			"minisky.profile": "",
+		},
+		mismatchedVolume: {
+			"managed-by":      "integration-test",
+			"minisky.profile": profile,
+		},
+		activeOwnedVolume: {
+			"managed-by":      "minisky",
+			"minisky.profile": profile,
+		},
+	} {
+		createNamedDockerVolume(t, ctx, manager, name, labels)
+		cleanupVolume(name)
+	}
+	holderID := createNamedVolumeContainer(t, ctx, manager, "minisky-cleanup-holder-"+suffix, image,
+		activeOwnedVolume, map[string]string{
+			"managed-by":      "integration-test",
+			"minisky.profile": profile,
+		})
+	cleanupContainer(holderID)
 
 	cleanupManager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
 	cleanupManager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -88,6 +138,7 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 			body, err := json.Marshal([]cleanupResource{
 				{ID: ownedID, Labels: map[string]string{"managed-by": "minisky", "minisky.profile": profile}},
 				{ID: unrelatedID, Labels: map[string]string{"managed-by": "integration-test", "minisky.profile": profile}},
+				{ID: holderID, Labels: map[string]string{"managed-by": "integration-test", "minisky.profile": profile}},
 			})
 			if err != nil {
 				return nil, err
@@ -95,8 +146,21 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 			return dockerResponse(http.StatusOK, string(body)), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/networks":
 			return dockerResponse(http.StatusOK, "[]"), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/volumes":
+			body, err := json.Marshal(struct {
+				Volumes []cleanupResource `json:"Volumes"`
+			}{Volumes: []cleanupResource{
+				{Name: ownedNamedVolume, Labels: map[string]string{"managed-by": "minisky", "minisky.profile": profile}},
+				{Name: emptyProfileVolume, Labels: map[string]string{"managed-by": "minisky", "minisky.profile": ""}},
+				{Name: mismatchedVolume, Labels: map[string]string{"managed-by": "integration-test", "minisky.profile": profile}},
+				{Name: activeOwnedVolume, Labels: map[string]string{"managed-by": "minisky", "minisky.profile": profile}},
+			}})
+			if err != nil {
+				return nil, err
+			}
+			return dockerResponse(http.StatusOK, string(body)), nil
 		case request.Method == http.MethodPost && request.URL.Path == "/volumes/prune":
-			return dockerResponse(http.StatusOK, `{"VolumesDeleted":[]}`), nil
+			return manager.dockerClient.Do(request)
 		default:
 			return manager.dockerClient.Do(request)
 		}
@@ -108,6 +172,85 @@ func TestCleanupAllProfilesRemovesAnonymousVolumesDockerIntegration(t *testing.T
 	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(ownedVolume), http.StatusNotFound)
 	assertDockerResourceStatus(t, ctx, manager, "/containers/"+url.PathEscape(unrelatedID)+"/json", http.StatusOK)
 	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(unrelatedVolume), http.StatusOK)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(ownedNamedVolume), http.StatusNotFound)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(emptyProfileVolume), http.StatusOK)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(mismatchedVolume), http.StatusOK)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(activeOwnedVolume), http.StatusOK)
+}
+
+func createNamedDockerVolume(
+	t *testing.T,
+	ctx context.Context,
+	manager *ServiceManager,
+	name string,
+	labels map[string]string,
+) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"Name": name, "Labels": labels})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/volumes/create", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := manager.doDocker(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
+		t.Fatalf("create Docker volume returned %d", response.StatusCode)
+	}
+}
+
+func createNamedVolumeContainer(
+	t *testing.T,
+	ctx context.Context,
+	manager *ServiceManager,
+	name string,
+	image string,
+	volume string,
+	labels map[string]string,
+) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"Image":  image,
+		"Labels": labels,
+		"HostConfig": map[string]any{
+			"Binds": []string{volume + ":/active"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/create?"+url.Values{"name": {name}}.Encode(), bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := manager.doDocker(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		detail, _ := io.ReadAll(response.Body)
+		t.Fatalf("create Docker holder returned %d: %s", response.StatusCode, detail)
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" {
+		t.Fatal("Docker returned an empty holder container ID")
+	}
+	return created.ID
 }
 
 func createAnonymousVolumeContainer(

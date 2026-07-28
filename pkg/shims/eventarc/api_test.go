@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"minisky/pkg/orchestrator"
+	"minisky/pkg/registry"
 	"minisky/pkg/shims/workflows"
 	"minisky/pkg/state"
 )
@@ -61,6 +62,27 @@ func TestCreateTrigger(t *testing.T) {
 	}
 	if trigger.Etag == "" {
 		t.Fatal("expected etag to be set")
+	}
+}
+
+func TestBootAllWiresWorkflowsWithoutPostBootOrderAssumption(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "eventarc-postboot")
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+
+	handlers, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	api, ok := handlers["eventarc.googleapis.com"].(*API)
+	if !ok {
+		t.Fatalf("Eventarc handler = %T", handlers["eventarc.googleapis.com"])
+	}
+	api.mu.RLock()
+	executor := api.executor
+	api.mu.RUnlock()
+	if executor == nil {
+		t.Fatal("Eventarc executor was not wired after the registry completed its instantiate-all pass")
+	}
+	if handlers["workflows.googleapis.com"] != handlers["workflowexecutions.googleapis.com"] {
+		t.Fatal("workflow control and execution domains do not share the wired API")
 	}
 }
 
@@ -162,7 +184,7 @@ func TestWorkflowDeliveryOutcomeIsPersisted(t *testing.T) {
 		},
 		deliveries: make(map[string]*Delivery),
 	}
-	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error { return nil }))
+	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string, string) error { return nil }))
 	api.HandleEvent("test", "resource", `{"x":1}`)
 	waitForDeliveries(t, api, "SUCCEEDED", 1)
 
@@ -217,7 +239,7 @@ func TestHandleEventPersistsOneSharedPayloadAndPropagatesIntentSaveFailure(t *te
 			Name: name, Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
 		}
 	}
-	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error { return nil }))
+	api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string, string) error { return nil }))
 	payload := strings.Repeat("p", 4096)
 	if err := api.HandleEventWithAck("test", "resource", payload); err != nil {
 		t.Fatal(err)
@@ -235,6 +257,185 @@ func TestHandleEventPersistsOneSharedPayloadAndPropagatesIntentSaveFailure(t *te
 	}
 	if len(api.deliveries) != before {
 		t.Fatal("failed intent persistence changed in-memory deliveries")
+	}
+}
+
+func TestHandleEventRevalidatesTriggerAfterConcurrentDelete(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	api := newTestAPI()
+	api.stateStore = store
+	triggerName := "projects/p/locations/l/triggers/t"
+	api.triggers[triggerName] = &Trigger{
+		Name: triggerName, Etag: "etag",
+		Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+	}
+	if err := api.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	matched := make(chan struct{})
+	release := make(chan struct{})
+	api.afterMatch = func() {
+		close(matched)
+		<-release
+	}
+	eventDone := make(chan error, 1)
+	go func() {
+		eventDone <- api.HandleEventWithAck("test", "resource", `{"nonce":"delete-race"}`)
+	}()
+	<-matched
+
+	deleteResponse := httptest.NewRecorder()
+	api.ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodDelete, "/v1/"+triggerName, nil))
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	close(release)
+	if err := <-eventDone; err != nil {
+		t.Fatal(err)
+	}
+	if len(api.deliveries) != 0 || len(api.payloads) != 0 {
+		t.Fatalf("orphan state deliveries=%d payloads=%d", len(api.deliveries), len(api.payloads))
+	}
+
+	restarted := newTestAPI()
+	restarted.stateStore = store
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.triggers) != 0 || len(restarted.deliveries) != 0 || len(restarted.payloads) != 0 {
+		t.Fatalf("durable orphan state triggers=%d deliveries=%d payloads=%d",
+			len(restarted.triggers), len(restarted.deliveries), len(restarted.payloads))
+	}
+}
+
+func TestHandleEventDeliveryIDGenerationFailsClosedAndBoundsCollisions(t *testing.T) {
+	triggerName := "projects/p/locations/l/triggers/t"
+	newAPI := func() *API {
+		api := newTestAPI()
+		api.triggers[triggerName] = &Trigger{
+			Name:        triggerName,
+			Destination: &Destination{Workflow: "projects/p/locations/l/workflows/w"},
+		}
+		return api
+	}
+
+	t.Run("source error", func(t *testing.T) {
+		api := newAPI()
+		api.newDeliveryID = func() (string, error) {
+			return "", errors.New("crypto source unavailable")
+		}
+		if err := api.HandleEventWithAck("test", "resource", `{}`); !errors.Is(err, errDeliveryIDUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+		if len(api.deliveries) != 0 || len(api.payloads) != 0 {
+			t.Fatal("ID source failure mutated delivery state")
+		}
+	})
+
+	t.Run("bounded collisions", func(t *testing.T) {
+		api := newAPI()
+		api.payloads["collision"] = `existing`
+		calls := 0
+		api.newDeliveryID = func() (string, error) {
+			calls++
+			return "collision", nil
+		}
+		if err := api.HandleEventWithAck("test", "resource", `{}`); !errors.Is(err, errDeliveryIDUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+		if calls != maxDeliveryIDAttempts {
+			t.Fatalf("generator calls = %d, want bounded %d", calls, maxDeliveryIDAttempts)
+		}
+		if len(api.deliveries) != 0 || len(api.payloads) != 1 {
+			t.Fatal("collision exhaustion mutated delivery state")
+		}
+	})
+
+	t.Run("retries collision", func(t *testing.T) {
+		api := newAPI()
+		api.payloads["collision"] = `existing`
+		ids := []string{"collision", "payload", "delivery"}
+		api.newDeliveryID = func() (string, error) {
+			id := ids[0]
+			ids = ids[1:]
+			return id, nil
+		}
+		api.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string, string) error { return nil }))
+		if err := api.HandleEventWithAck("test", "resource", `{}`); err != nil {
+			t.Fatal(err)
+		}
+		waitForDeliveries(t, api, "SUCCEEDED", 1)
+		if api.deliveries["delivery"] == nil || api.payloads["payload"] != `{}` {
+			t.Fatalf("generated state deliveries=%#v payloads=%#v", api.deliveries, api.payloads)
+		}
+	})
+}
+
+func TestPubSubDeliveryRequiresTriggerProjectAndTransportTopic(t *testing.T) {
+	const (
+		eventType = "google.cloud.pubsub.topic.v1.messagePublished"
+		workflow  = "projects/p/locations/us-central1/workflows/w"
+		topic     = "projects/p/topics/orders"
+	)
+	tests := []struct {
+		name           string
+		triggerName    string
+		transportTopic string
+		resource       string
+		wantDeliveries int
+	}{
+		{
+			name:           "same project and transport topic",
+			triggerName:    "projects/p/locations/us-central1/triggers/orders",
+			transportTopic: topic,
+			resource:       topic,
+			wantDeliveries: 1,
+		},
+		{
+			name:           "cross-project publish",
+			triggerName:    "projects/p/locations/us-central1/triggers/orders",
+			transportTopic: "projects/other/topics/orders",
+			resource:       "projects/other/topics/orders",
+		},
+		{
+			name:           "transport topic mismatch",
+			triggerName:    "projects/p/locations/us-central1/triggers/orders",
+			transportTopic: "projects/p/topics/other",
+			resource:       topic,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			api.triggers[test.triggerName] = &Trigger{
+				Name: test.triggerName,
+				EventFilters: []EventFilter{
+					{Attribute: "type", Value: eventType},
+					{Attribute: "resource", Value: test.resource},
+				},
+				Destination: &Destination{Workflow: workflow},
+				Transport:   &Transport{Pubsub: &PubsubTransport{Topic: test.transportTopic}},
+			}
+			calls := 0
+			api.SetWorkflowsExecutor(workflowsExecutorFunc(func(gotWorkflow, payload, _ string) error {
+				calls++
+				if gotWorkflow != workflow || payload != `{"nonce":"isolation"}` {
+					t.Fatalf("delivery = (%q, %q)", gotWorkflow, payload)
+				}
+				return nil
+			}))
+
+			if err := api.HandleEventWithAck(eventType, test.resource, `{"nonce":"isolation"}`); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantDeliveries == 1 {
+				waitForDeliveries(t, api, "SUCCEEDED", 1)
+			}
+			if len(api.deliveries) != test.wantDeliveries || calls != test.wantDeliveries {
+				t.Fatalf("deliveries=%d calls=%d, want %d", len(api.deliveries), calls, test.wantDeliveries)
+			}
+		})
 	}
 }
 
@@ -359,7 +560,7 @@ func TestFailedWorkflowDeliveryReplaysAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := 0
-	restarted.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string) error {
+	restarted.SetWorkflowsExecutor(workflowsExecutorFunc(func(string, string, string) error {
 		calls++
 		return nil
 	}))
@@ -370,6 +571,129 @@ func TestFailedWorkflowDeliveryReplaysAfterRestart(t *testing.T) {
 	}
 	if got := restarted.deliveries["d1"]; got.State != "SUCCEEDED" || got.Attempts != 2 {
 		t.Fatalf("delivery = %#v", got)
+	}
+}
+
+func TestInterruptedDeliveryReplayUsesOneWorkflowExecution(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", stateRoot)
+	t.Setenv("MINISKY_PROFILE", "eventarc-interrupted-replay")
+
+	opMgr := orchestrator.NewOperationManager()
+	workflowName := "projects/p/locations/us-central1/workflows/events"
+	workflowAPI := workflows.NewAPI(opMgr)
+	createWorkflow := httptest.NewRecorder()
+	workflowAPI.ServeHTTP(createWorkflow, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/p/locations/us-central1/workflows?workflowId=events",
+		bytes.NewBufferString(`{"sourceContents":"[{\"return\":\"${args}\"}]"}`),
+	))
+	if createWorkflow.Code != http.StatusOK {
+		t.Fatalf("create workflow status=%d body=%s", createWorkflow.Code, createWorkflow.Body.String())
+	}
+
+	store, err := state.New(t.TempDir(), "eventarc-interrupted-replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggerName := "projects/p/locations/us-central1/triggers/events"
+	payload := `{"messages":[{"attributes":{"nonce":"phase18-interrupted"}}]}`
+	first := &API{
+		opMgr: opMgr, stateStore: store,
+		triggers: map[string]*Trigger{triggerName: {
+			Name: triggerName, Destination: &Destination{Workflow: workflowName},
+		}},
+		deliveries: map[string]*Delivery{"delivery-1": {
+			ID: "delivery-1", Trigger: triggerName, Workflow: workflowName,
+			Payload: payload, State: "ATTEMPTING",
+		}},
+		payloads: make(map[string]string),
+	}
+	if err := first.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model daemon interruption after the Workflow accepted the stable delivery
+	// identity but before Eventarc persisted its terminal outcome.
+	if err := workflowAPI.CreateExecutionFromEvent(workflowName, payload, "delivery-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedWorkflow := workflows.NewAPI(opMgr)
+	restarted := &API{
+		opMgr: opMgr, stateStore: store,
+		triggers: make(map[string]*Trigger), deliveries: make(map[string]*Delivery),
+		payloads: make(map[string]string),
+	}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetWorkflowsExecutor(restartedWorkflow)
+	restarted.replayDeliveries()
+	waitForDeliveries(t, restarted, "SUCCEEDED", 1)
+
+	list := httptest.NewRecorder()
+	restartedWorkflow.ServeHTTP(list, httptest.NewRequest(
+		http.MethodGet, "/v1/"+workflowName+"/executions", nil,
+	))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list executions status=%d body=%s", list.Code, list.Body.String())
+	}
+	var response struct {
+		Executions []workflows.Execution `json:"executions"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Executions) != 1 {
+		t.Fatalf("executions = %d, want one terminal effect after replay", len(response.Executions))
+	}
+	if response.Executions[0].Argument != payload {
+		t.Fatalf("execution argument = %q, want nonce-correlated payload %q", response.Executions[0].Argument, payload)
+	}
+}
+
+func TestWorkflowExecutionFailureKeepsEventarcDeliveryNonSuccess(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", stateRoot)
+	t.Setenv("MINISKY_PROFILE", "eventarc-workflow-failure")
+	opMgr := orchestrator.NewOperationManager()
+	workflowAPI := workflows.NewAPI(opMgr)
+	workflowName := "projects/p/locations/us-central1/workflows/failing"
+	create := httptest.NewRecorder()
+	workflowAPI.ServeHTTP(create, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/projects/p/locations/us-central1/workflows?workflowId=failing",
+		bytes.NewBufferString(`{"sourceContents":"[{\"unsupported\":\"step\"}]"}`),
+	))
+	if create.Code != http.StatusOK {
+		t.Fatalf("create workflow status=%d body=%s", create.Code, create.Body.String())
+	}
+
+	api := newTestAPI()
+	triggerName := "projects/p/locations/us-central1/triggers/failing"
+	api.triggers[triggerName] = &Trigger{
+		Name: triggerName, Destination: &Destination{Workflow: workflowName},
+	}
+	api.SetWorkflowsExecutor(workflowAPI)
+	if err := api.HandleEventWithAck("test", "resource", `{"nonce":"must-fail"}`); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeliveries(t, api, "FAILED", 1)
+	for _, delivery := range api.deliveries {
+		if delivery.LastError == "" {
+			t.Fatal("failed Workflow execution did not keep Eventarc non-success")
+		}
+		executionName := workflowName + "/executions/event-" + delivery.ID
+		get := httptest.NewRecorder()
+		workflowAPI.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/"+executionName, nil))
+		var execution workflows.Execution
+		if err := json.Unmarshal(get.Body.Bytes(), &execution); err != nil {
+			t.Fatal(err)
+		}
+		if execution.State != "FAILED" || execution.Result != "" {
+			t.Fatalf("workflow execution = %#v", execution)
+		}
 	}
 }
 
@@ -425,6 +749,7 @@ func TestPubSubAndStorageEventsDeliverToWorkflowAfterRestart(t *testing.T) {
 		`{"bucket":"bucket","name":"object"}`,
 	)
 	waitForDeliveries(t, first, "FAILED", 2)
+	waitForStoreDeliveries(t, store, "FAILED", 2)
 	if len(first.deliveries) != 2 {
 		t.Fatalf("failed delivery intents = %d, want 2", len(first.deliveries))
 	}
@@ -444,6 +769,7 @@ func TestPubSubAndStorageEventsDeliverToWorkflowAfterRestart(t *testing.T) {
 	restarted.SetWorkflowsExecutor(workflowAPI)
 	restarted.replayDeliveries()
 	waitForDeliveries(t, restarted, "SUCCEEDED", 2)
+	waitForStoreDeliveries(t, store, "SUCCEEDED", 2)
 	for _, delivery := range restarted.deliveries {
 		if delivery.State != "SUCCEEDED" || delivery.Attempts != 2 {
 			t.Fatalf("post-restart delivery = %#v", delivery)
@@ -516,10 +842,10 @@ func TestPubSubAndStorageEventsDeliverToWorkflowAfterRestart(t *testing.T) {
 	}
 }
 
-type workflowsExecutorFunc func(string, string) error
+type workflowsExecutorFunc func(string, string, string) error
 
-func (f workflowsExecutorFunc) CreateExecutionFromEvent(workflow, payload string) error {
-	return f(workflow, payload)
+func (f workflowsExecutorFunc) CreateExecutionFromEvent(workflow, payload, deliveryID string) error {
+	return f(workflow, payload, deliveryID)
 }
 
 func TestCreateTriggerDuplicate(t *testing.T) {
@@ -711,6 +1037,52 @@ func TestDeleteTriggerAllowMissingReturnsTypedOperation(t *testing.T) {
 	result, _ := operation["response"].(map[string]any)
 	if operation["done"] != true || result["@type"] != "type.googleapis.com/google.protobuf.Empty" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestDeleteTriggerRemovesOnlyOwnedDeliveryIntentsAndPayloads(t *testing.T) {
+	api := newTestAPI()
+	firstName := "projects/test/locations/us-central1/triggers/first"
+	secondName := "projects/test/locations/us-central1/triggers/second"
+	workflow := "projects/test/locations/us-central1/workflows/w"
+	api.triggers[firstName] = &Trigger{Name: firstName, Etag: "first", Destination: &Destination{Workflow: workflow}}
+	api.triggers[secondName] = &Trigger{Name: secondName, Etag: "second", Destination: &Destination{Workflow: workflow}}
+	api.payloads["shared"] = `{"nonce":"shared"}`
+	api.payloads["first-only"] = `{"nonce":"first"}`
+	api.deliveries["first-shared"] = &Delivery{
+		ID: "first-shared", Trigger: firstName, Workflow: workflow,
+		PayloadRef: "shared", State: "FAILED",
+	}
+	api.deliveries["first-only"] = &Delivery{
+		ID: "first-only", Trigger: firstName, Workflow: workflow,
+		PayloadRef: "first-only", State: "FAILED",
+	}
+	api.deliveries["second-shared"] = &Delivery{
+		ID: "second-shared", Trigger: secondName, Workflow: workflow,
+		PayloadRef: "shared", State: "FAILED",
+	}
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(
+		http.MethodDelete, "/v1/"+firstName, nil,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, ok := api.deliveries["first-shared"]; ok {
+		t.Fatal("deleted trigger retained its shared delivery intent")
+	}
+	if _, ok := api.deliveries["first-only"]; ok {
+		t.Fatal("deleted trigger retained its exclusive delivery intent")
+	}
+	if _, ok := api.payloads["first-only"]; ok {
+		t.Fatal("deleted trigger retained its exclusive payload")
+	}
+	if _, ok := api.deliveries["second-shared"]; !ok {
+		t.Fatal("delete removed another trigger's delivery")
+	}
+	if _, ok := api.payloads["shared"]; !ok {
+		t.Fatal("delete removed a payload still referenced by another trigger")
 	}
 }
 
@@ -1202,6 +1574,27 @@ func waitForPersistedDeliveries(t *testing.T, store *controllableStore, stateNam
 	}
 	t.Fatalf("timed out waiting for persisted %s deliveries", stateName)
 	return nil
+}
+
+func waitForStoreDeliveries(t *testing.T, store eventarcStateStore, stateName string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var metadata eventarcMetadata
+		if store.Load(eventarcStateEntry, &metadata) == nil {
+			matches := 0
+			for _, delivery := range metadata.Deliveries {
+				if delivery != nil && delivery.State == stateName {
+					matches++
+				}
+			}
+			if matches == count {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d persisted %s deliveries", count, stateName)
 }
 
 // mockStore is a simple in-memory state store for testing.

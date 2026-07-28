@@ -82,6 +82,8 @@ func TestRuntimeHandlerDockerOperationPreflight(t *testing.T) {
 		{"alloydb instance delete", "alloydb.googleapis.com", http.MethodDelete, "/v1/projects/p/locations/l/clusters/c/instances/i", "", http.StatusTeapot, http.StatusServiceUnavailable, false},
 		{"redis create", "redis.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/instances", `{}`, http.StatusTeapot, http.StatusServiceUnavailable, false},
 		{"redis delete", "redis.googleapis.com", http.MethodDelete, "/v1/projects/p/locations/l/instances/i", "", http.StatusTeapot, http.StatusServiceUnavailable, false},
+		{"memcache node count update reaches semantic handler", "memcache.googleapis.com", http.MethodPatch, "/v1/projects/p/locations/l/instances/i?updateMask=nodeCount", `{}`, http.StatusTeapot, http.StatusTeapot, true},
+		{"memcache comma separated node count reaches semantic handler", "memcache.googleapis.com", http.MethodPatch, "/v1/projects/p/locations/l/instances/i?updateMask=displayName%2C%20nodeCount%20", `{}`, http.StatusTeapot, http.StatusTeapot, true},
 
 		{"batch metadata create", "batch.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/jobs", metadataBatch, http.StatusCreated, http.StatusCreated, true},
 		{"batch unsupported runnable shape", "batch.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/jobs", `{"taskGroups":[{"taskSpec":{"runnables":[{"container":{"imageUri":"busybox"}}]},"taskCount":"2"}]}`, http.StatusNotImplemented, http.StatusNotImplemented, true},
@@ -93,6 +95,8 @@ func TestRuntimeHandlerDockerOperationPreflight(t *testing.T) {
 		{"alloydb unsupported read pool", "alloydb.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/clusters/c/instances", readPool, http.StatusNotImplemented, http.StatusNotImplemented, true},
 		{"valkey remains unsupported", "memorystore.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/instances", `{}`, http.StatusNotImplemented, http.StatusNotImplemented, true},
 		{"redis unsupported export", "redis.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/instances/i:export", `{}`, http.StatusNotImplemented, http.StatusNotImplemented, true},
+		{"memcache metadata update", "memcache.googleapis.com", http.MethodPatch, "/v1/projects/p/locations/l/instances/i?updateMask=displayName%2Clabels", `{}`, http.StatusOK, http.StatusOK, true},
+		{"memcache noncanonical mask case remains metadata", "memcache.googleapis.com", http.MethodPatch, "/v1/projects/p/locations/l/instances/i?updateMask=NodeCount", `{}`, http.StatusOK, http.StatusOK, true},
 		{"unknown domain defaults off", "example.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/instances", `{}`, http.StatusCreated, http.StatusCreated, true},
 		{"available Docker bypasses preflight", "composer.googleapis.com", http.MethodPost, "/v1/projects/p/locations/l/environments", `{}`, http.StatusCreated, http.StatusCreated, true},
 	}

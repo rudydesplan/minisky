@@ -1,5 +1,57 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v python3 >/dev/null 2>&1 || { echo "Required command not found: python3" >&2; exit 1; }
+airflow_image="$(
+  python3 - "${root}/pkg/config/images.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.load(source)["composer"]["airflow_image"])
+PY
+)"
+
+verify_container_image() {
+  local container=$1 configured_reference expected_repo_digest repo_digests
+  configured_reference="$(docker inspect --format '{{.Config.Image}}' "${container}")"
+  [[ "${configured_reference}" == "${airflow_image}" ]] || {
+    echo "Airflow configured image mismatch: expected ${airflow_image}, got ${configured_reference}" >&2
+    return 1
+  }
+  expected_repo_digest="$(
+    python3 - "${airflow_image}" <<'PY'
+import sys
+tagged, digest = sys.argv[1].rsplit("@", 1)
+slash = tagged.rfind("/")
+colon = tagged.rfind(":")
+if colon <= slash:
+    raise SystemExit("image reference lacks an explicit tag")
+print(f"{tagged[:colon]}@{digest}")
+PY
+  )"
+  repo_digests="$(docker image inspect --format '{{json .RepoDigests}}' "${configured_reference}")"
+  python3 - "${repo_digests}" "${expected_repo_digest}" <<'PY' || {
+import json, sys
+raise SystemExit(0 if sys.argv[2] in (json.loads(sys.argv[1]) or []) else 1)
+PY
+    echo "Airflow repository digest mismatch: expected ${expected_repo_digest}, got ${repo_digests}" >&2
+    return 1
+  }
+}
+
+if [[ "${1:-}" == "--print-required-images" && "$#" -eq 1 ]]; then
+  printf '%s\n' "${airflow_image}"
+  exit 0
+fi
+if [[ "${1:-}" == "--verify-container-image" && "$#" -eq 2 ]]; then
+  verify_container_image "$2"
+  exit
+fi
+[[ "$#" -eq 0 ]] || {
+  echo "Usage: $0 [--print-required-images | --verify-container-image <container>]" >&2
+  exit 2
+}
 
 if [[ "${MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION:-}" != "1" ||
       "${MINISKY_PHASE19_DOCKER_INTEGRATION:-}" != "1" ]]; then
@@ -10,7 +62,6 @@ for command in curl docker go python3 terraform; do
   command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
 docker info >/dev/null
-airflow_image="apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
 docker image inspect "${airflow_image}" >/dev/null
 
 shared_lock="${TMPDIR:-/tmp}/minisky-net-integration.lock"
@@ -18,7 +69,6 @@ phase_lock="${TMPDIR:-/tmp}/minisky-phase19-composer-terraform-integration.lock"
 mkdir "${shared_lock}" 2>/dev/null || { echo "Another MiniSky Docker integration is active." >&2; exit 1; }
 mkdir "${phase_lock}" 2>/dev/null || { rmdir "${shared_lock}"; echo "Another Composer Terraform gate is active." >&2; exit 1; }
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 terraform_dir="${root}/terraform"
 work="$(mktemp -d)"
 home="${work}/home"
@@ -138,12 +188,10 @@ if sys.argv[3] == "ERROR" and config.get("airflowUri"):
 PY
 }
 assert_backend() {
-  local container image
+  local container
   container="$(docker ps -q --filter "label=minisky.profile=${profile}" --filter "label=minisky.resource=${canonical}")"
   [[ -n "${container}" ]] || { echo "Exact-owned Airflow container missing." >&2; return 1; }
-  image="$(docker inspect --format '{{.Image}}' "${container}")"
-  [[ "${image}" == "sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79" ]] ||
-    { echo "Airflow image digest mismatch: ${image}" >&2; return 1; }
+  verify_container_image "${container}"
   capture_volumes "${container}"
 }
 assert_dag_execution() {
@@ -202,7 +250,7 @@ stop_daemon
 
 start_daemon restart
 set_vars
-assert_environment ERROR
+assert_environment RUNNING
 assert_backend
 assert_no_drift
 terraform -chdir="${terraform_dir}" state rm -backup="${work}/state-before-import.backup" 'google_composer_environment.phase19[0]'

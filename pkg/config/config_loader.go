@@ -56,6 +56,7 @@ type ImageRegistry struct {
 	Dataproc         DataprocConfig            `json:"dataproc"`
 	Memorystore      MemorystoreConfig         `json:"memorystore"`
 	CloudBuild       CloudBuildConfig          `json:"cloudbuild"`
+	Composer         ComposerConfig            `json:"composer"`
 	ArtifactRegistry ArtifactRegistryConfig    `json:"artifact_registry"`
 	VertexAI         VertexAiConfig            `json:"vertex_ai"`
 }
@@ -129,6 +130,10 @@ type CloudBuildConfig struct {
 	DefaultBuilder string `json:"default_builder"`
 }
 
+type ComposerConfig struct {
+	AirflowImage string `json:"airflow_image"`
+}
+
 type ArtifactRegistryConfig struct {
 	Image  string `json:"image"`
 	Port   string `json:"port"`
@@ -183,12 +188,21 @@ func fallbackRegistry() *ImageRegistry {
 			MasterPorts:  []string{"8080/tcp"},
 		},
 		Memorystore: MemorystoreConfig{
-			Redis:     MemoryEngineConfig{DefaultImage: "redis:latest"},
-			Memcached: MemoryEngineConfig{DefaultImage: "memcached:latest"},
-			Valkey:    MemoryEngineConfig{DefaultImage: "valkey/valkey:latest"},
+			Redis: MemoryEngineConfig{DefaultImage: "redis:latest"},
+			Memcached: MemoryEngineConfig{
+				DefaultImage: "memcached:1.6.15-alpine",
+				Versions: []MemoryVersion{
+					{Version: "1.5.16", Label: "Memcached 1.5.16 (Provider API)", Image: "memcached:1.5.16-alpine"},
+					{Version: "1.6.15", Label: "Memcached 1.6.15 (Provider API)", Image: "memcached:1.6.15-alpine"},
+				},
+			},
+			Valkey: MemoryEngineConfig{DefaultImage: "valkey/valkey:latest"},
 		},
 		CloudBuild: CloudBuildConfig{
 			DefaultBuilder: "ubuntu:26.04",
+		},
+		Composer: ComposerConfig{
+			AirflowImage: "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79",
 		},
 	}
 }

@@ -1,8 +1,11 @@
 package composer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"sort"
+	"time"
 
 	"minisky/pkg/state"
 )
@@ -59,12 +62,35 @@ func (api *API) loadState() error {
 	}
 	if meta.Environments != nil {
 		api.environments = make(map[string]*Environment, len(meta.Environments))
-		for name, environment := range meta.Environments {
+		names := make([]string, 0, len(meta.Environments))
+		for name := range meta.Environments {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			environment := meta.Environments[name]
 			restored := deepCopyEnvironment(environment)
 			restored.State = "ERROR"
 			if restored.Config != nil {
 				restored.Config.AirflowURI = ""
 				restored.Config.DagGcsPrefix = ""
+			}
+			if api.backend != nil {
+				timeout := api.reconcileTimeout
+				if timeout <= 0 {
+					timeout = 5 * time.Second
+				}
+				reconcileCtx, cancel := context.WithTimeout(context.Background(), timeout)
+				endpoint, owned, reconcileErr := api.backend.Reconcile(reconcileCtx, name)
+				cancel()
+				if reconcileErr == nil && owned {
+					restored.State = "RUNNING"
+					if restored.Config == nil {
+						restored.Config = &EnvironmentConfig{}
+					}
+					restored.Config.AirflowURI = endpoint
+					restored.Config.DagGcsPrefix = "minisky://" + name + "/dags"
+				}
 			}
 			api.environments[name] = restored
 		}

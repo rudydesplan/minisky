@@ -219,6 +219,12 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		gatedHandler.ServeHTTP(w, r)
 		return
 	}
+	if targetDomain == "binaryauthorization.googleapis.com" &&
+		!validBinaryAuthorizationProjectPath(r.URL.Path) {
+		p.writeAuthError(w, http.StatusBadRequest, "INVALID_ARGUMENT",
+			"Binary Authorization project identifier is invalid")
+		return
+	}
 	if targetDomain == "vision.googleapis.com" &&
 		r.Method == http.MethodPost &&
 		r.URL.Path == "/v1/images:annotate" &&
@@ -342,7 +348,7 @@ func (p *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyRouter) enforceServicePerimeter(w http.ResponseWriter, r *http.Request, service string) bool {
-	if !strings.HasSuffix(service, ".googleapis.com") {
+	if !strings.HasSuffix(service, ".googleapis.com") || service == "iamcredentials.googleapis.com" {
 		return true
 	}
 	projects := projectsFromRequest(r)
@@ -675,6 +681,9 @@ func (p *ProxyRouter) validateProject(w http.ResponseWriter, r *http.Request, do
 }
 
 func routePermission(domain string, r *http.Request) (string, string) {
+	if domain == "memcache.googleapis.com" {
+		return memcacheRoutePermission(r)
+	}
 	project := projectFromRequest(r)
 	resource := "projects/" + project
 	path := strings.TrimSuffix(r.URL.Path, "/")
@@ -727,6 +736,124 @@ func routePermission(domain string, r *http.Request) (string, string) {
 		return permission, resource
 	}
 	return "", resource
+}
+
+func memcacheRoutePermission(r *http.Request) (string, string) {
+	if r.URL.RawPath != "" {
+		return "", ""
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	if len(parts) < 6 || parts[0] != "v1" || parts[1] != "projects" ||
+		!canonicalMemcacheProjectID(parts[2]) || parts[3] != "locations" ||
+		(parts[4] != "-" && !canonicalMemcacheResourceID(parts[4])) {
+		return "", ""
+	}
+	switch {
+	case len(parts) == 6 && parts[5] == "instances":
+		parent := strings.Join(parts[1:5], "/")
+		if parts[4] == "-" {
+			parent = strings.Join(parts[1:3], "/")
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			return "memcache.instances.list", parent
+		case http.MethodPost:
+			if parts[4] == "-" {
+				return "", ""
+			}
+			return "memcache.instances.create", parent
+		}
+	case len(parts) == 7 && parts[4] != "-" && parts[5] == "instances" && canonicalMemcacheResourceID(parts[6]):
+		resource := strings.Join(parts[1:], "/")
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			return "memcache.instances.get", resource
+		case http.MethodPatch:
+			return "memcache.instances.update", resource
+		case http.MethodDelete:
+			return "memcache.instances.delete", resource
+		}
+	case len(parts) == 7 && parts[4] != "-" && parts[5] == "operations" && canonicalMemcacheResourceID(parts[6]):
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			return "memcache.operations.get", strings.Join(parts[1:], "/")
+		}
+	}
+	return "", ""
+}
+
+func canonicalMemcacheProjectID(value string) bool {
+	if value == "" || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') && character != '-' {
+			return false
+		}
+	}
+	return value[len(value)-1] != '-'
+}
+
+func canonicalMemcacheResourceID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') && character != '-' {
+			return false
+		}
+	}
+	return value[0] != '-' && value[len(value)-1] != '-'
+}
+
+func validBinaryAuthorizationProjectPath(requestPath string) bool {
+	const prefix = "/v1/projects/"
+	if !strings.HasPrefix(requestPath, prefix) {
+		return true
+	}
+	rest := strings.TrimPrefix(requestPath, prefix)
+	project, _, found := strings.Cut(rest, "/")
+	if !found || project == "" {
+		return false
+	}
+	if allDecimal(project) {
+		return true
+	}
+	if project[0] < 'a' || project[0] > 'z' {
+		return false
+	}
+	last := project[len(project)-1]
+	if !lowercaseOrDigit(last) {
+		return false
+	}
+	for _, character := range project {
+		if character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func lowercaseOrDigit(character byte) bool {
+	return character >= 'a' && character <= 'z' ||
+		character >= '0' && character <= '9'
+}
+
+func allDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type strictIAMResourceRoute struct {
@@ -918,6 +1045,9 @@ var strictIAMResourceRoutes = map[string][]strictIAMResourceRoute{
 	},
 	"logging.googleapis.com": {
 		{[]string{"/v2/projects/{project}/sinks"}, "logging.sinks", false},
+	},
+	"memcache.googleapis.com": {
+		{[]string{"/v1/projects/{project}/locations/{location}/instances"}, "memcache.instances", false},
 	},
 	"managedkafka.googleapis.com": {
 		{[]string{"/v1/projects/{project}/locations/{location}/clusters"}, "managedkafka.clusters", false},
@@ -1454,8 +1584,17 @@ func canonicalEndpoint(path string) (selector, servicePath string, canonical boo
 }
 
 func rewriteRequestPath(r *http.Request, path string) {
+	hadEncodedPath := r.URL.RawPath != "" || strings.Contains(r.URL.EscapedPath(), "%")
 	r.URL.Path = path
-	r.URL.RawPath = ""
+	if hadEncodedPath {
+		// Keep a valid RawPath equivalent of the rewritten Path. The exact gateway
+		// prefix is intentionally removed, while the non-empty RawPath preserves
+		// evidence that the caller supplied path encoding for downstream canonical
+		// path validation. Query encoding remains untouched in RawQuery.
+		r.URL.RawPath = (&url.URL{Path: path}).EscapedPath()
+	} else {
+		r.URL.RawPath = ""
+	}
 	r.RequestURI = r.URL.RequestURI()
 }
 

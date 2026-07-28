@@ -23,9 +23,20 @@ type workflowsStateStore interface {
 }
 
 type workflowsMetadata struct {
-	Workflows  map[string]*Workflow  `json:"workflows"`
-	Executions map[string]*Execution `json:"executions"`
-	RevCounter int                   `json:"revCounter"`
+	Workflows       map[string]*Workflow       `json:"workflows"`
+	Executions      map[string]*Execution      `json:"executions"`
+	EventAdmissions map[string]*eventAdmission `json:"eventAdmissions,omitempty"`
+	RevCounter      int                        `json:"revCounter"`
+}
+
+const (
+	eventAdmissionAdmitted = "ADMITTED"
+	eventAdmissionRunning  = "RUNNING"
+)
+
+type eventAdmission struct {
+	DeliveryID string `json:"deliveryId"`
+	Phase      string `json:"phase"`
 }
 
 func validateWorkflowsMetadata(_ state.EntryValidationContext, metadata *workflowsMetadata) error {
@@ -59,6 +70,18 @@ func validateWorkflowsMetadata(_ state.EntryValidationContext, metadata *workflo
 			return fmt.Errorf("execution %q references missing workflow", name)
 		}
 	}
+	for name, admission := range metadata.EventAdmissions {
+		execution := metadata.Executions[name]
+		if admission == nil || execution == nil || execution.State != "ACTIVE" {
+			return fmt.Errorf("event admission %q does not reference an active execution", name)
+		}
+		if !validEventDeliveryID(admission.DeliveryID) {
+			return fmt.Errorf("event admission %q has invalid delivery ID", name)
+		}
+		if admission.Phase != eventAdmissionAdmitted && admission.Phase != eventAdmissionRunning {
+			return fmt.Errorf("event admission %q has invalid phase %q", name, admission.Phase)
+		}
+	}
 	return nil
 }
 
@@ -70,11 +93,10 @@ func (api *API) persistState() error {
 	api.persistMu.Lock()
 	defer api.persistMu.Unlock()
 
-	wfSnapshot, execSnapshot, revCounter := api.snapshot()
+	wfSnapshot, execSnapshot, admissionSnapshot, revCounter := api.snapshotPersistentState()
 	return api.stateStore.Save(workflowsStateEntry, workflowsMetadata{
-		Workflows:  wfSnapshot,
-		Executions: execSnapshot,
-		RevCounter: revCounter,
+		Workflows: wfSnapshot, Executions: execSnapshot,
+		EventAdmissions: admissionSnapshot, RevCounter: revCounter,
 	})
 }
 
@@ -99,6 +121,10 @@ func (api *API) compensateState(cause error) {
 	if api.executions == nil {
 		api.executions = make(map[string]*Execution)
 	}
+	api.eventAdmissions = durable.EventAdmissions
+	if api.eventAdmissions == nil {
+		api.eventAdmissions = make(map[string]*eventAdmission)
+	}
 	api.revCounter = durable.RevCounter
 	api.mu.Unlock()
 }
@@ -118,6 +144,29 @@ func (api *API) snapshot() (map[string]*Workflow, map[string]*Execution, int) {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return api.snapshotLocked()
+}
+
+func (api *API) snapshotPersistentState() (
+	map[string]*Workflow,
+	map[string]*Execution,
+	map[string]*eventAdmission,
+	int,
+) {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	workflows, executions, revision := api.snapshotLocked()
+	return workflows, executions, api.eventAdmissionsSnapshotLocked(), revision
+}
+
+func (api *API) eventAdmissionsSnapshotLocked() map[string]*eventAdmission {
+	admissions := make(map[string]*eventAdmission, len(api.eventAdmissions))
+	for name, admission := range api.eventAdmissions {
+		if admission != nil {
+			clone := *admission
+			admissions[name] = &clone
+		}
+	}
+	return admissions
 }
 
 func (api *API) snapshotLocked() (map[string]*Workflow, map[string]*Execution, int) {
@@ -150,23 +199,38 @@ func (api *API) loadState() error {
 	if meta.Executions != nil {
 		api.executions = meta.Executions
 	}
+	if meta.EventAdmissions != nil {
+		api.eventAdmissions = meta.EventAdmissions
+	}
 	api.revCounter = meta.RevCounter
 	changed := false
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for name, execution := range api.executions {
 		if execution != nil && execution.State == "ACTIVE" {
+			if admission := api.eventAdmissions[name]; admission != nil &&
+				admission.Phase == eventAdmissionAdmitted {
+				index := strings.LastIndex(name, "/executions/")
+				if index >= 0 {
+					workflow := api.workflows[name[:index]]
+					if workflow != nil && workflow.RevisionID == execution.WorkflowRevisionID {
+						continue
+					}
+				}
+			}
 			execution.State = "FAILED"
 			execution.EndTime = now
 			execution.Error = &ExecutionError{
 				Payload: "execution interrupted by MiniSky restart",
 				Context: name,
 			}
+			delete(api.eventAdmissions, name)
 			changed = true
 		}
 	}
 	if changed {
 		return api.stateStore.Save(workflowsStateEntry, workflowsMetadata{
-			Workflows: api.workflows, Executions: api.executions, RevCounter: api.revCounter,
+			Workflows: api.workflows, Executions: api.executions,
+			EventAdmissions: api.eventAdmissions, RevCounter: api.revCounter,
 		})
 	}
 	return nil

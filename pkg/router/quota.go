@@ -66,7 +66,35 @@ func NewQuotaLimiter(config QuotaConfig, now func() time.Time) (*QuotaLimiter, e
 			}
 		}
 	}
-	return &QuotaLimiter{config: config, buckets: make(map[string]quotaBucket), now: now}, nil
+	return &QuotaLimiter{
+		config: QuotaConfig{
+			Default:  cloneQuotaRule(config.Default),
+			Services: cloneQuotaRules(config.Services),
+			Projects: cloneQuotaRules(config.Projects),
+			Routes:   cloneQuotaRules(config.Routes),
+		},
+		buckets: make(map[string]quotaBucket),
+		now:     now,
+	}, nil
+}
+
+func cloneQuotaRule(rule *QuotaRule) *QuotaRule {
+	if rule == nil {
+		return nil
+	}
+	cloned := *rule
+	return &cloned
+}
+
+func cloneQuotaRules(rules map[string]QuotaRule) map[string]QuotaRule {
+	if rules == nil {
+		return nil
+	}
+	cloned := make(map[string]QuotaRule, len(rules))
+	for selector, rule := range rules {
+		cloned[selector] = rule
+	}
+	return cloned
 }
 
 func (q *QuotaLimiter) Allow(service, route, project string) QuotaDecision {

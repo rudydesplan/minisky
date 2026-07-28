@@ -271,6 +271,52 @@ func TestAuditCheckpointDetectsValidPrefixTruncation(t *testing.T) {
 	}
 }
 
+func TestAuditLogContinuesHashChainAfterRestart(t *testing.T) {
+	profileDir := t.TempDir()
+	appendMutation := func(t *testing.T, audit *AuditLog) {
+		t.Helper()
+		handler := audit.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}), func(r *http.Request) AuditEvent {
+			return AuditEvent{Method: r.Method, Route: "/resource"}
+		})
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/resource", nil))
+	}
+
+	first, err := OpenAuditLog(profileDir, "restart", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendMutation(t, first)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := OpenAuditLog(profileDir, "restart", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	appendMutation(t, restarted)
+	if err := restarted.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	var exported bytes.Buffer
+	if err := restarted.Export(&exported, 10); err != nil {
+		t.Fatal(err)
+	}
+	var records []AuditRecord
+	if err := json.Unmarshal(exported.Bytes(), &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 ||
+		records[0].Sequence != 1 ||
+		records[1].Sequence != 2 ||
+		records[1].PreviousHash != records[0].Hash {
+		t.Fatalf("restart chain = %#v", records)
+	}
+}
+
 func TestAuditRejectsSymlinkedProfilePath(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

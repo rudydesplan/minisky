@@ -6,15 +6,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type recordingKafkaRunner struct {
-	mu            sync.Mutex
-	commands      [][]string
-	inputs        [][]byte
-	inspectErr    error
-	inspectOutput []byte
-	exists        bool
+	mu             sync.Mutex
+	commands       [][]string
+	inputs         [][]byte
+	inspectErr     error
+	inspectOutput  []byte
+	exists         bool
+	readyFailures  int
+	readinessCalls int
 }
 
 func (r *recordingKafkaRunner) Run(_ context.Context, input []byte, args ...string) ([]byte, error) {
@@ -39,6 +42,16 @@ func (r *recordingKafkaRunner) Run(_ context.Context, input []byte, args ...stri
 	case "port":
 		return []byte("127.0.0.1:19092\n"), nil
 	default:
+		if strings.Contains(strings.Join(args, " "), "kafka-topics.sh") &&
+			strings.Contains(strings.Join(args, " "), "--list") {
+			r.mu.Lock()
+			r.readinessCalls++
+			calls := r.readinessCalls
+			r.mu.Unlock()
+			if calls <= r.readyFailures {
+				return []byte("broker unavailable"), errors.New("exit status 1")
+			}
+		}
 		if strings.Contains(strings.Join(args, " "), "kafka-console-consumer.sh") {
 			return []byte("first\nsecond\n"), nil
 		}
@@ -114,6 +127,66 @@ func TestKafkaBackendPropagatesDockerInspectFailure(t *testing.T) {
 	err := backend.Delete(context.Background(), "projects/p/locations/l/clusters/c")
 	if !errors.Is(err, daemonErr) {
 		t.Fatalf("Delete error = %v, want Docker inspect error", err)
+	}
+}
+
+func TestKafkaReconcileDoesNotCreateMissingContainer(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "kafka-backend-test")
+	runner := &recordingKafkaRunner{}
+	backend := &dockerKafkaBackend{runner: runner}
+
+	endpoint, ok, err := backend.Reconcile(context.Background(), "projects/p/locations/l/clusters/c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || endpoint != "" {
+		t.Fatalf("reconcile = (%q, %v), want missing backend", endpoint, ok)
+	}
+	if strings.Contains(kafkaCommandsText(runner.commands), "run ") {
+		t.Fatalf("reconcile created a container: %s", kafkaCommandsText(runner.commands))
+	}
+}
+
+func TestKafkaReconcileRetriesReadinessUntilSuccess(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "kafka-backend-test")
+	runner := &recordingKafkaRunner{exists: true, readyFailures: 2}
+	backend := &dockerKafkaBackend{runner: runner}
+
+	endpoint, owned, err := backend.Reconcile(context.Background(), "projects/p/locations/l/clusters/c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned || endpoint != "127.0.0.1:19092" || runner.readinessCalls != 3 {
+		t.Fatalf("reconcile = (%q, %v), readiness calls=%d", endpoint, owned, runner.readinessCalls)
+	}
+}
+
+func TestKafkaReconcileWrapsReadinessDeadline(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "kafka-backend-test")
+	runner := &recordingKafkaRunner{exists: true, readyFailures: 1000}
+	backend := &dockerKafkaBackend{runner: runner}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, _, err := backend.Reconcile(ctx, "projects/p/locations/l/clusters/c")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile error = %v, want wrapped deadline", err)
+	}
+}
+
+func TestKafkaTopicMutationRejectsUnownedContainer(t *testing.T) {
+	t.Setenv("MINISKY_PROFILE", "kafka-backend-test")
+	runner := &recordingKafkaRunner{exists: true}
+	backend := &dockerKafkaBackend{runner: runner}
+	resource := "projects/p/locations/l/clusters/other"
+	topic := &Topic{Name: resource + "/topics/events", PartitionCount: 1, ReplicationFactor: 1}
+
+	err := backend.CreateTopic(context.Background(), resource, topic)
+	if err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("CreateTopic error = %v, want ownership rejection", err)
+	}
+	if strings.Contains(kafkaCommandsText(runner.commands), "--create") {
+		t.Fatalf("unowned topic mutation executed: %s", kafkaCommandsText(runner.commands))
 	}
 }
 

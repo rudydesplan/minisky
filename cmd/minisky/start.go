@@ -34,6 +34,7 @@ import (
 	"minisky/pkg/shims/compute"
 	"minisky/pkg/shims/gke"
 	"minisky/pkg/shims/iam"
+	"minisky/pkg/shims/iamcredentials"
 	"minisky/pkg/shims/logging"
 	"minisky/pkg/shims/memorystore"
 	"minisky/pkg/shims/monitoring"
@@ -206,10 +207,7 @@ var startCmd = &cobra.Command{
 			Endpoint:       otelEndpoint,
 			ServiceVersion: version.Version,
 		})
-		if telemetryErr != nil {
-			log.Printf("[WARN] OpenTelemetry disabled after setup failure: %v", telemetryErr)
-			telemetryShutdown = func(context.Context) error { return nil }
-		}
+		telemetryShutdown = telemetrySetupOrNoop(telemetryShutdown, telemetryErr)
 		telemetryClosed := false
 		defer func() {
 			if telemetryClosed {
@@ -219,11 +217,6 @@ var startCmd = &cobra.Command{
 			defer cancelTelemetry()
 			result = errors.Join(result, telemetryShutdown(telemetryCtx))
 		}()
-		gatewayObservability := observability.New(observability.Config{
-			Capacity:           1000,
-			ReplayEnabled:      replayEnabled,
-			ReplayMaxBodyBytes: replayMaxBody,
-		})
 		quotaLimiter, err := router.ParseQuotaConfigJSON(quotaConfigJSON, time.Now)
 		if err != nil {
 			return fmt.Errorf("parse quota configuration: %w", err)
@@ -258,14 +251,21 @@ var startCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("select service domains: %w", err)
 		}
+		knownServices := make([]string, 0, len(exposedShims)+len(exposedLazyDomains))
+		for domain := range exposedShims {
+			knownServices = append(knownServices, domain)
+		}
+		knownServices = append(knownServices, exposedLazyDomains...)
+		gatewayObservability := observability.New(observability.Config{
+			Capacity:           1000,
+			ReplayEnabled:      replayEnabled,
+			ReplayMaxBodyBytes: replayMaxBody,
+			KnownServices:      knownServices,
+		})
 		iamAPI := shims["iam.googleapis.com"].(*iam.API)
 		projectAPI := shims["cloudresourcemanager.googleapis.com"].(*resourcemanager.API)
 		proxyRouter.ConfigureSecurity(iamAPI, projectAPI, enforceProjects, tokenAudience)
-		perimeterAPI, ok := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API)
-		if !ok {
-			perimeterAPI = accesscontextmanager.NewAPI(opMgr)
-		}
-		proxyRouter.ConfigureServicePerimeters(perimeterAPI)
+		configureStartupServicePerimeters(proxyRouter, shims, opMgr)
 		proxyRouter.ConfigureQuota(quotaLimiter, gatewayObservability.ObserveQuotaRejection)
 
 		for domain, handler := range exposedShims {
@@ -433,6 +433,33 @@ var startCmd = &cobra.Command{
 		}
 		return errors.Join(listenerErr, shutdownErr)
 	},
+}
+
+func configureStartupServicePerimeters(
+	proxyRouter *router.ProxyRouter,
+	shims map[string]http.Handler,
+	opMgr *orchestrator.OperationManager,
+) *accesscontextmanager.API {
+	perimeterAPI, ok := shims["accesscontextmanager.googleapis.com"].(*accesscontextmanager.API)
+	if !ok {
+		perimeterAPI = accesscontextmanager.NewAPI(opMgr)
+	}
+	proxyRouter.ConfigureServicePerimeters(perimeterAPI)
+	if credentialsAPI, ok := shims["iamcredentials.googleapis.com"].(*iamcredentials.API); ok {
+		credentialsAPI.ConfigureServicePerimeters(perimeterAPI)
+	}
+	return perimeterAPI
+}
+
+func telemetrySetupOrNoop(
+	shutdown func(context.Context) error,
+	setupErr error,
+) func(context.Context) error {
+	if setupErr == nil {
+		return shutdown
+	}
+	log.Printf("[WARN] OpenTelemetry disabled after setup failure: %v", setupErr)
+	return func(context.Context) error { return nil }
 }
 
 func waitForDaemonListener(ctx context.Context, results <-chan error) error {
@@ -771,7 +798,7 @@ func shutdownPlugins(ctx context.Context, shims map[string]http.Handler) error {
 		go func() {
 			completed <- shutdownResult{
 				domain: target.domain,
-				err:    target.lifecycle.Shutdown(ctx),
+				err:    invokePluginShutdown(ctx, target.lifecycle),
 			}
 		}()
 	}
@@ -804,6 +831,17 @@ func shutdownPlugins(ctx context.Context, shims map[string]http.Handler) error {
 		result = errors.Join(result, fmt.Errorf("%s: %w", failure.domain, failure.err))
 	}
 	return result
+}
+
+func invokePluginShutdown(ctx context.Context, lifecycle interface {
+	Shutdown(context.Context) error
+}) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("plugin shutdown panicked")
+		}
+	}()
+	return lifecycle.Shutdown(ctx)
 }
 
 func shutdownTelemetryAndPlugins(

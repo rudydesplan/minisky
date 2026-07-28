@@ -131,6 +131,10 @@ func NewAPIWithInventory(inventory Inventory, exportRoot string) *API {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-MiniSky-Simulated", "true")
+	if !canonicalCloudAssetRequestPath(r) {
+		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "non-canonical Cloud Asset request path")
+		return
+	}
 	switch {
 	case strings.HasSuffix(r.URL.Path, ":exportAssets") && r.Method == http.MethodPost:
 		api.exportAssets(w, r)
@@ -147,6 +151,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) listAssets(w http.ResponseWriter, r *http.Request) {
 	parent := parentFromPath(r.URL.Path, "/assets")
+	if !validateSupportedParent(w, parent) {
+		return
+	}
 	assets := api.assets(parent)
 	page, next, err := paginateAssets(assets, r.URL.Query().Get("pageSize"), r.URL.Query().Get("pageToken"),
 		pagination.Scope{Service: "cloudasset.assets", Parent: parent})
@@ -159,6 +166,9 @@ func (api *API) listAssets(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) searchAllResources(w http.ResponseWriter, r *http.Request) {
 	parent := parentFromPath(r.URL.Path, ":searchAllResources")
+	if !validateSupportedParent(w, parent) {
+		return
+	}
 	query := r.URL.Query().Get("query")
 	assets := api.assets(parent)
 	results := make([]Asset, 0, len(assets))
@@ -178,6 +188,10 @@ func (api *API) searchAllResources(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) exportAssets(w http.ResponseWriter, r *http.Request) {
+	parent := parentFromPath(r.URL.Path, ":exportAssets")
+	if !validateSupportedParent(w, parent) {
+		return
+	}
 	if api.exportRoot == "" {
 		gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
 			"exportAssets requires an explicitly configured local export root")
@@ -202,7 +216,6 @@ func (api *API) exportAssets(w http.ResponseWriter, r *http.Request) {
 		gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
-	parent := parentFromPath(r.URL.Path, ":exportAssets")
 	var payload bytes.Buffer
 	if err := json.NewEncoder(&payload).Encode(map[string]any{"assets": api.assets(parent)}); err != nil {
 		gcpError(w, http.StatusInternalServerError, "INTERNAL", "encode local asset export failed")
@@ -226,7 +239,13 @@ func (api *API) assets(parent string) []Asset {
 	if api.inventory == nil {
 		return []Asset{}
 	}
-	assets := append([]Asset(nil), api.inventory.Assets(parent)...)
+	discovered := api.inventory.Assets(parent)
+	assets := make([]Asset, 0, len(discovered))
+	for _, asset := range discovered {
+		if asset.Project == parent {
+			assets = append(assets, asset)
+		}
+	}
 	sort.Slice(assets, func(i, j int) bool {
 		if assets[i].AssetType == assets[j].AssetType {
 			return assets[i].Name < assets[j].Name
@@ -239,6 +258,68 @@ func (api *API) assets(parent string) []Asset {
 func parentFromPath(path, suffix string) string {
 	trimmed := strings.TrimPrefix(path, "/v1/")
 	return strings.TrimSuffix(trimmed, suffix)
+}
+
+func validateSupportedParent(w http.ResponseWriter, parent string) bool {
+	parts := strings.Split(parent, "/")
+	if len(parts) == 2 && parts[0] == "projects" && validScopeSegment(parts[1]) {
+		return true
+	}
+	if len(parts) == 2 && (parts[0] == "organizations" || parts[0] == "folders") &&
+		validNumericScopeID(parts[1]) {
+		gcpError(w, http.StatusNotImplemented, "UNIMPLEMENTED",
+			"only project-scoped local inventory is implemented")
+		return false
+	}
+	gcpError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid project parent")
+	return false
+}
+
+func validScopeSegment(segment string) bool {
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for index, character := range segment {
+		alphaNumeric := (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9')
+		if !alphaNumeric && character != '-' {
+			return false
+		}
+		if (index == 0 || index == len(segment)-1) && !alphaNumeric {
+			return false
+		}
+	}
+	return true
+}
+
+func validNumericScopeID(segment string) bool {
+	if segment == "" || segment[0] == '0' {
+		return false
+	}
+	for _, character := range segment {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(segment, 10, 64)
+	return err == nil
+}
+
+func canonicalCloudAssetRequestPath(request *http.Request) bool {
+	if request.URL.RawPath != "" || strings.Contains(request.URL.EscapedPath(), "%") {
+		return false
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(request.URL.Path, "/"), "/") {
+		if part == "" || part == "." || part == ".." || strings.Contains(part, `\`) {
+			return false
+		}
+		for _, character := range part {
+			if character < 0x20 || character == 0x7f {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func paginateAssets(assets []Asset, rawSize, rawToken string, scope pagination.Scope) ([]Asset, string, error) {

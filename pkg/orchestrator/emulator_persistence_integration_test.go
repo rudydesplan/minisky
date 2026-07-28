@@ -149,6 +149,15 @@ func TestStorageAndPubSubDataSurviveContainerAndManagerRestart(t *testing.T) {
 		pullResponse.ReceivedMessages[0].Message.Data != messageBody {
 		t.Fatalf("persisted Pub/Sub message response = %s", pulled)
 	}
+
+	if err := restarted.removeDurableEmulatorContainer(ctx, "storage.googleapis.com", storageConfig); err != nil {
+		t.Fatal(err)
+	}
+	storageRuntime := strings.TrimSuffix(
+		mustDurableEmulatorConfig(t, "storage.googleapis.com", storageConfig).Volume, ":/data")
+	if err := os.RemoveAll(storageRuntime); err != nil {
+		t.Fatalf("remove host-owned Storage runtime after container cleanup: %v", err)
+	}
 }
 
 func doEmulatorRequest(
@@ -179,6 +188,19 @@ func doEmulatorRequest(
 			method, endpoint, response.StatusCode, wantStatus, bytes.TrimSpace(payload))
 	}
 	return payload
+}
+
+func mustDurableEmulatorConfig(
+	t *testing.T,
+	domain string,
+	emulator config.EmulatorConfig,
+) ContainerConfig {
+	t.Helper()
+	container, _, err := durableEmulatorConfig(domain, emulator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return container
 }
 
 func isPinnedEmulatorImage(image string) bool {

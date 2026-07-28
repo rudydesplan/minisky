@@ -18,6 +18,10 @@ the complete native release-equivalent gate remains a promotion prerequisite. On
 dependencies and required images are available locally, verified workflows can
 run offline; first use may pull lazily loaded emulator images.
 
+The bounded Memorystore for Memcached milestone is tracked by the generated
+service-gate section below. It remains a deliberately narrow local emulator
+slice rather than a broad GCP/Memcached parity claim.
+
 [![Go Report Card](https://goreportcard.com/badge/github.com/qamarudeenm/minisky)](https://goreportcard.com/report/github.com/qamarudeenm/minisky)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Mini Movement](https://img.shields.io/badge/Mini-Family-blue.svg)](https://github.com/topics/mini-cloud)
@@ -27,13 +31,21 @@ run offline; first use may pull lazily loaded emulator images.
 ## ✨ Features
 
 <!-- BEGIN GENERATED REGISTRY COUNT -->
-- **🚀 71 Registry-Verified Domains**: The exact catalog count and generated
-  compatibility rows come from `registry.Services()`. Phase 18–25
-  inventory entries remain experimental and default-off.
-  See [Service Compatibility](docs/service-compatibility.md).
+- **🚀 71 Registry-Verified Domains**: 35 implemented, 36 experimental, and 0 deferred.
+  The exact counts and generated compatibility rows come from
+  `registry.Services()`. Phase 18–25 inventory entries remain
+  experimental and default-off. See [Service Compatibility](docs/service-compatibility.md).
 <!-- END GENERATED REGISTRY COUNT -->
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
-  and operational views.
+  and operational views. Dashboard exposure is not service-fidelity or
+  Terraform-compatibility evidence.
 - **🛠️ Terraform Gates**: The pinned Google provider is tested only for resources
   listed in `docs/terraform-compatibility.md`.
 - **🔌 Dynamic Registry**: Modular Go shim registry for community-led service contributions.
@@ -45,9 +57,9 @@ run offline; first use may pull lazily loaded emulator images.
 ### Phase 18–25 Services (Experimental)
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
-**Generated truth:** 36 experimental; 36 default-off; 11 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
+**Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 11 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -69,6 +81,23 @@ restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 The complete Go race suite, documentation truth checks, and package/strict-IAM
 evidence pass locally. All six Phase 18–25 generated-client
 workflows passed create, restart, terminal observation, delete, and cleanup locally.
+The guarded `make test-phase18-event-delivery` gate additionally publishes two
+exact raw `PublishRequest` payloads with unique nonces through the canonical
+public Pub/Sub gateway and observes matching Eventarc-triggered Workflow
+arguments and terminal results. Foreign-topic and foreign-project publishes
+through that gateway produce zero nonce-correlated executions; the Eventarc
+package race test separately isolates trigger-project mismatch and configured
+transport-topic mismatch non-delivery. The gate also proves that completed
+executions persist across restart. Commit
+`852d9e352b7fd400a86ccec655c2434008325cf8` additionally introduced a
+deterministic post-admission pause: the live gate interrupts MiniSky after the
+Eventarc intent and correlated Workflow execution admission are durable, then
+restarts and resumes the same stable execution identity to the exact terminal
+result without creating a duplicate execution resource. It then deletes
+trigger → topic → workflow, restarts, and proves durable absence, no
+post-delete delivery, and exact-owned cleanup. This proves idempotent admission
+and resource identity across restart, not exactly-once external side effects,
+CloudEvents envelope parity, OIDC, ordering, or Eventarc transport provisioning.
 Phase 19 additionally passed exact-owned Kafka protocol and Airflow DAG
 execution with container and anonymous-volume cleanup. Phase 20 passed AlloyDB,
 Filestore, Identity Platform, Redis-domain Valkey, Storage Transfer, canonical
@@ -94,7 +123,12 @@ provider gates now cover default-off `google_workflows_workflow` and
 no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
 canonical import, while provider 7.41.0 does not support Workflows import. The
 Eventarc gate persists one filter, workflow destination, and Pub/Sub transport
-topic but does not claim event delivery or transport provisioning. No other
+topic but remains a control-plane-only Terraform claim. The separate public
+gateway gate proves MiniSky's bounded Pub/Sub → Eventarc → Workflows path,
+including stable post-admission execution identity across restart. It does not
+provide Eventarc transport provisioning, CloudEvents envelope parity, OIDC,
+ordering, or exactly-once external side effects, and it does not promote
+Eventarc from experimental status. No other
 Phase 18 Terraform compatibility is claimed. Separate heavy Phase 19 gates pass
 `google_composer_environment` and `google_managed_kafka_cluster` lifecycles and
 canonical imports against digest-pinned exact-owned backends. Managed Kafka
@@ -128,6 +162,28 @@ including a real bounded local advisory decision, restart, zero drift, canonical
 import reconciliation, delete, durable 404, empty-list cleanup, and fallback to
 the seeded constraint default. This is local simulation, not production
 enforcement, IAM, organization hierarchy, or compliance.
+A separate locally passed Phase 25 gate covers only the default-off
+`google_binary_authorization_policy` project singleton with provider `7.41.0`.
+It applies the deny policy and observes whitelist allow and enforced deny
+before restart. After restart, it proves policy persistence and no drift; it
+does not repeat those decisions. A matching import returns `0`; a stale import
+returns `2` before apply reconciles it to zero drift. Destroy resets the
+singleton to the exact default policy and persists that reset across another
+restart. Package evidence separately proves enforced `DENY` locally blocks
+MiniSky Cloud Deploy rollouts. `DRYRUN_AUDIT_LOG_ONLY` permits rollout and
+returns `AUDIT`; no durable audit record or log is created. Attestation,
+global-policy, and cluster-rule evaluation each returns explicit `UNSUPPORTED`.
+This is Terraform compatibility evidence and local emulation, not fidelity
+promotion, GKE admission, or production admission security. Binary
+Authorization remains experimental and default-off. This Phase 25 Terraform
+gate has local-pass evidence only; no CI run or commit is claimed. A required
+12-entry GitHub Actions matrix now maps every machine-readable Phase 18–25
+Terraform claim exactly once to its guarded Make target and script on pull
+requests and `main`. Composer, Managed Kafka, and AlloyDB matrix entries derive,
+pull, and inspect exact tag-plus-SHA256 image references from their guarded
+scripts before execution; entries without backend images remain lightweight.
+Those CI checks remain `configured-unverified` until an
+external run passes; no run URL or commit is recorded for them yet.
 Unsupported methods return canonical 501
 responses rather than simulated success; Cloud CDN/Armor remains within the
 Compute domain and does not claim full GCP data-plane parity.
@@ -367,15 +423,15 @@ require network access; the command does not prune global Docker resources.
 | 6 | Service support/fidelity baseline and compatibility matrices | Manifest and docs agree on implemented/deferred status; implemented domains have an executable in-process or backend-gated contract, while deferred domains return deterministic unsupported responses | ✅ Baseline |
 | 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; bounded Phase-15 data and Phase-16 network resources are optional | ✅ Baseline |
 | 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
-| 9 | Executable serverless and event delivery | A guarded local Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes; Scheduler remains manual `:run` E2E | ✅ Verified bounded local slice |
+| 9 | Executable serverless and event delivery | A guarded Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes on Linux CI; Scheduler remains manual `:run` E2E | ✅ CI-verified bounded slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
-| 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; doctor covers all runtime dependencies; package-manager and container releases are tested | 🚧 Local slice |
-| 12 | Observability and request diagnostics | Structured gateway logs, trace correlation, and low-cardinality metrics are queryable; eligible requests support opt-in bounded replay | 🚧 Vertical slice |
+| 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; non-publishing GoReleaser, native package, and cross-platform CGO gates pass; external publication remains unverified | 🚧 CI-verified non-publishing slice |
+| 12 | Observability and request diagnostics | Bounded W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay response, and shutdown pass locally and in required CI | ✅ CI-verified bounded platform slice |
 | 13 | Security, authentication, and credential simulation | TLS and local credentials include a bounded static-JWKS OIDC WIF → delegated impersonation path; outputs remain non-production simulations | ✅ Verified local slice |
 | 14 | Multi-tenancy and organization emulation | A guarded two-project Terraform and Go SDK gate proves cross-project Pub/Sub create/read/publish/pull/ack/no-drift/destroy; shared passthrough isolation remains bounded | ✅ Verified bounded local slice |
-| 15 | Extended data services and caching | Spanner, Firestore, Datastore, and Memorystore provide executable query and caching backends | 🚧 Bounded slices |
-| 16 | ML/AI, monitoring, and advanced networking | Guarded generated-SDK restart gates prove persisted Monitoring/PromQL, Cloud Logging entries and sinks, Cloud DNS zones and UDP resolution, one custom-VPC IPv4 subnetwork/Docker bridge, and deterministic Vertex predictions; the bounded network also passes provider apply/import/no-drift/destroy | ✅ Verified bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and Vertex slices |
-| 17 | CI/CD integration, plugin ecosystem, and enterprise | Local CI templates, source-compiled plugin scaffolds, benchmarks, quotas, audit/RBAC controls, and offline bundles have executable checks | ✅ Verified bounded local slice |
+| 15 | Extended data services and caching | Spanner, Firestore, Datastore, Redis, and Memcached have bounded locally verified SDK/backend slices; Redis and Memcached also have guarded provider lifecycles | ✅ Local-verified bounded slices |
+| 16 | ML/AI, monitoring, and advanced networking | Linux CI verifies Monitoring/PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK and Terraform lifecycles, and Vertex prediction restart gates | ✅ CI-verified bounded slices |
+| 17 | CI/CD integration, plugin ecosystem, and enterprise | Linux CI verifies the bounded WIF/RBAC/quota/audit cross-gate; external identity, distributed controls, plugin loading, and publication remain deferred | ✅ CI-verified bounded slice |
 
 ### Phase 6 — Fidelity baseline
 
@@ -428,14 +484,15 @@ import → no-drift → destroy with run-scoped Docker ownership and cleanup.
 
 ### Phase 9 — Serverless and event-driven workflows
 
-**Status (2026-07-25): verified bounded local slice.** The real Pack v0.40.8
-gate passed locally in about 177 seconds. Through MiniSky's local
+**Status (2026-07-28): CI-verified bounded slice.** The real Pack v0.40.8
+gate passed locally in about 177 seconds and passed on Linux in
+[critical run 30333855843](https://github.com/rudydesplan/minisky/actions/runs/30333855843)
+at commit `f36b79eb6d4ed56776b6dac74b5bcb02dac1bffe`. Through MiniSky's local
 `POST /v2/deploy` helper, Storage and Pub/Sub each reached an existing function
 and a Cloud Run-style `type=service` handler; service metadata became ready and
 owned deletion removed its container. Cloud Tasks recorded transient
 `503` → `204` as `COMPLETED` in two attempts and terminal `500` as `FAILED` in
-two attempts. Scheduler HTTP delivery remains a manual `:run` E2E check. The
-opt-in CI job is configured but has no passing CI evidence yet.
+two attempts. Scheduler HTTP delivery remains a manual `:run` E2E check.
 
 `POST /v2/deploy` is a MiniSky-local source-deployment helper shared by the
 function and service harnesses. It is not the Google Cloud Run v2 image-based
@@ -454,7 +511,8 @@ service create API and does not demonstrate Terraform-managed serverless.
   Scheduler as a manual `:run` HTTP E2E check.
 
 Unsupported boundaries remain full Cloud Run v2 source build and Terraform
-serverless, Eventarc and CloudEvents envelopes, Pub/Sub push, Cloud Tasks OIDC,
+serverless, Eventarc CloudEvents envelope parity and transport provisioning,
+Pub/Sub push, Eventarc/Cloud Tasks OIDC,
 task-header, redirect, and dead-letter-queue parity, durable event queueing,
 ordering, exactly-once delivery, target-side deduplication, and production
 serverless operation. Interrupted Cloud Tasks are replayed at least once with a
@@ -503,16 +561,13 @@ and rpm are not published.
 
 ### Phase 12 — Observability and request diagnostics
 
-- Emit structured JSON logs for every API request with correlation IDs,
-  latency, and response status.
-- Integrate OpenTelemetry tracing so spans propagate across gateway, shims,
-  and Docker-backed services.
-- Expose a Prometheus-compatible `/metrics` endpoint for request rates, error
-  rates, and resource counts.
-- Provide opt-in replay for eligible same-gateway calls, with bounded JSON body
-  capture, sensitive-field rejection, and recursion prevention.
-- Surface gateway request and trace correlation data in a dedicated Dashboard
-  view and headless diagnostics CLI, separate from Cloud Logging.
+<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->
+**Generated Phase 12 platform truth:** Local-only gates passed: 3/3.
+
+The bounded platform diagnostics slice covers bounded W3C propagation, sanitized structured access logs, low-cardinality Prometheus metrics, bounded sanitized OTLP export inspection, exporter degradation without changing API responses, bounded replay responses, and graceful shutdown. Replay provides project-keyed lookup scoping, not cross-project authorization. Required Phase 12 CI passed in [GitHub Actions run 30337314745](https://github.com/rudydesplan/minisky/actions/runs/30337314745) on commit `60e82159d7fd80cf6472327b2cd14c2ae1465f23`.
+
+This platform diagnostics layer is separate from the experimental Phase 21–22 service domains. A persistent trace backend, remote diagnostics listener, Cloud Logging parity, and RBAC replay isolation remain deferred.
+<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->
 
 ### Phase 13 — Security, authentication, and credential simulation
 
@@ -568,29 +623,35 @@ shared VPC packet routing.
 
 ### Phase 15 — Extended data services and caching
 
-**Status (2026-07-25): bounded emulator slices implemented.** Memorystore
-metadata and owned Redis lifecycle, profile-scoped Spanner/Firestore/Datastore
-backends, and SDK/Terraform fixtures have local contract and static validation.
-The guarded Docker data-plane suite passed locally after public emulator images
-were preflighted without inheriting host credential helpers; its SDK smoke
-covered Firestore document CRUD/query, Datastore entity/ancestor operations,
-and Spanner DDL/read/write/delete. Firestore listeners/rules remain unsupported.
+**Status (2026-07-28): bounded local emulator slices verified.** Profile-scoped
+Firestore and Datastore backends and the official Spanner emulator passed their
+generated-client data-plane gate. Redis has a persisted metadata/owned-Valkey
+provider slice. The generated Memcached service gate above is authoritative for
+its lifecycle dimensions, local evidence status and revision provenance,
+provider/tool entry points, and CI state. Cache contents are intentionally
+ephemeral. GCP networking, HA,
+maintenance, security, and broad API parity are not claimed. Firestore
+listeners and rules remain unsupported.
 
-- Add a Spanner emulator with DDL support, read/write transactions, and
-  query execution.
-- Promote Firestore beyond metadata-only to support document CRUD, queries,
-  real-time listeners, and security rules evaluation.
-- Emulate Datastore (legacy mode) with entity operations, indexes, and
-  ancestor queries.
-- Add Memorystore emulation backed by a local Redis instance for caching
-  and session workflows.
-- Verify each data service with SDK-level integration tests and Terraform
-  resource lifecycle.
+- [x] Run the official Spanner emulator with bounded DDL, read/write, and query
+  behavior.
+- [x] Support bounded Firestore document CRUD and queries; keep real-time
+  listeners and security-rules evaluation unsupported.
+- [x] Support bounded Datastore entity CRUD and ancestor queries.
+- [x] Provide separate bounded Redis and Memcached Docker-backed Memorystore
+  lifecycles with profile-persisted metadata.
+- [x] Verify the accepted Phase 15 slices with generated-client/backend evidence
+  and guarded Terraform lifecycles where a provider resource is claimed.
 
 ### Phase 16 — ML/AI, monitoring, and advanced networking
 
-**Status (2026-07-26): bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and
-Vertex slices verified.** On 2026-07-26, `make test-phase16-subnetwork` passed
+**Status (2026-07-28): bounded Monitoring, Logging, DNS, Subnetwork/IPAM, and
+Vertex slices verified locally and on Linux CI.** All six critical Phase 16
+jobs passed in
+[run 30333855843](https://github.com/rudydesplan/minisky/actions/runs/30333855843)
+at commit `f36b79eb6d4ed56776b6dac74b5bcb02dac1bffe`: Monitoring, Logging,
+Cloud DNS, Vertex AI, Subnetwork SDK, and Subnetwork Terraform. On 2026-07-26,
+`make test-phase16-subnetwork` passed
 locally on Docker Desktop/macOS in 17 seconds. The official generated
 `google.golang.org/api/compute/v1` client created a custom-mode global network
 and one regional IPv4 subnetwork, polled global and regional operations,
@@ -605,7 +666,7 @@ project overlap rejection, page-token binding, save/LRO failure,
 parent/instance reference guards, exact project-scoped VM/network Docker
 identities, unowned or mismatched resource refusal, ambiguous-create recovery,
 attached-endpoint delete failure, fail-closed compensation, and state-graph
-validation. The opt-in Linux CI job is configured but has no CI pass evidence.
+validation. The Linux SDK gate is externally verified by the run above.
 
 The official Google provider `7.41.0` now has a separate guarded gate for
 `google_compute_network` and `google_compute_subnetwork`. On 2026-07-26,
@@ -617,8 +678,8 @@ IDs, required zero drift before and after another restart, destroyed the
 subnetwork before the network, and verified API `404` plus bridge cleanup after
 a final restart. Provider-generated disabled flow-log defaults, relative
 network references, regional request encoding, and classic-firewall enforcement
-defaults are accepted only within the bounded semantics. The opt-in Terraform
-CI job is configured but has no CI pass evidence.
+defaults are accepted only within the bounded semantics. The Linux Terraform
+gate is externally verified by the run above.
 
 A guarded Monitoring gate used
 the official generated REST client to create a descriptor and write a sample,
@@ -687,15 +748,16 @@ stores, log-based alerting, and peering/NAT/PSC remain unsupported.
 
 ### Phase 17 — CI/CD integration, plugin ecosystem, and enterprise
 
-**Status (2026-07-25): verified bounded local slice.** The repository-local
+**Status (2026-07-28): CI-verified bounded slice.** The repository-local
 GitHub Action is tested with a built artifact; GitLab and Compose templates,
 source-compiled SDK v0 scaffolds, correctness-checked benchmarks, opt-in
 fixed-window process-local quotas, profile audit records with a tamper-evident
 hash chain, local RBAC, and checksummed offline bundles have executable checks.
-A guarded Phase-13 WIF cross-gate passed locally with a federated principal
+A guarded Phase-13 WIF cross-gate passed locally and in
+[critical run 30333855843](https://github.com/rudydesplan/minisky/actions/runs/30333855843)
+at commit `f36b79eb6d4ed56776b6dac74b5bcb02dac1bffe`, with a federated principal
 exercising Dashboard RBAC, gateway authorization, quota rejection, audit
-verification, redaction checks, and tamper detection. An opt-in GitHub Actions
-job is configured, but has not yet produced CI pass evidence. See
+verification, redaction checks, and tamper detection. See
 [Phase 17 local operations](docs/phase17-local-operations.md).
 
 The SDK is intentionally not third-party installable: there is no runtime
@@ -706,6 +768,41 @@ immutable/WORM compliance storage, external identity providers/SSO/SCIM,
 distributed quotas, and video assets remain deferred. The WIF path retains the
 Phase-13 static-JWKS limits and issues local `ms1` credentials only; this
 bounded slice is not production federation or a production-ready Phase 17.
+
+### Current completion priorities
+
+As of 2026-07-28, PR
+[#21](https://github.com/rudydesplan/minisky/pull/21) has a complete required
+CI and critical-integration pair for commit
+`60e82159d7fd80cf6472327b2cd14c2ae1465f23`: [CI run
+30337314745](https://github.com/rudydesplan/minisky/actions/runs/30337314745)
+and [critical run
+30337314786](https://github.com/rudydesplan/minisky/actions/runs/30337314786)
+both passed. Optional opt-in integration jobs skipped by the pull-request
+workflow are not converted into pass claims. The Binary Authorization
+Terraform lifecycle and the other eleven domain-scoped Terraform checks remain
+local-passed only; their required matrix is configured but has no external
+exact-head pass record.
+
+The next evidence milestones are:
+
+The bounded Memcached lifecycle is no longer a deferred implementation
+priority. Its machine-readable service gate above owns the local and CI evidence
+wording and does not change the unresolved Phase 18–25 matrix requirement below.
+
+1. obtain one exact-head external run in which all 12 required Phase 18–25
+   Terraform matrix entries pass, then record its immutable run URL and full
+   commit without promoting any domain beyond its bounded claim;
+2. keep the 12 existing Phase 18–25 Terraform claims domain-scoped, and add any
+   further claim only with provider apply, restart, import where supported,
+   no-drift, destroy, and cleanup evidence;
+3. promote default-off experimental services individually only after their
+   documented client, persistence, failure, backend, and cleanup boundaries
+   pass—code existence and batch success alone are insufficient; and
+4. run a stable-tag release through native archives, container digest evidence,
+   and installed-artifact checks before claiming publication. Homebrew, Scoop,
+   deb/rpm repositories, GHCR tags, and the external setup action remain
+   explicit non-goals until their protected destinations and credentials exist.
 
 ---
 

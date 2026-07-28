@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
 
 [[ "${MINISKY_PHASE20_FILESTORE_TERRAFORM_INTEGRATION:-}" == "1" ]] || {
   echo "Refusing Filestore Terraform integration without explicit opt-in." >&2

@@ -46,6 +46,18 @@ func (s *GuardedEntryStore) Load(name string, target any) error {
 	return nil
 }
 
+// LoadDurable bypasses a sticky mutation failure for one serialized readback.
+// Callers use it only to determine whether an errored save committed before
+// returning. The original failure remains sticky for later mutations.
+func (s *GuardedEntryStore) LoadDurable(name string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.delegate == nil {
+		return s.degraded
+	}
+	return s.delegate.Load(name, target)
+}
+
 func (s *GuardedEntryStore) Save(name string, value any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

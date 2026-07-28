@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -42,10 +43,11 @@ func TestCreateTransferJob(t *testing.T) {
 
 func TestCreateTransferJobRejectsUnsupportedOrIncompleteTransferSpecs(t *testing.T) {
 	for name, body := range map[string]string{
-		"missing source": `{"projectId":"test","transferSpec":{"gcsDataSink":{"bucketName":"dst"}}}`,
-		"missing sink":   `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"}}}`,
-		"empty bucket":   `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":""},"gcsDataSink":{"bucketName":"dst"}}}`,
-		"unknown field":  `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"},"gcsDataSink":{"bucketName":"dst"},"awsS3DataSource":{"bucketName":"foreign"}}}`,
+		"missing source":            `{"projectId":"test","transferSpec":{"gcsDataSink":{"bucketName":"dst"}}}`,
+		"missing sink":              `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"}}}`,
+		"empty bucket":              `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":""},"gcsDataSink":{"bucketName":"dst"}}}`,
+		"unknown field":             `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src"},"gcsDataSink":{"bucketName":"dst"},"awsS3DataSource":{"bucketName":"foreign"}}}`,
+		"source path missing slash": `{"projectId":"test","transferSpec":{"gcsDataSource":{"bucketName":"src","path":"prefix"},"gcsDataSink":{"bucketName":"dst"}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			api := newTestAPI()
@@ -59,6 +61,146 @@ func TestCreateTransferJobRejectsUnsupportedOrIncompleteTransferSpecs(t *testing
 				t.Fatalf("invalid request created %d jobs", len(api.jobs))
 			}
 		})
+	}
+}
+
+func TestCreateTransferJobAcceptsFlatGCSObjectPrefixes(t *testing.T) {
+	prefixes := []string{
+		"repeated//slash/",
+		`back\slash/`,
+		"dot/../segment/",
+		"percent%2Fencoded/",
+		"日本語/",
+		"/leading/slash/",
+		strings.Repeat("é", 511) + "a/",
+	}
+	for _, side := range []string{"source", "sink"} {
+		for _, prefix := range prefixes {
+			t.Run(side+"/"+prefix, func(t *testing.T) {
+				spec := &TransferSpec{
+					GcsDataSource: &GcsData{BucketName: "src"},
+					GcsDataSink:   &GcsData{BucketName: "dst"},
+				}
+				if side == "source" {
+					spec.GcsDataSource.Path = prefix
+				} else {
+					spec.GcsDataSink.Path = prefix
+				}
+				body, err := json.Marshal(TransferJob{ProjectID: "test", TransferSpec: spec})
+				if err != nil {
+					t.Fatal(err)
+				}
+				api := newTestAPI()
+				response := httptest.NewRecorder()
+				api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/transferJobs", bytes.NewReader(body)))
+				if response.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestPatchTransferJobAcceptsFlatGCSObjectPrefixes(t *testing.T) {
+	prefixes := []string{
+		"repeated//slash/",
+		`back\slash/`,
+		"dot/../segment/",
+		"percent%2Fencoded/",
+		"日本語/",
+		"/leading/slash/",
+		strings.Repeat("é", 511) + "a/",
+	}
+	for _, side := range []string{"source", "sink"} {
+		for _, prefix := range prefixes {
+			t.Run(side+"/"+prefix, func(t *testing.T) {
+				spec := &TransferSpec{
+					GcsDataSource: &GcsData{BucketName: "src"},
+					GcsDataSink:   &GcsData{BucketName: "dst"},
+				}
+				if side == "source" {
+					spec.GcsDataSource.Path = prefix
+				} else {
+					spec.GcsDataSink.Path = prefix
+				}
+				body, err := json.Marshal(map[string]any{
+					"projectId": "test",
+					"transferJob": map[string]any{
+						"transferSpec": spec,
+					},
+					"updateTransferJobFieldMask": "transferSpec",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				api := newTestAPI()
+				api.jobs["transferJobs/1"] = &TransferJob{
+					Name: "transferJobs/1", ProjectID: "test", Status: "ENABLED",
+				}
+				response := httptest.NewRecorder()
+				api.ServeHTTP(response, httptest.NewRequest(
+					http.MethodPatch, "/v1/transferJobs/1", bytes.NewReader(body)))
+				if response.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestGCSObjectPrefixRejectsControlsAndUTF8OverflowOnCreateAndPatch(t *testing.T) {
+	invalid := []string{
+		"line\nbreak/",
+		"carriage\rreturn/",
+		"nul\x00/",
+		"delete\x7f/",
+		strings.Repeat("é", 512) + "/",
+	}
+	for _, method := range []string{"create", "patch"} {
+		for _, side := range []string{"source", "sink"} {
+			for index, prefix := range invalid {
+				t.Run(fmt.Sprintf("%s/%s/%d", method, side, index), func(t *testing.T) {
+					spec := &TransferSpec{
+						GcsDataSource: &GcsData{BucketName: "src"},
+						GcsDataSink:   &GcsData{BucketName: "dst"},
+					}
+					if side == "source" {
+						spec.GcsDataSource.Path = prefix
+					} else {
+						spec.GcsDataSink.Path = prefix
+					}
+					api := newTestAPI()
+					var request *http.Request
+					if method == "create" {
+						body, err := json.Marshal(TransferJob{ProjectID: "test", TransferSpec: spec})
+						if err != nil {
+							t.Fatal(err)
+						}
+						request = httptest.NewRequest(http.MethodPost, "/v1/transferJobs", bytes.NewReader(body))
+					} else {
+						api.jobs["transferJobs/1"] = &TransferJob{
+							Name: "transferJobs/1", ProjectID: "test", Status: "ENABLED",
+						}
+						body, err := json.Marshal(map[string]any{
+							"projectId": "test",
+							"transferJob": map[string]any{
+								"transferSpec": spec,
+							},
+							"updateTransferJobFieldMask": "transferSpec",
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+						request = httptest.NewRequest(http.MethodPatch, "/v1/transferJobs/1", bytes.NewReader(body))
+					}
+					response := httptest.NewRecorder()
+					api.ServeHTTP(response, request)
+					if response.Code != http.StatusBadRequest {
+						t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -268,6 +410,31 @@ func TestHandlerObjectCopierStreamsObjectWithinBound(t *testing.T) {
 	}
 }
 
+func TestHandlerObjectCopierRejectsObjectOutsideRequestedPrefix(t *testing.T) {
+	var downloadCalls int
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/storage/v1/"):
+			_, _ = io.WriteString(w, `{"items":[{"name":"outside.txt","size":"1"}]}`)
+		case strings.HasPrefix(r.URL.Path, "/download/"):
+			downloadCalls++
+			_, _ = io.WriteString(w, "x")
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	copier := handlerObjectCopier{handler: handler}
+	_, _, err := copier.Copy(context.Background(),
+		GcsData{BucketName: "source", Path: "prefix/"},
+		GcsData{BucketName: "sink", Path: "destination/"})
+	if err == nil {
+		t.Fatal("object outside requested prefix was copied")
+	}
+	if downloadCalls != 0 {
+		t.Fatalf("download calls = %d, want 0", downloadCalls)
+	}
+}
+
 func TestRunTransferJobRejectsConcurrentRunPerJob(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -451,6 +618,7 @@ func TestPatchTransferJobRequiresMaskedFieldAndValidOutcomeState(t *testing.T) {
 		"missing masked field": `{"projectId":"test","transferJob":{"description":"new"},"updateTransferJobFieldMask":"status"}`,
 		"invalid status":       `{"projectId":"test","transferJob":{"status":"BROKEN"},"updateTransferJobFieldMask":"status"}`,
 		"immutable project":    `{"projectId":"test","transferJob":{"projectId":"other"},"updateTransferJobFieldMask":"projectId"}`,
+		"invalid source path":  `{"projectId":"test","transferJob":{"transferSpec":{"gcsDataSource":{"bucketName":"src","path":"prefix"},"gcsDataSink":{"bucketName":"dst"}}},"updateTransferJobFieldMask":"transferSpec"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			api := newTestAPI()
@@ -569,6 +737,31 @@ func TestPersistAndReload(t *testing.T) {
 	}
 	if job.Description != "persist test" {
 		t.Fatalf("unexpected description after reload: %s", job.Description)
+	}
+}
+
+func TestCorruptStateFailsClosedWithoutOverwritingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MINISKY_STATE_DIR", root)
+	t.Setenv("MINISKY_PROFILE", "corrupt-storage-transfer")
+	store, err := state.New(root, "corrupt-storage-transfer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(storagetransferStateEntry, "corrupt"); err != nil {
+		t.Fatal(err)
+	}
+
+	api := NewAPI(nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		`/v1/transferJobs?filter=%7B%22projectId%22%3A%22test%22%7D`, nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var persisted string
+	if err := store.Load(storagetransferStateEntry, &persisted); err != nil || persisted != "corrupt" {
+		t.Fatalf("corrupt state changed: %q err=%v", persisted, err)
 	}
 }
 

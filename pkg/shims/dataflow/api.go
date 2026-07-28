@@ -64,12 +64,14 @@ type Environment struct {
 // API implements the Dataflow v1b3 REST surface.
 type API struct {
 	mu         sync.RWMutex
+	mutationMu sync.Mutex
 	persistMu  sync.Mutex
 	stateStore dataflowStateStore
 	jobs       map[string]*Job // keyed by job ID
 	nextID     int64
 	runner     jobRunner
 	cancels    map[string]context.CancelFunc
+	readState  func(*dataflowMetadata) error
 }
 
 type jobRunner interface {
@@ -80,13 +82,21 @@ type boundedLocalRunner struct{}
 
 // NewAPI creates a Dataflow shim with durable state.
 func NewAPI() *API {
-	store, err := state.New(config.GetStateDir(), config.GetProfile())
+	root, profile := config.GetStateDir(), config.GetProfile()
+	store, err := state.New(root, profile)
 	api := &API{
 		stateStore: state.NewGuardedEntryStore(store, err),
 		jobs:       make(map[string]*Job),
 		nextID:     1,
 		runner:     boundedLocalRunner{},
 		cancels:    make(map[string]context.CancelFunc),
+		readState: func(metadata *dataflowMetadata) error {
+			reader, readerErr := state.New(root, profile)
+			if readerErr != nil {
+				return readerErr
+			}
+			return reader.Load(dataflowStateEntry, metadata)
+		},
 	}
 	if err != nil {
 		log.Printf("[Shim: Dataflow] persistence degraded: %v", err)
@@ -94,6 +104,7 @@ func NewAPI() *API {
 	}
 	if err := api.loadState(); err != nil {
 		log.Printf("[Shim: Dataflow] state rehydration failed: %v", err)
+		api.stateStore = state.NewGuardedEntryStore(store, err)
 	}
 	// Derive nextID from existing jobs.
 	for _, j := range api.jobs {
@@ -117,6 +128,11 @@ func newTestAPI() *API {
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Dataflow] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet && api.persistenceError() != nil {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE",
+			"Dataflow persistence is degraded")
+		return
+	}
 
 	switch {
 	case matchJobsCollection(r.URL.Path) && r.Method == http.MethodPost:
@@ -141,6 +157,9 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (api *API) createJob(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var job Job
 	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
@@ -184,6 +203,7 @@ func (api *API) createJob(w http.ResponseWriter, r *http.Request) {
 		api.mu.Lock()
 		delete(api.jobs, job.ID)
 		delete(api.cancels, job.ID)
+		api.nextID--
 		api.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
@@ -229,8 +249,12 @@ func (boundedLocalRunner) Run(ctx context.Context, job *Job) error {
 }
 
 func (api *API) runJob(ctx context.Context, id string) {
-	api.setExecutionState(id, "JOB_STATE_RUNNING")
+	if !api.setExecutionState(id, "JOB_STATE_RUNNING") {
+		return
+	}
 	err := api.runner.Run(ctx, api.jobSnapshot(id))
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
 	api.mu.Lock()
 	job := api.jobs[id]
 	delete(api.cancels, id)
@@ -247,25 +271,76 @@ func (api *API) runJob(ctx context.Context, id string) {
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
 		log.Printf("[Shim: Dataflow] persist terminal job %s: %v", id, err)
+		if reconcileErr := api.reconcileJobFromDurableState(id); reconcileErr != nil {
+			log.Printf("[Shim: Dataflow] reconcile terminal job %s: %v", id, reconcileErr)
+		}
 	}
 }
 
-func (api *API) setExecutionState(id, state string) {
+func (api *API) setExecutionState(id, executionState string) bool {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
 	api.mu.Lock()
 	if job := api.jobs[id]; job != nil {
-		job.CurrentState = state
+		job.CurrentState = executionState
 		job.CurrentStateTime = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	api.mu.Unlock()
 	if err := api.persistState(); err != nil {
 		log.Printf("[Shim: Dataflow] persist job %s transition: %v", id, err)
+		if reconcileErr := api.reconcileJobFromDurableState(id); reconcileErr != nil {
+			log.Printf("[Shim: Dataflow] reconcile job %s transition: %v", id, reconcileErr)
+		}
+		return false
 	}
+	return true
 }
 
 func (api *API) jobSnapshot(id string) *Job {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return deepCopyJob(api.jobs[id])
+}
+
+func (api *API) reconcileJobFromDurableState(id string) error {
+	if api.readState == nil {
+		api.mu.Lock()
+		if job := api.jobs[id]; job != nil {
+			stopJob(job)
+		}
+		delete(api.cancels, id)
+		api.mu.Unlock()
+		return fmt.Errorf("durable state reader is unavailable")
+	}
+	var metadata dataflowMetadata
+	if err := api.readState(&metadata); err != nil {
+		api.mu.Lock()
+		if job := api.jobs[id]; job != nil {
+			stopJob(job)
+		}
+		delete(api.cancels, id)
+		api.mu.Unlock()
+		return err
+	}
+	persisted := deepCopyJob(metadata.Jobs[id])
+	reconcileRestoredJob(persisted)
+	api.mu.Lock()
+	if persisted == nil {
+		delete(api.jobs, id)
+	} else {
+		api.jobs[id] = persisted
+	}
+	delete(api.cancels, id)
+	api.mu.Unlock()
+	return nil
+}
+
+func (api *API) persistenceError() error {
+	health, ok := api.stateStore.(interface{ Degraded() error })
+	if !ok {
+		return nil
+	}
+	return health.Degraded()
 }
 
 func (api *API) getJob(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +401,9 @@ func (api *API) listJobs(w http.ResponseWriter, r *http.Request) {
 
 // cancelJob handles PUT /jobs/{jobId} — used to cancel or drain a job.
 func (api *API) cancelJob(w http.ResponseWriter, r *http.Request) {
+	api.mutationMu.Lock()
+	defer api.mutationMu.Unlock()
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	jobID := extractJobID(r.URL.Path)
 
@@ -360,11 +438,7 @@ func (api *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	job.RequestedState = req.RequestedState
 	clone := deepCopyJob(job)
 	cancel := api.cancels[jobID]
-	delete(api.cancels, jobID)
 	api.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
 
 	if err := api.persistState(); err != nil {
 		api.mu.Lock()
@@ -374,6 +448,12 @@ func (api *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 		api.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "State persistence failed")
 		return
+	}
+	api.mu.Lock()
+	delete(api.cancels, jobID)
+	api.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 
 	_ = json.NewEncoder(w).Encode(clone)

@@ -1,6 +1,7 @@
 package composer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,15 +19,20 @@ import (
 	"minisky/pkg/orchestrator"
 )
 
-const airflowImage = "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
 const airflowDockerService = "composer-airflow"
 
-var airflowIdentifier = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var (
+	airflowImage      = config.GetImageRegistry().Composer.AirflowImage
+	airflowIdentifier = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+)
 
 type unavailableAirflowBackend struct{}
 
 func (unavailableAirflowBackend) Provision(context.Context, string) (string, error) {
 	return "", errors.New("Airflow backend unavailable")
+}
+func (unavailableAirflowBackend) Reconcile(context.Context, string) (string, bool, error) {
+	return "", false, errors.New("Airflow backend unavailable")
 }
 func (unavailableAirflowBackend) Delete(context.Context, string) error {
 	return errors.New("Airflow backend unavailable")
@@ -121,6 +127,37 @@ func (b *dockerAirflowBackend) Delete(parent context.Context, resource string) e
 	return nil
 }
 
+func (b *dockerAirflowBackend) Reconcile(parent context.Context, resource string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	name := airflowContainerName(resource)
+	exists, err := b.requireOwned(ctx, name, resource)
+	if err != nil || !exists {
+		return "", false, err
+	}
+	var lastErr error
+	for {
+		if output, commandErr := b.runner.Run(ctx, "exec", name, "airflow", "dags", "list"); commandErr != nil {
+			lastErr = fmt.Errorf("check Airflow readiness: %w: %s", commandErr, strings.TrimSpace(string(output)))
+		} else {
+			port, portErr := b.runner.Run(ctx, "port", name, "8080/tcp")
+			if portErr == nil {
+				address := strings.TrimSpace(string(port))
+				if index := strings.LastIndex(address, ":"); index >= 0 {
+					address = "127.0.0.1:" + address[index+1:]
+				}
+				return "http://" + address, true, nil
+			}
+			lastErr = fmt.Errorf("discover Airflow port: %w", portErr)
+		}
+		select {
+		case <-ctx.Done():
+			return "", false, fmt.Errorf("wait for Airflow readiness: %v: %w", lastErr, ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
 func (b *dockerAirflowBackend) UploadDAG(parent context.Context, resource, dagID, source string) error {
 	if !airflowIdentifier.MatchString(dagID) {
 		return errors.New("invalid DAG identifier")
@@ -148,10 +185,64 @@ func (b *dockerAirflowBackend) UploadDAG(parent context.Context, resource, dagID
 	if err != nil {
 		return fmt.Errorf("upload DAG: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	if output, err = b.runner.Run(ctx, "exec", name, "airflow", "dags", "list"); err != nil {
-		return fmt.Errorf("validate DAG: %w: %s", err, strings.TrimSpace(string(output)))
+	destination := "/opt/airflow/dags/" + dagID + ".py"
+	if output, err = b.runner.Run(ctx, "exec", "--user", "root", name, "chmod", "0644", destination); err != nil {
+		return fmt.Errorf("make DAG readable: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	return nil
+	for {
+		output, err = b.runner.Run(ctx, "exec", name, "airflow", "dags", "list", "--output", "json")
+		if err == nil {
+			listed, parseErr := airflowDAGListed(output, dagID)
+			if parseErr == nil && listed {
+				return nil
+			}
+			if parseErr != nil {
+				err = parseErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return fmt.Errorf("wait for DAG %q readiness: %v: %w", dagID, err, ctx.Err())
+			}
+			return fmt.Errorf("wait for DAG %q readiness: %w", dagID, ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func airflowDAGListed(output []byte, dagID string) (bool, error) {
+	type dagSummary struct {
+		DAGID string `json:"dag_id"`
+	}
+	decode := func(payload []byte) ([]dagSummary, error) {
+		var dags []dagSummary
+		if err := json.Unmarshal(payload, &dags); err != nil {
+			return nil, err
+		}
+		return dags, nil
+	}
+	dags, err := decode(output)
+	if err != nil {
+		for _, line := range bytes.Split(output, []byte{'\n'}) {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || line[0] != '[' {
+				continue
+			}
+			if dags, err = decode(line); err == nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		return false, fmt.Errorf("decode Airflow DAG list: %w", err)
+	}
+	for _, dag := range dags {
+		if dag.DAGID == dagID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (b *dockerAirflowBackend) TriggerDAG(parent context.Context, resource, dagID, runID string) error {

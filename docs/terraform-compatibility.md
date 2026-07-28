@@ -31,6 +31,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | Provider setting | Canonical endpoint | Routed domain |
 | :--- | :--- | :--- |
 | `artifact_registry_custom_endpoint` | `http://127.0.0.1:8080/_minisky/artifactregistry/` | `artifactregistry.googleapis.com` |
+| `binary_authorization_custom_endpoint` | `http://127.0.0.1:8080/_minisky/binaryauthorization/v1/` | `binaryauthorization.googleapis.com` |
 | `big_query_custom_endpoint` | `http://127.0.0.1:8080/_minisky/bigquery/bigquery/v2/` | `bigquery.googleapis.com` |
 | `compute_custom_endpoint` | `http://127.0.0.1:8080/_minisky/compute/compute/v1/` | `compute.googleapis.com` |
 | `iam_beta_custom_endpoint` | `http://127.0.0.1:8080/_minisky/iam/v1/` | `iam.googleapis.com` |
@@ -51,6 +52,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `filestore_custom_endpoint` | `http://127.0.0.1:8080/_minisky/file/v1/` | `file.googleapis.com` |
 | `identity_platform_custom_endpoint` | `http://127.0.0.1:8080/_minisky/identityplatform/v2/` | `identityplatform.googleapis.com` |
 | `managed_kafka_custom_endpoint` | `http://127.0.0.1:8080/_minisky/managedkafka/v1/` | `managedkafka.googleapis.com` |
+| `memcache_custom_endpoint` | `http://127.0.0.1:8080/_minisky/memcache/v1/` | `memcache.googleapis.com` |
 | `workflows_custom_endpoint` | `http://127.0.0.1:8080/_minisky/workflows/v1/` | `workflows.googleapis.com` |
 
 The repeated `bigquery/bigquery` segments are intentional: the first is the
@@ -58,6 +60,14 @@ MiniSky service selector and is removed by the router; the second is part of
 the BigQuery v2 API base path expected by the provider. Google provider 7.41.0
 constructs `google_service_account` through its IAM beta client, which is why
 the example overrides `iam_beta_custom_endpoint`.
+
+<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+
+Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+<!-- END GENERATED MEMCACHED SERVICE GATE -->
 
 ## Acceptance-tested resources
 
@@ -81,6 +91,7 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_compute_subnetwork` (optional Phase 16) | Profile-persisted bounded regional IPv4 metadata plus one exact owned Docker bridge | Regional Compute LRO | Canonical import preserves bridge identity; destroy removes metadata and the exact bridge |
 | `google_compute_instance` (optional Phase 16) | One profile-owned container with one NIC on the bounded regional IPv4 subnetwork | Zonal Compute LRO | Canonical metadata and Docker-observed primary IPv4 address are exposed when enabled |
 | `google_redis_instance` (optional Phase 15) | Profile metadata plus owned Redis container/volume and loopback endpoint | Service LRO | Instance name and endpoint are read through the canonical endpoint when enabled |
+| `google_memcache_instance` (guarded Phase 15) | Profile-persisted metadata plus an exact-owned Memcached container with an ephemeral cache and loopback endpoint | Service LRO | See the generated Memcached service gate above |
 | `google_spanner_instance` (optional Phase 15) | Official emulator admin passthrough | Emulator LRO | Instance is read through the canonical endpoint when enabled |
 | `google_spanner_database` (optional Phase 15) | Official emulator DDL/database passthrough | Emulator LRO | Database is read through the canonical endpoint when enabled |
 | `google_eventarc_trigger` (optional Phase 18) | Profile-persisted trigger control-plane metadata with a Workflows destination | Service LRO | Filter, destination, and Pub/Sub transport metadata survive restart and canonical import; destroy remains 404 after a final restart |
@@ -94,6 +105,7 @@ the example overrides `iam_beta_custom_endpoint`.
 | `google_service_directory_namespace` + `google_service_directory_service` + `google_service_directory_endpoint` (optional Phase 21) | Persisted isolated hierarchy and opaque endpoint registration metadata | Synchronous hierarchy | API observation before/after restart, no-drift, three canonical imports/reconciliation, child-first destroy, durable 404s, and empty-list cleanup pass |
 | `google_document_ai_processor` (optional Phase 23) | Persisted processor control-plane metadata | Create synchronous; delete service LRO | API observation before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, and empty-list cleanup pass |
 | `google_org_policy_policy` (optional Phase 24) | Persisted project boolean policy and bounded advisory evaluation | Synchronous policy lifecycle | Local enforced decision before/after restart, no-drift, canonical import/reconciliation, delete, durable 404, empty-list cleanup, and constraint-default fallback pass |
+| `google_binary_authorization_policy` (optional Phase 25) | Persisted project singleton policy with bounded local Cloud Deploy enforcement | Singleton reset lifecycle | Apply and pre-restart allow/deny observation, restart persistence/no-drift, matching import exit 0, stale import exit 2 then reconciliation/no-drift, and destroy reset to the exact persisted default policy pass locally |
 
 The table sets `deletion_protection = false`, and the dataset sets
 `delete_contents_on_destroy = true`, so the example can be destroyed
@@ -103,7 +115,7 @@ The fixture uses `US-CENTRAL1`, the location returned consistently by the
 current pinned `fake-gcs-server` backend, so refresh remains drift-free.
 Bucket labels are omitted because that backend does not persist them.
 
-The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Spanner,
+The Cloud SQL, GKE, Phase-13 WIF, Artifact Registry, Redis, Memcached, Spanner,
 Phase-16 networking/instance, and Phase-18 Workflows/Eventarc resources are
 disabled by default and local-profile-only. Artifact Registry
 uses profile-owned Registry v2, and `emulator-config` is not a production
@@ -114,7 +126,11 @@ Spanner configuration. Enable Artifact Registry with
 subnetwork with `enable_phase16_network_resources = true`; their outputs are
 `null` or empty while disabled. Enable the bounded Workflows resource with
 `enable_phase18_workflows_resource = true`; the dependent Eventarc trigger also
-requires `enable_phase18_eventarc_resource = true`.
+requires `enable_phase18_eventarc_resource = true`. The Phase 25 Binary
+Authorization singleton is separately default-off behind
+`enable_phase25_binary_authorization_policy = true`. The Memcached root fixture
+remains separately default-off behind
+`enable_memcache_resource = true`.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative
@@ -130,6 +146,22 @@ Compute/VPC/load-balancer surfaces, and general Cloud SQL or GKE APIs remain
 outside the claim. See
 `docs/service-compatibility.md`; API routes alone do not establish provider
 compatibility.
+
+The dedicated one-resource Memcached fixture uses the configured
+`memcache_custom_endpoint` and the lifecycle entry points named by the generated
+service gate above. Its guarded import normalization structurally allows only provider-side
+`deletion_protection`, `terraform_labels`, and timeout state, applied the saved
+plan, proves that the API resource is unchanged, and requires post-import no
+drift. `effective_labels` is computed by the provider from API `labels`;
+neither field is fabricated in the fixture. The bounded lifecycle requires
+destroy to be followed by another daemon restart, a durable `404`, and
+exact-owned Memcached container absence.
+The gate uses an untargeted fixture, bounded commands and overall timeout,
+stable collision locks, isolated HOME/provider/profile/Terraform state, and
+fail-closed cleanup. Cache contents are ephemeral and excluded from metadata
+export. The generated service gate is authoritative for local status, revision
+provenance, and CI status; the claim does not include GCP networking, HA,
+maintenance, security, or broad Memorystore API parity.
 
 The separate guarded Phase-16 Terraform gate targets only
 `google_compute_network.phase16[0]` and
@@ -173,6 +205,17 @@ temporary-state, collision, credential-clearing, and ten-minute guards as the
 Workflows gate. It does not publish an event or claim that MiniSky provisions a
 real Eventarc Pub/Sub transport; delivery, subscription creation, and broader
 trigger destinations remain outside this Terraform claim.
+
+Separately from that provider control-plane claim, commit
+`852d9e352b7fd400a86ccec655c2434008325cf8` passed the guarded local/live
+public-gateway delivery gate with a deterministic post-admission pause. The
+gate interrupts MiniSky after the Eventarc intent and correlated Workflow
+execution admission are durable, restarts, and reaches the exact terminal
+result through the same stable execution identity without creating a duplicate
+execution resource. It also proves project/topic and strict-IAM non-delivery
+bounds plus exact-owned cleanup. This is evidence of idempotent admission and
+resource identity across restart, not exactly-once external side effects,
+CloudEvents parity, OIDC, ordering, or Eventarc transport provisioning.
 
 The guarded Phase-19 Composer gate requires both
 `MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION=1` and
@@ -252,6 +295,35 @@ empty-list cleanup, and fallback to the seeded constraint default. This is a
 bounded local policy simulation, not production enforcement, IAM, inferred
 organization hierarchy, or compliance.
 
+The separate Phase 25 gate targets only
+`google_binary_authorization_policy.phase25[0]`. Provider `7.41.0` applies the
+project singleton through the canonical Binary Authorization endpoint and
+observes a whitelist allow plus an enforced default-rule deny before restart.
+After restart, the gate proves policy persistence and zero drift; it does not
+repeat the allow/deny observations. Removing the resource from Terraform state
+uses a temporary backup; a matching import of `projects/<project>` then
+produces plan exit `0`. The gate next writes deliberately stale remote
+description metadata, removes state with a second temporary backup, imports the
+same singleton, and requires stale import plan exit `2`; targeted apply
+reconciles the policy and the next plan returns `0`. Destroy does not delete a
+Binary Authorization singleton: it resets the API object to the exact default
+policy—`gcr.io/google_containers/*`, `ALWAYS_ALLOW`, and
+`ENFORCED_BLOCK_AND_AUDIT_LOG`—with stale description, global-policy, and
+cluster-rule fields absent. A final restart proves that reset persists.
+
+Independent package tests cover the evaluation boundary omitted from the
+provider fixture: enforced `DENY` locally blocks MiniSky Cloud Deploy rollouts.
+`DRYRUN_AUDIT_LOG_ONLY` permits rollout and returns `AUDIT`; no durable audit
+record or log is created. Unsupported attestation, global-policy, and
+cluster-rule evaluation returns explicit `UNSUPPORTED`. This is Terraform
+lifecycle compatibility and local emulation, not service fidelity promotion,
+GKE admission, or production admission security. The service remains
+experimental and default-off. The gate is recorded as `local-passed`
+only—there is no claimed CI run URL or commit. Its guarded runner uses isolated
+temporary HOME, Terraform data/state, profile state, ports, sanitized
+diagnostics, state backups, and EXIT/INT/TERM cleanup; it removes the temporary
+work directory and process lock on exit.
+
 ## Go, Python, and Java SDK smoke suites
 
 Phase 7 includes self-contained smoke programs in `sdk-smoke/go` and
@@ -308,6 +380,28 @@ The regular `terraform-validate` job:
 1. checks `terraform fmt`;
 2. initializes the pinned provider with the lock file in read-only mode; and
 3. runs `terraform validate`.
+
+The required `phase18-25-terraform-integration` job is a 12-entry matrix on
+pull requests and `main`. Each entry maps one machine-readable domain claim to
+one existing guarded Make target and integration script, checks out the
+workflow run revision, uses Terraform `1.15.8` with provider `7.41.0`, and runs
+in an isolated hosted runner. The matrix is fail-independent with four-way
+parallelism; Docker/network-backed entries declare their prerequisite, while
+all entries retain per-script collision locks, temporary HOME/provider/state
+directories, invocation-owned cleanup, bounded timeouts, and seven-day failure
+diagnostics. Composer, Managed Kafka, and AlloyDB expose their exact
+tag-plus-SHA256 image references from the guarded scripts; clean hosted runners
+pull each exact content-addressed reference, then inspect that same reference
+for local availability before the scripts perform their own image checks. A
+successful digest pull is the portable verification; the gate does not compare
+the registry manifest digest to Docker's store-specific local image ID. The
+workflow rejects empty, malformed, or unpinned image declarations,
+while entries without backend images skip provisioning. Static evidence tests
+reject missing, duplicate, unpinned, or cross-wired
+claim/target/script/matrix mappings. These jobs are currently
+`configured-unverified`: no external passing run URL or commit has been
+recorded, so the existing 12 provider lifecycle claims remain local-pass
+evidence only.
 
 The regular `sdk-smoke-validate` job installs the pinned Python requirement,
 compiles the Go smoke with `go test`, and byte-compiles the Python smoke on

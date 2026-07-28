@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
+
+postgres_image="postgres:15.8-bookworm@sha256:eb3747f5d0a92195ca486d2f15d9a4ee5e9461b0332fe87fbc59069490a5c659"
+if [[ "${1:-}" == "--print-required-images" && "$#" -eq 1 ]]; then
+  printf '%s\n' "${postgres_image}"
+  exit 0
+fi
+[[ "$#" -eq 0 ]] || { echo "Usage: $0 [--print-required-images]" >&2; exit 2; }
 
 if [[ "${MINISKY_PHASE20_ALLOYDB_TERRAFORM_INTEGRATION:-}" != "1" ||
       "${MINISKY_PHASE20_ALLOYDB_DOCKER_INTEGRATION:-}" != "1" ]]; then
@@ -10,7 +18,7 @@ for command in curl docker go python3 terraform; do
   command -v "${command}" >/dev/null || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
 docker info >/dev/null
-docker image inspect postgres:15.8-bookworm >/dev/null
+docker image inspect "${postgres_image}" >/dev/null
 
 shared_lock="${TMPDIR:-/tmp}/minisky-net-integration.lock"
 phase_lock="${TMPDIR:-/tmp}/minisky-phase20-alloydb-terraform-integration.lock"

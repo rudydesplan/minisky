@@ -26,6 +26,8 @@ import (
 
 const memorystoreStateEntry = "memorystore/redis"
 
+const redisBackendTimeout = 35 * time.Second
+
 func init() {
 	registry.Register("redis.googleapis.com", func(ctx *registry.Context) http.Handler {
 		var logAPI *logging.API
@@ -34,11 +36,8 @@ func init() {
 		}
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr, logAPI)
 	})
-	registry.Register("memcache.googleapis.com", func(_ *registry.Context) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Memorystore for Memcached is not implemented")
-		})
+	registry.Register("memcache.googleapis.com", func(ctx *registry.Context) http.Handler {
+		return NewMemcacheAPI(ctx.OpMgr, memcacheBackendFromManager(ctx.SvcMgr))
 	})
 }
 
@@ -177,7 +176,30 @@ func NewAPIWithStore(opMgr *orchestrator.OperationManager, backend redisBackend,
 			changed = true
 			continue
 		}
-		endpoint, owned, err := backend.ReconcileRedis(context.Background(), instance.BackendID)
+		if instance.State == "DELETING" {
+			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), redisBackendTimeout)
+			deleteErr := backend.DeleteRedis(deleteCtx, instance.BackendID)
+			deleteCancel()
+			if deleteErr != nil {
+				return nil, fmt.Errorf("resume deleting Redis backend %q: %w", instance.BackendID, deleteErr)
+			}
+			delete(api.instances, key)
+			for _, target := range api.operations {
+				if target.Delete && target.ResourceKey == key {
+					api.opMgr.MarkDone(target.ManagerName)
+				}
+			}
+			changed = true
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), redisBackendTimeout)
+		endpoint, owned, err := backend.ReconcileRedis(ctx, instance.BackendID)
+		cancel()
+		if err == nil && !owned && instance.State == "CREATING" {
+			delete(api.instances, key)
+			changed = true
+			continue
+		}
 		if err != nil || !owned {
 			instance.State = "REPAIRING"
 			instance.Host = ""
@@ -223,7 +245,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Memorystore] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 	if api.initErr != nil {
-		writeError(w, http.StatusServiceUnavailable, "FAILED_PRECONDITION", "Memorystore state is unavailable")
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Memorystore state is unavailable")
 		return
 	}
 	if strings.EqualFold(strings.Split(r.Host, ":")[0], "memorystore.googleapis.com") {
@@ -321,7 +343,9 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	image := redisImage(instance.RedisVersion)
 	api.opMgr.RunAsync(managerOp.Name, func() error {
-		endpoint, err := api.backend.ProvisionRedis(context.Background(), instance.BackendID, image)
+		ctx, cancel := context.WithTimeout(context.Background(), redisBackendTimeout)
+		endpoint, err := api.backend.ProvisionRedis(ctx, instance.BackendID, image)
+		cancel()
 		api.mu.Lock()
 		current := api.instances[key]
 		if current != nil {
@@ -344,13 +368,36 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		api.mu.Unlock()
-		if persistErr := api.persist(); persistErr != nil && err == nil {
-			err = persistErr
+		if err != nil {
+			cleanupErr := api.cleanupRedisBackend(instance.BackendID)
+			api.mu.Lock()
+			if cleanupErr == nil {
+				delete(api.instances, key)
+			} else if current := api.instances[key]; current != nil {
+				current.State = "REPAIRING"
+				current.Host = ""
+				current.Port = 0
+			}
+			api.mu.Unlock()
+			persistErr := api.persist()
+			return errors.Join(err, cleanupErr, persistErr)
 		}
-		if err == nil {
-			api.pushLog(project, "INFO", id, "Redis instance is READY")
+		if persistErr := api.persist(); persistErr != nil {
+			cleanupErr := api.cleanupRedisBackend(instance.BackendID)
+			api.mu.Lock()
+			if cleanupErr == nil {
+				delete(api.instances, key)
+			} else if current := api.instances[key]; current != nil {
+				current.State = "REPAIRING"
+				current.Host = ""
+				current.Port = 0
+			}
+			api.mu.Unlock()
+			compensationErr := api.persist()
+			return errors.Join(persistErr, cleanupErr, compensationErr)
 		}
-		return err
+		api.pushLog(project, "INFO", id, "Redis instance is READY")
+		return nil
 	})
 	api.writeOperation(w, serviceName, managerOp)
 }
@@ -414,7 +461,20 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	api.opMgr.RunAsync(managerOp.Name, func() error {
-		if err := api.backend.DeleteRedis(context.Background(), backendResource); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), redisBackendTimeout)
+		err := api.backend.DeleteRedis(ctx, backendResource)
+		cancel()
+		if err != nil {
+			api.mu.Lock()
+			if current := api.instances[name]; current != nil {
+				current.State = "REPAIRING"
+				current.Host = ""
+				current.Port = 0
+			}
+			api.mu.Unlock()
+			if persistErr := api.persist(); persistErr != nil {
+				return errors.Join(err, persistErr)
+			}
 			return err
 		}
 		api.mu.Lock()
@@ -427,6 +487,12 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	api.writeOperation(w, serviceName, managerOp)
+}
+
+func (api *API) cleanupRedisBackend(backendID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisBackendTimeout)
+	defer cancel()
+	return api.backend.DeleteRedis(ctx, backendID)
 }
 
 func (api *API) getOperation(w http.ResponseWriter, r *http.Request) {
@@ -600,6 +666,6 @@ func decodeJSON(r *http.Request, target any) error {
 func writeError(w http.ResponseWriter, code int, status, message string) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"code": code, "status": status, "message": message},
+		"error": map[string]any{"code": code, "status": status, "message": message, "details": []any{}},
 	})
 }

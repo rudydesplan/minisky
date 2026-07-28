@@ -26,8 +26,12 @@ import (
 	"minisky/pkg/shims/appengine"
 	"minisky/pkg/shims/bigquery"
 	"minisky/pkg/shims/bigtable"
+	"minisky/pkg/shims/binaryauthorization"
+	"minisky/pkg/shims/cloudasset"
 	"minisky/pkg/shims/cloudsql"
 	"minisky/pkg/shims/compute"
+	iamshim "minisky/pkg/shims/iam"
+	"minisky/pkg/shims/orgpolicy"
 	"minisky/pkg/shims/serverless"
 	"minisky/pkg/state"
 )
@@ -107,6 +111,113 @@ func TestSpannerTerraformCompatibilityPreservesLifecycleRequests(t *testing.T) {
 				t.Fatalf("body=%s", response.Body.String())
 			}
 		})
+	}
+}
+
+func TestPhase24ProviderRoutingPreservesEncodedPathEvidence(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("orgpolicy.googleapis.com", orgpolicy.NewAPI())
+	proxy.RegisterShim("cloudasset.googleapis.com", cloudasset.NewAPIWithInventory(nil, ""))
+
+	tests := []struct {
+		name   string
+		path   string
+		status int
+		symbol string
+	}{
+		{
+			name:   "org policy single encoded alias",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/%70olicies",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "org policy double encoded alias",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/%2570olicies",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "org policy encoded separator",
+			path:   "/_minisky/orgpolicy/v2/projects/project-a/policies/compute%2FrequireOsLogin",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset single encoded decimal alias",
+			path:   "/_minisky/cloudasset/v1/organizations/%31%32%33/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset double encoded decimal alias",
+			path:   "/_minisky/cloudasset/v1/organizations/%2531%2532%2533/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset encoded separator",
+			path:   "/_minisky/cloudasset/v1/organizations/123%2Fextra/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+		{
+			name:   "cloud asset canonical unsupported parent",
+			path:   "/_minisky/cloudasset/v1/organizations/123/assets",
+			status: http.StatusNotImplemented, symbol: "UNIMPLEMENTED",
+		},
+		{
+			name:   "cloud asset leading zero parent",
+			path:   "/_minisky/cloudasset/v1/organizations/0123/assets",
+			status: http.StatusBadRequest, symbol: "INVALID_ARGUMENT",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, httptest.NewRequest(
+				http.MethodGet, "http://localhost"+test.path, nil,
+			))
+			if response.Code != test.status ||
+				!strings.Contains(response.Body.String(), `"`+test.symbol+`"`) {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProviderRoutingKeepsCanonicalPathsAndEncodedQueriesCompatible(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("orgpolicy.googleapis.com", orgpolicy.NewAPI())
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/_minisky/orgpolicy/v2/projects/project-a/policies?filter=name%3Afoo%2Fbar",
+		nil,
+	)
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("canonical provider status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	var gotPath, gotRawPath, gotQuery string
+	proxy.RegisterShim("example.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		gotRawPath = request.URL.RawPath
+		gotQuery = request.URL.RawQuery
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	response = httptest.NewRecorder()
+	proxy.ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"http://localhost/_minisky/example/v1/items?name=folder%2Fitem&label=a%3Ab",
+		nil,
+	))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("unrelated route status=%d body=%s", response.Code, response.Body.String())
+	}
+	if gotPath != "/v1/items" || gotRawPath != "" ||
+		gotQuery != "name=folder%2Fitem&label=a%3Ab" {
+		t.Fatalf("path=%q rawPath=%q query=%q", gotPath, gotRawPath, gotQuery)
 	}
 }
 
@@ -420,6 +531,370 @@ func TestStrictAuthorizationReturnsRedacted401And403(t *testing.T) {
 	}
 }
 
+func TestMemcachedStrictIAMPermissionsAndProjectResources(t *testing.T) {
+	tests := []struct {
+		method     string
+		path       string
+		permission string
+		resource   string
+	}{
+		{http.MethodGet, "/v1/projects/demo/locations/-/instances", "memcache.instances.list", "projects/demo"},
+		{http.MethodGet, "/v1/projects/demo/locations/us-central1/instances", "memcache.instances.list", "projects/demo/locations/us-central1"},
+		{http.MethodPost, "/v1/projects/demo/locations/us-central1/instances", "memcache.instances.create", "projects/demo/locations/us-central1"},
+		{http.MethodGet, "/v1/projects/demo/locations/us-central1/instances/cache", "memcache.instances.get", "projects/demo/locations/us-central1/instances/cache"},
+		{http.MethodPatch, "/v1/projects/demo/locations/us-central1/instances/cache", "memcache.instances.update", "projects/demo/locations/us-central1/instances/cache"},
+		{http.MethodDelete, "/v1/projects/demo/locations/us-central1/instances/cache", "memcache.instances.delete", "projects/demo/locations/us-central1/instances/cache"},
+		{http.MethodGet, "/v1/projects/demo/locations/us-central1/operations/op-1", "memcache.operations.get", "projects/demo/locations/us-central1/operations/op-1"},
+	}
+	for _, test := range tests {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		permission, resource := routePermission("memcache.googleapis.com", request)
+		if permission != test.permission || resource != test.resource {
+			t.Errorf("%s %s = (%q, %q), want (%q, %q)",
+				test.method, test.path, permission, resource, test.permission, test.resource)
+		}
+	}
+}
+
+func TestMemcachedStrictIAMRejectsNoncanonicalResourceAliases(t *testing.T) {
+	for _, path := range []string{
+		"/v1/projects/Demo/locations/us-central1/instances/cache",
+		"/v1/projects/demo:other/locations/us-central1/instances/cache",
+		"/v1/projects/demo/locations/us-central1/instances/cache:alias",
+		"/v1/projects/%64emo/locations/us-central1/instances/cache",
+		"/v1/projects/demo%2Fother/locations/us-central1/instances/cache",
+		"/v1/projects/demo/locations/%2D/instances",
+		"/v1/projects/demo/locations/--/instances",
+		"/v1/projects/demo/locations/-/instances/cache",
+	} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		permission, resource := routePermission("memcache.googleapis.com", request)
+		if permission != "" || resource != "" {
+			t.Errorf("%s = (%q, %q), want no IAM classification", path, permission, resource)
+		}
+	}
+	canonical := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/projects/demo/locations/us-central1/instances/cache?projectId=sibling",
+		nil,
+	)
+	canonical.Header.Set("X-Goog-User-Project", "billing-project")
+	permission, resource := routePermission("memcache.googleapis.com", canonical)
+	if permission != "memcache.instances.get" ||
+		resource != "projects/demo/locations/us-central1/instances/cache" {
+		t.Fatalf("query/header aliases changed canonical path resource: (%q, %q)", permission, resource)
+	}
+}
+
+func TestMemcachedStrictIAMAllRegionsListUsesProjectParent(t *testing.T) {
+	const principal = "user:cache-reader@example.com"
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dispatches := 0
+	authorizer := &recordingAuthorizer{
+		issuer:           issuer,
+		allowedPrincipal: principal,
+		allowed: map[resourcePermission]bool{
+			{resource: "projects/demo", permission: "memcache.instances.list"}: true,
+		},
+	}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("memcache.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatches++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	proxy.ConfigureSecurity(authorizer, testProjects{"demo": true, "sibling": true}, true, "gateway")
+
+	for _, test := range []struct {
+		name       string
+		url        string
+		wantStatus int
+	}{
+		{
+			name:       "canonical all-regions list dispatches",
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/-/instances",
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "sibling project is isolated",
+			url:        "http://localhost/_minisky/memcache/v1/projects/sibling/locations/-/instances",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "encoded wildcard alias is rejected",
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/%2D/instances",
+			wantStatus: http.StatusForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, test.url, nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+		})
+	}
+	if dispatches != 1 {
+		t.Fatalf("dispatches=%d want=1", dispatches)
+	}
+}
+
+func TestMemcachedStrictIAMAllowDenyAndProjectEnforcement(t *testing.T) {
+	const (
+		path      = "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache"
+		principal = "user:cache-admin@example.com"
+	)
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		allow      bool
+		projects   testProjects
+		wantStatus int
+	}{
+		{name: "permission denied", projects: testProjects{"demo": true}, wantStatus: http.StatusForbidden},
+		{name: "permission allowed", allow: true, projects: testProjects{"demo": true}, wantStatus: http.StatusNoContent},
+		{name: "unknown project", allow: true, projects: testProjects{}, wantStatus: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dispatches := 0
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("memcache.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatches++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			proxy.ConfigureSecurity(testAuthorizer{issuer: issuer, allow: test.allow}, test.projects, true, "gateway")
+			request := httptest.NewRequest(http.MethodPost, path,
+				strings.NewReader(`{"nodeCount":1,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024}}`))
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			wantDispatches := 0
+			if test.wantStatus == http.StatusNoContent {
+				wantDispatches = 1
+			}
+			if dispatches != wantDispatches {
+				t.Fatalf("dispatches=%d want=%d", dispatches, wantDispatches)
+			}
+		})
+	}
+}
+
+func TestMemcachedStrictIAMIsolatesSiblingResourcesThroughPublicRouter(t *testing.T) {
+	const principal = "user:cache-reader@example.com"
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject: principal, Audience: "gateway",
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		permission string
+		resource   string
+		allowedURL string
+		siblingURL string
+	}{
+		{
+			name:       "location parents",
+			permission: "memcache.instances.list",
+			resource:   "projects/demo/locations/us-central1",
+			allowedURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances",
+			siblingURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-east1/instances",
+		},
+		{
+			name:       "instances",
+			permission: "memcache.instances.get",
+			resource:   "projects/demo/locations/us-central1/instances/cache-a",
+			allowedURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache-a",
+			siblingURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache-b",
+		},
+		{
+			name:       "operations",
+			permission: "memcache.operations.get",
+			resource:   "projects/demo/locations/us-central1/operations/op-a",
+			allowedURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/operations/op-a",
+			siblingURL: "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/operations/op-b",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dispatches := 0
+			authorizer := &recordingAuthorizer{
+				issuer:           issuer,
+				allowedPrincipal: principal,
+				allowed: map[resourcePermission]bool{
+					{resource: test.resource, permission: test.permission}: true,
+				},
+			}
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("memcache.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatches++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			proxy.ConfigureSecurity(authorizer, testProjects{"demo": true}, true, "gateway")
+			for _, requestTest := range []struct {
+				url        string
+				wantStatus int
+			}{
+				{url: test.allowedURL, wantStatus: http.StatusNoContent},
+				{url: test.siblingURL, wantStatus: http.StatusForbidden},
+			} {
+				request := httptest.NewRequest(http.MethodGet, requestTest.url, nil)
+				request.Header.Set("Authorization", "Bearer "+token)
+				response := httptest.NewRecorder()
+				proxy.ServeHTTP(response, request)
+				if response.Code != requestTest.wantStatus {
+					t.Fatalf("%s status=%d want=%d body=%s",
+						requestTest.url, response.Code, requestTest.wantStatus, response.Body.String())
+				}
+			}
+			if dispatches != 1 {
+				t.Fatalf("dispatches=%d want=1", dispatches)
+			}
+			if len(authorizer.checks) != 2 ||
+				authorizer.checks[0].resource != test.resource ||
+				authorizer.checks[1].resource == test.resource {
+				t.Fatalf("authorization checks did not isolate siblings: %+v", authorizer.checks)
+			}
+		})
+	}
+}
+
+func TestStrictIAMPubSubPublishDenialsPrecedeDownstreamDelivery(t *testing.T) {
+	const (
+		principal  = "user:publisher@example.com"
+		other      = "user:other@example.com"
+		topic      = "projects/demo/topics/orders"
+		requestURL = "http://localhost/_minisky/pubsub.googleapis.com/v1/" + topic + ":publish"
+	)
+	t.Setenv("MINISKY_IAM_MODE", "strict")
+
+	tests := []struct {
+		name             string
+		authenticated    bool
+		policyResource   string
+		policyPrincipal  string
+		policyPermission string
+		wantStatus       int
+		wantExecutions   int
+	}{
+		{
+			name:             "missing token",
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusUnauthorized,
+		},
+		{
+			name:             "unauthorized principal",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  other,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusForbidden,
+		},
+		{
+			name:             "policy lacks publish permission",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.get",
+			wantStatus:       http.StatusForbidden,
+		},
+		{
+			name:             "project permission inherits",
+			authenticated:    true,
+			policyResource:   "projects/demo",
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusNoContent,
+			wantExecutions:   1,
+		},
+		{
+			name:             "topic scoped permission",
+			authenticated:    true,
+			policyResource:   topic,
+			policyPrincipal:  principal,
+			policyPermission: "pubsub.topics.publish",
+			wantStatus:       http.StatusNoContent,
+			wantExecutions:   1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			iamAPI, err := iamshim.NewAPIWithStore(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyBody, err := json.Marshal(map[string]any{
+				"policy": iamshim.IamPolicy{Bindings: []iamshim.Binding{{
+					Role: "permission:" + test.policyPermission, Members: []string{test.policyPrincipal},
+				}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyRequest := httptest.NewRequest(http.MethodPost,
+				"/v1/"+test.policyResource+":setIamPolicy", bytes.NewReader(policyBody))
+			policyResponse := httptest.NewRecorder()
+			iamAPI.ServeHTTP(policyResponse, policyRequest)
+			if policyResponse.Code != http.StatusOK {
+				t.Fatalf("set policy status=%d body=%s", policyResponse.Code, policyResponse.Body.String())
+			}
+
+			executions := 0
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("pubsub.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				executions++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			proxy.ConfigureSecurity(iamAPI, nil, false, "gateway")
+
+			request := httptest.NewRequest(http.MethodPost, requestURL,
+				strings.NewReader(`{"messages":[{"data":"bm9uY2U="}]}`))
+			request.Header.Set("Content-Type", "application/json")
+			if test.authenticated {
+				token, _, err := iamAPI.IssueLocalToken(principal, "gateway",
+					[]string{"https://www.googleapis.com/auth/cloud-platform"}, time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Authorization", "Bearer "+token)
+			}
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if executions != test.wantExecutions {
+				t.Fatalf("downstream executions=%d, want %d", executions, test.wantExecutions)
+			}
+		})
+	}
+}
+
 func TestExperimentalGatePrecedesStrictIAMAndValidation(t *testing.T) {
 	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
 	t.Setenv("MINISKY_PROFILE", "experimental-strict-gate")
@@ -527,6 +1002,36 @@ func TestGatewayServicePerimeterDecisionPrecedesDispatch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIAMCredentialsGatewayDefersServicePerimeterToHandler(t *testing.T) {
+	dispatched := 0
+	evaluator := &recordingPerimeterEvaluator{configured: true, allowed: false}
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("iamcredentials.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatched++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	proxy.ConfigureServicePerimeters(evaluator)
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://127.0.0.1/_minisky/iamcredentials/v1/projects/-/serviceAccounts/minisky-target@local-dev-project.iam.gserviceaccount.com:generateAccessToken",
+		strings.NewReader(`{"scope":["scope"]}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatches=%d want=1", dispatched)
+	}
+	if len(evaluator.calls) != 0 {
+		t.Fatalf("router evaluated IAM Credentials perimeter: %+v", evaluator.calls)
 	}
 }
 
@@ -998,6 +1503,141 @@ func TestExperimentalCanonicalRoutingDescriptors(t *testing.T) {
 				t.Fatalf("route response=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestBinaryAuthorizationProviderPutBoundsThroughCanonicalRouter(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewProxyRouterWithManager(nil)
+	router.RegisterShim("binaryauthorization.googleapis.com", api)
+	oversized := `{"description":"` + strings.Repeat("x", 1<<20) + `"}`
+	for _, test := range []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "fixed"},
+		{name: "chunked", chunked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPut,
+				"http://localhost/_minisky/binaryauthorization/v1/projects/demo/policy",
+				strings.NewReader(oversized))
+			request.Header.Set("Content-Type", "application/json")
+			if test.chunked {
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if decision := api.Evaluate("projects/demo", "example/image"); decision.Reason != "policy not found" {
+				t.Fatalf("oversized request mutated policy: %#v", decision)
+			}
+		})
+	}
+
+	request := httptest.NewRequest(http.MethodPut,
+		"http://localhost/_minisky/binaryauthorization/v1/projects/demo/policy",
+		strings.NewReader(`{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("provider PUT without name status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBinaryAuthorizationStrictIAMRejectsAmbiguousProjectBeforeAuthorization(t *testing.T) {
+	t.Setenv(registry.ExperimentalServicesEnv, "1")
+	issuer := localsecurity.NewIssuer([]byte("01234567890123456789012345678901"), time.Now)
+	token, _, err := issuer.Issue(localsecurity.TokenRequest{
+		Subject:  "user:alice@example.com",
+		Audience: "gateway",
+		Scopes:   []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Lifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`
+	for _, projectPath := range []string{"acme:prod", "acme%3Aprod"} {
+		t.Run(projectPath, func(t *testing.T) {
+			api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatches := 0
+			proxy := NewProxyRouterWithManager(nil)
+			proxy.RegisterShim("binaryauthorization.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dispatches++
+				api.ServeHTTP(w, r)
+			}))
+			authorizer := &recordingAuthorizer{
+				issuer: issuer,
+				allowed: map[resourcePermission]bool{{
+					resource:   "projects/acme",
+					permission: "binaryauthorization.policy.update",
+				}: true},
+			}
+			proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+			request := httptest.NewRequest(http.MethodPut,
+				"http://localhost/_minisky/binaryauthorization/v1/projects/"+projectPath+"/policy",
+				strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+token)
+			response := httptest.NewRecorder()
+			proxy.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest ||
+				!strings.Contains(response.Body.String(), `"INVALID_ARGUMENT"`) {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(authorizer.checks) != 0 {
+				t.Fatalf("ambiguous project reached authorizer: %+v", authorizer.checks)
+			}
+			if dispatches != 0 {
+				t.Fatalf("ambiguous project dispatched %d times", dispatches)
+			}
+		})
+	}
+
+	api, err := binaryauthorization.NewAPIWithStore(nil, binaryauthorization.AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatches := 0
+	proxy := NewProxyRouterWithManager(nil)
+	proxy.RegisterShim("binaryauthorization.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatches++
+		api.ServeHTTP(w, r)
+	}))
+	authorizer := &recordingAuthorizer{
+		issuer: issuer,
+		allowed: map[resourcePermission]bool{{
+			resource:   "projects/acme-prod",
+			permission: "binaryauthorization.policy.update",
+		}: true},
+	}
+	proxy.ConfigureSecurity(authorizer, nil, false, "gateway")
+	request := httptest.NewRequest(http.MethodPut,
+		"http://localhost/_minisky/binaryauthorization/v1/projects/acme-prod/policy",
+		strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid project status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dispatches != 1 || len(authorizer.checks) != 1 ||
+		authorizer.checks[0].resource != "projects/acme-prod" {
+		t.Fatalf("dispatches=%d checks=%+v", dispatches, authorizer.checks)
 	}
 }
 
@@ -1683,6 +2323,7 @@ func TestManifestImplementedDomainsHaveStrictIAMMappings(t *testing.T) {
 		"identitytoolkit.googleapis.com":      {{http.MethodPost, "/v1/accounts:lookup", "firebaseauth.users.get"}},
 		"logging.googleapis.com":              {{http.MethodPost, "/v2/entries:list", "logging.logEntries.list"}},
 		"managedkafka.googleapis.com":         {{http.MethodPost, "/v1/projects/demo/locations/us/clusters", "managedkafka.clusters.create"}},
+		"memcache.googleapis.com":             {{http.MethodPost, "/v1/projects/demo/locations/us/instances", "memcache.instances.create"}},
 		"networkservices.googleapis.com":      {{http.MethodGet, "/v1/projects/demo/locations/us/meshes", "networkservices.meshes.list"}},
 		"metadata.google.internal":            {{http.MethodGet, "/computeMetadata/v1/instance/id", "compute.instances.get"}},
 		"monitoring.googleapis.com":           {{http.MethodPost, "/v3/projects/demo/timeSeries", "monitoring.timeSeries.create"}},
@@ -1727,6 +2368,9 @@ func TestManifestImplementedDomainsHaveStrictIAMMappings(t *testing.T) {
 					wantResource := "projects/demo"
 					if service.Domain == "pubsub.googleapis.com" {
 						wantResource = "projects/demo/topics/t"
+					}
+					if service.Domain == "memcache.googleapis.com" {
+						wantResource = "projects/demo/locations/us"
 					}
 					if resource != wantResource {
 						t.Errorf("%s %s resource = %q, want %q", test.method, test.path, resource, wantResource)
@@ -2961,6 +3605,56 @@ func TestServeHTTPRoutesCanonicalEndpointByRegisteredDomain(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
 	}
+}
+
+func TestMemcachedCanonicalAliasFullDomainAndAmbiguity(t *testing.T) {
+	t.Run("canonical selectors", func(t *testing.T) {
+		router := NewProxyRouterWithManager(nil)
+		router.RegisterShim("memcache.googleapis.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/projects/demo/locations/us-central1/instances" ||
+				r.URL.Query().Get("pageToken") != "next" {
+				t.Fatalf("path=%q query=%q", r.URL.Path, r.URL.RawQuery)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		for _, selector := range []string{"memcache", "memcache.googleapis.com"} {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(
+				http.MethodGet,
+				"http://127.0.0.1:8080/_minisky/"+selector+
+					"/v1/projects/demo/locations/us-central1/instances?pageToken=next",
+				nil,
+			))
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("%s status=%d body=%s", selector, response.Code, response.Body.String())
+			}
+		}
+	})
+
+	t.Run("ambiguous alias keeps full domain", func(t *testing.T) {
+		router := NewProxyRouterWithManager(nil)
+		for _, domain := range []string{"memcache.googleapis.com", "memcache.example.test"} {
+			router.RegisterShim(domain, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+		}
+		ambiguous := httptest.NewRecorder()
+		router.ServeHTTP(ambiguous, httptest.NewRequest(
+			http.MethodGet, "http://localhost/_minisky/memcache/v1/projects/demo/locations/us/instances", nil,
+		))
+		if ambiguous.Code != http.StatusNotImplemented {
+			t.Fatalf("ambiguous alias status=%d body=%s", ambiguous.Code, ambiguous.Body.String())
+		}
+		fullDomain := httptest.NewRecorder()
+		router.ServeHTTP(fullDomain, httptest.NewRequest(
+			http.MethodGet,
+			"http://localhost/_minisky/memcache.googleapis.com/v1/projects/demo/locations/us/instances",
+			nil,
+		))
+		if fullDomain.Code != http.StatusNoContent {
+			t.Fatalf("full-domain status=%d body=%s", fullDomain.Code, fullDomain.Body.String())
+		}
+	})
 }
 
 func TestServeHTTPRoutesEveryRegisteredCanonicalSelectorAndAlias(t *testing.T) {

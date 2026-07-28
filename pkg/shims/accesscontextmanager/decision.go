@@ -2,6 +2,7 @@ package accesscontextmanager
 
 import (
 	"net/netip"
+	"sort"
 	"strings"
 )
 
@@ -23,6 +24,9 @@ type AccessDecision struct {
 // CheckAccess evaluates persisted service-perimeter metadata. It is callable by
 // local shims but does not intercept unrelated handlers automatically.
 func (api *API) CheckAccess(request AccessRequest) AccessDecision {
+	if api.PersistenceError() != nil {
+		return AccessDecision{Reason: "policy persistence is unavailable"}
+	}
 	if !validProjectResource(request.Project) {
 		return AccessDecision{Reason: "invalid project resource"}
 	}
@@ -32,24 +36,42 @@ func (api *API) CheckAccess(request AccessRequest) AccessDecision {
 
 	api.mu.RLock()
 	defer api.mu.RUnlock()
+	perimeters := make([]*ServicePerimeter, 0)
 	for _, perimeter := range api.perimeters {
 		if perimeter == nil || perimeter.Status == nil ||
 			!contains(perimeter.Status.Resources, request.Project) ||
 			!contains(perimeter.Status.RestrictedServices, request.Service) {
 			continue
 		}
+		perimeters = append(perimeters, perimeter)
+	}
+	sort.Slice(perimeters, func(i, j int) bool {
+		return perimeters[i].Name < perimeters[j].Name
+	})
+	var allowedPerimeter string
+	for _, perimeter := range perimeters {
+		matched := false
 		for _, levelName := range perimeter.Status.AccessLevels {
 			if level := api.levels[levelName]; levelMatches(level, request) {
-				return AccessDecision{Allowed: true, Reason: "access level matched", Perimeter: perimeter.Name}
+				matched = true
+				break
 			}
 		}
-		return AccessDecision{Reason: "restricted by service perimeter", Perimeter: perimeter.Name}
+		if !matched {
+			return AccessDecision{Reason: "restricted by service perimeter", Perimeter: perimeter.Name}
+		}
+		if allowedPerimeter == "" {
+			allowedPerimeter = perimeter.Name
+		}
+	}
+	if allowedPerimeter != "" {
+		return AccessDecision{Allowed: true, Reason: "access level matched", Perimeter: allowedPerimeter}
 	}
 	return AccessDecision{Allowed: true, Reason: "not restricted by a service perimeter"}
 }
 
-// EvaluateServicePerimeter exposes the bounded persisted decision to the
-// gateway without coupling the router to this shim package.
+// EvaluateServicePerimeter exposes the bounded persisted decision to runtime
+// consumers without coupling them to this shim package.
 func (api *API) EvaluateServicePerimeter(project, service, sourceIP, region string) (bool, bool) {
 	decision := api.CheckAccess(AccessRequest{
 		Project:  project,
@@ -57,13 +79,28 @@ func (api *API) EvaluateServicePerimeter(project, service, sourceIP, region stri
 		SourceIP: sourceIP,
 		Region:   region,
 	})
-	return decision.Perimeter != "", decision.Allowed
+	return decision.Perimeter != "" || !decision.Allowed, decision.Allowed
 }
 
 func validProjectResource(project string) bool {
-	return strings.HasPrefix(project, "projects/") &&
-		strings.Count(project, "/") == 1 &&
-		len(strings.TrimPrefix(project, "projects/")) > 0
+	if !strings.HasPrefix(project, "projects/") || strings.Count(project, "/") != 1 {
+		return false
+	}
+	segment := strings.TrimPrefix(project, "projects/")
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for index, character := range segment {
+		alphaNumeric := (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9')
+		if !alphaNumeric && character != '-' {
+			return false
+		}
+		if (index == 0 || index == len(segment)-1) && !alphaNumeric {
+			return false
+		}
+	}
+	return true
 }
 
 func levelMatches(level *AccessLevel, request AccessRequest) bool {

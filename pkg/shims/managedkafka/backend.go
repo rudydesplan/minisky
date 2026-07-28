@@ -129,7 +129,42 @@ func (b *dockerKafkaBackend) Delete(parent context.Context, resource string) err
 	return nil
 }
 
+func (b *dockerKafkaBackend) Reconcile(parent context.Context, resource string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	name := kafkaContainerName(resource)
+	exists, err := b.requireOwned(ctx, name, resource)
+	if err != nil || !exists {
+		return "", false, err
+	}
+	var lastErr error
+	for {
+		if output, commandErr := b.runner.Run(ctx, nil, "exec", name, "/opt/kafka/bin/kafka-topics.sh",
+			"--bootstrap-server", "localhost:9092", "--list"); commandErr != nil {
+			lastErr = fmt.Errorf("check Kafka readiness: %w: %s", commandErr, strings.TrimSpace(string(output)))
+		} else {
+			portOutput, portErr := b.runner.Run(ctx, nil, "port", name, "9094/tcp")
+			if portErr == nil {
+				address := strings.TrimSpace(string(portOutput))
+				if index := strings.LastIndex(address, ":"); index >= 0 {
+					address = "127.0.0.1:" + address[index+1:]
+				}
+				return address, true, nil
+			}
+			lastErr = fmt.Errorf("discover Kafka port: %w", portErr)
+		}
+		select {
+		case <-ctx.Done():
+			return "", false, fmt.Errorf("wait for Kafka readiness: %v: %w", lastErr, ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
 func (b *dockerKafkaBackend) CreateTopic(ctx context.Context, resource string, topic *Topic) error {
+	if err := b.requireOwnedResource(ctx, resource); err != nil {
+		return err
+	}
 	args := []string{"exec", kafkaContainerName(resource), "/opt/kafka/bin/kafka-topics.sh",
 		"--bootstrap-server", "localhost:9092", "--create", "--topic", topicID(topic.Name),
 		"--partitions", strconv.Itoa(topic.PartitionCount), "--replication-factor", strconv.Itoa(topic.ReplicationFactor)}
@@ -141,6 +176,9 @@ func (b *dockerKafkaBackend) CreateTopic(ctx context.Context, resource string, t
 }
 
 func (b *dockerKafkaBackend) UpdateTopic(ctx context.Context, resource string, topic *Topic) error {
+	if err := b.requireOwnedResource(ctx, resource); err != nil {
+		return err
+	}
 	output, err := b.runner.Run(ctx, nil, "exec", kafkaContainerName(resource), "/opt/kafka/bin/kafka-topics.sh",
 		"--bootstrap-server", "localhost:9092", "--alter", "--topic", topicID(topic.Name),
 		"--partitions", strconv.Itoa(topic.PartitionCount))
@@ -151,6 +189,9 @@ func (b *dockerKafkaBackend) UpdateTopic(ctx context.Context, resource string, t
 }
 
 func (b *dockerKafkaBackend) DeleteTopic(ctx context.Context, resource, topicName string) error {
+	if err := b.requireOwnedResource(ctx, resource); err != nil {
+		return err
+	}
 	output, err := b.runner.Run(ctx, nil, "exec", kafkaContainerName(resource), "/opt/kafka/bin/kafka-topics.sh",
 		"--bootstrap-server", "localhost:9092", "--delete", "--topic", topicID(topicName))
 	if err != nil {
@@ -160,6 +201,9 @@ func (b *dockerKafkaBackend) DeleteTopic(ctx context.Context, resource, topicNam
 }
 
 func (b *dockerKafkaBackend) Produce(ctx context.Context, resource, topicName string, messages []string) error {
+	if err := b.requireOwnedResource(ctx, resource); err != nil {
+		return err
+	}
 	input := []byte(strings.Join(messages, "\n") + "\n")
 	output, err := b.runner.Run(ctx, input, "exec", "-i", kafkaContainerName(resource),
 		"/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server", "localhost:9092",
@@ -171,6 +215,9 @@ func (b *dockerKafkaBackend) Produce(ctx context.Context, resource, topicName st
 }
 
 func (b *dockerKafkaBackend) Consume(ctx context.Context, resource, topicName string, count int) ([]string, error) {
+	if err := b.requireOwnedResource(ctx, resource); err != nil {
+		return nil, err
+	}
 	output, err := b.runner.Run(ctx, nil, "exec", kafkaContainerName(resource),
 		"/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", "localhost:9092",
 		"--topic", topicID(topicName), "--partition", "0", "--offset", "earliest", "--max-messages", strconv.Itoa(count),
@@ -194,6 +241,17 @@ func (b *dockerKafkaBackend) Consume(ctx context.Context, resource, topicName st
 		return nil, fmt.Errorf("consume Kafka records: expected %d messages, got %d: %s", count, len(messages), text)
 	}
 	return messages, nil
+}
+
+func (b *dockerKafkaBackend) requireOwnedResource(ctx context.Context, resource string) error {
+	exists, err := b.requireOwned(ctx, kafkaContainerName(resource), resource)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("Kafka cluster backend is not running")
+	}
+	return nil
 }
 
 func (b *dockerKafkaBackend) requireOwned(ctx context.Context, name, resource string) (bool, error) {

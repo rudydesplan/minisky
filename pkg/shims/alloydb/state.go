@@ -76,9 +76,9 @@ func (api *API) loadState() error {
 
 // reconcileBackends observes exact-owned Docker resources without creating or
 // adopting anything. Ephemeral ports are rediscovered after every restart.
-func (api *API) reconcileBackends() {
+func (api *API) reconcileBackends() error {
 	if api.backend == nil {
-		return
+		return nil
 	}
 	api.mu.RLock()
 	names := make([]string, 0, len(api.instances))
@@ -124,8 +124,10 @@ func (api *API) reconcileBackends() {
 	if changed {
 		if err := api.persistState(); err != nil {
 			api.opMgr.MarkPersistenceFailure(err)
+			return err
 		}
 	}
+	return nil
 }
 
 // deepCopyCluster returns a fully independent copy of a Cluster.

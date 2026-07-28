@@ -48,6 +48,248 @@ func TestCreatePolicyMissingName(t *testing.T) {
 	}
 }
 
+func TestCreatePolicyRequiresExactRequestScope(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "body project differs from request",
+			path: "/v2/projects/project-a/policies",
+			body: `{"name":"projects/project-b/policies/compute.requireOsLogin","spec":{"rules":[{"enforce":true}]}}`,
+		},
+		{
+			name: "nested policy resource",
+			path: "/v2/projects/project-a/policies",
+			body: `{"name":"projects/project-a/policies/compute.requireOsLogin/extra","spec":{"rules":[{"enforce":true}]}}`,
+		},
+		{
+			name: "invalid project segment",
+			path: "/v2/projects/project_a/policies",
+			body: `{"name":"projects/project_a/policies/compute.requireOsLogin","spec":{"rules":[{"enforce":true}]}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(api.policies) != 0 {
+				t.Fatalf("invalid request mutated policies: %#v", api.policies)
+			}
+		})
+	}
+}
+
+func TestCreatePolicyRejectsMalformedCanonicalPolicyIDs(t *testing.T) {
+	tests := []struct {
+		name     string
+		policyID string
+	}{
+		{name: "colon", policyID: "compute:requireOsLogin"},
+		{name: "control", policyID: "compute.\u0000requireOsLogin"},
+		{name: "encoded separator", policyID: "compute%2FrequireOsLogin"},
+		{name: "leading separator", policyID: ".compute.requireOsLogin"},
+		{name: "trailing separator", policyID: "compute.requireOsLogin."},
+		{name: "duplicate separator", policyID: "compute..requireOsLogin"},
+		{name: "leading hyphen", policyID: "-compute.requireOsLogin"},
+		{name: "mixed duplicate separators", policyID: "compute.-requireOsLogin"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			body, err := json.Marshal(Policy{
+				Name: "projects/project-a/policies/" + test.policyID,
+				Spec: &PolicySpec{Rules: []PolicyRule{{Enforce: true}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(
+				http.MethodPost, "/v2/projects/project-a/policies", strings.NewReader(string(body)),
+			))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if contentType := response.Header().Get("Content-Type"); contentType != "application/json" {
+				t.Fatalf("content-type=%q", contentType)
+			}
+			var envelope struct {
+				Error struct {
+					Code   int    `json:"code"`
+					Status string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Error.Code != http.StatusBadRequest || envelope.Error.Status != "INVALID_ARGUMENT" {
+				t.Fatalf("error envelope = %#v", envelope.Error)
+			}
+			if len(api.policies) != 0 {
+				t.Fatalf("invalid policy ID mutated policies: %#v", api.policies)
+			}
+		})
+	}
+}
+
+func TestPolicyResourceMutationsRejectMalformedCanonicalIDs(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name: "patch colon", method: http.MethodPatch,
+			path: "/v2/projects/project-a/policies/compute:requireOsLogin", body: `{"spec":{}}`,
+		},
+		{
+			name: "delete encoded separator", method: http.MethodDelete,
+			path: "/v2/projects/project-a/policies/compute%2FrequireOsLogin",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			api.policies["projects/project-a/policies/preserved"] = &Policy{
+				Name: "projects/project-a/policies/preserved",
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(
+				test.method, test.path, strings.NewReader(test.body),
+			))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var envelope struct {
+				Error struct {
+					Code   int    `json:"code"`
+					Status string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Error.Code != http.StatusBadRequest || envelope.Error.Status != "INVALID_ARGUMENT" {
+				t.Fatalf("error envelope = %#v", envelope.Error)
+			}
+			if len(api.policies) != 1 || api.policies["projects/project-a/policies/preserved"] == nil {
+				t.Fatalf("malformed mutation changed policies: %#v", api.policies)
+			}
+		})
+	}
+}
+
+func TestPolicyRoutesRequireCanonicalRawPathsForEveryMethod(t *testing.T) {
+	const canonicalName = "projects/project-a/policies/compute.requireOsLogin"
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name: "create encoded collection alias", method: http.MethodPost,
+			path: "/v2/projects/project-a/%70olicies",
+			body: `{"name":"` + canonicalName + `","spec":{"rules":[{"enforce":true}]}}`,
+		},
+		{name: "list encoded collection alias", method: http.MethodGet, path: "/v2/projects/project-a/%70olicies"},
+		{
+			name: "get encoded dot alias", method: http.MethodGet,
+			path: "/v2/projects/project-a/policies/compute%2ErequireOsLogin",
+		},
+		{
+			name: "patch encoded separator", method: http.MethodPatch,
+			path: "/v2/projects/project-a/policies/compute%2FrequireOsLogin", body: `{"spec":{}}`,
+		},
+		{
+			name: "delete encoded control", method: http.MethodDelete,
+			path: "/v2/projects/project-a/policies/compute%00requireOsLogin",
+		},
+		{
+			name: "get encoded parent dot segment", method: http.MethodGet,
+			path: "/v2/projects/%2E/policies/compute.requireOsLogin",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			api.policies[canonicalName] = &Policy{Name: canonicalName}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(
+				test.method, test.path, strings.NewReader(test.body),
+			))
+			assertOrgPolicyError(t, response, http.StatusBadRequest, "INVALID_ARGUMENT")
+			if len(api.policies) != 1 || api.policies[canonicalName] == nil {
+				t.Fatalf("non-canonical route mutated policies: %#v", api.policies)
+			}
+		})
+	}
+}
+
+func TestPolicyCanonicalRouteMethodMatrix(t *testing.T) {
+	const canonicalName = "projects/project-a/policies/compute.requireOsLogin"
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		seed   bool
+	}{
+		{
+			name: "create", method: http.MethodPost, path: "/v2/projects/project-a/policies",
+			body: `{"name":"` + canonicalName + `","spec":{"rules":[{"enforce":true}]}}`,
+		},
+		{name: "list", method: http.MethodGet, path: "/v2/projects/project-a/policies", seed: true},
+		{name: "get", method: http.MethodGet, path: "/v2/" + canonicalName, seed: true},
+		{name: "patch", method: http.MethodPatch, path: "/v2/" + canonicalName, body: `{"spec":{}}`, seed: true},
+		{name: "delete", method: http.MethodDelete, path: "/v2/" + canonicalName, seed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newTestAPI()
+			if test.seed {
+				api.policies[canonicalName] = &Policy{Name: canonicalName}
+			}
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, httptest.NewRequest(
+				test.method, test.path, strings.NewReader(test.body),
+			))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func assertOrgPolicyError(t *testing.T, response *httptest.ResponseRecorder, code int, status string) {
+	t.Helper()
+	if response.Code != code {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content-type=%q", response.Header().Get("Content-Type"))
+	}
+	var envelope struct {
+		Error struct {
+			Code   int    `json:"code"`
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != code || envelope.Error.Status != status {
+		t.Fatalf("error envelope = %#v", envelope.Error)
+	}
+}
+
 func TestCreatePolicyDuplicate(t *testing.T) {
 	api := newTestAPI()
 	api.mu.Lock()

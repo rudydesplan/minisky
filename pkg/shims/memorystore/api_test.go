@@ -236,6 +236,134 @@ func TestRedisBackendAndPersistenceFailuresAreTerminal(t *testing.T) {
 	}
 }
 
+func TestRedisPostProvisionSaveFailureCleansOwnedBackendAndMetadata(t *testing.T) {
+	store := &failSecondRedisStore{}
+	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := redisRequest(api, http.MethodPost,
+		"/v1/projects/test/locations/us-central1/instances?instanceId=cache",
+		`{"tier":"BASIC","memorySizeGb":1}`)
+	operationName := operationNameFromResponse(t, create)
+	operation := waitForRedisOperation(t, api, operationName)
+	if operation.Error == nil || !strings.Contains(operation.Error.Message, "injected post-provision save failure") {
+		t.Fatalf("operation = %+v", operation)
+	}
+	if backend.deleteCalls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", backend.deleteCalls)
+	}
+	api.mu.RLock()
+	instance := api.instances["projects/test/locations/us-central1/instances/cache"]
+	api.mu.RUnlock()
+	if instance != nil {
+		t.Fatalf("failed create retained metadata: %+v", instance)
+	}
+
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := redisRequest(restarted, http.MethodGet,
+		"/v1/projects/test/locations/us-central1/instances/cache", "")
+	assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestRedisRestartResumesExactOwnedDeletingBackend(t *testing.T) {
+	const name = "projects/test/locations/us-central1/instances/cache"
+	store := &failCombinedRedisStore{}
+	if err := store.Save(memorystoreStateEntry, redisMetadata{
+		Instances: map[string]persistedInstance{name: {
+			Instance: &Instance{
+				Name: name, Tier: "BASIC", MemorySizeGb: 1, State: "DELETING",
+				LocationId: "us-central1",
+			},
+			BackendID: "redis-backend",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeRedisBackend{endpoint: "127.0.0.1:46379", owned: true}
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.deleteCalls != 1 {
+		t.Fatalf("delete calls = %d, want one resumed exact-owned deletion", backend.deleteCalls)
+	}
+	missing := redisRequest(restarted, http.MethodGet, "/v1/"+name, "")
+	assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+
+	var persisted redisMetadata
+	if err := store.Load(memorystoreStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Instances[name].Instance != nil {
+		t.Fatalf("deleting metadata survived restart: %+v", persisted.Instances[name])
+	}
+}
+
+func TestRedisRestartCleansOrphanedVolumeWhenContainerIsMissing(t *testing.T) {
+	const name = "projects/test/locations/us-central1/instances/cache"
+	store := &failCombinedRedisStore{}
+	if err := store.Save(memorystoreStateEntry, redisMetadata{
+		Instances: map[string]persistedInstance{name: {
+			Instance: &Instance{
+				Name: name, Tier: "BASIC", MemorySizeGb: 1, State: "DELETING",
+				LocationId: "us-central1",
+			},
+			BackendID: "redis-backend",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeRedisBackend{owned: false}
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.deleteCalls != 1 {
+		t.Fatalf("delete calls = %d, want orphaned volume cleanup despite missing container", backend.deleteCalls)
+	}
+	missing := redisRequest(restarted, http.MethodGet, "/v1/"+name, "")
+	assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestRedisRestartPreservesDeletingWhenResumedCleanupFails(t *testing.T) {
+	const name = "projects/test/locations/us-central1/instances/cache"
+	store := &failCombinedRedisStore{}
+	if err := store.Save(memorystoreStateEntry, redisMetadata{
+		Instances: map[string]persistedInstance{name: {
+			Instance: &Instance{
+				Name: name, Tier: "BASIC", MemorySizeGb: 1, State: "DELETING",
+				LocationId: "us-central1",
+			},
+			BackendID: "redis-backend",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeRedisBackend{
+		owned:     false,
+		deleteErr: errors.New("injected cleanup failure"),
+	}
+	restarted, err := NewAPIWithStore(orchestrator.NewOperationManager(), backend, nil, store)
+	if err == nil {
+		t.Fatal("restart accepted failed resumed deletion")
+	}
+	if restarted != nil {
+		t.Fatalf("restart API = %#v, want nil on failed resumed deletion", restarted)
+	}
+	var persisted redisMetadata
+	if err := store.Load(memorystoreStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Instances[name].Instance; got == nil || got.State != "DELETING" {
+		t.Fatalf("failed resumed deletion changed durable state: %#v", got)
+	}
+}
+
 func TestRedisOperationMappingSurvivesRestart(t *testing.T) {
 	store, err := state.New(t.TempDir(), "redis-operations")
 	if err != nil {
@@ -393,6 +521,7 @@ type fakeRedisBackend struct {
 	endpoint       string
 	owned          bool
 	err            error
+	deleteErr      error
 	lastImage      string
 	provisionCalls int
 	reconcileCalls int
@@ -403,6 +532,35 @@ type failCombinedRedisStore struct {
 	mu      sync.Mutex
 	data    []byte
 	failing bool
+}
+
+type failSecondRedisStore struct {
+	mu    sync.Mutex
+	data  []byte
+	saves int
+}
+
+func (s *failSecondRedisStore) Load(_ string, target any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(s.data, target)
+}
+
+func (s *failSecondRedisStore) Save(_ string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saves++
+	if s.saves == 2 {
+		return errors.New("injected post-provision save failure")
+	}
+	data, err := json.Marshal(value)
+	if err == nil {
+		s.data = data
+	}
+	return err
 }
 
 func (s *failCombinedRedisStore) Load(_ string, target any) error {
@@ -464,6 +622,9 @@ func (b *fakeRedisBackend) DeleteRedis(context.Context, string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.deleteCalls++
+	if b.deleteErr != nil {
+		return b.deleteErr
+	}
 	return b.err
 }
 
