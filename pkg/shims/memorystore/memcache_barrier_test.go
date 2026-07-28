@@ -212,6 +212,7 @@ func TestMemcacheDurableOperationPollingSurvivesCommittedDegradation(t *testing.
 			}
 			operationName := operationNameFromResponse(t, response)
 			waitForMemcachePersistenceFailure(t, api.opMgr)
+			waitForMemcacheManagerTerminal(t, api.opMgr, operationName)
 
 			polled := memcacheRequest(api, http.MethodGet, "/v1/"+operationName, "")
 			if polled.Code != http.StatusOK {
