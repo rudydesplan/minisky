@@ -300,8 +300,8 @@ func TestFinalizeScopedDurableWithBarrierValidatesOperationState(t *testing.T) {
 	if err := manager.FinalizeScopedDurableWithBarrier(scoped.Name, nil, 0, "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.FinalizeScopedDurableWithBarrier(scoped.Name, nil, 0, "", barrier); err == nil {
-		t.Fatal("already-terminal operation was finalized again")
+	if err := manager.FinalizeScopedDurableWithBarrier(scoped.Name, nil, 0, "", barrier); err != nil {
+		t.Fatalf("idempotent terminal retry error = %v", err)
 	}
 	if barrierCalls.Load() != 0 {
 		t.Fatalf("barrier calls for invalid operations = %d", barrierCalls.Load())

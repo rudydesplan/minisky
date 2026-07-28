@@ -112,10 +112,14 @@ Dashboard denial records the federated principal, scans generated state and
 working files for selected secrets, proves an isolated mutation breaks audit
 verification, and clears the project policy during cleanup.
 
-This guarded cross-gate passed locally on 2026-07-25. The opt-in
-`phase17-enterprise-integration` GitHub Actions job is configured behind the
-`run_phase17_enterprise_integration` workflow-dispatch input, but configuration
-is not evidence that the job has passed in CI.
+This guarded cross-gate passed locally on 2026-07-25. In GitHub Actions, the
+`enterprise-controls` job belongs to `.github/workflows/critical-integration.yml`
+and runs with that workflow on matching path-filtered pull requests and `main`
+pushes, its weekly schedule, or an input-free manual full-workflow rerun. To
+request the manual rerun, select **Critical integration evidence** and choose
+**Run workflow**; there is no per-job dispatch boolean. This trigger
+configuration is not evidence that the job has passed externally or that it is
+required by branch protection.
 
 ## In-tree plugin SDK v0
 

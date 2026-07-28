@@ -3,6 +3,7 @@ package compute
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -433,9 +434,9 @@ func TestSynchronousFirewallFailureReconcilesTerminalOperationPostCommitError(t 
 	if !inProcess.Done || inProcess.Error == nil {
 		t.Fatalf("in-process terminal operation = %#v", inProcess)
 	}
-	if degraded := api.initializationError(); degraded == nil ||
+	if degraded := opMgr.PersistenceError(); degraded == nil ||
 		!strings.Contains(degraded.Error(), "terminal failure sync error") {
-		t.Fatalf("synchronous terminal failure did not degrade Compute: %v", degraded)
+		t.Fatalf("synchronous terminal failure did not remain diagnostically degraded: %v", degraded)
 	}
 	poll := performComputeRequest(api, http.MethodGet,
 		"/compute/v1/projects/project-a/global/operations/"+inProcess.Name, "")
@@ -473,9 +474,12 @@ func TestSynchronousFirewallFailureReconcilesUncommittedTerminalOperation(t *tes
 		`{"name":"sync-failure","network":"https://www.googleapis.com/compute/v1/projects/project-a/global/networks/custom","allowed":[{"IPProtocol":"tcp","ports":["8080"]}]}`)
 	assertComputeError(t, response, http.StatusInternalServerError, "INTERNAL")
 	inProcess := opMgr.List()[0]
-	if !inProcess.Done || inProcess.Error == nil ||
-		!strings.Contains(inProcess.Error.Message, "interrupted by MiniSky restart") {
-		t.Fatalf("in-process terminal operation = %#v", inProcess)
+	if inProcess.Done || inProcess.Status == orchestrator.StatusDone || inProcess.Error != nil {
+		t.Fatalf("uncommitted terminal operation was published in-process: %#v", inProcess)
+	}
+	if degraded := api.initializationError(); degraded == nil ||
+		!strings.Contains(degraded.Error(), "terminal failure before commit") {
+		t.Fatalf("uncommitted terminal failure did not degrade Compute: %v", degraded)
 	}
 
 	restarted, err := orchestrator.NewOperationManagerWithStore(operationStore)
@@ -484,8 +488,225 @@ func TestSynchronousFirewallFailureReconcilesUncommittedTerminalOperation(t *tes
 	}
 	durable := restarted.Get(inProcess.Name)
 	if durable == nil || !durable.Done || durable.Error == nil ||
-		durable.Error.Message != inProcess.Error.Message {
-		t.Fatalf("terminal polling diverged across restart: in-process=%#v restarted=%#v", inProcess, durable)
+		!strings.Contains(durable.Error.Message, "interrupted by MiniSky restart") {
+		t.Fatalf("restart did not safely interrupt uncommitted operation: %#v", durable)
+	}
+}
+
+func TestControlPlaneTerminalPostCommitReadbackDoesNotRollbackMetadata(t *testing.T) {
+	operationStore := &failingFirewallOperationStore{
+		failAfterCommit: map[int]error{2: errors.New("terminal operation sync failure")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &toggleComputeStore{}
+	api, err := newTestAPIWithMetadataStore(opMgr, metadataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := performComputeRequest(api, http.MethodPost,
+		"/compute/v1/projects/project-a/global/securityPolicies",
+		`{"name":"committed-policy"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	if api.securityPolicies["project-a:committed-policy"] == nil {
+		t.Fatal("exact committed terminal readback rolled back live metadata")
+	}
+	var persisted computeMetadata
+	if err := metadataStore.Load(computeStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.SecurityPolicies["project-a:committed-policy"] == nil {
+		t.Fatal("exact committed terminal readback rolled back durable metadata")
+	}
+	if degraded := api.initializationError(); degraded == nil ||
+		!strings.Contains(degraded.Error(), "terminal operation sync failure") {
+		t.Fatalf("post-commit operation save failure was not sticky: %v", degraded)
+	}
+
+	restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := newTestAPIWithMetadataStore(restartedOps, metadataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.securityPolicies["project-a:committed-policy"] == nil {
+		t.Fatal("committed metadata did not survive restart")
+	}
+	operations := restartedOps.List()
+	if len(operations) != 1 || !operations[0].Done || operations[0].Error != nil {
+		t.Fatalf("committed operation did not survive restart: %#v", operations)
+	}
+}
+
+func TestControlPlaneUncommittedTerminalFailureRollsBackMetadata(t *testing.T) {
+	operationStore := &failingFirewallOperationStore{
+		failOnSave: map[int]error{2: errors.New("terminal operation before commit")},
+	}
+	opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataStore := &toggleComputeStore{}
+	api, err := newTestAPIWithMetadataStore(opMgr, metadataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := performComputeRequest(api, http.MethodPost,
+		"/compute/v1/projects/project-a/global/securityPolicies",
+		`{"name":"rolled-back-policy"}`)
+	assertComputeError(t, response, http.StatusInternalServerError, "INTERNAL")
+	if api.securityPolicies["project-a:rolled-back-policy"] != nil {
+		t.Fatal("uncommitted terminal failure published live metadata")
+	}
+	var persisted computeMetadata
+	if err := metadataStore.Load(computeStateEntry, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.SecurityPolicies["project-a:rolled-back-policy"] != nil {
+		t.Fatal("uncommitted terminal failure left durable metadata")
+	}
+	inProcess := opMgr.List()
+	if len(inProcess) != 1 || inProcess[0].Done || inProcess[0].Error != nil {
+		t.Fatalf("uncommitted operation was published in-process: %#v", inProcess)
+	}
+
+	restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := newTestAPIWithMetadataStore(restartedOps, metadataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.securityPolicies["project-a:rolled-back-policy"] != nil {
+		t.Fatal("rolled-back metadata reappeared after restart")
+	}
+	operations := restartedOps.List()
+	if len(operations) != 1 || !operations[0].Done || operations[0].Error == nil ||
+		!strings.Contains(operations[0].Error.Message, "interrupted by MiniSky restart") {
+		t.Fatalf("restart did not safely interrupt uncommitted operation: %#v", operations)
+	}
+}
+
+func TestControlPlaneTerminalConflictPreservesCommittedMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		assert func(*testing.T, *API, computeMetadata)
+	}{
+		{
+			name: "security policy",
+			path: "/compute/v1/projects/project-a/global/securityPolicies",
+			body: `{"name":"conflict-policy"}`,
+			assert: func(t *testing.T, api *API, persisted computeMetadata) {
+				t.Helper()
+				key := "project-a:conflict-policy"
+				if api.securityPolicies[key] == nil || persisted.SecurityPolicies[key] == nil {
+					t.Fatalf("committed security policy was lost: live=%#v persisted=%#v",
+						api.securityPolicies[key], persisted.SecurityPolicies[key])
+				}
+			},
+		},
+		{
+			name: "load balancer",
+			path: "/compute/v1/projects/project-a/global/healthChecks",
+			body: `{"name":"conflict-health-check"}`,
+			assert: func(t *testing.T, api *API, persisted computeMetadata) {
+				t.Helper()
+				key := loadBalancerKey("project-a", "healthChecks", "conflict-health-check")
+				if api.loadBalancers[key] == nil || persisted.LoadBalancers[key] == nil {
+					t.Fatalf("committed load-balancer metadata was lost: live=%#v persisted=%#v",
+						api.loadBalancers[key], persisted.LoadBalancers[key])
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operationStore := &toggleComputeStore{}
+			opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadataStore := &terminalConflictComputeStore{manager: opMgr}
+			api, err := newTestAPIWithMetadataStore(opMgr, metadataStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response := performComputeRequest(api, http.MethodPost, test.path, test.body)
+			assertComputeError(t, response, http.StatusInternalServerError, "INTERNAL")
+			if degraded := api.initializationError(); !errors.Is(degraded, orchestrator.ErrOperationTerminalConflict) {
+				t.Fatalf("terminal conflict did not fail closed: %v", degraded)
+			}
+			if err := metadataStore.hookError(); err != nil {
+				t.Fatalf("inject terminal conflict: %v", err)
+			}
+			if saves := metadataStore.saveCount(); saves != 1 {
+				t.Fatalf("metadata saves = %d, want committed write without rollback", saves)
+			}
+
+			restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := newTestAPIWithMetadataStore(restartedOps, metadataStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted computeMetadata
+			if err := metadataStore.Load(computeStateEntry, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			test.assert(t, restarted, persisted)
+			operations := restartedOps.List()
+			if len(operations) != 1 || !operations[0].Done || operations[0].Error == nil ||
+				operations[0].Error.Message != "preexisting immutable terminal result" {
+				t.Fatalf("restart operation truth changed: %#v", operations)
+			}
+		})
+	}
+}
+
+func TestFirewallTerminalRetriesAreIdempotentAndConflictsFailClosed(t *testing.T) {
+	opMgr := orchestrator.NewOperationManager()
+	api := newAPI(opMgr, nil, nil)
+	operation, err := opMgr.RegisterDurable(
+		"compute#operation",
+		"insert",
+		"https://www.googleapis.com/compute/v1/projects/project-a/global/firewalls/retry",
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutationErr := errors.New("backend failed")
+	if message := api.failFirewallOperation(operation.Name, mutationErr); message != mutationErr.Error() {
+		t.Fatalf("first terminal result = %q", message)
+	}
+	if message := api.failFirewallOperation(operation.Name, mutationErr); message != mutationErr.Error() {
+		t.Fatalf("idempotent terminal retry = %q", message)
+	}
+	if api.initializationError() != nil {
+		t.Fatalf("idempotent retry degraded Compute: %v", api.initializationError())
+	}
+
+	message := api.failFirewallOperation(operation.Name, errors.New("different backend failure"))
+	if !strings.Contains(message, orchestrator.ErrOperationTerminalConflict.Error()) {
+		t.Fatalf("conflicting retry did not return terminal conflict: %q", message)
+	}
+	if degraded := api.initializationError(); !errors.Is(degraded, orchestrator.ErrOperationTerminalConflict) {
+		t.Fatalf("conflicting retry did not fail closed: %v", degraded)
 	}
 }
 
@@ -559,13 +780,9 @@ func TestFirewallTerminalOperationPostCommitFailureDegradesButPollsTruthfully(t 
 	var operation orchestrator.Operation
 	decodeComputeResponse(t, response, &operation)
 	waitForFirewallTerminal(t, opMgr, operation.Name)
-	deadline := time.Now().Add(time.Second)
-	for api.initializationError() == nil && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if degraded := api.initializationError(); degraded == nil ||
+	if degraded := opMgr.PersistenceError(); degraded == nil ||
 		!strings.Contains(degraded.Error(), "terminal operation sync failure") {
-		t.Fatalf("terminal operation failure did not degrade Compute: %v", degraded)
+		t.Fatalf("terminal operation failure did not retain manager degradation: %v", degraded)
 	}
 	poll := performComputeRequest(api, http.MethodGet,
 		"/compute/v1/projects/project-a/global/operations/"+operation.Name, "")
@@ -741,6 +958,60 @@ func (store *postCommitComputeStore) Save(_ string, value any) error {
 	}
 	store.data = data
 	return store.failAfterCommit[store.saveCount]
+}
+
+type terminalConflictComputeStore struct {
+	mu      sync.Mutex
+	data    []byte
+	saves   int
+	manager *orchestrator.OperationManager
+	once    sync.Once
+	hookErr error
+}
+
+func (store *terminalConflictComputeStore) Load(_ string, target any) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(store.data, target)
+}
+
+func (store *terminalConflictComputeStore) Save(_ string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	store.mu.Lock()
+	store.saves++
+	store.data = data
+	store.mu.Unlock()
+	store.once.Do(func() {
+		operations := store.manager.List()
+		if len(operations) != 1 {
+			store.hookErr = fmt.Errorf("operations = %#v", operations)
+			return
+		}
+		store.hookErr = store.manager.FailDurable(
+			operations[0].Name,
+			http.StatusInternalServerError,
+			"preexisting immutable terminal result",
+		)
+	})
+	return nil
+}
+
+func (store *terminalConflictComputeStore) saveCount() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.saves
+}
+
+func (store *terminalConflictComputeStore) hookError() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.hookErr
 }
 
 type armableComputeStore struct {

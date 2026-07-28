@@ -1,12 +1,15 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +18,8 @@ import (
 )
 
 const operationStateEntry = "orchestrator/operations"
+
+const interruptedOperationMessage = "operation interrupted by MiniSky restart; side effects were not replayed"
 
 // OperationStatus mirrors GCP's LRO status strings.
 type OperationStatus string
@@ -74,6 +79,10 @@ var ErrOperationNotFound = errors.New("operation not found")
 // cleanup completed.
 var ErrOperationTerminalBarrier = errors.New("terminal operation barrier failed")
 
+// ErrOperationTerminalConflict classifies a retry that disagrees with an
+// operation's already-published terminal result.
+var ErrOperationTerminalConflict = errors.New("operation terminal result conflicts with existing result")
+
 // OperationScope is the durable identity of one service-specific operation.
 type OperationScope struct {
 	ServiceKind string
@@ -125,12 +134,14 @@ func NewOperationManagerWithStore(store operationStore) (*OperationManager, erro
 	if store == nil {
 		return manager, nil
 	}
-	if err := store.Load(operationStateEntry, &manager.ops); err != nil {
+	loaded, err := loadOperationSnapshot(store)
+	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return manager, nil
 		}
 		return nil, fmt.Errorf("load operations: %w", err)
 	}
+	manager.ops = loaded
 	if manager.ops == nil {
 		manager.ops = make(map[string]*Operation)
 	}
@@ -217,10 +228,10 @@ func (om *OperationManager) insertDurable(op *Operation, rollbackOnFailure bool)
 			delete(om.ops, op.Name)
 			om.mu.Unlock()
 			if compensationErr := om.persistLocked(); compensationErr != nil {
-				var durable map[string]*Operation
 				loadErr := error(nil)
+				var durable map[string]*Operation
 				if om.store != nil {
-					loadErr = om.store.Load(operationStateEntry, &durable)
+					durable, loadErr = loadOperationSnapshot(om.store)
 				}
 				if errors.Is(loadErr, state.ErrNotFound) {
 					loadErr = nil
@@ -353,10 +364,13 @@ func (om *OperationManager) Advance(name string, progress int, status OperationS
 }
 
 // AdvanceDurable updates an operation and reports whether the resulting
-// snapshot was saved. A terminal save failure remains visible in-process on the
-// operation; after restart, the last durable non-terminal state is reported as
-// interrupted and no work is replayed.
+// non-terminal snapshot was saved. Terminal transitions use the canonical
+// persist-before-publish finalizer.
 func (om *OperationManager) AdvanceDurable(name string, progress int, status OperationStatus) error {
+	if status == StatusDone {
+		return om.FinalizeDurable(name, 0, "")
+	}
+
 	om.persistMu.Lock()
 
 	om.mu.Lock()
@@ -366,6 +380,11 @@ func (om *OperationManager) AdvanceDurable(name string, progress int, status Ope
 		om.persistMu.Unlock()
 		return nil
 	}
+	if op.Done || op.Status == StatusDone {
+		om.mu.Unlock()
+		om.persistMu.Unlock()
+		return fmt.Errorf("%w: %q", ErrOperationTerminalConflict, name)
+	}
 
 	op.Progress = progress
 	op.Status = status
@@ -374,40 +393,45 @@ func (om *OperationManager) AdvanceDurable(name string, progress int, status Ope
 		op.StartTime = time.Now().UTC().Format(time.RFC3339)
 	}
 
-	if status == StatusDone {
-		op.Done = true
-		op.Progress = 100
-		op.EndTime = time.Now().UTC().Format(time.RFC3339)
-		ensureScopedTerminalResponse(op)
-	}
 	om.mu.Unlock()
 	if err := om.persistLocked(); err != nil {
-		om.recordPersistenceFailure(name, status == StatusDone, err)
+		om.recordPersistenceFailure(name, false, err)
 		om.persistMu.Unlock()
 		return err
 	}
-	terminal := status == StatusDone
-	completed := om.Get(name)
 	om.persistMu.Unlock()
-	if terminal {
-		om.notifyTerminal(completed)
-	}
 	return nil
 }
 
-// UpdateMetadata updates the metadata of an operation.
-func (om *OperationManager) UpdateMetadata(name string, metadata interface{}) {
+// UpdateMetadata validates and durably updates an operation's JSON metadata.
+func (om *OperationManager) UpdateMetadata(name string, metadata interface{}) error {
+	normalized, err := normalizeOperationMetadata(metadata)
+	if err != nil {
+		return fmt.Errorf("normalize operation metadata: %w", err)
+	}
+
+	om.persistMu.Lock()
 	om.mu.Lock()
-	if op, ok := om.ops[name]; ok {
-		op.Metadata = metadata
+	op, ok := om.ops[name]
+	if ok {
+		op.Metadata = normalized
 	}
 	om.mu.Unlock()
-	om.persistBestEffort()
+	if !ok {
+		om.persistMu.Unlock()
+		return nil
+	}
+	err = om.persistLocked()
+	om.persistMu.Unlock()
+	if err != nil {
+		om.recordPersistenceFailure("", false, err)
+	}
+	return err
 }
 
 // MarkDone marks the operation as successfully completed.
 func (om *OperationManager) MarkDone(name string) {
-	om.Advance(name, 100, StatusDone)
+	_ = om.FinalizeDurable(name, 0, "")
 }
 
 // List returns all operations in the registry.
@@ -426,43 +450,13 @@ func (om *OperationManager) Fail(name string, code int, message string) {
 	_ = om.FailDurable(name, code, message)
 }
 
-// FailDurable marks an operation failed and reports whether the terminal state
-// was saved.
+// FailDurable durably marks an operation failed, then publishes the terminal
+// state to pollers and observers.
 func (om *OperationManager) FailDurable(name string, code int, message string) error {
-	om.persistMu.Lock()
-
-	om.mu.Lock()
-	op, ok := om.ops[name]
-	if !ok {
-		om.mu.Unlock()
-		om.persistMu.Unlock()
-		return nil
-	}
-	op.Status = StatusDone
-	op.Done = true
-	op.Progress = 100
-	op.EndTime = time.Now().UTC().Format(time.RFC3339)
-	if isScopedOperation(op) {
-		code = canonicalRPCCode(code)
-	}
-	op.Error = &OperationError{Code: code, Message: message}
-	op.Response = nil
-	om.mu.Unlock()
-	if err := om.persistLocked(); err != nil {
-		om.recordPersistenceFailure(name, true, err)
-		om.persistMu.Unlock()
-		return err
-	}
-	completed := om.Get(name)
-	om.persistMu.Unlock()
-	om.notifyTerminal(completed)
-	return nil
+	return om.finalizeDurable(name, nil, code, message)
 }
 
-// FinalizeDurable records a terminal result and reconciles an ambiguous Save
-// error against the operation store before returning. The returned error is
-// preserved even when readback confirms the terminal state, allowing callers
-// to enter a degraded mode for uncertain filesystem durability.
+// FinalizeDurable records a terminal result durably before publishing it.
 func (om *OperationManager) FinalizeDurable(name string, code int, message string) error {
 	return om.finalizeDurable(name, nil, code, message)
 }
@@ -479,10 +473,11 @@ func (om *OperationManager) FinalizeScopedDurable(name string, response json.Raw
 // not call an OperationManager method that acquires persistMu.
 //
 // A save failure skips the barrier and leaves the visible operation
-// non-terminal. A barrier failure means the operation is already durably
-// terminal: the terminal candidate is published and observers are notified,
-// while the joined ErrOperationTerminalBarrier result tells the caller to
-// retain or reconcile any association the barrier could not durably clear.
+// non-terminal unless readback exactly confirms that the candidate committed.
+// A barrier failure means the operation is already durably terminal: the
+// terminal candidate is published and observers are notified, while the joined
+// ErrOperationTerminalBarrier result tells the caller to retain or reconcile
+// any association the barrier could not durably clear.
 func (om *OperationManager) FinalizeScopedDurableWithBarrier(
 	name string,
 	response json.RawMessage,
@@ -493,7 +488,7 @@ func (om *OperationManager) FinalizeScopedDurableWithBarrier(
 	om.persistMu.Lock()
 
 	om.mu.RLock()
-	current := om.ops[name]
+	current := cloneOperation(om.ops[name])
 	switch {
 	case current == nil:
 		om.mu.RUnlock()
@@ -503,31 +498,36 @@ func (om *OperationManager) FinalizeScopedDurableWithBarrier(
 		om.mu.RUnlock()
 		om.persistMu.Unlock()
 		return ErrOperationNotFound
-	case current.Done || current.Status == StatusDone:
-		om.mu.RUnlock()
-		om.persistMu.Unlock()
-		return fmt.Errorf("operation %q is already terminal", name)
 	}
-	candidate := terminalOperationCandidate(current, response, code, message)
 	snapshot := make(map[string]*Operation, len(om.ops))
 	for operationName, operation := range om.ops {
 		snapshot[operationName] = cloneOperation(operation)
 	}
-	snapshot[name] = cloneOperation(candidate)
 	om.mu.RUnlock()
 
-	if err := om.persistOperationSnapshotLocked(snapshot); err != nil {
-		om.recordPersistenceFailure(name, false, err)
+	candidate := terminalOperationCandidate(current, response, code, message)
+	if (current.Done || current.Status == StatusDone) && !isInterruptedOperation(current) {
+		matches, err := terminalResultsEqual(current, candidate)
 		om.persistMu.Unlock()
-		return err
+		if err != nil {
+			return err
+		}
+		if matches {
+			return nil
+		}
+		return fmt.Errorf("%w: %q", ErrOperationTerminalConflict, name)
+	}
+	snapshot[name] = cloneOperation(candidate)
+
+	committed, saveErr, readbackErr := om.persistTerminalCandidateLocked(name, candidate, snapshot)
+	if !committed {
+		om.persistMu.Unlock()
+		return terminalPersistenceError(saveErr, readbackErr)
 	}
 
 	barrierErr := runOperationTerminalBarrier(barrier)
 
-	om.mu.Lock()
-	om.ops[name] = cloneOperation(candidate)
-	completed := cloneOperation(om.ops[name])
-	om.mu.Unlock()
+	completed := om.publishTerminalCandidate(name, candidate)
 	om.persistMu.Unlock()
 
 	om.notifyTerminal(completed)
@@ -540,60 +540,43 @@ func (om *OperationManager) FinalizeScopedDurableWithBarrier(
 func (om *OperationManager) finalizeDurable(name string, response json.RawMessage, code int, message string) error {
 	om.persistMu.Lock()
 
-	om.mu.Lock()
-	op, ok := om.ops[name]
+	om.mu.RLock()
+	current, ok := om.ops[name]
 	if !ok {
-		om.mu.Unlock()
+		om.mu.RUnlock()
 		om.persistMu.Unlock()
 		return nil
 	}
-	op.Status = StatusDone
-	op.Done = true
-	op.Progress = 100
-	op.EndTime = time.Now().UTC().Format(time.RFC3339)
-	if code != 0 {
-		if isScopedOperation(op) {
-			code = canonicalRPCCode(code)
-		}
-		op.Error = &OperationError{Code: code, Message: message}
-		op.Response = nil
-	} else {
-		op.Error = nil
-		op.Response = append(json.RawMessage(nil), response...)
-		ensureScopedTerminalResponse(op)
+	current = cloneOperation(current)
+	snapshot := make(map[string]*Operation, len(om.ops))
+	for operationName, operation := range om.ops {
+		snapshot[operationName] = cloneOperation(operation)
 	}
-	om.mu.Unlock()
+	om.mu.RUnlock()
 
-	if err := om.persistLocked(); err != nil {
-		var durable map[string]*Operation
-		loadErr := error(nil)
-		if om.store != nil {
-			loadErr = om.store.Load(operationStateEntry, &durable)
-		}
-		if errors.Is(loadErr, state.ErrNotFound) {
-			loadErr = nil
-			durable = nil
-		}
-		wrapped := fmt.Errorf("terminal operation persistence degraded: %w", err)
-		om.mu.Lock()
-		if loadErr == nil && durable[name] != nil {
-			reconciled := cloneOperation(durable[name])
-			if !reconciled.Done && reconciled.Status != StatusDone {
-				interruptOperation(reconciled)
-			}
-			om.ops[name] = reconciled
-		}
-		om.persistenceErr = wrapped
-		om.mu.Unlock()
-		if loadErr != nil {
-			om.persistMu.Unlock()
-			return fmt.Errorf("%w; read back operations: %v", wrapped, loadErr)
-		}
+	candidate := terminalOperationCandidate(current, response, code, message)
+	if (current.Done || current.Status == StatusDone) && !isInterruptedOperation(current) {
+		matches, err := terminalResultsEqual(current, candidate)
 		om.persistMu.Unlock()
-		return wrapped
+		if err != nil {
+			return err
+		}
+		if matches {
+			return nil
+		}
+		return fmt.Errorf("%w: %q", ErrOperationTerminalConflict, name)
 	}
-	completed := om.Get(name)
+	snapshot[name] = cloneOperation(candidate)
+
+	committed, saveErr, readbackErr := om.persistTerminalCandidateLocked(name, candidate, snapshot)
+	if !committed {
+		om.persistMu.Unlock()
+		return terminalPersistenceError(saveErr, readbackErr)
+	}
+
+	completed := om.publishTerminalCandidate(name, candidate)
 	om.persistMu.Unlock()
+
 	om.notifyTerminal(completed)
 	return nil
 }
@@ -623,6 +606,16 @@ func terminalOperationCandidate(
 	return candidate
 }
 
+func terminalResultsEqual(left, right *Operation) (bool, error) {
+	if !reflect.DeepEqual(left.Error, right.Error) {
+		return false, nil
+	}
+	if len(left.Response) == 0 || len(right.Response) == 0 {
+		return len(left.Response) == 0 && len(right.Response) == 0, nil
+	}
+	return exactJSONEqual(left.Response, right.Response)
+}
+
 func runOperationTerminalBarrier(barrier func() error) (err error) {
 	if barrier == nil {
 		return nil
@@ -649,10 +642,10 @@ func (om *OperationManager) RollbackScopedRegistration(name string) error {
 		return nil
 	}
 	if err := om.persistLocked(); err != nil {
-		var durable map[string]*Operation
 		loadErr := error(nil)
+		var durable map[string]*Operation
 		if om.store != nil {
-			loadErr = om.store.Load(operationStateEntry, &durable)
+			durable, loadErr = loadOperationSnapshot(om.store)
 		}
 		wrapped := fmt.Errorf("operation rollback persistence degraded: %w", err)
 		om.mu.Lock()
@@ -782,10 +775,10 @@ func (om *OperationManager) RemoveDurable(name string) error {
 	om.mu.Unlock()
 
 	if err := om.persistLocked(); err != nil {
-		var durable map[string]*Operation
 		loadErr := error(nil)
+		var durable map[string]*Operation
 		if om.store != nil {
-			loadErr = om.store.Load(operationStateEntry, &durable)
+			durable, loadErr = loadOperationSnapshot(om.store)
 		}
 		if loadErr == nil && durable[name] == nil {
 			return nil
@@ -805,42 +798,48 @@ func (om *OperationManager) RemoveDurable(name string) error {
 // It ensures that intermediate states (PENDING, RUNNING) are visible to polling clients
 // by introducing artificial delays and granular progress increments.
 func (om *OperationManager) RunAsync(name string, workFn func() error) {
-	go func() {
-		// 1. Initial delay to ensure the caller (Terraform/UI) registers the initial PENDING state
-		time.Sleep(800 * time.Millisecond)
-
-		// 2. Transition PENDING → RUNNING (Low progress)
-		om.Advance(name, 5, StatusRunning)
-		time.Sleep(1200 * time.Millisecond)
-
-		// 3. Increment progress to show life before work starts
-		om.Advance(name, 25, StatusRunning)
-		time.Sleep(500 * time.Millisecond)
-
-		// 4. Execute actual work (container boot, provisioning, etc.)
-		if err := workFn(); err != nil {
-			code := 500
-			var coded interface{ OperationCode() int }
-			if errors.As(err, &coded) {
-				code = coded.OperationCode()
-			}
-			om.Fail(name, code, err.Error())
-			return
-		}
-
-		// 5. Successful work completion - show high progress before finishing
-		om.Advance(name, 85, StatusRunning)
-		time.Sleep(500 * time.Millisecond)
-
-		// 6. Transition RUNNING → DONE
-		om.Advance(name, 100, StatusDone)
-	}()
+	go om.runAsyncWithPauses(name, workFn, time.Sleep)
 }
 
-func (om *OperationManager) persistBestEffort() {
-	if err := om.persist(); err != nil {
-		om.recordPersistenceFailure("", false, err)
+func (om *OperationManager) runAsyncWithPauses(
+	name string,
+	workFn func() error,
+	pause func(time.Duration),
+) {
+	// 1. Initial delay to ensure the caller (Terraform/UI) registers the initial PENDING state.
+	pause(800 * time.Millisecond)
+
+	// 2. Transition PENDING → RUNNING (Low progress).
+	if err := om.AdvanceDurable(name, 5, StatusRunning); errors.Is(err, ErrOperationTerminalConflict) {
+		return
 	}
+	pause(1200 * time.Millisecond)
+
+	// 3. Increment progress to show life before work starts.
+	if err := om.AdvanceDurable(name, 25, StatusRunning); errors.Is(err, ErrOperationTerminalConflict) {
+		return
+	}
+	pause(500 * time.Millisecond)
+
+	// 4. Execute actual work (container boot, provisioning, etc.).
+	if err := workFn(); err != nil {
+		code := 500
+		var coded interface{ OperationCode() int }
+		if errors.As(err, &coded) {
+			code = coded.OperationCode()
+		}
+		_ = om.FailDurable(name, code, err.Error())
+		return
+	}
+
+	// 5. Successful work completion - show high progress before finishing.
+	if err := om.AdvanceDurable(name, 85, StatusRunning); errors.Is(err, ErrOperationTerminalConflict) {
+		return
+	}
+	pause(500 * time.Millisecond)
+
+	// 6. Transition RUNNING → DONE through the canonical durable finalizer.
+	_ = om.FinalizeDurable(name, 0, "")
 }
 
 func (om *OperationManager) persist() error {
@@ -857,15 +856,12 @@ func (om *OperationManager) persistLocked() error {
 		return nil
 	}
 	om.mu.RLock()
-	payload, err := json.Marshal(om.ops)
+	snapshot := make(map[string]*Operation, len(om.ops))
+	for name, operation := range om.ops {
+		snapshot[name] = cloneOperation(operation)
+	}
 	om.mu.RUnlock()
-	if err != nil {
-		return fmt.Errorf("snapshot operations: %w", err)
-	}
-	if err := om.store.Save(operationStateEntry, json.RawMessage(payload)); err != nil {
-		return fmt.Errorf("save operations: %w", err)
-	}
-	return nil
+	return om.persistOperationSnapshotLocked(snapshot)
 }
 
 // persistOperationSnapshotLocked saves an already-cloned operation snapshot.
@@ -882,6 +878,128 @@ func (om *OperationManager) persistOperationSnapshotLocked(snapshot map[string]*
 		return fmt.Errorf("save operations: %w", err)
 	}
 	return nil
+}
+
+// persistTerminalCandidateLocked reports whether the terminal candidate is
+// known durable. The caller must hold persistMu.
+func (om *OperationManager) persistTerminalCandidateLocked(
+	name string,
+	candidate *Operation,
+	snapshot map[string]*Operation,
+) (bool, error, error) {
+	saveErr := om.persistOperationSnapshotLocked(snapshot)
+	if saveErr == nil {
+		return true, nil, nil
+	}
+	om.recordPersistenceFailure(name, false, saveErr)
+
+	if om.store == nil {
+		return false, saveErr, errors.New("operation store is unavailable for readback")
+	}
+	durableSnapshot, err := loadOperationSnapshot(om.store)
+	if err != nil {
+		return false, saveErr, err
+	}
+	durable, ok := durableSnapshot[name]
+	if !ok {
+		return false, saveErr, nil
+	}
+	matches, err := operationsExactlyEqual(candidate, durable)
+	if err != nil {
+		return false, saveErr, err
+	}
+	return matches, saveErr, nil
+}
+
+func terminalPersistenceError(saveErr, readbackErr error) error {
+	if saveErr == nil {
+		return nil
+	}
+	wrapped := fmt.Errorf("terminal operation persistence degraded: %w", saveErr)
+	if readbackErr != nil {
+		return fmt.Errorf("%w; read back operations: %v", wrapped, readbackErr)
+	}
+	return wrapped
+}
+
+func operationsExactlyEqual(left, right *Operation) (bool, error) {
+	encode := func(operation *Operation) ([]byte, error) {
+		if operation == nil {
+			return nil, nil
+		}
+		payload, err := json.Marshal(operation)
+		if err != nil {
+			return nil, err
+		}
+		return payload, nil
+	}
+	encodedLeft, err := encode(left)
+	if err != nil {
+		return false, fmt.Errorf("encode terminal candidate: %w", err)
+	}
+	encodedRight, err := encode(right)
+	if err != nil {
+		return false, fmt.Errorf("encode durable terminal operation: %w", err)
+	}
+	return exactJSONEqual(encodedLeft, encodedRight)
+}
+
+func loadOperationSnapshot(store operationStore) (map[string]*Operation, error) {
+	var payload json.RawMessage
+	if err := store.Load(operationStateEntry, &payload); err != nil {
+		return nil, err
+	}
+	var rawSnapshot map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &rawSnapshot); err != nil {
+		return nil, fmt.Errorf("decode durable operation snapshot: %w", err)
+	}
+	snapshot := make(map[string]*Operation, len(rawSnapshot))
+	for name, rawOperation := range rawSnapshot {
+		decoder := json.NewDecoder(bytes.NewReader(rawOperation))
+		decoder.DisallowUnknownFields()
+		decoder.UseNumber()
+		var operation Operation
+		if err := decoder.Decode(&operation); err != nil {
+			return nil, fmt.Errorf("decode durable operation %q: %w", name, err)
+		}
+		snapshot[name] = &operation
+	}
+	return snapshot, nil
+}
+
+func exactJSONEqual(left, right []byte) (bool, error) {
+	decode := func(payload []byte) (any, error) {
+		if len(payload) == 0 {
+			return nil, nil
+		}
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return nil, errors.New("JSON value has trailing content")
+		}
+		return value, nil
+	}
+	decodedLeft, err := decode(left)
+	if err != nil {
+		return false, err
+	}
+	decodedRight, err := decode(right)
+	if err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(decodedLeft, decodedRight), nil
+}
+
+func (om *OperationManager) publishTerminalCandidate(name string, candidate *Operation) *Operation {
+	om.mu.Lock()
+	om.ops[name] = cloneOperation(candidate)
+	completed := cloneOperation(om.ops[name])
+	om.mu.Unlock()
+	return completed
 }
 
 // PersistenceError returns the latest durable state failure observed by this
@@ -975,8 +1093,53 @@ func cloneOperation(op *Operation) *Operation {
 		operationError := *op.Error
 		clone.Error = &operationError
 	}
+	clone.Metadata = cloneNormalizedOperationMetadata(op.Metadata)
 	clone.Response = append(json.RawMessage(nil), op.Response...)
 	return &clone
+}
+
+func cloneOperationMetadata(metadata any) (any, error) {
+	normalized, err := normalizeOperationMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	return cloneNormalizedOperationMetadata(normalized), nil
+}
+
+func cloneNormalizedOperationMetadata(metadata any) any {
+	switch typed := metadata.(type) {
+	case map[string]any:
+		clone := make(map[string]any, len(typed))
+		for key, value := range typed {
+			clone[key] = cloneNormalizedOperationMetadata(value)
+		}
+		return clone
+	case []any:
+		clone := make([]any, len(typed))
+		for index, value := range typed {
+			clone[index] = cloneNormalizedOperationMetadata(value)
+		}
+		return clone
+	default:
+		return typed
+	}
+}
+
+func normalizeOperationMetadata(metadata any) (any, error) {
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var normalized any
+	if err := decoder.Decode(&normalized); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("operation metadata has trailing JSON content")
+	}
+	return normalized, nil
 }
 
 func canonicalOperationName(project, location string) string {
@@ -1057,8 +1220,12 @@ func interruptOperation(op *Operation) {
 	}
 	op.Error = &OperationError{
 		Code:    code,
-		Message: "operation interrupted by MiniSky restart; side effects were not replayed",
+		Message: interruptedOperationMessage,
 	}
+}
+
+func isInterruptedOperation(op *Operation) bool {
+	return op != nil && op.Error != nil && op.Error.Message == interruptedOperationMessage
 }
 
 func isScopedOperation(op *Operation) bool {

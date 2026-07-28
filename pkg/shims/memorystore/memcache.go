@@ -273,16 +273,34 @@ func (api *MemcacheAPI) initializationError() error {
 
 func (api *MemcacheAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	canonicalPath := r.URL.RawPath == "" && r.URL.EscapedPath() == r.URL.Path
+	var route memcacheRoute
+	var ok bool
+	if canonicalPath {
+		route, ok = parseMemcacheRoute(r.URL.Path)
+		if ok && route.kind == memcacheRouteOperations && r.Method == http.MethodGet {
+			operation, err := api.opMgr.PollScoped(r.URL.Path, memcacheOperationKind)
+			if err == nil {
+				api.writeMemcacheOperation(w, operation)
+				return
+			}
+			if api.initializationError() != nil || api.opMgr.PersistenceError() != nil {
+				writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Memcached state is unavailable")
+			} else {
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "Memcached operation not found")
+			}
+			return
+		}
+	}
+
 	if api.initializationError() != nil || api.opMgr.PersistenceError() != nil {
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Memcached state is unavailable")
 		return
 	}
-
-	if r.URL.RawPath != "" || r.URL.EscapedPath() != r.URL.Path {
+	if !canonicalPath {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "Memcached resource not found")
 		return
 	}
-	route, ok := parseMemcacheRoute(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "Memcached resource not found")
 		return
@@ -1008,7 +1026,8 @@ func (api *MemcacheAPI) finalizeMemcacheInstanceSuccess(operationName string, in
 	if err != nil {
 		return api.finalizeMemcacheFailure(operationName, "encode Memcached operation response", false)
 	}
-	if err := api.opMgr.FinalizeScopedDurable(operationName, response, 0, ""); err != nil {
+	if err := api.opMgr.FinalizeScopedDurable(operationName, response, 0, ""); err != nil &&
+		!errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
 		return err
 	}
 	return api.clearMemcacheOperation(operationName)
@@ -1016,14 +1035,16 @@ func (api *MemcacheAPI) finalizeMemcacheInstanceSuccess(operationName string, in
 
 func (api *MemcacheAPI) finalizeMemcacheEmptySuccess(operationName string) error {
 	response := json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`)
-	if err := api.opMgr.FinalizeScopedDurable(operationName, response, 0, ""); err != nil {
+	if err := api.opMgr.FinalizeScopedDurable(operationName, response, 0, ""); err != nil &&
+		!errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
 		return err
 	}
 	return api.clearMemcacheOperation(operationName)
 }
 
 func (api *MemcacheAPI) finalizeMemcacheFailure(operationName, message string, stateCommitted bool) error {
-	if err := api.opMgr.FinalizeScopedDurable(operationName, nil, 13, message); err != nil {
+	if err := api.opMgr.FinalizeScopedDurable(operationName, nil, 13, message); err != nil &&
+		!errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
 		return err
 	}
 	if !stateCommitted {

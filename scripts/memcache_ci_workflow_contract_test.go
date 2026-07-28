@@ -44,12 +44,12 @@ func TestMatrixAndMemcacheJobsRejectSharedConcurrency(t *testing.T) {
 		t.Error("Memcached job must not use cross-runner shared concurrency")
 	}
 
-	ci := readWorkflow(t, "ci.yml")
-	matrixJob := workflowJob(t, ci, "phase18-25-terraform-integration")
+	promotion := readWorkflow(t, "promotion-integration.yml")
+	matrixJob := workflowJob(t, promotion, "phase18-25-terraform-integration")
 	if _, found := matrixJob["concurrency"]; found {
 		t.Error("12-leg Terraform matrix must not use job concurrency that cancels pending legs")
 	}
-	for name, value := range mustMap(ci["jobs"]) {
+	for name, value := range mustMap(promotion["jobs"]) {
 		job := mustMap(value)
 		if concurrency, found := job["concurrency"]; found &&
 			strings.Contains(scalarString(mustMap(concurrency)["group"]), "minisky-net-integration") {

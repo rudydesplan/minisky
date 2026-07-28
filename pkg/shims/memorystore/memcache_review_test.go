@@ -444,6 +444,153 @@ func TestMemcacheCrashReconciliation(t *testing.T) {
 
 }
 
+func TestMemcacheTerminalReconciliationPreservesExactlyOnceResult(t *testing.T) {
+	previous := memcachePersistedInstance{
+		Instance:  readyMemcacheInstance("test", "us-central1", "cache", "READY"),
+		BackendID: memcacheBackendID("test", "us-central1", "cache"),
+	}
+	for _, test := range []struct {
+		name              string
+		action            string
+		state             string
+		previous          *memcachePersistedInstance
+		result            MemcacheBackendResult
+		wantResource      bool
+		wantResourceState string
+	}{
+		{
+			name:              "create restart",
+			action:            "create",
+			state:             "CREATING",
+			result:            readyMemcacheResult(1),
+			wantResource:      true,
+			wantResourceState: "READY",
+		},
+		{
+			name:              "update restart",
+			action:            "update",
+			state:             "UPDATING",
+			previous:          &previous,
+			result:            readyMemcacheResult(1),
+			wantResource:      true,
+			wantResourceState: "READY",
+		},
+		{
+			name:     "delete restart with authoritative absence",
+			action:   "delete",
+			state:    "DELETING",
+			previous: &previous,
+			result:   MemcacheBackendResult{Owned: true, Exists: false},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, operationName := seedInterruptedMemcacheOperation(
+				t, test.action, test.state, test.previous, true,
+			)
+			manager, err := orchestrator.NewOperationManagerWithStore(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.FinalizeScopedDurable(
+				operationName, nil, 13, "original terminal failure",
+			); err != nil {
+				t.Fatal(err)
+			}
+			before := manager.Get(operationName)
+
+			backend := &fakeMemcacheBackend{result: test.result}
+			api, err := NewMemcacheAPIWithStore(nil, backend, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertMemcacheTerminalResultEqual(t, before, api.opMgr.Get(operationName))
+			if _, associated := api.metadataSnapshot().Operations[operationName]; associated {
+				t.Fatal("authoritatively reconciled terminal operation retained its association")
+			}
+			if test.wantResource {
+				assertMemcacheState(t, api, "test", "us-central1", "cache", test.wantResourceState)
+			} else {
+				missing := memcacheRequest(api, http.MethodGet,
+					instancePath("test", "us-central1", "cache"), "")
+				assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+			}
+			assertNoMemcacheMutationReplay(t, backend)
+		})
+	}
+}
+
+func TestMemcacheTerminalReconciliationSameResultRetry(t *testing.T) {
+	previous := memcachePersistedInstance{
+		Instance:  readyMemcacheInstance("test", "us-central1", "cache", "READY"),
+		BackendID: memcacheBackendID("test", "us-central1", "cache"),
+	}
+	store, operationName := seedInterruptedMemcacheOperation(
+		t, "delete", "DELETING", &previous, false,
+	)
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeScopedDurable(
+		operationName,
+		json.RawMessage(`{"@type":"type.googleapis.com/google.protobuf.Empty"}`),
+		0,
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.Get(operationName)
+
+	backend := &fakeMemcacheBackend{result: MemcacheBackendResult{Owned: true, Exists: false}}
+	api, err := NewMemcacheAPIWithStore(nil, backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMemcacheTerminalResultEqual(t, before, api.opMgr.Get(operationName))
+	if _, associated := api.metadataSnapshot().Operations[operationName]; associated {
+		t.Fatal("idempotent terminal retry did not clear operation association")
+	}
+	assertNoMemcacheMutationReplay(t, backend)
+}
+
+func TestMemcacheTerminalSuccessSurvivesAuthoritativeBackendAbsence(t *testing.T) {
+	store, operationName := seedInterruptedMemcacheOperation(
+		t, "create", "READY", nil, true,
+	)
+	var metadata memcacheMetadata
+	if err := store.Load(memcacheStateEntry, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	response, err := typedMemcacheInstance(
+		metadata.Instances[resourceName("test", "us-central1", "cache")].Instance,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := orchestrator.NewOperationManagerWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeScopedDurable(operationName, response, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.Get(operationName)
+
+	backend := &fakeMemcacheBackend{result: MemcacheBackendResult{Owned: true, Exists: false}}
+	api, err := NewMemcacheAPIWithStore(nil, backend, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMemcacheTerminalResultEqual(t, before, api.opMgr.Get(operationName))
+	missing := memcacheRequest(api, http.MethodGet,
+		instancePath("test", "us-central1", "cache"), "")
+	assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+	if _, associated := api.metadataSnapshot().Operations[operationName]; associated {
+		t.Fatal("authoritative absence retained terminal create association")
+	}
+	assertNoMemcacheMutationReplay(t, backend)
+}
+
 func TestMemcacheReconcilePassesPersistedBackendSpec(t *testing.T) {
 	store, _ := seedInterruptedMemcacheOperation(t, "create", "CREATING", nil, true)
 	backend := &fakeMemcacheBackend{result: MemcacheBackendResult{Exists: false}}
@@ -1003,6 +1150,33 @@ func assertMemcacheOperationError(t *testing.T, api *MemcacheAPI, name string) {
 		!strings.Contains(response.Body.String(), `"done":true`) ||
 		!strings.Contains(response.Body.String(), `"error"`) {
 		t.Fatalf("operation error=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func assertMemcacheTerminalResultEqual(t *testing.T, before, after *orchestrator.Operation) {
+	t.Helper()
+	if before == nil || after == nil {
+		t.Fatalf("terminal operation before=%+v after=%+v", before, after)
+	}
+	var beforeResponse any
+	var afterResponse any
+	if len(before.Response) != 0 {
+		if err := json.Unmarshal(before.Response, &beforeResponse); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(after.Response) != 0 {
+		if err := json.Unmarshal(after.Response, &afterResponse); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeWithoutResponse := *before
+	beforeWithoutResponse.Response = nil
+	afterWithoutResponse := *after
+	afterWithoutResponse.Response = nil
+	if !reflect.DeepEqual(beforeWithoutResponse, afterWithoutResponse) ||
+		!reflect.DeepEqual(beforeResponse, afterResponse) {
+		t.Fatalf("terminal result changed: before=%+v after=%+v", before, after)
 	}
 }
 

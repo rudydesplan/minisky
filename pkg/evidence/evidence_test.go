@@ -665,12 +665,16 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			gate.RealBackendDocker.Status != backendStatus ||
 			gate.StrictIAM.Status != EvidenceLocalPassed ||
 			gate.Cleanup.Status != cleanupStatus ||
-			gate.CI.Status != EvidenceCIPassed {
+			gate.CI.Status != EvidenceConfiguredUnverified {
 			t.Errorf("%s overstates or conflates batch evidence: %+v", gate.ID, gate)
 		}
-		if gate.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30285572232" ||
-			gate.CI.Commit != "62d6fa245774f3ff3bdd9b82e19d1c617650d448" {
-			t.Errorf("%s CI evidence does not identify the passing run and commit: %+v", gate.ID, gate.CI)
+		if gate.CI.Workflow != ".github/workflows/promotion-integration.yml" ||
+			gate.CI.RunURL != "" || gate.CI.Commit != "" {
+			t.Errorf("%s promotion evidence is not configured-unverified: %+v", gate.ID, gate.CI)
+		}
+		if !hasPathFilteredPromotionWording(gate.CI.Note) {
+			t.Errorf("%s promotion evidence does not describe path-filtered triggers: %q",
+				gate.ID, gate.CI.Note)
 		}
 		for _, check := range gate.TerraformChecks {
 			if prior := terraformCheckByDomain[check.Domain]; prior != "" {
@@ -751,7 +755,7 @@ func TestTerraformClaimsMapExactlyOnceToRequiredCI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := readTerraformWorkflowJob(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	job := readTerraformWorkflowJob(t, filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
 	matrixByID := make(map[string]terraformWorkflowMatrixEntry, len(job.Strategy.Matrix.Include))
 	for _, entry := range job.Strategy.Matrix.Include {
 		if _, duplicate := matrixByID[entry.ID]; duplicate {
@@ -797,10 +801,14 @@ func TestTerraformClaimsMapExactlyOnceToRequiredCI(t *testing.T) {
 			}
 			seenScripts[check.Script] = true
 			if check.CI.Status != EvidenceConfiguredUnverified ||
-				check.CI.Workflow != ".github/workflows/ci.yml" ||
+				check.CI.Workflow != ".github/workflows/promotion-integration.yml" ||
 				check.CI.Job != "phase18-25-terraform-integration" ||
 				check.CI.RunURL != "" || check.CI.Commit != "" {
 				t.Errorf("%s overstates or incompletely records configured CI: %+v", check.Domain, check.CI)
+			}
+			if !hasPathFilteredPromotionWording(check.CI.Note) {
+				t.Errorf("%s configured CI does not describe path-filtered triggers: %q",
+					check.Domain, check.CI.Note)
 			}
 			entry, ok := matrixByID[check.MatrixID]
 			if !ok {
@@ -856,7 +864,7 @@ func TestTerraformClaimsMapExactlyOnceToRequiredCI(t *testing.T) {
 	for _, problem := range validateTerraformWorkflowJob(job) {
 		t.Error(problem)
 	}
-	triggers := readTerraformWorkflowTriggers(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	triggers := readTerraformWorkflowTriggers(t, filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
 	for _, problem := range validateTerraformWorkflowTriggers(triggers) {
 		t.Error(problem)
 	}
@@ -864,7 +872,7 @@ func TestTerraformClaimsMapExactlyOnceToRequiredCI(t *testing.T) {
 
 func TestTerraformMatrixProvisionsExactPinnedBackendImages(t *testing.T) {
 	root := repositoryRoot(t)
-	job := readTerraformWorkflowJob(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	job := readTerraformWorkflowJob(t, filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
 	for _, entry := range job.Strategy.Matrix.Include {
 		if entry.RequiredImagesScript == "none" {
 			continue
@@ -1000,7 +1008,7 @@ func TestTerraformWorkflowCommentsCannotSatisfyContracts(t *testing.T) {
 
 func TestTerraformWorkflowTriggerContractRejectsInactiveMutations(t *testing.T) {
 	root := repositoryRoot(t)
-	actual := readTerraformWorkflowTriggers(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	actual := readTerraformWorkflowTriggers(t, filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
 	if problems := validateTerraformWorkflowTriggers(actual); len(problems) != 0 {
 		t.Fatalf("active workflow trigger contract is invalid: %q", problems)
 	}
@@ -1056,6 +1064,63 @@ func TestREADMEPrioritizesExactHeadTerraformMatrixEvidence(t *testing.T) {
 	} {
 		if strings.Contains(priorities, stale) {
 			t.Errorf("README retains completed Eventarc replay milestone %q", stale)
+		}
+	}
+}
+
+func TestOperatorDocsRejectRemovedWorkflowDispatchInputs(t *testing.T) {
+	root := repositoryRoot(t)
+	paths := []string{filepath.Join(root, "README.md")}
+	err := filepath.WalkDir(filepath.Join(root, "docs"),
+		func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(path, ".md") || strings.HasSuffix(path, ".canvas.tsx") {
+				paths = append(paths, path)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removed := []string{
+		"run_terraform_integration",
+		"run_state_durability_integration",
+		"run_event_delivery_integration",
+		"run_phase10_artifact_integration",
+		"run_phase13_wif_integration",
+		"run_phase15_emulator_integration",
+		"run_phase16_monitoring_integration",
+		"run_phase16_logging_integration",
+		"run_phase16_dns_integration",
+		"run_phase16_vertex_integration",
+		"run_phase16_subnetwork_integration",
+		"run_phase16_subnetwork_terraform_integration",
+		"run_phase17_enterprise_integration",
+		"run_phase18_25_sdk_integration",
+		"run_phase19_sdk_integration",
+		"run_phase19_heavy_backend_integration",
+		"run_phase20_sdk_integration",
+		"run_phase21_22_sdk_integration",
+		"run_phase23_sdk_integration",
+		"run_phase24_25_sdk_integration",
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(data)
+		for _, input := range removed {
+			if strings.Contains(source, input) {
+				t.Errorf("%s retains removed workflow-dispatch input %q",
+					strings.TrimPrefix(path, root+string(os.PathSeparator)), input)
+			}
 		}
 	}
 }
@@ -1245,6 +1310,13 @@ func stringSetContainsAll(got, required []string) bool {
 	return true
 }
 
+func hasPathFilteredPromotionWording(note string) bool {
+	normalized := strings.ToLower(note)
+	return strings.Contains(normalized, "matching path-filtered pull-request and main-branch pushes") &&
+		strings.Contains(normalized, "weekly and manual") &&
+		!strings.Contains(normalized, "required pull-request")
+}
+
 func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 	var problems []string
 	add := func(condition bool, format string, args ...any) {
@@ -1253,12 +1325,9 @@ func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 		}
 	}
 	add(job.Name == "Terraform 7.41.0 (${{ matrix.domain }})", "Terraform job name = %q", job.Name)
-	add(job.If == "github.event_name == 'pull_request' || github.event_name == 'push'",
-		"Terraform job if = %q", job.If)
-	add(stringSetEqual(job.Needs, []string{"quality", "terraform-validate"}),
+	add(job.If == "", "Terraform job must not have an event or dispatch gate: %q", job.If)
+	add(stringSetEqual(job.Needs, []string{"quality", "phase18-25-evidence", "terraform-validate"}),
 		"Terraform job needs = %q", job.Needs)
-	add(len(job.Permissions) == 1 && job.Permissions["contents"] == "read",
-		"Terraform job permissions = %v", job.Permissions)
 	add(job.Strategy.FailFast != nil && !*job.Strategy.FailFast,
 		"Terraform strategy fail-fast must be explicit false")
 	add(job.Strategy.MaxParallel != nil && *job.Strategy.MaxParallel == 4,
@@ -1294,7 +1363,7 @@ func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 		add(seen[id], "Terraform matrix is missing id %q", id)
 	}
 
-	add(len(job.Steps) == 9, "Terraform job has %d active steps, want 9", len(job.Steps))
+	add(len(job.Steps) == 10, "Terraform job has %d active steps, want 10", len(job.Steps))
 	stepByName := make(map[string]terraformWorkflowStep)
 	stepByUses := make(map[string]terraformWorkflowStep)
 	var actionUses []string
@@ -1319,7 +1388,7 @@ func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 		"actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
 	}), "Terraform action steps = %q", actionUses)
 	downloadStep := stepByUses["actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"]
-	add(fmt.Sprint(downloadStep.With["name"]) == "ui-dist" &&
+	add(fmt.Sprint(downloadStep.With["name"]) == "promotion-ui-dist" &&
 		fmt.Sprint(downloadStep.With["path"]) == "ui/dist",
 		"download-artifact inputs = %v", downloadStep.With)
 	setupGoStep := stepByUses["actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"]
@@ -1359,15 +1428,24 @@ func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 	diagnosticsStep, ok := stepByName["Capture bounded failure diagnostics"]
 	add(ok, "Terraform job is missing active step %q", "Capture bounded failure diagnostics")
 	if ok {
-		add(diagnosticsStep.If == "failure()", "diagnostics if = %q", diagnosticsStep.If)
+		add(normalizeWorkflowCondition(diagnosticsStep.If) == "failure()||cancelled()",
+			"diagnostics if = %q", diagnosticsStep.If)
 		for _, command := range []string{"docker ps -a", "docker network ls", "docker volume ls"} {
 			add(activeRunContains(diagnosticsStep.Run, command), "diagnostics run omits active %q", command)
 		}
 	}
+	cleanupStep, ok := stepByName["Verify bounded lifecycle cleanup"]
+	add(ok, "Terraform job is missing active cleanup verification")
+	if ok {
+		add(normalizeWorkflowCondition(cleanupStep.If) == "always()", "cleanup if = %q", cleanupStep.If)
+		add(activeRunContains(cleanupStep.Run, "matrix.lock_name"),
+			"cleanup does not verify the matrix-specific lock")
+	}
 	retainStep, ok := stepByName["Retain failure diagnostics"]
 	add(ok, "Terraform job is missing active step %q", "Retain failure diagnostics")
 	if ok {
-		add(retainStep.If == "failure()", "artifact retention if = %q", retainStep.If)
+		add(normalizeWorkflowCondition(retainStep.If) == "failure()||cancelled()",
+			"artifact retention if = %q", retainStep.If)
 		add(fmt.Sprint(retainStep.With["retention-days"]) == "7",
 			"artifact retention-days = %v", retainStep.With["retention-days"])
 		add(fmt.Sprint(retainStep.With["if-no-files-found"]) == "error",
@@ -1399,6 +1477,13 @@ func activeRunContains(script, fragment string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeWorkflowCondition(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "${{")
+	value = strings.TrimSuffix(value, "}}")
+	return strings.ReplaceAll(strings.TrimSpace(value), " ", "")
 }
 
 func stringSetEqual(got, want []string) bool {
@@ -1495,55 +1580,71 @@ func TestPhase19HeavyBackendCIIsExplicitAndIsolated(t *testing.T) {
 			break
 		}
 	}
-	if phase19.BackendCI.Status != EvidenceCIPassed ||
-		phase19.BackendCI.Workflow != ".github/workflows/ci.yml" ||
+	if phase19.BackendCI.Status != EvidenceConfiguredUnverified ||
+		phase19.BackendCI.Workflow != ".github/workflows/promotion-integration.yml" ||
 		phase19.BackendCI.Job != "phase19-heavy-backend-integration" ||
 		phase19.BackendCI.MakeTarget != "test-phase19-heavy-backend" {
-		t.Fatalf("Phase 19 heavy backend CI evidence is not passed: %+v", phase19.BackendCI)
+		t.Fatalf("Phase 19 heavy backend promotion evidence is not configured truthfully: %+v", phase19.BackendCI)
 	}
-	if phase19.BackendCI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30287887431" ||
-		phase19.BackendCI.Commit != "d657e4b0b77a34ddb615124db2d82da810238502" {
-		t.Fatalf("Phase 19 heavy backend CI does not identify the passing run: %+v", phase19.BackendCI)
+	if phase19.BackendCI.RunURL != "" || phase19.BackendCI.Commit != "" {
+		t.Fatalf("unverified promotion evidence records an external pass: %+v", phase19.BackendCI)
+	}
+	if !hasPathFilteredPromotionWording(phase19.BackendCI.Note) {
+		t.Fatalf("Phase 19 backend evidence does not describe path-filtered triggers: %q",
+			phase19.BackendCI.Note)
 	}
 
-	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
+	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(workflow)
-	inputStart := strings.Index(source, "      run_phase19_heavy_backend_integration:")
-	inputEnd := strings.Index(source[inputStart+1:], "\n      run_phase20_sdk_integration:")
-	if inputStart < 0 || inputEnd < 0 {
-		t.Fatal("Phase 19 heavy backend workflow_dispatch input is missing or misplaced")
+	var document struct {
+		On   map[string]yaml.Node `yaml:"on"`
+		Jobs map[string]yaml.Node `yaml:"jobs"`
 	}
-	input := source[inputStart : inputStart+1+inputEnd]
-	for _, want := range []string{"type: boolean", "default: false"} {
-		if !strings.Contains(input, want) {
-			t.Errorf("Phase 19 heavy backend input is missing %q", want)
-		}
+	if err := yaml.Unmarshal(workflow, &document); err != nil {
+		t.Fatal(err)
 	}
-
-	jobStart := strings.Index(source, "\n  phase19-heavy-backend-integration:")
-	jobEnd := strings.Index(source[jobStart+1:], "\n  phase20-sdk-integration:")
-	if jobStart < 0 || jobEnd < 0 {
-		t.Fatal("Phase 19 heavy backend job is missing or misplaced")
+	dispatch, ok := document.On["workflow_dispatch"]
+	if !ok {
+		t.Fatal("promotion workflow has no workflow_dispatch trigger")
 	}
-	job := source[jobStart : jobStart+1+jobEnd]
-	for _, want := range []string{
-		"github.event_name == 'workflow_dispatch' && inputs.run_phase19_heavy_backend_integration",
-		"permissions:\n      contents: read",
-		"timeout-minutes: 30",
-		"docker info >/dev/null",
-		"MINISKY_PHASE19_PROFILE:",
-		"make test-phase19-heavy-backend",
-		"if: failure()",
-		"phase19-heavy-backend-integration.log",
-		"if: always()",
-		`docker rm -f -v`,
+	if dispatch.Kind == yaml.MappingNode && len(dispatch.Content) != 0 {
+		t.Fatal("promotion workflow_dispatch unexpectedly has per-job inputs")
+	}
+	jobNode, ok := document.Jobs["phase19-heavy-backend-integration"]
+	if !ok {
+		t.Fatal("Phase 19 heavy backend promotion job is missing")
+	}
+	var job terraformWorkflowJob
+	if err := jobNode.Decode(&job); err != nil {
+		t.Fatal(err)
+	}
+	if job.If != "" || job.TimeoutMinutes != "30" {
+		t.Fatalf("Phase 19 heavy backend job gate/timeout = if %q timeout %q", job.If, job.TimeoutMinutes)
+	}
+	steps := make(map[string]terraformWorkflowStep, len(job.Steps))
+	for _, step := range job.Steps {
+		steps[step.Name] = step
+	}
+	for _, name := range []string{
+		"Verify Docker availability",
+		"Run Phase 19 heavy backend integration",
+		"Remove exact-owned Phase 19 resources",
+		"Capture bounded failure diagnostics",
+		"Retain failure diagnostics",
 	} {
-		if !strings.Contains(job, want) {
-			t.Errorf("Phase 19 heavy backend job is missing %q", want)
+		if _, ok := steps[name]; !ok {
+			t.Errorf("Phase 19 heavy backend job is missing %q", name)
 		}
+	}
+	if !activeRunContains(steps["Run Phase 19 heavy backend integration"].Run,
+		"make test-phase19-heavy-backend") {
+		t.Error("Phase 19 heavy backend job does not own its Make target")
+	}
+	if normalizeWorkflowCondition(steps["Remove exact-owned Phase 19 resources"].If) != "always()" ||
+		!activeRunContains(steps["Remove exact-owned Phase 19 resources"].Run, "docker rm -f -v") {
+		t.Error("Phase 19 heavy backend exact-owned cleanup is not always-on")
 	}
 
 	makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
@@ -2654,7 +2755,7 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 	}
 	source := strings.Join(strings.Fields(string(data)), " ")
 	for _, want := range []string{
-		"twelve independently recorded, domain-scoped Terraform",
+		"12 Terraform legs plus seven SDK/backend gates exactly once",
 		"Twelve bounded provider lifecycles now pass",
 		"google_binary_authorization_policy",
 		"matching import returns 0",
@@ -2668,9 +2769,11 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 		"no durable audit record or log is created",
 		"returns explicit UNSUPPORTED",
 		"not GKE or production admission security",
-		"without batch-wide production promotion",
-		"required 12-entry pull-request/main matrix",
-		"configured-unverified and has no external pass URL or commit",
+		"dedicated path-aware, weekly, and manually runnable promotion workflow",
+		"configured-unverified with no run URL or commit",
+		"CI run 30384072102",
+		"source commit 7035b25b056e03334656029af1e5c1259ab91765",
+		"Main CI run 30387050664",
 		"Commit 852d9e3",
 		"same stable Workflow execution identity",
 		"no duplicate execution resource",

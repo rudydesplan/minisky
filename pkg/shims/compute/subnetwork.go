@@ -241,7 +241,7 @@ func (api *API) insertSubnetwork(w http.ResponseWriter, r *http.Request, project
 		return
 	}
 
-	if err := api.opMgr.AdvanceDurable(op.Name, 100, orchestrator.StatusDone); err != nil {
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist terminal operation metadata")
 		return
 	}
@@ -411,7 +411,7 @@ func (api *API) deleteSubnetwork(w http.ResponseWriter, r *http.Request, project
 		return
 	}
 
-	if err := api.opMgr.AdvanceDurable(op.Name, 100, orchestrator.StatusDone); err != nil {
+	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", "persist terminal operation metadata")
 		return
 	}

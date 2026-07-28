@@ -524,12 +524,11 @@ func TestEnvironmentMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMeta
 
 			operations := opMgr.List()
 			if len(operations) != 1 {
-				t.Fatalf("operations = %+v, want one reconciled operation", operations)
+				t.Fatalf("operations = %+v, want one pending operation", operations)
 			}
 			inProcess := operations[0]
-			if !inProcess.Done || inProcess.Error == nil ||
-				!strings.Contains(inProcess.Error.Message, "interrupted by MiniSky restart") {
-				t.Fatalf("in-process operation was not reconciled: %+v", inProcess)
+			if inProcess.Done || inProcess.Status != orchestrator.StatusPending || inProcess.Error != nil {
+				t.Fatalf("uncommitted terminal result was published in process: %+v", inProcess)
 			}
 
 			restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
@@ -538,8 +537,8 @@ func TestEnvironmentMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMeta
 			}
 			durable := restartedOps.Get(inProcess.Name)
 			if durable == nil || !durable.Done || durable.Error == nil ||
-				durable.Error.Message != inProcess.Error.Message {
-				t.Fatalf("operation truth diverged across restart: in-process=%+v restarted=%+v", inProcess, durable)
+				!strings.Contains(durable.Error.Message, "interrupted by MiniSky restart") {
+				t.Fatalf("pending operation was not reconciled across restart: in-process=%+v restarted=%+v", inProcess, durable)
 			}
 
 			restarted := &API{

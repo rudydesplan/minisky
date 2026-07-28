@@ -488,6 +488,179 @@ func TestSubnetworkTerminalOperationFailureKeepsMetadataTruth(t *testing.T) {
 	}
 }
 
+func TestSubnetworkTerminalPublicationIsExactOnce(t *testing.T) {
+	actions := []struct {
+		name       string
+		method     string
+		pathSuffix string
+		body       string
+		seed       bool
+		wantExists bool
+	}{
+		{
+			name: "create", method: http.MethodPost,
+			body:       `{"name":"exact-once","ipCidrRange":"10.0.0.0/24","network":"custom"}`,
+			wantExists: true,
+		},
+		{
+			name: "delete", method: http.MethodDelete, pathSuffix: "/exact-once",
+			seed: true, wantExists: false,
+		},
+	}
+	outcomes := []struct {
+		name           string
+		commitTerminal bool
+		wantStatus     int
+	}{
+		{name: "unverified save failure", wantStatus: http.StatusInternalServerError},
+		{name: "exact post-commit readback", commitTerminal: true, wantStatus: http.StatusOK},
+	}
+	for _, action := range actions {
+		for _, outcome := range outcomes {
+			t.Run(action.name+"/"+outcome.name, func(t *testing.T) {
+				metadataStore := &toggleComputeStore{}
+				operationStore := newBlockingTerminalOperationStore(outcome.commitTerminal)
+				opMgr, err := orchestrator.NewOperationManagerWithStore(operationStore)
+				if err != nil {
+					t.Fatal(err)
+				}
+				api, err := newTestAPIWithMetadataStore(opMgr, metadataStore)
+				if err != nil {
+					t.Fatal(err)
+				}
+				addCustomNetwork(api, "test-project", "custom")
+				key := subnetworkKey("test-project", "us-central1", "exact-once")
+				if action.seed {
+					api.mu.Lock()
+					api.subnetworks[key] = persistedSubnetworkForTest(
+						"test-project", "us-central1", "exact-once", "custom", "10.0.0.0/24", "1",
+					)
+					api.nextSubnetworkID = 2
+					api.mu.Unlock()
+					if _, err := api.vpcIPAM.EnsureVPCNetworkIPAM(
+						context.Background(),
+						orchestrator.VPCNetworkIdentity{Project: "test-project", Network: "custom"},
+						"10.0.0.0/24",
+					); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := api.persistMetadata(); err != nil {
+					t.Fatal(err)
+				}
+
+				base := "/compute/v1/projects/test-project/regions/us-central1/subnetworks"
+				responseCh := make(chan *httptest.ResponseRecorder, 1)
+				go func() {
+					responseCh <- performComputeRequest(api, action.method, base+action.pathSuffix, action.body)
+				}()
+				operationStore.waitForTerminalSave(t)
+				defer operationStore.releaseTerminalSave()
+
+				operations := opMgr.List()
+				if len(operations) != 1 {
+					t.Fatalf("operations = %#v", operations)
+				}
+				operation := operations[0]
+				if operation.Done || operation.Status == orchestrator.StatusDone || operation.Error != nil {
+					t.Fatalf("terminal candidate became visible before durable save: %#v", operation)
+				}
+				if operation.Region != "us-central1" ||
+					operation.TargetLink != subnetworkSelfLink("test-project", "us-central1", "exact-once") {
+					t.Fatalf("regional operation association changed: %#v", operation)
+				}
+				poll := performComputeRequest(api, http.MethodGet,
+					fmt.Sprintf("/compute/v1/projects/test-project/regions/us-central1/operations/%s", operation.Name), "")
+				if poll.Code != http.StatusOK {
+					t.Fatalf("pending poll status=%d body=%s", poll.Code, poll.Body.String())
+				}
+				var pending orchestrator.Operation
+				decodeComputeResponse(t, poll, &pending)
+				if pending.Done || pending.Status == orchestrator.StatusDone || pending.Error != nil {
+					t.Fatalf("poller observed uncommitted terminal state: %#v", pending)
+				}
+
+				operationStore.releaseTerminalSave()
+				response := <-responseCh
+				if outcome.wantStatus == http.StatusOK {
+					if response.Code != http.StatusOK {
+						t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
+					}
+					var completed orchestrator.Operation
+					decodeComputeResponse(t, response, &completed)
+					if !completed.Done || completed.Status != orchestrator.StatusDone ||
+						completed.Progress != 100 || completed.Error != nil ||
+						completed.Region != regionSelfLink("test-project", "us-central1") {
+						t.Fatalf("terminal response shape changed: %#v", completed)
+					}
+					if degraded := api.initializationError(); degraded == nil ||
+						!strings.Contains(degraded.Error(), "terminal operation save failure") {
+						t.Fatalf("post-commit save failure was not sticky: %v", degraded)
+					}
+					if err := opMgr.FinalizeDurable(operation.Name, 0, ""); err != nil {
+						t.Fatalf("idempotent terminal retry: %v", err)
+					}
+					before, err := api.metadataSnapshot()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := opMgr.FailDurable(operation.Name, http.StatusInternalServerError, "conflict"); !errors.Is(
+						err,
+						orchestrator.ErrOperationTerminalConflict,
+					) {
+						t.Fatalf("conflicting retry error = %v", err)
+					}
+					after, err := api.metadataSnapshot()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !computeMetadataEqual(before, after) {
+						t.Fatal("conflicting terminal retry mutated resource metadata")
+					}
+				} else {
+					assertComputeError(t, response, http.StatusInternalServerError, "INTERNAL")
+					current := opMgr.Get(operation.Name)
+					if current == nil || current.Done || current.Status == orchestrator.StatusDone ||
+						current.Error != nil {
+						t.Fatalf("unverified terminal save was published: %#v", current)
+					}
+				}
+
+				restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
+				if err != nil {
+					t.Fatal(err)
+				}
+				restarted, err := newTestAPIWithMetadataStore(restartedOps, metadataStore)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var persisted computeMetadata
+				if err := metadataStore.Load(computeStateEntry, &persisted); err != nil {
+					t.Fatal(err)
+				}
+				if got := restarted.subnetworks[key] != nil; got != action.wantExists {
+					t.Fatalf("restart live metadata exists=%v, want %v", got, action.wantExists)
+				}
+				if got := persisted.Subnetworks[key] != nil; got != action.wantExists {
+					t.Fatalf("restart durable metadata exists=%v, want %v", got, action.wantExists)
+				}
+				restartedOperation := restartedOps.Get(operation.Name)
+				if restartedOperation == nil || !restartedOperation.Done ||
+					restartedOperation.Status != orchestrator.StatusDone {
+					t.Fatalf("restart operation = %#v", restartedOperation)
+				}
+				if outcome.commitTerminal && restartedOperation.Error != nil {
+					t.Fatalf("exact terminal readback changed across restart: %#v", restartedOperation)
+				}
+				if !outcome.commitTerminal && (restartedOperation.Error == nil ||
+					!strings.Contains(restartedOperation.Error.Message, "interrupted by MiniSky restart")) {
+					t.Fatalf("unverified terminal save was not interrupted on restart: %#v", restartedOperation)
+				}
+			})
+		}
+	}
+}
+
 func TestSubnetworkSaveFailureRollsBack(t *testing.T) {
 	base := "/compute/v1/projects/test-project/regions/us-central1/subnetworks"
 	t.Run("create", func(t *testing.T) {
@@ -627,7 +800,16 @@ func TestSubnetworkOperationRegistrationFailureRollsBack(t *testing.T) {
 	assertComputeError(t, performComputeRequest(api, http.MethodPost, base,
 		`{"name":"no-operation","ipCidrRange":"10.0.0.0/24","network":"custom"}`),
 		http.StatusInternalServerError, "INTERNAL")
+	if api.subnetworks[subnetworkKey("test-project", "us-central1", "no-operation")] != nil {
+		t.Fatal("operation registration failure changed live metadata")
+	}
 	assertComputeError(t, performComputeRequest(api, http.MethodGet, base+"/no-operation", ""),
+		http.StatusServiceUnavailable, "FAILED_PRECONDITION")
+	restarted, err := newTestAPIWithMetadataStore(orchestrator.NewOperationManager(), metadataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertComputeError(t, performComputeRequest(restarted, http.MethodGet, base+"/no-operation", ""),
 		http.StatusNotFound, "NOT_FOUND")
 }
 
@@ -1133,6 +1315,72 @@ func (s *blockingComputeStore) Save(string, any) error {
 	s.once.Do(func() { close(s.started) })
 	<-s.release
 	return nil
+}
+
+type blockingTerminalOperationStore struct {
+	mu             sync.Mutex
+	data           []byte
+	saveCount      int
+	commitTerminal bool
+	started        chan struct{}
+	release        chan struct{}
+	once           sync.Once
+	releaseOnce    sync.Once
+}
+
+func newBlockingTerminalOperationStore(commitTerminal bool) *blockingTerminalOperationStore {
+	return &blockingTerminalOperationStore{
+		commitTerminal: commitTerminal,
+		started:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+}
+
+func (store *blockingTerminalOperationStore) Load(_ string, target any) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.data) == 0 {
+		return state.ErrNotFound
+	}
+	return json.Unmarshal(store.data, target)
+}
+
+func (store *blockingTerminalOperationStore) Save(_ string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	store.mu.Lock()
+	store.saveCount++
+	saveCount := store.saveCount
+	if saveCount != 2 {
+		store.data = data
+		store.mu.Unlock()
+		return nil
+	}
+	store.once.Do(func() { close(store.started) })
+	store.mu.Unlock()
+
+	<-store.release
+	store.mu.Lock()
+	if store.commitTerminal {
+		store.data = data
+	}
+	store.mu.Unlock()
+	return errors.New("terminal operation save failure")
+}
+
+func (store *blockingTerminalOperationStore) waitForTerminalSave(t *testing.T) {
+	t.Helper()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("terminal operation save did not start")
+	}
+}
+
+func (store *blockingTerminalOperationStore) releaseTerminalSave() {
+	store.releaseOnce.Do(func() { close(store.release) })
 }
 
 func addCustomNetwork(api *API, project, name string) {
