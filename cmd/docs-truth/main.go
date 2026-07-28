@@ -175,6 +175,7 @@ func validateHandwrittenClaims(document string) error {
 
 func renderPhase12PlatformSummary(gates []evidence.PlatformGate) (string, error) {
 	localPassed := 0
+	localTotal := 0
 	var ciCheck *evidence.EvidenceCheck
 	seen := make(map[string]bool, len(gates))
 	for _, gate := range gates {
@@ -194,6 +195,8 @@ func renderPhase12PlatformSummary(gates []evidence.PlatformGate) (string, error)
 			}
 			check := gate.Check
 			ciCheck = &check
+		} else {
+			localTotal++
 		}
 		switch gate.Check.Status {
 		case evidence.EvidenceLocalPassed:
@@ -224,14 +227,14 @@ func renderPhase12PlatformSummary(gates []evidence.PlatformGate) (string, error)
 		return "", fmt.Errorf("unsupported Phase 12 CI status %q", ciCheck.Status)
 	}
 	return fmt.Sprintf(
-		"**Generated Phase 12 platform truth:** Local passes: %d/%d.\n\n"+
+		"**Generated Phase 12 platform truth:** Local-only gates passed: %d/%d.\n\n"+
 			"The bounded platform diagnostics slice covers bounded W3C propagation, sanitized structured access logs, "+
 			"low-cardinality Prometheus metrics, bounded sanitized OTLP export inspection, exporter degradation without "+
 			"changing API responses, bounded replay responses, and graceful shutdown. Replay provides project-keyed "+
 			"lookup scoping, not cross-project authorization. %s\n\n"+
 			"This platform diagnostics layer is separate from the experimental Phase 21–22 service domains. A persistent "+
 			"trace backend, remote diagnostics listener, Cloud Logging parity, and RBAC replay isolation remain deferred.\n",
-		localPassed, len(gates), ciStatement,
+		localPassed, localTotal, ciStatement,
 	), nil
 }
 

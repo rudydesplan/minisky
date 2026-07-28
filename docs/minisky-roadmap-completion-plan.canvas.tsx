@@ -21,21 +21,28 @@ const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
   ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; optional Phase-15 Terraform remains"],
   ["8", "Durable state", "Verified foundation", "Guarded restart/export/import/destroy passes; Docker data snapshots remain bounded"],
-  ["9", "Serverless and events", "Verified bounded local slice", "Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes pass; Scheduler remains manual :run E2E"],
+  ["9", "Serverless and events", "CI-verified bounded slice", "Linux CI proves Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
   ["11", "DX and distribution", "CI-verified distribution slice", "GoReleaser Linux AMD64 snapshot, native amd64/arm64 deb/rpm, and Linux ARM64/macOS ARM64/Windows AMD64 CGO gates pass; publication remains external"],
-  ["12", "Platform diagnostics", "Verified bounded local slice · CI configured", "W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown pass locally; external CI pass remains unrecorded"],
+  ["12", "Platform diagnostics", "CI-verified bounded platform slice", "Required CI run 30337314745 proves W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown on the current PR head"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
-  ["16", "ML, monitoring, networking", "Monitoring + Logging + DNS + Subnetwork/IPAM + Vertex", "Persisted PromQL, Logging, DNS/UDP, Terraform-importable custom-VPC IPv4 subnet/bridge, and deterministic predictions pass restart gates"],
-  ["17", "CI/CD, plugins, enterprise", "Verified bounded local slice", "Federated RBAC/quota/audit integration passes locally; CI pass evidence and production controls remain"],
-  ["18", "Event workflows", "Experimental · delivery + two Terraform gates passed", "The public gateway proves same-project dispatch plus foreign-topic/project non-delivery; a package race test isolates trigger-project and transport-topic mismatch checks; terminal execution persistence is separate from unproven interrupted-intent replay"],
+  ["16", "ML, monitoring, networking", "CI-verified bounded slices", "Linux critical CI proves persisted PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK + Terraform, and deterministic Vertex restart gates"],
+  ["17", "CI/CD, plugins, enterprise", "CI-verified bounded slice", "Linux critical CI proves federated RBAC/quota/audit integration; production controls and external publication remain"],
+  ["18", "Event workflows", "Experimental · delivery + two Terraform gates passed", "The public gateway proves dispatch, negative isolation, and terminal persistence; one package test replays FAILED → SUCCEEDED, but public-gateway crash-window replay remains unproven"],
   ["19", "Pipelines and streaming", "Experimental · core + heavy CI + two Terraform gates passed", "Dataflow/Dataform lifecycle plus exact-owned Kafka protocol and Airflow DAG execution pass; provider 7.41.0 proves bounded Composer and Managed Kafka lifecycles/imports; Pub/Sub Lite stays explicit 501"],
   ["20", "Extended databases", "Experimental · local + CI + four Terraform gates passed", "Provider 7.41.0 proves bounded AlloyDB cluster/primary, Filestore, Identity Platform singleton, and local GCS-to-GCS Storage Transfer lifecycles; production networking remains outside the claims"],
   ["21–22", "Observability and API management", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves the Service Directory namespace/service/endpoint hierarchy; durable ingestion, gateway, rollout, policy, restart, and cleanup gates pass while external deployment and DNS parity remain unsupported"],
   ["23", "AI and ML services", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one metadata-only Document AI processor lifecycle; bounded client contracts, restart, sensitive-data absence, and cleanup pass while processing and inference parity remain unsupported"],
   ["24–25", "Security and networking", "Experimental · batch CI + two local Terraform gates", "Provider 7.41.0 proves bounded Organization Policy and Binary Authorization project-policy lifecycles locally; both remain local emulation without production enforcement claims"],
+];
+
+const priorities = [
+  ["1", "Close Eventarc crash-window evidence", "Interrupt a persisted intent before execution, restart through the public gateway, and prove bounded replay", "The package FAILED → SUCCEEDED test is necessary but not gateway evidence"],
+  ["2", "Qualify Terraform claims individually", "Keep the existing 12 domain claims; add another only after provider restart/import/no-drift/destroy evidence", "API routes and generated-client gates do not establish provider compatibility"],
+  ["3", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
+  ["4", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
 ];
 
 const waves = [
@@ -48,7 +55,7 @@ const waves = [
       "Expand canonical endpoint coverage and the live Terraform/Go/Python stack.",
       "Add profile-scoped emulator storage, explicit Docker reconciliation, durable LRO terminal state, and restart/export/import CI.",
     ],
-    gate: "32/32 domains covered; apply → restart → no-drift → export → clean import → destroy passes in CI.",
+    gate: "All 71 registered domains stay aligned with generated compatibility truth; durability remains bounded to documented metadata and owned backends.",
   },
   {
     title: "Wave 2 — Complete existing executable workflows",
@@ -70,7 +77,7 @@ const waves = [
       "Keep diagnostics on the loopback Dashboard listener, separate from Cloud Logging and the Phase 21–22 service domains.",
       "Treat replay as opt-in in-process execution with project-keyed lookup scoping, not cross-project authorization.",
     ],
-    gate: "Package/race, guard self-test, and guarded loopback/OTLP gates pass locally. Required PR/main CI plus optional manual execution are configured, but no external run URL and full commit are recorded.",
+    gate: "Three local-only gates pass, and required CI passed in run 30337314745 on full commit 60e82159d7fd80cf6472327b2cd14c2ae1465f23.",
   },
   {
     title: "Wave 4 — Identity and tenant boundaries",
@@ -103,7 +110,7 @@ const waves = [
       "16.3 DNS local resolution backed by the existing zone store.",
       "16.4 Bounded subnetwork/IPv4 IPAM plus provider apply/import/no-drift/destroy is complete; workload connectivity, NAT, peering, and PSC remain future work.",
     ],
-    gate: "No fidelity promotion without SDK, provider, persistence, and data-plane evidence; both subnet gates passed on local Docker Desktop/macOS and have opt-in Linux CI configured.",
+    gate: "No fidelity promotion without SDK, provider, persistence, and data-plane evidence; all six critical Phase 16 Linux jobs passed in run 30333855843.",
   },
   {
     title: "Wave 7 — Delivery ecosystem before enterprise",
@@ -114,7 +121,7 @@ const waves = [
       "17.3 Maintain reproducible benchmarks and fixed-window, process-local quota middleware.",
       "17.4 Preserve the guarded federated RBAC/quota/audit cross-gate and checksummed air-gap evidence.",
     ],
-    gate: "The bounded local slice is verified; CI pass evidence, external identity, distributed quotas, immutable audit storage, package publication, and runtime loading remain separate gates.",
+    gate: "The bounded enterprise cross-gate passed in critical run 30333855843; external identity, distributed quotas, immutable audit storage, package publication, and runtime loading remain separate gates.",
   },
   {
     title: "Wave 8 — Promote Phase 18–25 services by evidence",
@@ -157,13 +164,23 @@ export default function MiniSkyRoadmapCompletionPlan() {
         pass locally, including the applicable Docker and loopback backend boundaries. All six external CI gates
         passed on commit 62d6fa2. On commit d657e4b, Phase 19 Kafka/Airflow, the corrected GoReleaser validation,
         Linux AMD64 release snapshot, native AMD64/ARM64 packages, and Linux ARM64, macOS ARM64, and Windows AMD64
-        CGO jobs all passed. Provider 7.41.0 now passes twelve independently recorded, domain-scoped Terraform
+        CGO jobs all passed. On the current PR head, required CI run 30337314745 and critical run 30337314786
+        both passed on full commit 60e82159d7fd80cf6472327b2cd14c2ae1465f23, including Phase 12 diagnostics,
+        Phase 9, all six Phase 16 jobs, and Phase 17. Provider 7.41.0 now passes twelve independently recorded, domain-scoped Terraform
         lifecycles while every Phase 18–25 service remains default-off and bounded by its documented local contract.
         Phase 18 now also has isolated public-gateway Pub/Sub → Eventarc → Workflows live-dispatch evidence with
         exact raw request nonce/argument/result checks, foreign-topic/project negative publishes, and separate
         terminal execution persistence across restart. A package race test independently isolates trigger-project
-        mismatch and configured transport-topic mismatch non-delivery.
+        mismatch and configured transport-topic mismatch non-delivery. One package restart test replays a persisted
+        FAILED delivery to SUCCEEDED; deterministic public-gateway crash-window replay remains unproven.
         Production-grade semantics remain explicit external boundaries.
+      </Callout>
+
+      <Callout tone="info" title="Current PR evidence">
+        PR #21 targets 60e82159d7fd80cf6472327b2cd14c2ae1465f23. Required CI run 30337314745 and
+        critical-integration run 30337314786 both completed successfully. Optional opt-in integration jobs skipped by
+        the pull-request workflow are not treated as passes. The Binary Authorization Terraform lifecycle remains
+        local-passed only, with no dedicated Terraform CI pass.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -202,8 +219,9 @@ export default function MiniSkyRoadmapCompletionPlan() {
             The guarded Phase 18 public-gateway gate separately proves that Pub/Sub publish creates an
             Eventarc-triggered Workflow execution containing the exact raw PublishRequest nonce, argument, and
             terminal result, and that the completed execution remains visible after daemon restart. The request is
-            not a CloudEvent envelope. The gate does not interrupt a persisted intent before execution, so
-            deterministic intent replay remains unproven; transport provisioning, OIDC, ordering, exactly-once
+            not a CloudEvent envelope. A package restart test separately replays one persisted FAILED delivery exactly
+            once to SUCCEEDED. The public-gateway gate does not interrupt a persisted intent before execution, so
+            deterministic crash-window replay remains unproven; transport provisioning, OIDC, ordering, exactly-once
             delivery, and Eventarc promotion remain explicit non-goals.
           </Text>
         </Stack>
@@ -247,11 +265,26 @@ export default function MiniSkyRoadmapCompletionPlan() {
 
       <Divider />
 
+      <Stack gap={10}>
+        <H2>Next evidence milestones</H2>
+        <Text tone="secondary">
+          Ordered by what currently blocks truthful promotion or release claims.
+        </Text>
+        <Table
+          headers={["Order", "Milestone", "Required evidence", "Do not overclaim"]}
+          rows={priorities}
+          striped
+          stickyHeader
+        />
+      </Stack>
+
+      <Divider />
+
       <Grid columns="2fr 1fr" gap={20}>
         <Stack gap={8}>
           <H2>Phase 9, 13, 14, 16, 17, and 18 verified boundaries</H2>
           <Text>
-            The real Pack v0.40.8 gate passed locally in about 235 seconds. Storage and Pub/Sub each invoked an
+            The real Pack v0.40.8 gate passed locally and in critical Linux run 30333855843. Storage and Pub/Sub each invoked an
             existing function and a Cloud Run-style service through MiniSky&apos;s local <Code>/v2/deploy</Code>
             helper; service readiness and owned container deletion passed. Tasks proved two-attempt
             <Code>503 → 204</Code> completion and two-attempt terminal <Code>500</Code> failure.
@@ -259,7 +292,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
           <Text tone="secondary">
             This does not verify the Cloud Run v2 image API, full source builds, Terraform serverless,
             Eventarc CloudEvents parity or transport provisioning, Pub/Sub push, Eventarc/Cloud Tasks
-            OIDC/task-header/redirect/dead-letter-queue parity, interrupted task replay, production serverless,
+            OIDC/task-header/redirect/dead-letter-queue parity, exactly-once task replay, production serverless,
             ordering, or exactly-once delivery. The Phase 18 path remains default-off experimental and Scheduler
             remains a manual <Code>:run</Code> HTTP E2E check.
           </Text>
@@ -297,8 +330,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
           </Text>
           <Text tone="secondary">
             The bounded slice supports entries write/list and sink create/get/list/delete. Pagination,
-            partial-success writes, sink updates, per-entry errors, delivery replay, log-based metrics, and alerting
-            remain unsupported.
+            partial-success writes, sink updates, per-entry errors, exactly-once delivery guarantees, log-based
+            metrics, and alerting remain unsupported.
           </Text>
           <Text>
             The generated Cloud DNS REST client created a public zone and A record. Restart validated the supported
@@ -330,9 +363,10 @@ export default function MiniSkyRoadmapCompletionPlan() {
             custom VPC, project overlap rejection, page-token binding, save/LRO failure, parent and instance reference
             guards, exact project-scoped VM/network Docker identities, unowned/mismatch refusal, ambiguous-create
             recovery, attached-endpoint delete failure, fail-closed compensation, and state-graph validation. This does not
-            establish Terraform compatibility, auto-mode networks, multiple/secondary ranges, IPv6, routes, workload
+            establish broad Terraform compatibility, auto-mode networks, multiple/secondary ranges, IPv6, routes, workload
             connectivity, firewall packet isolation, Shared VPC, host routing/iptables, cross-host semantics, NAT,
-            peering, PSC, VPN/interconnect, or full GCP VPC parity. Opt-in Linux CI is configured without pass evidence.
+            peering, PSC, VPN/interconnect, or full GCP VPC parity. Both bounded subnet gates passed in critical Linux
+            run 30333855843.
           </Text>
           <Text>
             The generated AI Platform REST client recorded two deterministic endpoint predictions, MiniSky
@@ -344,7 +378,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
             deployment, real inference, streaming/raw/batch prediction, and feature stores remain unsupported.
           </Text>
           <Text>
-            The Phase-17 cross-gate passed locally with the federated principal exercising Dashboard RBAC,
+            The Phase-17 cross-gate passed locally and in critical Linux run 30333855843 with the federated principal exercising Dashboard RBAC,
             gateway authorization, route quota rejection, audit verification, redaction checks, and tamper
             detection. This verifies a bounded local slice, not production-ready enterprise controls.
           </Text>

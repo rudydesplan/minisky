@@ -122,7 +122,7 @@ func TestPhase12PlatformGatesAreCompleteAndReferenceable(t *testing.T) {
 		"phase12-package-race-unit":   EvidenceLocalPassed,
 		"phase12-guarded-integration": EvidenceLocalPassed,
 		"phase12-guard-self-test":     EvidenceLocalPassed,
-		"phase12-ci":                  EvidenceConfiguredUnverified,
+		"phase12-ci":                  EvidenceCIPassed,
 	}
 	if len(gates) != len(want) {
 		t.Fatalf("platform gates = %d, want %d", len(gates), len(want))

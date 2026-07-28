@@ -48,11 +48,13 @@
     "phase": 12,
     "name": "Required GitHub Actions observability acceptance",
     "check": {
-      "status": "configured-unverified",
+      "status": "ci-passed",
       "workflow": ".github/workflows/ci.yml",
       "job": "phase12-observability-integration",
       "makeTarget": "test-phase12-observability",
-      "note": "The job is required on pull requests and main pushes and remains optionally selectable on manual dispatch. No completed external GitHub Actions run URL and full commit SHA are recorded, so this is configuration evidence only."
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30337314745",
+      "commit": "60e82159d7fd80cf6472327b2cd14c2ae1465f23",
+      "note": "The required pull-request Phase 12 loopback observability acceptance job and its containing CI workflow completed successfully on the recorded commit on 2026-07-28; optional opt-in integration jobs were skipped by design."
     }
   }
 ]
