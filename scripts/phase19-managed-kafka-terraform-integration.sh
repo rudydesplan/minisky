@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
+
+kafka_image="apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f"
+if [[ "${1:-}" == "--print-required-images" && "$#" -eq 1 ]]; then
+  printf '%s\n' "${kafka_image}"
+  exit 0
+fi
+[[ "$#" -eq 0 ]] || { echo "Usage: $0 [--print-required-images]" >&2; exit 2; }
 
 if [[ "${MINISKY_PHASE19_MANAGED_KAFKA_TERRAFORM_INTEGRATION:-}" != "1" ||
       "${MINISKY_PHASE19_DOCKER_INTEGRATION:-}" != "1" ]]; then
@@ -10,7 +18,6 @@ for command in curl docker go python3 terraform; do
   command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
 docker info >/dev/null
-kafka_image="apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f"
 docker image inspect "${kafka_image}" >/dev/null
 
 shared_lock="${TMPDIR:-/tmp}/minisky-net-integration.lock"

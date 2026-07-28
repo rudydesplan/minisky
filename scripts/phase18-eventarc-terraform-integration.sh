@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
 
 if [[ "${MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION:-}" != "1" ]]; then
   echo "Refusing Phase 18 Eventarc Terraform integration without MINISKY_PHASE18_EVENTARC_TERRAFORM_INTEGRATION=1." >&2

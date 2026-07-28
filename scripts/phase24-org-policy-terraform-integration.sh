@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
 
 [[ "${MINISKY_PHASE24_ORG_POLICY_TERRAFORM_INTEGRATION:-}" == "1" ]] ||
   { echo "Refusing Organization Policy Terraform integration without explicit opt-in." >&2; exit 2; }

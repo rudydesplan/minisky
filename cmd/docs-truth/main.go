@@ -408,8 +408,20 @@ func renderPhaseSummary(
 	backendCIPassed := 0
 	backendCIConfigured := 0
 	terraformChecks := 0
+	terraformCIPassed := 0
+	terraformCIConfigured := 0
+	admissionReplayTotal := 0
+	admissionReplayLocal := 0
 	for _, gate := range gates {
 		terraformChecks += len(gate.TerraformChecks)
+		for _, check := range gate.TerraformChecks {
+			if check.CI.Status == evidence.EvidenceCIPassed {
+				terraformCIPassed++
+			}
+			if check.CI.Status == evidence.EvidenceConfiguredUnverified {
+				terraformCIConfigured++
+			}
+		}
 		if gate.PackageUnit.Status == evidence.EvidenceLocalPassed {
 			packageLocal++
 		}
@@ -443,6 +455,12 @@ func renderPhaseSummary(
 		if gate.BackendCI.Status == evidence.EvidenceConfiguredUnverified {
 			backendCIConfigured++
 		}
+		if gate.AdmissionReplay.Status != "" {
+			admissionReplayTotal++
+		}
+		if gate.AdmissionReplay.Status == evidence.EvidenceLocalPassed {
+			admissionReplayLocal++
+		}
 	}
 	return fmt.Sprintf(
 		"**Generated truth:** %d experimental; %d default-off; %d Terraform %s. "+
@@ -452,6 +470,8 @@ func renderPhaseSummary(
 			"configured but unverified: %d/%d. Restart gates passed locally: %d/%d; cleanup gates passed locally: %d/%d; "+
 			"CI gates passed: %d/%d; configured but unverified: %d/%d. "+
 			"Heavy backend CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Terraform CI gates passed: %d/%d; configured but unverified: %d/%d. "+
+			"Admission replay gates passed locally: %d/%d. "+
 			"Package and IAM passes do not promote compatibility; "+
 			"every inventoried service remains experimental until its required integration gates pass.\n",
 		experimental,
@@ -481,6 +501,12 @@ func renderPhaseSummary(
 		backendCITotal,
 		backendCIConfigured,
 		backendCITotal,
+		terraformCIPassed,
+		terraformChecks,
+		terraformCIConfigured,
+		terraformChecks,
+		admissionReplayLocal,
+		admissionReplayTotal,
 	), nil
 }
 

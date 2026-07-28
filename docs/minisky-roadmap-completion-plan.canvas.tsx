@@ -30,19 +30,18 @@ const phases = [
   ["15", "Data services", "Verified bounded slice", "Firestore, Datastore, and Spanner SDK data-plane gate passes locally"],
   ["16", "ML, monitoring, networking", "CI-verified bounded slices", "Linux critical CI proves persisted PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK + Terraform, and deterministic Vertex restart gates"],
   ["17", "CI/CD, plugins, enterprise", "CI-verified bounded slice", "Linux critical CI proves federated RBAC/quota/audit integration; production controls and external publication remain"],
-  ["18", "Event workflows", "Experimental · delivery + two Terraform gates passed", "The public gateway proves dispatch, negative isolation, and terminal persistence; one package test replays FAILED → SUCCEEDED, but public-gateway crash-window replay remains unproven"],
-  ["19", "Pipelines and streaming", "Experimental · core + heavy CI + two Terraform gates passed", "Dataflow/Dataform lifecycle plus exact-owned Kafka protocol and Airflow DAG execution pass; provider 7.41.0 proves bounded Composer and Managed Kafka lifecycles/imports; Pub/Sub Lite stays explicit 501"],
-  ["20", "Extended databases", "Experimental · local + CI + four Terraform gates passed", "Provider 7.41.0 proves bounded AlloyDB cluster/primary, Filestore, Identity Platform singleton, and local GCS-to-GCS Storage Transfer lifecycles; production networking remains outside the claims"],
-  ["21–22", "Observability and API management", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves the Service Directory namespace/service/endpoint hierarchy; durable ingestion, gateway, rollout, policy, restart, and cleanup gates pass while external deployment and DNS parity remain unsupported"],
-  ["23", "AI and ML services", "Experimental · local + CI + one Terraform gate passed", "Provider 7.41.0 proves one metadata-only Document AI processor lifecycle; bounded client contracts, restart, sensitive-data absence, and cleanup pass while processing and inference parity remain unsupported"],
-  ["24–25", "Security and networking", "Experimental · batch CI + two local Terraform gates", "Provider 7.41.0 proves bounded Organization Policy and Binary Authorization project-policy lifecycles locally; both remain local emulation without production enforcement claims"],
+  ["18", "Event workflows", "Experimental · replay locally proven", "Commit 852d9e3 proves deterministic post-admission restart with the same execution identity; external Terraform CI and exactly-once external side effects remain unverified"],
+  ["19", "Pipelines and streaming", "Experimental · Terraform CI configured", "Composer and Managed Kafka local provider lifecycles have isolated required matrix entries with Docker prerequisites; Pub/Sub Lite stays explicit 501"],
+  ["20", "Extended databases", "Experimental · Terraform CI configured", "Four bounded local provider lifecycles have isolated required matrix entries; production networking remains outside the claims"],
+  ["21–22", "Observability and API management", "Experimental · Terraform CI configured", "The local Service Directory hierarchy lifecycle has one required matrix entry; external CI, deployment, and DNS parity remain unverified"],
+  ["23", "AI and ML services", "Experimental · Terraform CI configured", "The local metadata-only Document AI lifecycle has one required matrix entry; processing and inference parity remain unsupported"],
+  ["24–25", "Security and networking", "Experimental · Terraform CI configured", "Organization Policy and Binary Authorization local lifecycles have isolated required matrix entries without production enforcement claims"],
 ];
 
 const priorities = [
-  ["1", "Close Eventarc crash-window evidence", "Interrupt a persisted intent before execution, restart through the public gateway, and prove bounded replay", "The package FAILED → SUCCEEDED test is necessary but not gateway evidence"],
-  ["2", "Qualify Terraform claims individually", "Keep the existing 12 domain claims; add another only after provider restart/import/no-drift/destroy evidence", "API routes and generated-client gates do not establish provider compatibility"],
-  ["3", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
-  ["4", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
+  ["1", "Record exact-head Terraform CI", "Let the required 12-entry matrix pass on one external pull-request or main revision, then record its immutable run URL and commit", "Configured CI is not passing evidence"],
+  ["2", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
+  ["3", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
 ];
 
 const waves = [
@@ -133,7 +132,7 @@ const waves = [
       "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI. Twelve domain-scoped Terraform checks pass locally; Binary Authorization has no separate CI pass record.",
+    gate: "Offline evidence, docs truth, the full race suite, and all six generated-client/restart/cleanup workflows pass locally and in CI. Twelve domain-scoped Terraform checks pass locally and are mapped exactly once to required CI, but the new matrix has no external pass record.",
   },
 ];
 
@@ -168,19 +167,22 @@ export default function MiniSkyRoadmapCompletionPlan() {
         both passed on full commit 60e82159d7fd80cf6472327b2cd14c2ae1465f23, including Phase 12 diagnostics,
         Phase 9, all six Phase 16 jobs, and Phase 17. Provider 7.41.0 now passes twelve independently recorded, domain-scoped Terraform
         lifecycles while every Phase 18–25 service remains default-off and bounded by its documented local contract.
-        Phase 18 now also has isolated public-gateway Pub/Sub → Eventarc → Workflows live-dispatch evidence with
-        exact raw request nonce/argument/result checks, foreign-topic/project negative publishes, and separate
-        terminal execution persistence across restart. A package race test independently isolates trigger-project
-        mismatch and configured transport-topic mismatch non-delivery. One package restart test replays a persisted
-        FAILED delivery to SUCCEEDED; deterministic public-gateway crash-window replay remains unproven.
-        Production-grade semantics remain explicit external boundaries.
+        A required 12-entry pull-request/main matrix now maps those claims exactly once to their guarded Make targets
+        and scripts with isolated runners, bounded timeouts, and failure diagnostics. The matrix is
+        configured-unverified and has no external pass URL or commit.
+        Commit 852d9e3 adds isolated public-gateway Pub/Sub → Eventarc → Workflows evidence with exact raw request
+        nonce/argument/result checks, foreign-topic/project and strict-IAM bounds, and a deterministic post-admission
+        pause. The live gate interrupts MiniSky after durable admission, then resumes the same stable Workflow
+        execution identity to its exact terminal result with no duplicate execution resource and exact-owned cleanup.
+        This proves idempotent admission/resource identity, not exactly-once external side effects, CloudEvents parity,
+        OIDC, ordering, or transport provisioning.
       </Callout>
 
       <Callout tone="info" title="Current PR evidence">
         PR #21 targets 60e82159d7fd80cf6472327b2cd14c2ae1465f23. Required CI run 30337314745 and
         critical-integration run 30337314786 both completed successfully. Optional opt-in integration jobs skipped by
-        the pull-request workflow are not treated as passes. The Binary Authorization Terraform lifecycle remains
-        local-passed only, with no dedicated Terraform CI pass.
+        the pull-request workflow are not treated as passes. All twelve Terraform lifecycles remain local-passed;
+        their newly required matrix is configured-unverified until an external exact-revision run passes.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -194,7 +196,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Card>
         <Card>
           <CardHeader>Promotion status</CardHeader>
-          <CardBody><H2>Default-off</H2><Text tone="secondary">Twelve bounded provider lifecycles pass without batch-wide production promotion</Text></CardBody>
+          <CardBody><H2>CI configured</H2><Text tone="secondary">Twelve local provider lifecycles await external matrix evidence without batch-wide production promotion</Text></CardBody>
         </Card>
       </Grid>
 
@@ -216,13 +218,12 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Linux package jobs, and Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs.
           </Text>
           <Text tone="secondary">
-            The guarded Phase 18 public-gateway gate separately proves that Pub/Sub publish creates an
-            Eventarc-triggered Workflow execution containing the exact raw PublishRequest nonce, argument, and
-            terminal result, and that the completed execution remains visible after daemon restart. The request is
-            not a CloudEvent envelope. A package restart test separately replays one persisted FAILED delivery exactly
-            once to SUCCEEDED. The public-gateway gate does not interrupt a persisted intent before execution, so
-            deterministic crash-window replay remains unproven; transport provisioning, OIDC, ordering, exactly-once
-            delivery, and Eventarc promotion remain explicit non-goals.
+            Commit 852d9e3&apos;s guarded Phase 18 public-gateway gate deterministically pauses after durable Eventarc
+            intent and Workflow execution admission, interrupts MiniSky, and resumes the same stable execution
+            identity to the exact terminal result without creating a duplicate execution resource. It also proves
+            foreign-project/topic and strict-IAM non-delivery plus exact-owned cleanup. Idempotent admission/resource
+            identity is proven; exactly-once external side effects, CloudEvents parity, OIDC, ordering, transport
+            provisioning, and Eventarc promotion remain explicit non-goals.
           </Text>
         </Stack>
         <Stack gap={8}>
@@ -247,7 +248,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
             DRYRUN_AUDIT_LOG_ONLY permits rollout and returns AUDIT; no durable audit record or log is created.
             Unsupported attestation, global-policy, and cluster-rule evaluation returns explicit UNSUPPORTED.
             This is local emulation, not GKE or production admission security. The Binary Authorization Terraform
-            check is local-passed only; it has no invented CI run URL or commit, and it does not promote service fidelity.
+            check is local-passed only. Like the other eleven domain checks, its required matrix entry is
+            configured-unverified; it has no invented CI run URL or commit, and it does not promote service fidelity.
           </Text>
         </Stack>
       </Grid>

@@ -27,7 +27,7 @@ const (
 	networkName            = "minisky-net"
 	dockerImagePullTimeout = 15 * time.Minute
 	dockerRequestTimeout   = 10 * time.Second
-	alloyDBPostgresImage   = "postgres:15.8-bookworm"
+	alloyDBPostgresImage   = "postgres:15.8-bookworm@sha256:eb3747f5d0a92195ca486d2f15d9a4ee5e9461b0332fe87fbc59069490a5c659"
 	maxBuildLogBytes       = 64 << 10
 	buildCleanupTimeout    = 30 * time.Second
 )

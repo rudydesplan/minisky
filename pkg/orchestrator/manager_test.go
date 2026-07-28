@@ -301,7 +301,7 @@ func TestAlloyDBEndpointUsesDynamicLoopbackPortWithoutURLScheme(t *testing.T) {
 	if endpoint != "127.0.0.1:49152" {
 		t.Fatalf("endpoint = %q", endpoint)
 	}
-	if alloyDBPostgresImage != "postgres:15.8-bookworm" {
+	if alloyDBPostgresImage != "postgres:15.8-bookworm@sha256:eb3747f5d0a92195ca486d2f15d9a4ee5e9461b0332fe87fbc59069490a5c659" {
 		t.Fatalf("AlloyDB image is not pinned: %q", alloyDBPostgresImage)
 	}
 }

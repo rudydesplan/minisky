@@ -1,0 +1,35 @@
+jobs:
+  phase18-25-terraform-integration:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - id: workflows
+            domain: workflows.googleapis.com
+            make_target: test-phase18-workflows-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+          # - id: composer
+          #   domain: composer.googleapis.com
+          #   make_target: test-phase19-composer-terraform
+          #   docker_required: true
+          #   required_images_script: scripts/phase19-composer-terraform-integration.sh
+          #   timeout_minutes: 25
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      CHECKPOINT_DISABLE: "1"
+    steps:
+      - name: Verify Docker availability
+        if: matrix.docker_required
+        run: docker info >/dev/null
+      # - name: Provision pinned backend images
+      #   if: matrix.required_images_script != 'none'
+      #   run: scripts/provision-required-images.sh "${{ matrix.required_images_script }}"
+      - name: Run exact domain lifecycle
+        run: make "${{ matrix.make_target }}"

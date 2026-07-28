@@ -260,7 +260,7 @@ jobs:
 
       - name: Validate integration script syntax
         run: |
-          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase12-observability-integration-test.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase18-eventarc-terraform-integration.sh scripts/phase18-workflows-terraform-integration.sh scripts/phase19-composer-terraform-integration.sh scripts/phase19-managed-kafka-terraform-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-alloydb-terraform-integration.sh scripts/phase20-filestore-terraform-integration.sh scripts/phase20-identity-platform-terraform-integration.sh scripts/phase20-storage-transfer-terraform-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase21-service-directory-terraform-integration.sh scripts/phase23-document-ai-terraform-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/phase24-org-policy-terraform-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase12-observability-integration-test.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase18-eventarc-terraform-integration.sh scripts/phase18-workflows-terraform-integration.sh scripts/phase19-composer-terraform-integration.sh scripts/phase19-managed-kafka-terraform-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-alloydb-terraform-integration.sh scripts/phase20-filestore-terraform-integration.sh scripts/phase20-identity-platform-terraform-integration.sh scripts/phase20-storage-transfer-terraform-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase21-service-directory-terraform-integration.sh scripts/phase23-document-ai-terraform-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/phase24-org-policy-terraform-integration.sh scripts/phase25-binary-authorization-terraform-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
           ./scripts/phase11-distribution-test.sh --self-test
           make test-phase12-observability-contract
           MINISKY_KIND_SELF_TEST=1 ./scripts/kind-integration.sh
@@ -382,6 +382,158 @@ jobs:
 
       - name: Run Phase 18-25 offline evidence
         run: make test-phase18-25-evidence
+
+  phase18-25-terraform-integration:
+    name: Terraform 7.41.0 (${{ matrix.domain }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    needs:
+      - quality
+      - terraform-validate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          # BEGIN PHASE18_25_TERRAFORM_MATRIX
+          - id: workflows
+            domain: workflows.googleapis.com
+            make_target: test-phase18-workflows-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+          - id: eventarc
+            domain: eventarc.googleapis.com
+            make_target: test-phase18-eventarc-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+          - id: composer
+            domain: composer.googleapis.com
+            make_target: test-phase19-composer-terraform
+            docker_required: true
+            required_images_script: scripts/phase19-composer-terraform-integration.sh
+            timeout_minutes: 25
+          - id: managed-kafka
+            domain: managedkafka.googleapis.com
+            make_target: test-phase19-managed-kafka-terraform
+            docker_required: true
+            required_images_script: scripts/phase19-managed-kafka-terraform-integration.sh
+            timeout_minutes: 25
+          - id: alloydb
+            domain: alloydb.googleapis.com
+            make_target: test-phase20-alloydb-terraform
+            docker_required: true
+            required_images_script: scripts/phase20-alloydb-terraform-integration.sh
+            timeout_minutes: 25
+          - id: filestore
+            domain: file.googleapis.com
+            make_target: test-phase20-filestore-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+          - id: identity-platform
+            domain: identityplatform.googleapis.com
+            make_target: test-phase20-identity-platform-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+          - id: storage-transfer
+            domain: storagetransfer.googleapis.com
+            make_target: test-phase20-storage-transfer-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+          - id: service-directory
+            domain: servicedirectory.googleapis.com
+            make_target: test-phase21-service-directory-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+          - id: document-ai
+            domain: documentai.googleapis.com
+            make_target: test-phase23-document-ai-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+          - id: org-policy
+            domain: orgpolicy.googleapis.com
+            make_target: test-phase24-org-policy-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+          - id: binary-authorization
+            domain: binaryauthorization.googleapis.com
+            make_target: test-phase25-binary-authorization-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+          # END PHASE18_25_TERRAFORM_MATRIX
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      CHECKPOINT_DISABLE: "1"
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        if: matrix.docker_required
+        run: docker info >/dev/null
+
+      - name: Provision pinned backend images
+        if: matrix.required_images_script != 'none'
+        run: scripts/provision-required-images.sh "${{ matrix.required_images_script }}"
+
+      - name: Run exact domain lifecycle
+        run: |
+          set -o pipefail
+          git rev-parse HEAD | tee "terraform-${{ matrix.id }}.commit"
+          make "${{ matrix.make_target }}" 2>&1 | tee "terraform-${{ matrix.id }}.log"
+
+      - name: Capture bounded failure diagnostics
+        if: failure()
+        run: |
+          {
+            printf 'domain=%s\n' '${{ matrix.domain }}'
+            printf 'make_target=%s\n' '${{ matrix.make_target }}'
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            printf '%s\n' 'containers:'
+            docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null || true
+            printf '%s\n' 'networks:'
+            docker network ls 2>/dev/null || true
+            printf '%s\n' 'volumes:'
+            docker volume ls 2>/dev/null || true
+          } >"terraform-${{ matrix.id }}-diagnostics.txt"
+
+      - name: Retain failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: terraform-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            terraform-${{ matrix.id }}.commit
+            terraform-${{ matrix.id }}.log
+            terraform-${{ matrix.id }}-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
 
   phase18-25-sdk-integration:
     name: Phase 18-25 generated Go client restart acceptance

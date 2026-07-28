@@ -137,6 +137,8 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"cleanup gates passed locally: 6/6",
 		"CI gates passed: 6/6; configured but unverified: 0/6",
 		"Heavy backend CI gates passed: 1/1; configured but unverified: 0/1",
+		"Terraform CI gates passed: 0/12; configured but unverified: 12/12",
+		"Admission replay gates passed locally: 1/1",
 		"Package and IAM passes do not promote compatibility",
 	} {
 		if !strings.Contains(got, want) {

@@ -48,7 +48,7 @@ run offline; first use may pull lazily loaded emulator images.
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -77,12 +77,16 @@ arguments and terminal results. Foreign-topic and foreign-project publishes
 through that gateway produce zero nonce-correlated executions; the Eventarc
 package race test separately isolates trigger-project mismatch and configured
 transport-topic mismatch non-delivery. The gate also proves that completed
-executions persist across restart, then deletes trigger → topic → workflow,
-restarts, and proves durable absence and no post-delete delivery. The raw
-request is not a CloudEvent envelope. The gate does not interrupt a persisted
-Eventarc intent before execution. A package restart test replays one persisted
-`FAILED` delivery exactly once to `SUCCEEDED`, but deterministic crash-window
-intent replay through the public gateway remains unproven.
+executions persist across restart. Commit
+`852d9e352b7fd400a86ccec655c2434008325cf8` additionally introduced a
+deterministic post-admission pause: the live gate interrupts MiniSky after the
+Eventarc intent and correlated Workflow execution admission are durable, then
+restarts and resumes the same stable execution identity to the exact terminal
+result without creating a duplicate execution resource. It then deletes
+trigger → topic → workflow, restarts, and proves durable absence, no
+post-delete delivery, and exact-owned cleanup. This proves idempotent admission
+and resource identity across restart, not exactly-once external side effects,
+CloudEvents envelope parity, OIDC, ordering, or Eventarc transport provisioning.
 Phase 19 additionally passed exact-owned Kafka protocol and Airflow DAG
 execution with container and anonymous-volume cleanup. Phase 20 passed AlloyDB,
 Filestore, Identity Platform, Redis-domain Valkey, Storage Transfer, canonical
@@ -109,10 +113,11 @@ no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
 canonical import, while provider 7.41.0 does not support Workflows import. The
 Eventarc gate persists one filter, workflow destination, and Pub/Sub transport
 topic but remains a control-plane-only Terraform claim. The separate public
-gateway gate proves only MiniSky's bounded Pub/Sub → Eventarc → Workflows path;
-it does not provide Eventarc transport provisioning, CloudEvents envelope
-parity, deterministic crash-window intent replay, OIDC, ordering, or exactly-once
-delivery, and it does not promote Eventarc from experimental status. No other
+gateway gate proves MiniSky's bounded Pub/Sub → Eventarc → Workflows path,
+including stable post-admission execution identity across restart. It does not
+provide Eventarc transport provisioning, CloudEvents envelope parity, OIDC,
+ordering, or exactly-once external side effects, and it does not promote
+Eventarc from experimental status. No other
 Phase 18 Terraform compatibility is claimed. Separate heavy Phase 19 gates pass
 `google_composer_environment` and `google_managed_kafka_cluster` lifecycles and
 canonical imports against digest-pinned exact-owned backends. Managed Kafka
@@ -160,7 +165,14 @@ global-policy, and cluster-rule evaluation each returns explicit `UNSUPPORTED`.
 This is Terraform compatibility evidence and local emulation, not fidelity
 promotion, GKE admission, or production admission security. Binary
 Authorization remains experimental and default-off. This Phase 25 Terraform
-gate has local-pass evidence only; no CI run or commit is claimed.
+gate has local-pass evidence only; no CI run or commit is claimed. A required
+12-entry GitHub Actions matrix now maps every machine-readable Phase 18–25
+Terraform claim exactly once to its guarded Make target and script on pull
+requests and `main`. Composer, Managed Kafka, and AlloyDB matrix entries derive,
+pull, and inspect exact tag-plus-SHA256 image references from their guarded
+scripts before execution; entries without backend images remain lightweight.
+Those CI checks remain `configured-unverified` until an
+external run passes; no run URL or commit is recorded for them yet.
 Unsupported methods return canonical 501
 responses rather than simulated success; Cloud CDN/Armor remains within the
 Compute domain and does not claim full GCP data-plane parity.
@@ -756,12 +768,15 @@ and [critical run
 30337314786](https://github.com/rudydesplan/minisky/actions/runs/30337314786)
 both passed. Optional opt-in integration jobs skipped by the pull-request
 workflow are not converted into pass claims. The Binary Authorization
-Terraform lifecycle remains local-passed only.
+Terraform lifecycle and the other eleven domain-scoped Terraform checks remain
+local-passed only; their required matrix is configured but has no external
+exact-head pass record.
 
 The next evidence milestones are:
 
-1. add a public-gateway restart gate that deterministically interrupts and
-   replays a persisted Eventarc delivery intent;
+1. obtain one exact-head external run in which all 12 required Phase 18–25
+   Terraform matrix entries pass, then record its immutable run URL and full
+   commit without promoting any domain beyond its bounded claim;
 2. keep the 12 existing Phase 18–25 Terraform claims domain-scoped, and add any
    further claim only with provider apply, restart, import where supported,
    no-drift, destroy, and cleanup evidence;

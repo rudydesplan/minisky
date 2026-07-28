@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
+
+airflow_image="apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
+if [[ "${1:-}" == "--print-required-images" && "$#" -eq 1 ]]; then
+  printf '%s\n' "${airflow_image}"
+  exit 0
+fi
+[[ "$#" -eq 0 ]] || { echo "Usage: $0 [--print-required-images]" >&2; exit 2; }
 
 if [[ "${MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION:-}" != "1" ||
       "${MINISKY_PHASE19_DOCKER_INTEGRATION:-}" != "1" ]]; then
@@ -10,7 +18,6 @@ for command in curl docker go python3 terraform; do
   command -v "${command}" >/dev/null 2>&1 || { echo "Required command not found: ${command}" >&2; exit 1; }
 done
 docker info >/dev/null
-airflow_image="apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79"
 docker image inspect "${airflow_image}" >/dev/null
 
 shared_lock="${TMPDIR:-/tmp}/minisky-net-integration.lock"

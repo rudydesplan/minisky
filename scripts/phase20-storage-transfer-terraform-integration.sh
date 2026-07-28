@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TF_IN_AUTOMATION=1 CHECKPOINT_DISABLE=1
 [[ "${MINISKY_PHASE20_STORAGE_TRANSFER_TERRAFORM_INTEGRATION:-}" == "1" ]] || { echo "Explicit opt-in required." >&2; exit 2; }
 for command in curl docker go python3 terraform; do command -v "${command}" >/dev/null || exit 1; done
 shared_lock="${TMPDIR:-/tmp}/minisky-net-integration.lock"

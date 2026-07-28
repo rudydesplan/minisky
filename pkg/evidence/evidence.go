@@ -69,15 +69,16 @@ type TestReference struct {
 // Configured checks are not pass claims until an actual local or GitHub run is
 // recorded. CI passes identify the immutable source commit and durable run URL.
 type EvidenceCheck struct {
-	Status     EvidenceStatus  `json:"status"`
-	References []TestReference `json:"references,omitempty"`
-	Script     string          `json:"script,omitempty"`
-	MakeTarget string          `json:"makeTarget,omitempty"`
-	Workflow   string          `json:"workflow,omitempty"`
-	Job        string          `json:"job,omitempty"`
-	RunURL     string          `json:"runUrl,omitempty"`
-	Commit     string          `json:"commit,omitempty"`
-	Note       string          `json:"note"`
+	Status       EvidenceStatus  `json:"status"`
+	References   []TestReference `json:"references,omitempty"`
+	Script       string          `json:"script,omitempty"`
+	MakeTarget   string          `json:"makeTarget,omitempty"`
+	Workflow     string          `json:"workflow,omitempty"`
+	Job          string          `json:"job,omitempty"`
+	RunURL       string          `json:"runUrl,omitempty"`
+	Commit       string          `json:"commit,omitempty"`
+	SourceCommit string          `json:"sourceCommit,omitempty"`
+	Note         string          `json:"note"`
 }
 
 // PlatformGate records one platform-level verification boundary. It remains
@@ -97,7 +98,9 @@ var platformGatesJSON []byte
 // domain. Terraform evidence is intentionally not represented as a batch-wide
 // check because each claimed domain has its own fixture and executable gate.
 type TerraformCheck struct {
-	Domain string `json:"domain"`
+	Domain   string        `json:"domain"`
+	MatrixID string        `json:"matrixId"`
+	CI       EvidenceCheck `json:"ci"`
 	EvidenceCheck
 }
 
@@ -113,6 +116,7 @@ type BatchGate struct {
 	DaemonRestart               EvidenceCheck    `json:"daemonRestart"`
 	RealBackendDocker           EvidenceCheck    `json:"realBackendDocker"`
 	StrictIAM                   EvidenceCheck    `json:"strictIAM"`
+	AdmissionReplay             EvidenceCheck    `json:"admissionReplay,omitempty"`
 	TerraformChecks             []TerraformCheck `json:"terraformChecks,omitempty"`
 	Cleanup                     EvidenceCheck    `json:"cleanup"`
 	CI                          EvidenceCheck    `json:"ci"`
@@ -180,6 +184,9 @@ func BatchGates() ([]BatchGate, error) {
 		if gate.BackendCI.Status != "" {
 			checks["backendCI"] = gate.BackendCI
 		}
+		if gate.AdmissionReplay.Status != "" {
+			checks["admissionReplay"] = gate.AdmissionReplay
+		}
 		for name, check := range checks {
 			if err := ValidateEvidenceCheck(check); err != nil {
 				return nil, fmt.Errorf("%s %s: %w", gate.ID, name, err)
@@ -188,6 +195,12 @@ func BatchGates() ([]BatchGate, error) {
 		for _, check := range gate.TerraformChecks {
 			if err := ValidateEvidenceCheck(check.EvidenceCheck); err != nil {
 				return nil, fmt.Errorf("%s Terraform check for %s: %w", gate.ID, check.Domain, err)
+			}
+			if check.MatrixID == "" {
+				return nil, fmt.Errorf("%s Terraform check for %s: matrix ID is required", gate.ID, check.Domain)
+			}
+			if err := ValidateEvidenceCheck(check.CI); err != nil {
+				return nil, fmt.Errorf("%s Terraform CI check for %s: %w", gate.ID, check.Domain, err)
 			}
 		}
 	}
@@ -224,8 +237,14 @@ func ValidateEvidenceCheck(check EvidenceCheck) error {
 	if check.Status == "" || check.Note == "" {
 		return fmt.Errorf("status and note are required")
 	}
+	if check.SourceCommit != "" && !fullCommitPattern.MatchString(check.SourceCommit) {
+		return fmt.Errorf("source commit requires a lowercase 40-hex commit")
+	}
 	switch check.Status {
 	case EvidenceCIPassed:
+		if check.SourceCommit != "" {
+			return fmt.Errorf("ci-passed uses commit, not sourceCommit")
+		}
 		runURL, err := url.Parse(check.RunURL)
 		if err != nil || runURL.Scheme != "https" || runURL.Host != "github.com" ||
 			!actionsRunPattern.MatchString(runURL.Path) || runURL.RawQuery != "" ||
@@ -239,6 +258,9 @@ func ValidateEvidenceCheck(check EvidenceCheck) error {
 		EvidenceNotApplicable, EvidenceAbsent:
 		if check.RunURL != "" || check.Commit != "" {
 			return fmt.Errorf("%s must not include CI run or commit fields", check.Status)
+		}
+		if check.SourceCommit != "" && check.Status != EvidenceLocalPassed {
+			return fmt.Errorf("%s must not include a local source commit", check.Status)
 		}
 	default:
 		return fmt.Errorf("unknown evidence status %q", check.Status)

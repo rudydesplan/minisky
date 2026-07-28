@@ -178,6 +178,17 @@ Workflows gate. It does not publish an event or claim that MiniSky provisions a
 real Eventarc Pub/Sub transport; delivery, subscription creation, and broader
 trigger destinations remain outside this Terraform claim.
 
+Separately from that provider control-plane claim, commit
+`852d9e352b7fd400a86ccec655c2434008325cf8` passed the guarded local/live
+public-gateway delivery gate with a deterministic post-admission pause. The
+gate interrupts MiniSky after the Eventarc intent and correlated Workflow
+execution admission are durable, restarts, and reaches the exact terminal
+result through the same stable execution identity without creating a duplicate
+execution resource. It also proves project/topic and strict-IAM non-delivery
+bounds plus exact-owned cleanup. This is evidence of idempotent admission and
+resource identity across restart, not exactly-once external side effects,
+CloudEvents parity, OIDC, ordering, or Eventarc transport provisioning.
+
 The guarded Phase-19 Composer gate requires both
 `MINISKY_PHASE19_COMPOSER_TERRAFORM_INTEGRATION=1` and
 `MINISKY_PHASE19_DOCKER_INTEGRATION=1`. Provider `7.41.0` applies the smallest
@@ -341,6 +352,28 @@ The regular `terraform-validate` job:
 1. checks `terraform fmt`;
 2. initializes the pinned provider with the lock file in read-only mode; and
 3. runs `terraform validate`.
+
+The required `phase18-25-terraform-integration` job is a 12-entry matrix on
+pull requests and `main`. Each entry maps one machine-readable domain claim to
+one existing guarded Make target and integration script, checks out the
+workflow run revision, uses Terraform `1.15.8` with provider `7.41.0`, and runs
+in an isolated hosted runner. The matrix is fail-independent with four-way
+parallelism; Docker/network-backed entries declare their prerequisite, while
+all entries retain per-script collision locks, temporary HOME/provider/state
+directories, invocation-owned cleanup, bounded timeouts, and seven-day failure
+diagnostics. Composer, Managed Kafka, and AlloyDB expose their exact
+tag-plus-SHA256 image references from the guarded scripts; clean hosted runners
+pull each exact content-addressed reference, then inspect that same reference
+for local availability before the scripts perform their own image checks. A
+successful digest pull is the portable verification; the gate does not compare
+the registry manifest digest to Docker's store-specific local image ID. The
+workflow rejects empty, malformed, or unpinned image declarations,
+while entries without backend images skip provisioning. Static evidence tests
+reject missing, duplicate, unpinned, or cross-wired
+claim/target/script/matrix mappings. These jobs are currently
+`configured-unverified`: no external passing run URL or commit has been
+recorded, so the existing 12 provider lifecycle claims remain local-pass
+evidence only.
 
 The regular `sdk-smoke-validate` job installs the pinned Python requirement,
 compiles the Go smoke with `go test`, and byte-compiles the Python smoke on

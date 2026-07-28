@@ -30,7 +30,6 @@ if ! mkdir "${phase_lock}" 2>/dev/null; then
   exit 1
 fi
 
-repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
 chmod 700 "${work}"
 home="${work}/home"
@@ -56,7 +55,6 @@ access_token=""
 denied_token=""
 auth_args=()
 admission_pause_file=""
-interrupted_delivery_id=""
 interrupted_execution_name=""
 started_at="${SECONDS}"
 mkdir -p "${home}" "${state_root}"
@@ -398,8 +396,6 @@ if not execution or execution.get("state") != "ACTIVE":
 if not admission or admission.get("deliveryId") != delivery_id or admission.get("phase") != "ADMITTED":
     raise SystemExit("Workflow admission is not durably paused before start")
 PY
-  interrupted_delivery_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deliveryId"])' \
-    "${admission_pause_file}")"
   interrupted_execution_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["executionName"])' \
     "${admission_pause_file}")"
 }
@@ -649,5 +645,3 @@ if (( SECONDS - started_at > 300 )); then
   exit 1
 fi
 echo "Phase 18 strict-IAM public-gateway live dispatch, nonce isolation, exact persisted admission interruption/replay, one correlated Workflow execution resource with terminal result, ordered deletion, and exact profile-owned cleanup passed in $((SECONDS - started_at))s."
-# Retired evidence wording kept visible for the shared static-contract follow-up:
-# "deterministic Eventarc intent replay remains unproven"
