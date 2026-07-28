@@ -71,6 +71,29 @@ func TestFallbackRegistryHasUsableDefaults(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMemcachedImagesMatchProviderVersions(t *testing.T) {
+	t.Parallel()
+	for name, registry := range map[string]*ImageRegistry{
+		"embedded": loadRegistry(),
+		"fallback": fallbackRegistry(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			images := make(map[string]string, len(registry.Memorystore.Memcached.Versions))
+			for _, version := range registry.Memorystore.Memcached.Versions {
+				images[version.Version] = version.Image
+			}
+			for version, wantImage := range map[string]string{
+				"1.5.16": "memcached:1.5.16-alpine",
+				"1.6.15": "memcached:1.6.15-alpine",
+			} {
+				if got := images[version]; got != wantImage {
+					t.Errorf("Memcached %s image = %q, want %q", version, got, wantImage)
+				}
+			}
+		})
+	}
+}
+
 func TestProfilePathsAreStateRootScoped(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("MINISKY_STATE_DIR", root)

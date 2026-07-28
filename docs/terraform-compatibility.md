@@ -52,6 +52,7 @@ For a gateway at `http://127.0.0.1:8080`, the local provider uses:
 | `filestore_custom_endpoint` | `http://127.0.0.1:8080/_minisky/file/v1/` | `file.googleapis.com` |
 | `identity_platform_custom_endpoint` | `http://127.0.0.1:8080/_minisky/identityplatform/v2/` | `identityplatform.googleapis.com` |
 | `managed_kafka_custom_endpoint` | `http://127.0.0.1:8080/_minisky/managedkafka/v1/` | `managedkafka.googleapis.com` |
+| `memcache_custom_endpoint` | `http://127.0.0.1:8080/_minisky/memcache/v1/` | `memcache.googleapis.com` |
 | `workflows_custom_endpoint` | `http://127.0.0.1:8080/_minisky/workflows/v1/` | `workflows.googleapis.com` |
 
 The repeated `bigquery/bigquery` segments are intentional: the first is the
@@ -59,6 +60,25 @@ MiniSky service selector and is removed by the router; the second is part of
 the BigQuery v2 API base path expected by the provider. Google provider 7.41.0
 constructs `google_service_account` through its IAM beta client, which is why
 the example overrides `iam_beta_custom_endpoint`.
+
+## Configured but unverified resources
+
+| Terraform resource | Bounded local configuration | Verification status |
+| :--- | :--- | :--- |
+| `google_memcache_instance` | Provider `7.41.0` uses the locally configured `memcache_custom_endpoint`; the default-off root fixture and dedicated untargeted integration fixture set one node with required `node_count`, `node_config.cpu_count`, and `node_config.memory_size_mb` fields | configured but unverified |
+
+A prior local guarded Memcached SDK/Terraform lifecycle passed with provider
+`7.41.0`; no external CI run or commit evidence is recorded, so the row remains
+configured but unverified. The hardened runner is configured to limit import
+normalization by structural plan inspection to provider-only
+`deletion_protection`, `terraform_labels`, and timeout state. It compares the
+API resource before and after applying that saved plan, requires
+post-normalization no-drift, destroys the instance, restarts the daemon, and
+requires durable `404` plus exact-owned container absence before generic
+cleanup. That hardened sequence is not recorded as passing. `effective_labels`
+is computed by the provider from API `labels`; neither field is fabricated by
+the fixture. The gate uses the dedicated one-resource fixture without `-target`
+or plan-text filtering.
 
 ## Acceptance-tested resources
 
@@ -118,7 +138,9 @@ subnetwork with `enable_phase16_network_resources = true`; their outputs are
 `enable_phase18_workflows_resource = true`; the dependent Eventarc trigger also
 requires `enable_phase18_eventarc_resource = true`. The Phase 25 Binary
 Authorization singleton is separately default-off behind
-`enable_phase25_binary_authorization_policy = true`.
+`enable_phase25_binary_authorization_policy = true`. The configured but
+unverified Memcached fixture is separately default-off behind
+`enable_memcache_resource = true`.
 The guarded Terraform script accepts
 `MINISKY_TERRAFORM_PHASE10_ARTIFACT=1` and `MINISKY_TERRAFORM_PHASE15=1`,
 but the separate Phase-15 emulator integration remains the authoritative

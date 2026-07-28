@@ -183,9 +183,15 @@ func fallbackRegistry() *ImageRegistry {
 			MasterPorts:  []string{"8080/tcp"},
 		},
 		Memorystore: MemorystoreConfig{
-			Redis:     MemoryEngineConfig{DefaultImage: "redis:latest"},
-			Memcached: MemoryEngineConfig{DefaultImage: "memcached:latest"},
-			Valkey:    MemoryEngineConfig{DefaultImage: "valkey/valkey:latest"},
+			Redis: MemoryEngineConfig{DefaultImage: "redis:latest"},
+			Memcached: MemoryEngineConfig{
+				DefaultImage: "memcached:1.6.15-alpine",
+				Versions: []MemoryVersion{
+					{Version: "1.5.16", Label: "Memcached 1.5.16 (Provider API)", Image: "memcached:1.5.16-alpine"},
+					{Version: "1.6.15", Label: "Memcached 1.6.15 (Provider API)", Image: "memcached:1.6.15-alpine"},
+				},
+			},
+			Valkey: MemoryEngineConfig{DefaultImage: "valkey/valkey:latest"},
 		},
 		CloudBuild: CloudBuildConfig{
 			DefaultBuilder: "ubuntu:26.04",

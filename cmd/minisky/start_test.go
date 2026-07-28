@@ -344,6 +344,82 @@ func TestNativeIntegrationDockerBypassIsNarrow(t *testing.T) {
 	}
 }
 
+func TestStartupClassifiesMemcachedDockerMutationsWhenDockerIsUnavailable(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "memcached-docker-unavailable")
+	shims, _ := registry.BootAll(orchestrator.NewOperationManager(), nil)
+	handler := shims["memcache.googleapis.com"]
+	if handler == nil {
+		t.Fatal("Memcached handler is not registered")
+	}
+	gateway := router.NewProxyRouterWithManager(nil)
+	gateway.RegisterShim(
+		"memcache.googleapis.com",
+		registry.RuntimeHandler("memcache.googleapis.com", handler, false),
+	)
+	for _, test := range []struct {
+		name       string
+		method     string
+		url        string
+		body       string
+		wantStatus int
+		wantRPC    string
+	}{
+		{
+			name:       "supported create reaches backend availability check",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":1,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024}}`,
+			wantStatus: http.StatusServiceUnavailable,
+			wantRPC:    "UNAVAILABLE",
+		},
+		{
+			name:       "unsupported multi-node create wins before backend availability",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":2,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024}}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "unsupported custom parameters win before backend availability",
+			method:     http.MethodPost,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances?instanceId=cache",
+			body:       `{"nodeCount":1,"nodeConfig":{"cpuCount":1,"memorySizeMb":1024},"parameters":{"params":{"-m":"64"}}}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "unsupported resize wins before backend availability",
+			method:     http.MethodPatch,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache?updateMask=displayName%2C%20nodeCount%20",
+			body:       `{"displayName":"updated","nodeCount":2}`,
+			wantStatus: http.StatusNotImplemented,
+			wantRPC:    "UNIMPLEMENTED",
+		},
+		{
+			name:       "metadata only update remains available",
+			method:     http.MethodPatch,
+			url:        "http://localhost/_minisky/memcache/v1/projects/demo/locations/us-central1/instances/cache?updateMask=displayName",
+			body:       `{"displayName":"updated"}`,
+			wantStatus: http.StatusNotFound,
+			wantRPC:    "NOT_FOUND",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.url, strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			gateway.ServeHTTP(response, request)
+			if response.Code != test.wantStatus ||
+				!strings.Contains(response.Body.String(), `"status":"`+test.wantRPC+`"`) {
+				t.Fatalf("status=%d body=%s, want %d %s",
+					response.Code, response.Body.String(), test.wantStatus, test.wantRPC)
+			}
+		})
+	}
+}
+
 type shutdownHandler struct {
 	http.Handler
 	called atomic.Bool

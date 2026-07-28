@@ -33,6 +33,11 @@ output "phase15_redis_instance_name" {
   value       = var.enable_phase15_resources ? google_redis_instance.compatibility[0].name : null
 }
 
+output "memcache_instance_name" {
+  description = "Canonical name of the guarded local Memcached instance, or null when disabled"
+  value       = local.use_minisky && var.enable_memcache_resource ? google_memcache_instance.compatibility[0].id : null
+}
+
 output "phase15_spanner_instance_name" {
   description = "Name of the optional local Phase-15 Spanner instance, or null when disabled"
   value       = var.enable_phase15_resources ? google_spanner_instance.compatibility[0].name : null

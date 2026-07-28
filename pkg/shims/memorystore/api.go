@@ -36,11 +36,8 @@ func init() {
 		}
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr, logAPI)
 	})
-	registry.Register("memcache.googleapis.com", func(_ *registry.Context) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			writeError(w, http.StatusNotImplemented, "UNIMPLEMENTED", "Memorystore for Memcached is not implemented")
-		})
+	registry.Register("memcache.googleapis.com", func(ctx *registry.Context) http.Handler {
+		return NewMemcacheAPI(ctx.OpMgr, memcacheBackendFromManager(ctx.SvcMgr))
 	})
 }
 
@@ -669,6 +666,6 @@ func decodeJSON(r *http.Request, target any) error {
 func writeError(w http.ResponseWriter, code int, status, message string) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"code": code, "status": status, "message": message},
+		"error": map[string]any{"code": code, "status": status, "message": message, "details": []any{}},
 	})
 }

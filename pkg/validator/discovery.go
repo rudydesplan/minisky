@@ -561,6 +561,41 @@ var embeddedRules = []ServiceSchema{
 		}},
 	},
 	{
+		Domain: "memcache.googleapis.com",
+		Methods: []MethodSchema{
+			{
+				HTTPMethod:    "POST",
+				PathGlob:      "/v1/projects/*/locations/*/instances",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"instanceId"},
+				RequiredBody: []BodyField{
+					{
+						Path: "nodeCount", Type: "integer",
+						Message: "field 'nodeCount' is required for instances.create",
+					},
+					{
+						Path: "nodeConfig", Type: "object",
+						Message: "field 'nodeConfig' is required for instances.create",
+					},
+					{
+						Path: "nodeConfig.cpuCount", Type: "integer",
+						Message: "field 'nodeConfig.cpuCount' is required for instances.create",
+					},
+					{
+						Path: "nodeConfig.memorySizeMb", Type: "integer",
+						Message: "field 'nodeConfig.memorySizeMb' is required for instances.create",
+					},
+				},
+			},
+			{
+				HTTPMethod:    "PATCH",
+				PathGlob:      "/v1/projects/*/locations/*/instances/*",
+				ContentType:   "application/json",
+				RequiredQuery: []string{"updateMask"},
+			},
+		},
+	},
+	{
 		Domain: "monitoring.googleapis.com",
 		Methods: []MethodSchema{
 			{

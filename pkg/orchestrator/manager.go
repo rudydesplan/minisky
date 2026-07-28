@@ -41,17 +41,19 @@ var ErrServerlessLifecycleInProgress = errors.New("Serverless lifecycle already 
 
 // ServiceManager handles native REST-driven lifecycle events over the Docker Unix Socket.
 type ServiceManager struct {
-	mu               sync.RWMutex
-	emulatorMu       sync.Mutex
-	serverlessMu     sync.Mutex
-	dockerClient     *http.Client
-	dockerTimeout    time.Duration
-	sockPath         string
-	portRegistry     map[string][]PortMapping   // containerName → host ports
-	fwRules          map[string][]FirewallEntry // vpcName → rules
-	serverlessActive map[ServerlessIdentity]struct{}
-	serverlessReady  func(string, time.Duration) error
-	emulatorReady    func(string, time.Duration) error
+	mu                sync.RWMutex
+	emulatorMu        sync.Mutex
+	serverlessMu      sync.Mutex
+	dockerClient      *http.Client
+	dockerTimeout     time.Duration
+	sockPath          string
+	portRegistry      map[string][]PortMapping   // containerName → host ports
+	fwRules           map[string][]FirewallEntry // vpcName → rules
+	serverlessActive  map[ServerlessIdentity]struct{}
+	serverlessReady   func(string, time.Duration) error
+	emulatorReady     func(string, time.Duration) error
+	memcachedReady    func(context.Context, string, string, time.Duration) error
+	memcacheUncertain map[string]error
 }
 
 type deadlineRoundTripper struct {
@@ -147,13 +149,15 @@ func NewServiceManager() (*ServiceManager, error) {
 	}
 	log.Printf("[ServiceManager] Docker socket resolved: %s", sockPath)
 	sm := &ServiceManager{
-		sockPath:         sockPath,
-		dockerTimeout:    dockerRequestTimeout,
-		portRegistry:     make(map[string][]PortMapping),
-		fwRules:          make(map[string][]FirewallEntry),
-		serverlessActive: make(map[ServerlessIdentity]struct{}),
-		serverlessReady:  waitUntilHTTPReady,
-		emulatorReady:    waitUntilHTTPReady,
+		sockPath:          sockPath,
+		dockerTimeout:     dockerRequestTimeout,
+		portRegistry:      make(map[string][]PortMapping),
+		fwRules:           make(map[string][]FirewallEntry),
+		serverlessActive:  make(map[ServerlessIdentity]struct{}),
+		serverlessReady:   waitUntilHTTPReady,
+		emulatorReady:     waitUntilHTTPReady,
+		memcachedReady:    waitUntilMemcachedReady,
+		memcacheUncertain: make(map[string]error),
 	}
 	transport := &http.Transport{
 		DialContext: sm.dialDocker,

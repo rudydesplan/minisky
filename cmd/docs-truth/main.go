@@ -95,6 +95,19 @@ func generate(root string, check bool) error {
 	if err := validateHandwrittenClaims(updatedDocs); err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	statePath := filepath.Join(root, "docs", "state-model.md")
+	stateModel, err := os.ReadFile(statePath)
+	if err != nil {
+		return err
+	}
+	terraformPath := filepath.Join(root, "docs", "terraform-compatibility.md")
+	terraformCompatibility, err := os.ReadFile(terraformPath)
+	if err != nil {
+		return err
+	}
+	if err := validateMemcacheClaims(updatedDocs, string(stateModel), string(terraformCompatibility)); err != nil {
+		return fmt.Errorf("Memcached documentation truth: %w", err)
+	}
 
 	readmePath := filepath.Join(root, "README.md")
 	readme, err := os.ReadFile(readmePath)
@@ -169,6 +182,63 @@ func generate(root string, check bool) error {
 func validateHandwrittenClaims(document string) error {
 	if strings.Contains(document, "Terraform provider evidence remains absent") {
 		return errors.New("stale batch-wide Terraform absence claim; use generated per-domain evidence")
+	}
+	return nil
+}
+
+func validateMemcacheClaims(serviceCompatibility, stateModel, terraformCompatibility string) error {
+	start := strings.Index(serviceCompatibility, serviceCatalogStart)
+	end := strings.Index(serviceCompatibility, serviceCatalogEnd)
+	if start < 0 || end <= start {
+		return errors.New("generated service catalog markers are missing or out of order")
+	}
+	catalog := serviceCompatibility[start:end]
+	if count := strings.Count(catalog, "`memcache.googleapis.com`"); count != 1 {
+		return fmt.Errorf("generated service catalog contains Memcached %d times, want exactly once", count)
+	}
+	for name, document := range map[string]string{
+		"service compatibility": serviceCompatibility,
+		"state model":           stateModel,
+	} {
+		for _, line := range strings.Split(document, "\n") {
+			lower := strings.ToLower(line)
+			if !strings.Contains(lower, "memcache") {
+				continue
+			}
+			if strings.Contains(lower, "501") || strings.Contains(lower, "deferred") ||
+				strings.Contains(lower, "not implemented") {
+				return fmt.Errorf("%s retains contradictory Memcached claim %q", name, strings.TrimSpace(line))
+			}
+		}
+	}
+	normalizedTerraform := strings.Join(strings.Fields(terraformCompatibility), " ")
+	for _, required := range []string{
+		"Memcached metadata is profile-persisted",
+		"owned Memcached containers",
+	} {
+		if !strings.Contains(stateModel, required) {
+			return fmt.Errorf("state model is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"`memcache_custom_endpoint`",
+		"`google_memcache_instance`",
+		"configured but unverified",
+		"A prior local guarded Memcached SDK/Terraform lifecycle passed",
+		"That hardened sequence is not recorded as passing",
+		"`effective_labels` is computed by the",
+		"provider from API `labels`",
+	} {
+		if !strings.Contains(normalizedTerraform, required) {
+			return fmt.Errorf("Terraform compatibility is missing %q", required)
+		}
+	}
+	for _, line := range strings.Split(terraformCompatibility, "\n") {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "memcache") &&
+			(strings.Contains(lower, "passed locally") || strings.Contains(lower, "acceptance-tested")) {
+			return fmt.Errorf("Terraform compatibility prematurely claims a Memcached pass: %q", strings.TrimSpace(line))
+		}
 	}
 	return nil
 }

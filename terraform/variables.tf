@@ -16,6 +16,23 @@ variable "enable_phase15_resources" {
   default     = false
 }
 
+variable "enable_memcache_resource" {
+  description = "Create the guarded local Memorystore for Memcached compatibility instance"
+  type        = bool
+  default     = false
+}
+
+variable "memcache_instance_name" {
+  description = "Name of the guarded local Memorystore for Memcached instance"
+  type        = string
+  default     = "minisky-memcached"
+
+  validation {
+    condition     = can(regex("^[a-z](?:[-a-z0-9]{0,38}[a-z0-9])?$", var.memcache_instance_name))
+    error_message = "memcache_instance_name must start with a letter, contain only lowercase letters, digits, and hyphens, and be at most 40 characters."
+  }
+}
+
 variable "enable_fidelity_cloudsql_resources" {
   description = "Create the guarded local Cloud SQL instance, database, and user lifecycle gate"
   type        = bool

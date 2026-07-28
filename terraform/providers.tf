@@ -31,6 +31,7 @@ provider "google" {
   filestore_custom_endpoint            = local.use_minisky ? "${local.minisky_base_url}/_minisky/file/v1/" : null
   identity_platform_custom_endpoint    = local.use_minisky ? "${local.minisky_base_url}/_minisky/identityplatform/v2/" : null
   managed_kafka_custom_endpoint        = local.use_minisky ? "${local.minisky_base_url}/_minisky/managedkafka/v1/" : null
+  memcache_custom_endpoint             = local.use_minisky ? "${local.minisky_base_url}/_minisky/memcache/v1/" : null
   workflows_custom_endpoint            = local.use_minisky ? "${local.minisky_base_url}/_minisky/workflows/v1/" : null
 }
 

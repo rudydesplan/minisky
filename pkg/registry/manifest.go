@@ -144,7 +144,7 @@ var serviceManifest = map[string]serviceMetadata{
 	"identityplatform.googleapis.com":     {"", PersistenceFile, true},
 	"identitytoolkit.googleapis.com":      {FidelityPassthrough, PersistenceDocker, true},
 	"logging.googleapis.com":              {FidelityStandard, PersistenceFile, true},
-	"memcache.googleapis.com":             {"", PersistenceStatic, true},
+	"memcache.googleapis.com":             {FidelityStandard, PersistenceHybrid, true},
 	"metadata.google.internal":            {FidelityHigh, PersistenceStatic, true},
 	"monitoring.googleapis.com":           {FidelityStandard, PersistenceFile, true},
 	"pubsub.googleapis.com":               {FidelityPassthrough, PersistenceDocker, true},
@@ -157,9 +157,7 @@ var serviceManifest = map[string]serviceMetadata{
 	"sts.googleapis.com":                  {FidelityStandard, PersistenceStatic, true},
 }
 
-var deferredServiceContracts = map[string]string{
-	"memcache.googleapis.com": "Memorystore for Memcached is not implemented; every request returns 501 UNIMPLEMENTED",
-}
+var deferredServiceContracts = map[string]string{}
 
 var experimentalServiceContracts = map[string]bool{
 	"accesscontextmanager.googleapis.com": true,
@@ -294,6 +292,7 @@ var backendContracts = map[string]string{
 	"datastore.googleapis.com":    "Google Cloud Datastore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
 	"firestore.googleapis.com":    "Google Cloud Firestore emulator; cold-start and backend errors are deterministic, CRUD requires Docker",
 	"managedkafka.googleapis.com": "Managed Kafka metadata is profile-persisted; clusters use exact-owned Kafka containers",
+	"memcache.googleapis.com":     "Memcached metadata is profile-persisted; instances use exact-owned Memcached containers without durable cache contents",
 	"redis.googleapis.com":        "Memorystore metadata is profile-persisted; instances use exact-owned Valkey containers and volumes",
 	"spanner.googleapis.com":      "Cloud Spanner emulator; cold-start and backend errors are deterministic, database behavior requires Docker",
 }

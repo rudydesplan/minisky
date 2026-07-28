@@ -413,6 +413,7 @@ func TestRunnableDockerServicesCannotClaimFileOnlyPersistence(t *testing.T) {
 		"batch.googleapis.com":        false,
 		"composer.googleapis.com":     false,
 		"managedkafka.googleapis.com": false,
+		"memcache.googleapis.com":     false,
 		"redis.googleapis.com":        false,
 	}
 	for _, service := range services {
@@ -531,7 +532,7 @@ func TestChangedDurableEntriesRegisterImportValidators(t *testing.T) {
 	}
 }
 
-func TestMemcachedContractIsExplicitlyDeferred(t *testing.T) {
+func TestMemcachedManifestIsPromotedAsBoundedHybridService(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
 	t.Setenv("MINISKY_PROFILE", "contract-test")
@@ -550,50 +551,20 @@ func TestMemcachedContractIsExplicitlyDeferred(t *testing.T) {
 	if memcached.Domain == "" {
 		t.Fatal("manifest does not contain memcache.googleapis.com")
 	}
-	if memcached.Support != registry.SupportDeferred {
-		t.Errorf("support = %q, want %q", memcached.Support, registry.SupportDeferred)
+	if memcached.Support != registry.SupportImplemented {
+		t.Errorf("support = %q, want %q", memcached.Support, registry.SupportImplemented)
 	}
-	if memcached.Fidelity != "" {
-		t.Errorf("fidelity = %q, want empty for deferred service", memcached.Fidelity)
+	if memcached.Fidelity != registry.FidelityStandard {
+		t.Errorf("fidelity = %q, want %q", memcached.Fidelity, registry.FidelityStandard)
 	}
-	if memcached.Persistence != registry.PersistenceStatic {
-		t.Errorf("persistence = %q, want %q", memcached.Persistence, registry.PersistenceStatic)
+	if memcached.Persistence != registry.PersistenceHybrid {
+		t.Errorf("persistence = %q, want %q", memcached.Persistence, registry.PersistenceHybrid)
 	}
-
-	handlers, err := registry.ContractHandlers(orchestrator.NewOperationManager(), nil)
-	if err != nil {
-		t.Fatal(err)
+	if memcached.BackendContract == "" {
+		t.Fatal("bounded Memcached Docker contract is absent")
 	}
-	handler, ok := handlers["memcache.googleapis.com"]
-	if !ok {
-		t.Fatal("no contract handler for memcache.googleapis.com")
-	}
-
-	request := httptest.NewRequest(
-		http.MethodGet,
-		"/v1/projects/local-dev-project/locations/us-central1/instances",
-		nil,
-	)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusNotImplemented, response.Body.String())
-	}
-	var envelope struct {
-		Error struct {
-			Code    int    `json:"code"`
-			Status  string `json:"status"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
-		t.Fatalf("response is not JSON: %v", err)
-	}
-	if envelope.Error.Code != http.StatusNotImplemented ||
-		envelope.Error.Status != "UNIMPLEMENTED" ||
-		!strings.Contains(envelope.Error.Message, "Memcached") {
-		t.Fatalf("unexpected deferred Memcached response: %+v", envelope.Error)
+	if len(memcached.DockerOperations) != 0 {
+		t.Fatalf("Docker operations = %#v, want handler-owned semantic classification", memcached.DockerOperations)
 	}
 }
 

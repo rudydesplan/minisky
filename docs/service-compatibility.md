@@ -117,12 +117,6 @@ entire service API. Important boundaries:
 | firebasehosting.googleapis.com | Firebase Hosting | Passthrough | Docker | Firebase emulator |
 | firebaseio.com | Firebase RTDB | Passthrough | Docker | Firebase emulator |
 
-## Deferred Services
-
-| Domain | Reason |
-|--------|--------|
-| memcache.googleapis.com | Returns 501 UNIMPLEMENTED for all operations |
-
 ## Experimental Services
 
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
@@ -229,7 +223,7 @@ opt-in and do not change that existing evidence claim.
 | `language.googleapis.com` | experimental | static | experimental | — (not promoted) | Yes | deterministic stateless analysis only<br>Package tests only: `pkg/shims/language.TestAnalyzeSentimentBoundaries` | No |
 | `logging.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `managedkafka.googleapis.com` | experimental | hybrid | experimental | — (not promoted) | Yes | persisted cluster/topic metadata plus exact-owned plaintext loopback Kafka backend; provider 7.41.0 apply/restart/no-drift/import/destroy lifecycle<br>Package tests only: `pkg/shims/managedkafka.TestPersistAndReload`<br>`pkg/shims/managedkafka.TestCreateCluster` | Yes |
-| `memcache.googleapis.com` | deferred | static | deferred | — (not promoted) | No | Memorystore for Memcached is not implemented; every request returns 501 UNIMPLEMENTED | Not inventoried |
+| `memcache.googleapis.com` | standard | hybrid | implemented | standard | No | Memcached metadata is profile-persisted; instances use exact-owned Memcached containers without durable cache contents | Not inventoried |
 | `metadata.google.internal` | high | static | implemented | high | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `monitoring.googleapis.com` | standard | file | implemented | standard | No | Registry metadata only; see the hand-written compatibility boundaries above | Not inventoried |
 | `networksecurity.googleapis.com` | experimental | file | experimental | — (not promoted) | Yes | authorization and TLS policy metadata with advisory policy evaluation<br>Package tests only: `pkg/shims/networksecurity.TestPersistAndReload`<br>`pkg/shims/networksecurity.TestAuthorizationPolicyRequestUsesStoredDenyRule` | No |

@@ -332,6 +332,69 @@ func TestValidateHandwrittenClaimsRejectsStaleTerraformAbsence(t *testing.T) {
 	}
 }
 
+func TestMemcacheDocumentationClaimsStayConsistent(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	read := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	if err := validateMemcacheClaims(
+		read("docs/service-compatibility.md"),
+		read("docs/state-model.md"),
+		read("docs/terraform-compatibility.md"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		validService   = serviceCatalogStart + "\n| `memcache.googleapis.com` | standard |\n" + serviceCatalogEnd
+		validState     = "Memcached metadata is profile-persisted in owned Memcached containers"
+		validTerraform = "`memcache_custom_endpoint` `google_memcache_instance` configured but unverified\nA prior local guarded Memcached SDK/Terraform lifecycle passed\nThat hardened sequence is not recorded as passing\n`effective_labels` is computed by the provider from API `labels`"
+	)
+	for _, test := range []struct {
+		name      string
+		service   string
+		state     string
+		terraform string
+		wantError string
+	}{
+		{
+			name:      "deferred service claim",
+			service:   validService + "\nMemcached returns 501 UNIMPLEMENTED for all operations",
+			state:     validState,
+			terraform: validTerraform,
+			wantError: "contradictory",
+		},
+		{
+			name:      "duplicate generated row",
+			service:   serviceCatalogStart + "\n| `memcache.googleapis.com` |\n| `memcache.googleapis.com` |\n" + serviceCatalogEnd,
+			state:     validState,
+			terraform: validTerraform,
+			wantError: "exactly once",
+		},
+		{
+			name:      "premature terraform pass",
+			service:   validService,
+			state:     validState,
+			terraform: strings.Replace(validTerraform, "configured but unverified", "Memcached passed locally", 1),
+			wantError: "configured but unverified",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateMemcacheClaims(test.service, test.state, test.terraform)
+			if err == nil {
+				t.Fatal("contradictory Memcached documentation was accepted")
+			}
+			if !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error=%q want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	read := func(path string) string {
