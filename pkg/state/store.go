@@ -3,14 +3,15 @@ package state
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -38,13 +39,19 @@ var (
 	ErrProfileReplaced          = errors.New("state profile directory was replaced")
 	ErrSafeOwnershipUnsupported = errors.New("safe profile ownership is unsupported")
 	ErrStateRootReplaced        = errors.New("state root directory was replaced")
+	ErrStateConflict            = errors.New("state version conflict")
 	ErrUnsupportedVersion       = errors.New("unsupported state version")
 	ErrEntryValidatorConflict   = errors.New("state entry validator conflict")
 
-	profilePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	entryPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	pathLocks       sync.Map
-	entryValidators sync.Map
+	profilePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	entryPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	pathLocks          sync.Map
+	hooksMu            sync.RWMutex
+	entryValidators    = make(map[string]entryValidatorRegistration)
+	portableCodecs     = make(map[string]portableCodecRegistration)
+	snapshotCodecs     = make(map[string]snapshotCodecRegistration)
+	snapshotValidators = make(map[string]snapshotValidatorRegistration)
+	hookGeneration     uint64
 )
 
 type document struct {
@@ -61,10 +68,24 @@ type Snapshot struct {
 	Entries map[string]json.RawMessage `json:"entries"`
 }
 
+// TransformResult is the committed readback from one atomic state transform.
+type TransformResult struct {
+	Version string
+	Entries map[string]json.RawMessage
+}
+
+// EntryTransform edits a private state snapshot while its cross-instance lock
+// is not held. The input map is isolated from the active document. It may be
+// invoked again after an optimistic conflict and must tolerate retries.
+type EntryTransform func(map[string]json.RawMessage) error
+
 // EntryValidationContext identifies the explicit import destination.
 type EntryValidationContext struct {
 	Store   *Store
 	Profile string
+	// Entries contains the complete candidate portable snapshot during import.
+	// Validators must treat it as read-only. It is nil for local-load validation.
+	Entries map[string]json.RawMessage
 }
 
 // EntryValidator validates one durable state entry before snapshot replacement.
@@ -72,7 +93,186 @@ type EntryValidator func(EntryValidationContext, json.RawMessage) error
 
 type entryValidatorRegistration struct {
 	validator EntryValidator
-	pointer   uintptr
+}
+
+// PortableEntryCodec redacts profile-local fields on export and normalizes
+// imported metadata before semantic validation and atomic replacement.
+type PortableEntryCodec struct {
+	Export func(EntryValidationContext, json.RawMessage) (json.RawMessage, error)
+	Import func(EntryValidationContext, json.RawMessage) (json.RawMessage, error)
+}
+
+// SnapshotValidationContext exposes one complete candidate snapshot.
+type SnapshotValidationContext struct {
+	Store   *Store
+	Profile string
+	Entries map[string]json.RawMessage
+}
+
+// SnapshotValidator validates relationships across sibling state entries.
+type SnapshotValidator func(SnapshotValidationContext) error
+
+// SnapshotCodec normalizes relationships spanning multiple portable entries.
+type SnapshotCodec func(SnapshotValidationContext) error
+
+type snapshotValidatorRegistration struct {
+	validator SnapshotValidator
+}
+
+type snapshotCodecRegistration struct {
+	codec SnapshotCodec
+}
+
+type pipelineHooks struct {
+	generation             uint64
+	entryValidators        map[string]entryValidatorRegistration
+	portableCodecs         map[string]portableCodecRegistration
+	snapshotCodecNames     []string
+	snapshotCodecs         []snapshotCodecRegistration
+	snapshotValidatorNames []string
+	snapshotValidators     []snapshotValidatorRegistration
+}
+
+func capturePipelineHooks() pipelineHooks {
+	hooksMu.RLock()
+	defer hooksMu.RUnlock()
+	hooks := pipelineHooks{
+		generation:      hookGeneration,
+		entryValidators: make(map[string]entryValidatorRegistration, len(entryValidators)),
+		portableCodecs:  make(map[string]portableCodecRegistration, len(portableCodecs)),
+	}
+	for name, validator := range entryValidators {
+		hooks.entryValidators[name] = validator
+	}
+	for name, codec := range portableCodecs {
+		hooks.portableCodecs[name] = codec
+	}
+	hooks.snapshotCodecNames = sortedMapKeys(snapshotCodecs)
+	hooks.snapshotCodecs = make([]snapshotCodecRegistration, len(hooks.snapshotCodecNames))
+	for index, name := range hooks.snapshotCodecNames {
+		hooks.snapshotCodecs[index] = snapshotCodecs[name]
+	}
+	hooks.snapshotValidatorNames = sortedMapKeys(snapshotValidators)
+	hooks.snapshotValidators = make([]snapshotValidatorRegistration, len(hooks.snapshotValidatorNames))
+	for index, name := range hooks.snapshotValidatorNames {
+		hooks.snapshotValidators[index] = snapshotValidators[name]
+	}
+	return hooks
+}
+
+// RegisterSnapshotValidator registers one named cross-entry validator.
+func RegisterSnapshotValidator(name string, validator SnapshotValidator) error {
+	if strings.TrimSpace(name) == "" || validator == nil {
+		return errors.New("snapshot validator name and function are required")
+	}
+	registration := snapshotValidatorRegistration{validator: validator}
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	if _, loaded := snapshotValidators[name]; loaded {
+		return fmt.Errorf("snapshot validator conflict: %q", name)
+	}
+	snapshotValidators[name] = registration
+	hookGeneration++
+	return nil
+}
+
+// MustRegisterSnapshotValidator registers a cross-entry validator or panics.
+func MustRegisterSnapshotValidator(name string, validator SnapshotValidator) {
+	if err := RegisterSnapshotValidator(name, validator); err != nil {
+		panic(err)
+	}
+}
+
+// RegisterSnapshotCodec registers one named cross-entry portable normalizer.
+func RegisterSnapshotCodec(name string, codec SnapshotCodec) error {
+	if strings.TrimSpace(name) == "" || codec == nil {
+		return errors.New("snapshot codec name and function are required")
+	}
+	registration := snapshotCodecRegistration{codec: codec}
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	if _, loaded := snapshotCodecs[name]; loaded {
+		return fmt.Errorf("snapshot codec conflict: %q", name)
+	}
+	snapshotCodecs[name] = registration
+	hookGeneration++
+	return nil
+}
+
+// MustRegisterSnapshotCodec registers a cross-entry codec or panics.
+func MustRegisterSnapshotCodec(name string, codec SnapshotCodec) {
+	if err := RegisterSnapshotCodec(name, codec); err != nil {
+		panic(err)
+	}
+}
+
+func applySnapshotCodecs(context SnapshotValidationContext, hooks pipelineHooks) error {
+	for index, codec := range hooks.snapshotCodecs {
+		if err := codec.codec(context); err != nil {
+			return fmt.Errorf("snapshot codec %q: %w", hooks.snapshotCodecNames[index], err)
+		}
+	}
+	return nil
+}
+
+func validateSnapshot(context SnapshotValidationContext, hooks pipelineHooks) error {
+	for index, validator := range hooks.snapshotValidators {
+		if err := validator.validator(context); err != nil {
+			return fmt.Errorf("snapshot validator %q: %w", hooks.snapshotValidatorNames[index], err)
+		}
+	}
+	return nil
+}
+
+type portableCodecRegistration struct {
+	codec PortableEntryCodec
+}
+
+func sortedMapKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func validatePortableEntries(entries map[string]json.RawMessage) error {
+	for _, name := range sortedMapKeys(entries) {
+		if err := validateEntryName(name); err != nil {
+			return err
+		}
+		if !json.Valid(entries[name]) {
+			return fmt.Errorf("invalid JSON in state entry %q", name)
+		}
+	}
+	return nil
+}
+
+// RegisterPortableEntryCodec registers portable transforms for an exact entry.
+func RegisterPortableEntryCodec(name string, codec PortableEntryCodec) error {
+	if err := validateEntryName(name); err != nil {
+		return err
+	}
+	if codec.Export == nil || codec.Import == nil {
+		return fmt.Errorf("portable state codec %q is incomplete", name)
+	}
+	registration := portableCodecRegistration{codec: codec}
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	if _, loaded := portableCodecs[name]; loaded {
+		return fmt.Errorf("portable state codec conflict: %q", name)
+	}
+	portableCodecs[name] = registration
+	hookGeneration++
+	return nil
+}
+
+// MustRegisterPortableEntryCodec registers a codec or panics during init.
+func MustRegisterPortableEntryCodec(name string, codec PortableEntryCodec) {
+	if err := RegisterPortableEntryCodec(name, codec); err != nil {
+		panic(err)
+	}
 }
 
 // RegisterEntryValidator registers the schema validator for an exact state entry.
@@ -83,16 +283,14 @@ func RegisterEntryValidator(name string, validator EntryValidator) error {
 	if validator == nil {
 		return fmt.Errorf("state entry validator %q is nil", name)
 	}
-	registration := entryValidatorRegistration{
-		validator: validator,
-		pointer:   reflect.ValueOf(validator).Pointer(),
-	}
-	if existing, loaded := entryValidators.LoadOrStore(name, registration); loaded {
-		if existing.(entryValidatorRegistration).pointer == registration.pointer {
-			return nil
-		}
+	registration := entryValidatorRegistration{validator: validator}
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	if _, loaded := entryValidators[name]; loaded {
 		return fmt.Errorf("%w: %q", ErrEntryValidatorConflict, name)
 	}
+	entryValidators[name] = registration
+	hookGeneration++
 	return nil
 }
 
@@ -300,6 +498,179 @@ func (s *Store) Save(name string, value any) error {
 	return err
 }
 
+// SaveEntries atomically replaces multiple named JSON entries in one state
+// document commit. No entry is changed if validation or the write fails.
+func (s *Store) SaveEntries(entries map[string]json.RawMessage) error {
+	if err := s.persistenceError(); err != nil {
+		return err
+	}
+	prepared := make(map[string]json.RawMessage, len(entries))
+	for _, name := range sortedMapKeys(entries) {
+		if err := validateEntryName(name); err != nil {
+			return err
+		}
+		payload := entries[name]
+		if !json.Valid(payload) {
+			return fmt.Errorf("invalid JSON in state entry %q", name)
+		}
+		prepared[name] = append(json.RawMessage(nil), payload...)
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+	err := s.withMutationLock(func(profileDir *pinnedDirectory) error {
+		doc, err := s.readLocked(profileDir)
+		if err != nil {
+			return err
+		}
+		for _, name := range sortedMapKeys(prepared) {
+			doc.Entries[name] = prepared[name]
+		}
+		return s.writeLocked(profileDir, doc)
+	})
+	if err != nil {
+		s.markPersistenceDegraded(err)
+	}
+	return err
+}
+
+// TransformEntries reloads and atomically transforms the latest committed
+// private entries under the cross-instance state lock. expectedVersion may be
+// empty; otherwise a mismatch returns ErrStateConflict without writing.
+func (s *Store) TransformEntries(
+	expectedVersion string,
+	transform EntryTransform,
+) (TransformResult, error) {
+	if transform == nil {
+		return TransformResult{}, errors.New("state entry transform is required")
+	}
+	if err := s.persistenceError(); err != nil {
+		return TransformResult{}, err
+	}
+	const maxAttempts = 4
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var base document
+		if err := s.withStateLock(false, func(profileDir *pinnedDirectory) error {
+			doc, err := s.readLocked(profileDir)
+			if err != nil {
+				return err
+			}
+			base = document{
+				Format: doc.Format, Version: doc.Version,
+				Entries: cloneRawEntries(doc.Entries),
+			}
+			return nil
+		}); err != nil {
+			s.markPersistenceDegraded(err)
+			return TransformResult{}, err
+		}
+		baseVersion, err := stateDocumentVersion(base)
+		if err != nil {
+			return TransformResult{}, err
+		}
+		baseResult := TransformResult{
+			Version: baseVersion, Entries: cloneRawEntries(base.Entries),
+		}
+		if expectedVersion != "" && expectedVersion != baseVersion {
+			return baseResult, fmt.Errorf("%w: expected %s, current %s",
+				ErrStateConflict, expectedVersion, baseVersion)
+		}
+		hooks := capturePipelineHooks()
+		entries := cloneRawEntries(base.Entries)
+		if err := transform(entries); err != nil {
+			return TransformResult{}, err
+		}
+		if err := validatePortableEntries(entries); err != nil {
+			return TransformResult{}, fmt.Errorf("validate transformed state entries: %w", err)
+		}
+		context := EntryValidationContext{Store: s, Profile: s.profile, Entries: entries}
+		for _, name := range sortedMapKeys(entries) {
+			if registered, ok := hooks.entryValidators[name]; ok {
+				if err := registered.validator(context, entries[name]); err != nil {
+					return TransformResult{},
+						fmt.Errorf("invalid transformed state entry %q: %w", name, err)
+				}
+			}
+		}
+		if err := validateSnapshot(SnapshotValidationContext{
+			Store: s, Profile: s.profile, Entries: entries,
+		}, hooks); err != nil {
+			return TransformResult{},
+				fmt.Errorf("invalid transformed state relationships: %w", err)
+		}
+
+		var result TransformResult
+		conflict := false
+		err = s.withMutationLock(func(profileDir *pinnedDirectory) error {
+			current, err := s.readLocked(profileDir)
+			if err != nil {
+				return err
+			}
+			currentVersion, err := stateDocumentVersion(current)
+			if err != nil {
+				return err
+			}
+			result = TransformResult{
+				Version: currentVersion, Entries: cloneRawEntries(current.Entries),
+			}
+			if currentVersion != baseVersion {
+				conflict = true
+				return nil
+			}
+			hooksMu.RLock()
+			defer hooksMu.RUnlock()
+			if hookGeneration != hooks.generation {
+				conflict = true
+				return nil
+			}
+			current.Entries = entries
+			if err := s.writeLocked(profileDir, current); err != nil {
+				return err
+			}
+			committed, err := s.readLocked(profileDir)
+			if err != nil {
+				return fmt.Errorf("read back transformed state: %w", err)
+			}
+			version, err := stateDocumentVersion(committed)
+			if err != nil {
+				return err
+			}
+			result = TransformResult{
+				Version: version, Entries: cloneRawEntries(committed.Entries),
+			}
+			return nil
+		})
+		if err != nil {
+			s.markPersistenceDegraded(err)
+			return TransformResult{}, err
+		}
+		if !conflict {
+			return result, nil
+		}
+		if expectedVersion != "" || attempt+1 == maxAttempts {
+			return result, fmt.Errorf("%w after %d attempts", ErrStateConflict, attempt+1)
+		}
+	}
+	panic("unreachable state transform retry")
+}
+
+func cloneRawEntries(entries map[string]json.RawMessage) map[string]json.RawMessage {
+	cloned := make(map[string]json.RawMessage, len(entries))
+	for name, payload := range entries {
+		cloned[name] = append(json.RawMessage(nil), payload...)
+	}
+	return cloned
+}
+
+func stateDocumentVersion(doc document) (string, error) {
+	payload, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("marshal state version: %w", err)
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", sum[:]), nil
+}
+
 // Load decodes one named entry into target.
 func (s *Store) Load(name string, target any) error {
 	if err := validateEntryName(name); err != nil {
@@ -374,16 +745,55 @@ func (s *Store) Delete(name string) error {
 
 // Export writes a portable metadata snapshot. It never copies arbitrary files.
 func (s *Store) Export(w io.Writer) error {
-	var snapshot Snapshot
+	var entries map[string]json.RawMessage
 	if err := s.withStateLock(false, func(profileDir *pinnedDirectory) error {
 		doc, err := s.readLocked(profileDir)
 		if err != nil {
 			return err
 		}
-		snapshot = Snapshot{Format: SnapshotFormat, Version: Version, Entries: doc.Entries}
+		entries = make(map[string]json.RawMessage, len(doc.Entries))
+		for name, payload := range doc.Entries {
+			entries[name] = append(json.RawMessage(nil), payload...)
+		}
 		return nil
 	}); err != nil {
 		return err
+	}
+	hooks := capturePipelineHooks()
+	context := EntryValidationContext{Store: s, Profile: s.profile, Entries: entries}
+	for _, name := range sortedMapKeys(entries) {
+		payload := entries[name]
+		if registered, ok := hooks.portableCodecs[name]; ok {
+			normalized, err := registered.codec.Export(context, payload)
+			if err != nil {
+				return fmt.Errorf("export state entry %q: %w", name, err)
+			}
+			if !json.Valid(normalized) {
+				return fmt.Errorf("portable codec returned invalid JSON for state entry %q", name)
+			}
+			entries[name] = normalized
+		}
+	}
+	snapshot := Snapshot{Format: SnapshotFormat, Version: Version, Entries: entries}
+	if err := applySnapshotCodecs(SnapshotValidationContext{
+		Store: s, Profile: s.profile, Entries: entries,
+	}, hooks); err != nil {
+		return fmt.Errorf("normalize exported state snapshot: %w", err)
+	}
+	if err := validatePortableEntries(entries); err != nil {
+		return fmt.Errorf("validate normalized exported entries: %w", err)
+	}
+	for _, name := range sortedMapKeys(entries) {
+		if registered, ok := hooks.entryValidators[name]; ok {
+			if err := registered.validator(context, entries[name]); err != nil {
+				return fmt.Errorf("invalid schema for exported state entry %q: %w", name, err)
+			}
+		}
+	}
+	if err := validateSnapshot(SnapshotValidationContext{
+		Store: s, Profile: s.profile, Entries: entries,
+	}, hooks); err != nil {
+		return fmt.Errorf("validate exported state snapshot: %w", err)
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
@@ -414,19 +824,46 @@ func (s *Store) Import(r io.Reader) error {
 	if snapshot.Entries == nil {
 		snapshot.Entries = make(map[string]json.RawMessage)
 	}
-	for name, payload := range snapshot.Entries {
-		if err := validateEntryName(name); err != nil {
-			return err
+	hooks := capturePipelineHooks()
+	if err := validatePortableEntries(snapshot.Entries); err != nil {
+		return err
+	}
+	entryNames := sortedMapKeys(snapshot.Entries)
+	context := EntryValidationContext{Store: s, Profile: s.profile, Entries: snapshot.Entries}
+	for _, name := range entryNames {
+		payload := snapshot.Entries[name]
+		if registered, ok := hooks.portableCodecs[name]; ok {
+			normalized, normalizeErr := registered.codec.Import(context, payload)
+			if normalizeErr != nil {
+				return fmt.Errorf("normalize imported state entry %q: %w", name, normalizeErr)
+			}
+			if !json.Valid(normalized) {
+				return fmt.Errorf("portable codec returned invalid JSON for state entry %q", name)
+			}
+			payload = normalized
+			snapshot.Entries[name] = payload
 		}
-		if !json.Valid(payload) {
-			return fmt.Errorf("invalid JSON in state entry %q", name)
-		}
-		if registered, ok := entryValidators.Load(name); ok {
-			context := EntryValidationContext{Store: s, Profile: s.profile}
-			if err := registered.(entryValidatorRegistration).validator(context, payload); err != nil {
+	}
+	if err := applySnapshotCodecs(SnapshotValidationContext{
+		Store: s, Profile: s.profile, Entries: snapshot.Entries,
+	}, hooks); err != nil {
+		return fmt.Errorf("normalize imported state snapshot: %w", err)
+	}
+	if err := validatePortableEntries(snapshot.Entries); err != nil {
+		return fmt.Errorf("validate normalized imported entries: %w", err)
+	}
+	entryNames = sortedMapKeys(snapshot.Entries)
+	for _, name := range entryNames {
+		if registered, ok := hooks.entryValidators[name]; ok {
+			if err := registered.validator(context, snapshot.Entries[name]); err != nil {
 				return fmt.Errorf("invalid schema for state entry %q: %w", name, err)
 			}
 		}
+	}
+	if err := validateSnapshot(SnapshotValidationContext{
+		Store: s, Profile: s.profile, Entries: snapshot.Entries,
+	}, hooks); err != nil {
+		return fmt.Errorf("invalid state snapshot relationships: %w", err)
 	}
 
 	ownership, err := s.acquireOwnership(false)

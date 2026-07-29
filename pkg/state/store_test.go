@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,6 +48,276 @@ func TestStoreAtomicRoundTrip(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary files left behind: %v", matches)
+	}
+}
+
+func TestSaveEntriesCommitsOneWholeDocument(t *testing.T) {
+	store, err := New(t.TempDir(), "batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("existing/value", map[string]string{"value": "old"}); err != nil {
+		t.Fatal(err)
+	}
+	replacements := 0
+	store.beforeStateReplace = func() { replacements++ }
+	if err := store.SaveEntries(map[string]json.RawMessage{
+		"batch/a": json.RawMessage(`{"value":"a"}`),
+		"batch/b": json.RawMessage(`{"value":"b"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if replacements != 1 {
+		t.Fatalf("state replacements=%d, want one atomic batch replacement", replacements)
+	}
+	before, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveEntries(map[string]json.RawMessage{
+		"batch/a": json.RawMessage(`{"value":"changed"}`),
+		"batch/b": json.RawMessage(`not-json`),
+	}); err == nil {
+		t.Fatal("SaveEntries accepted malformed second entry")
+	}
+	after, err := os.ReadFile(store.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed batch validation partially changed state document")
+	}
+}
+
+func TestTransformEntriesCASConflictRetryAndFailure(t *testing.T) {
+	root := t.TempDir()
+	first, err := New(root, "transform-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(root, "transform-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Save("service/value", map[string]string{"value": "initial"}); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := first.TransformEntries("", func(map[string]json.RawMessage) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Save("other/value", map[string]string{"value": "concurrent"}); err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := first.TransformEntries(baseline.Version,
+		func(entries map[string]json.RawMessage) error {
+			entries["service/value"] = json.RawMessage(`{"value":"stale"}`)
+			return nil
+		})
+	if !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("TransformEntries conflict error=%v", err)
+	}
+	if conflict.Version == "" || conflict.Version == baseline.Version {
+		t.Fatalf("conflict version=%q baseline=%q", conflict.Version, baseline.Version)
+	}
+	retried, err := first.TransformEntries(conflict.Version,
+		func(entries map[string]json.RawMessage) error {
+			entries["service/value"] = json.RawMessage(`{"value":"retried"}`)
+			return nil
+		})
+	if err != nil || retried.Version == conflict.Version {
+		t.Fatalf("CAS retry result=%#v err=%v", retried, err)
+	}
+	if _, exists := retried.Entries["other/value"]; !exists {
+		t.Fatal("CAS retry lost concurrent entry")
+	}
+	before, err := os.ReadFile(first.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected transform failure")
+	if _, err := first.TransformEntries(retried.Version,
+		func(entries map[string]json.RawMessage) error {
+			entries["service/value"] = json.RawMessage(`{"value":"rejected"}`)
+			return injected
+		}); !errors.Is(err, injected) {
+		t.Fatalf("TransformEntries failure error=%v", err)
+	}
+	after, err := os.ReadFile(first.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed transform changed state document")
+	}
+	if _, err := first.TransformEntries(retried.Version,
+		func(map[string]json.RawMessage) error { return nil }); err != nil {
+		t.Fatalf("logical transform failure poisoned later retry: %v", err)
+	}
+}
+
+func TestTransformEntriesReentrantCallbacksAndValidators(t *testing.T) {
+	store, err := New(t.TempDir(), "transform-reentrant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("reentrant/base", map[string]string{"value": "base"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterEntryValidator(uniqueStateHookName("reentrant-validator"),
+		func(context EntryValidationContext, _ json.RawMessage) error {
+			var base map[string]string
+			return context.Store.Load("reentrant/base", &base)
+		}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, transformErr := store.TransformEntries("", func(entries map[string]json.RawMessage) error {
+			var base map[string]string
+			if err := store.Load("reentrant/base", &base); err != nil {
+				return err
+			}
+			entries["reentrant/validated"] = json.RawMessage(`{"value":"valid"}`)
+			return nil
+		})
+		done <- transformErr
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reentrant Load or validator Store.Load deadlocked TransformEntries")
+	}
+}
+
+func TestTransformEntriesNestedTransformAndSaveCauseRetry(t *testing.T) {
+	store, err := New(t.TempDir(), "transform-nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("base/value", true); err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	result, err := store.TransformEntries("", func(entries map[string]json.RawMessage) error {
+		attempts.Add(1)
+		if _, exists := entries["nested/value"]; !exists {
+			if _, err := store.TransformEntries("", func(nested map[string]json.RawMessage) error {
+				nested["nested/value"] = json.RawMessage(`true`)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		if _, exists := entries["saved/value"]; !exists {
+			if err := store.Save("saved/value", true); err != nil {
+				return err
+			}
+		}
+		entries["outer/value"] = json.RawMessage(`true`)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("transform attempts=%d, want optimistic retry", attempts.Load())
+	}
+	for _, name := range []string{"nested/value", "saved/value", "outer/value"} {
+		if _, exists := result.Entries[name]; !exists {
+			t.Fatalf("committed result lost %s", name)
+		}
+	}
+}
+
+func TestTransformEntriesExternalAndRegistryConflictsRetry(t *testing.T) {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	hookPrefix := fmt.Sprintf("transform-conflicts-%d", sequence)
+	store, err := New(t.TempDir(), "transform-conflicts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := New(store.Root(), store.Profile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	result, err := store.TransformEntries("", func(entries map[string]json.RawMessage) error {
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			if err := writer.Save("external/value", true); err != nil {
+				return err
+			}
+			if err := RegisterSnapshotValidator(
+				hookPrefix+"/validator",
+				func(SnapshotValidationContext) error { return nil }); err != nil {
+				return err
+			}
+		}
+		entries["outer/value"] = json.RawMessage(`true`)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("transform attempts=%d, want document/registry retry", attempts.Load())
+	}
+	if _, exists := result.Entries["external/value"]; !exists {
+		t.Fatal("retry lost external writer")
+	}
+	attempts.Store(0)
+	if _, err := store.TransformEntries("", func(entries map[string]json.RawMessage) error {
+		if attempts.Add(1) == 1 {
+			if err := RegisterSnapshotCodec(
+				hookPrefix+"/codec",
+				func(SnapshotValidationContext) error { return nil }); err != nil {
+				return err
+			}
+		}
+		entries["registry/value"] = json.RawMessage(`true`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("registry-only transform attempts=%d, want retry", attempts.Load())
+	}
+}
+
+func TestTransformEntriesBoundsMutatingCallbackRetries(t *testing.T) {
+	store, err := New(t.TempDir(), "transform-bounded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	var attempts atomic.Int32
+	go func() {
+		_, transformErr := store.TransformEntries("", func(entries map[string]json.RawMessage) error {
+			attempt := attempts.Add(1)
+			if err := store.Save("callback/write", attempt); err != nil {
+				return err
+			}
+			entries["outer/value"] = json.RawMessage(`true`)
+			return nil
+		})
+		done <- transformErr
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrStateConflict) {
+			t.Fatalf("mutating callback error=%v, want typed conflict", err)
+		}
+		if attempts.Load() != 4 {
+			t.Fatalf("mutating callback attempts=%d, want 4", attempts.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mutating callback deadlocked instead of returning bounded conflict")
 	}
 }
 
@@ -304,13 +576,14 @@ func TestImportValidationDoesNotReplaceActiveState(t *testing.T) {
 }
 
 func TestImportEntryValidatorRejectsWrongSchemaBeforeReplacement(t *testing.T) {
-	const entry = "test-validator/metadata"
-	MustRegisterEntryValidator(entry, func(_ EntryValidationContext, payload json.RawMessage) error {
-		var value struct {
-			Items []string `json:"items"`
-		}
-		return json.Unmarshal(payload, &value)
-	})
+	entry := uniqueStateHookName("wrong-schema-validator")
+	MustRegisterEntryValidator(entry,
+		func(_ EntryValidationContext, payload json.RawMessage) error {
+			var value struct {
+				Items []string `json:"items"`
+			}
+			return json.Unmarshal(payload, &value)
+		})
 
 	store, err := New(t.TempDir(), "default")
 	if err != nil {
@@ -320,9 +593,10 @@ func TestImportEntryValidatorRejectsWrongSchemaBeforeReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	badSnapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"test-validator/metadata":{"items":"wrong"}}}`)
+	badSnapshot := []byte(fmt.Sprintf(
+		`{"format":"minisky-state","version":1,"entries":{%q:{"items":"wrong"}}}`, entry))
 	if err := store.Import(bytes.NewReader(badSnapshot)); err == nil ||
-		!strings.Contains(err.Error(), `state entry "test-validator/metadata"`) {
+		!strings.Contains(err.Error(), fmt.Sprintf(`state entry %q`, entry)) {
 		t.Fatalf("Import error = %v, want entry schema rejection", err)
 	}
 
@@ -336,36 +610,163 @@ func TestImportEntryValidatorRejectsWrongSchemaBeforeReplacement(t *testing.T) {
 }
 
 func TestImportEntryValidatorReceivesTargetStore(t *testing.T) {
-	const entry = "context-validator/metadata"
-	MustRegisterEntryValidator(entry, func(context EntryValidationContext, _ json.RawMessage) error {
-		if context.Store == nil || context.Profile != context.Store.Profile() {
-			return errors.New("validator did not receive target store context")
-		}
-		if context.Profile != "destination" {
-			return fmt.Errorf("validator profile = %q", context.Profile)
-		}
-		return nil
-	})
+	entry := uniqueStateHookName("target-store-validator")
+	MustRegisterEntryValidator(entry,
+		func(context EntryValidationContext, _ json.RawMessage) error {
+			if context.Store == nil || context.Profile != context.Store.Profile() {
+				return errors.New("validator did not receive target store context")
+			}
+			if context.Profile != "destination" {
+				return fmt.Errorf("validator profile = %q", context.Profile)
+			}
+			if _, ok := context.Entries[entry]; !ok || len(context.Entries) != 1 {
+				return errors.New("validator did not receive complete candidate snapshot")
+			}
+			return nil
+		})
 	store, err := New(t.TempDir(), "destination")
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := []byte(`{"format":"minisky-state","version":1,"entries":{"context-validator/metadata":{}}}`)
+	snapshot := []byte(fmt.Sprintf(
+		`{"format":"minisky-state","version":1,"entries":{%q:{}}}`, entry))
 	if err := store.Import(bytes.NewReader(snapshot)); err != nil {
 		t.Fatalf("Import error = %v", err)
 	}
 }
 
-func TestMustRegisterEntryValidatorIsRepeatSafe(t *testing.T) {
-	const entry = "repeat-validator/metadata"
+func TestRegisterEntryValidatorRejectsExactFunctionDuplicate(t *testing.T) {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	entry := fmt.Sprintf("repeat-validator-%d/metadata", sequence)
 	validator := func(EntryValidationContext, json.RawMessage) error { return nil }
 
-	MustRegisterEntryValidator(entry, validator)
-	MustRegisterEntryValidator(entry, validator)
+	hooksMu.RLock()
+	before := hookGeneration
+	hooksMu.RUnlock()
+	if err := RegisterEntryValidator(entry, validator); err != nil {
+		t.Fatal(err)
+	}
+	hooksMu.RLock()
+	afterFirst := hookGeneration
+	hooksMu.RUnlock()
+	if err := RegisterEntryValidator(entry, validator); !errors.Is(err, ErrEntryValidatorConflict) {
+		t.Fatalf("duplicate exact validator error=%v, want conflict", err)
+	}
+	hooksMu.RLock()
+	afterDuplicate := hookGeneration
+	hooksMu.RUnlock()
+	if afterFirst != before+1 || afterDuplicate != afterFirst {
+		t.Fatalf("hook generations before=%d first=%d duplicate=%d",
+			before, afterFirst, afterDuplicate)
+	}
+}
+
+func TestHookRegistrationRejectsClosureAliasesAndNameReuse(t *testing.T) {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	prefix := fmt.Sprintf("hook-identity-%d", sequence)
+	validatorFactory := func(value string) EntryValidator {
+		return func(EntryValidationContext, json.RawMessage) error {
+			if value == "" {
+				return errors.New("empty")
+			}
+			return nil
+		}
+	}
+	if err := RegisterEntryValidator(prefix+"/captured",
+		validatorFactory("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterEntryValidator(prefix+"/captured",
+		validatorFactory("second")); !errors.Is(err, ErrEntryValidatorConflict) {
+		t.Fatalf("same-factory different-capture validator error=%v", err)
+	}
+
+	codecFactory := func(capture string) PortableEntryCodec {
+		return PortableEntryCodec{
+			Export: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+				if capture == "" {
+					return nil, errors.New("empty")
+				}
+				return payload, nil
+			},
+			Import: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+				return payload, nil
+			},
+		}
+	}
+	codec := codecFactory("first")
+	if err := RegisterPortableEntryCodec(prefix+"/codec", codec); err != nil {
+		t.Fatal(err)
+	}
+	differentCodec := codecFactory("second")
+	if err := RegisterPortableEntryCodec(prefix+"/codec", differentCodec); err == nil {
+		t.Fatal("same-name different-function portable codec was accepted")
+	}
+
+	snapshotCodecFactory := func(capture string) SnapshotCodec {
+		return func(SnapshotValidationContext) error {
+			if capture == "" {
+				return errors.New("empty")
+			}
+			return nil
+		}
+	}
+	if err := RegisterSnapshotCodec(prefix+"/snapshot-codec",
+		snapshotCodecFactory("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterSnapshotCodec(prefix+"/snapshot-codec",
+		snapshotCodecFactory("second")); err == nil {
+		t.Fatal("same-name different-function snapshot codec was accepted")
+	}
+	snapshotValidatorFactory := func(capture string) SnapshotValidator {
+		return func(SnapshotValidationContext) error {
+			if capture == "" {
+				return errors.New("empty")
+			}
+			return nil
+		}
+	}
+	if err := RegisterSnapshotValidator(prefix+"/snapshot-validator",
+		snapshotValidatorFactory("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterSnapshotValidator(prefix+"/snapshot-validator",
+		snapshotValidatorFactory("second")); err == nil {
+		t.Fatal("same-name different-function snapshot validator was accepted")
+	}
+}
+
+func TestConcurrentDuplicateHookRegistrationHasOneWinner(t *testing.T) {
+	name := uniqueStateHookName("concurrent-duplicate-validator")
+	var wait sync.WaitGroup
+	var successes atomic.Int32
+	for index := 0; index < 20; index++ {
+		index := index
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := RegisterSnapshotValidator(name,
+				func(SnapshotValidationContext) error {
+					if index < 0 {
+						return errors.New("impossible")
+					}
+					return nil
+				}); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("concurrent duplicate registrations succeeded=%d, want one",
+			successes.Load())
+	}
 }
 
 func TestRegisterEntryValidatorRejectsDifferentDuplicateWithTypedError(t *testing.T) {
-	const entry = "conflicting-validator/metadata"
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	entry := fmt.Sprintf("conflicting-validator-%d/metadata", sequence)
 	first := func(EntryValidationContext, json.RawMessage) error { return nil }
 	second := func(EntryValidationContext, json.RawMessage) error { return errors.New("different") }
 
@@ -379,7 +780,8 @@ func TestRegisterEntryValidatorRejectsDifferentDuplicateWithTypedError(t *testin
 }
 
 func TestMustRegisterEntryValidatorPanicsForDifferentDuplicate(t *testing.T) {
-	const entry = "conflicting-must-validator/metadata"
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	entry := fmt.Sprintf("conflicting-must-validator-%d/metadata", sequence)
 	MustRegisterEntryValidator(entry, func(EntryValidationContext, json.RawMessage) error { return nil })
 
 	defer func() {
@@ -548,6 +950,331 @@ func TestExportImportPortableSnapshot(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(target.ProfileDir(), stateFileName)); err != nil {
 		t.Fatalf("state file missing: %v", err)
+	}
+}
+
+func TestPortableEntryCodecTransformsOnlyRegisteredEntry(t *testing.T) {
+	entry := uniqueStateHookName("portable-codec")
+	codec := PortableEntryCodec{
+		Export: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+			var value map[string]string
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return nil, err
+			}
+			delete(value, "local")
+			value["portable"] = "yes"
+			return json.Marshal(value)
+		},
+		Import: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+			var value map[string]string
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return nil, err
+			}
+			value["imported"] = "yes"
+			return json.Marshal(value)
+		},
+	}
+	MustRegisterPortableEntryCodec(entry, codec)
+	root := t.TempDir()
+	source, err := New(root, "codec-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Save(entry, map[string]string{"local": "secret", "keep": "value"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Save("unrelated/entry", map[string]string{"local": "unchanged"}); err != nil {
+		t.Fatal(err)
+	}
+	var exported bytes.Buffer
+	if err := source.Export(&exported); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(exported.Bytes(), []byte(`"secret"`)) {
+		t.Fatalf("portable codec did not redact registered entry: %s", exported.String())
+	}
+	target, err := New(root, "codec-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Import(bytes.NewReader(exported.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	var transformed map[string]string
+	if err := target.Load(entry, &transformed); err != nil {
+		t.Fatal(err)
+	}
+	if transformed["portable"] != "yes" || transformed["imported"] != "yes" ||
+		transformed["local"] != "" {
+		t.Fatalf("portable transformed entry=%v", transformed)
+	}
+	var unrelated map[string]string
+	if err := target.Load("unrelated/entry", &unrelated); err != nil {
+		t.Fatal(err)
+	}
+	if unrelated["local"] != "unchanged" {
+		t.Fatalf("portable codec changed unrelated entry=%v", unrelated)
+	}
+}
+
+func TestSnapshotValidatorSeesSiblingEntriesOnExportAndImport(t *testing.T) {
+	prefix := uniqueStateHookName("snapshot-context")
+	primary := prefix + "-primary/value"
+	sibling := prefix + "-sibling/value"
+	MustRegisterSnapshotValidator(uniqueStateHookName("snapshot-context-validator"),
+		func(context SnapshotValidationContext) error {
+			if _, exists := context.Entries[primary]; !exists {
+				return nil
+			}
+			payload, exists := context.Entries[sibling]
+			if !exists {
+				return errors.New("required sibling is absent")
+			}
+			var values []string
+			if err := json.Unmarshal(payload, &values); err != nil {
+				return err
+			}
+			if values == nil {
+				return errors.New("explicit sibling set is null")
+			}
+			return nil
+		})
+	root := t.TempDir()
+	source, err := New(root, "snapshot-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Save(primary, map[string]string{"value": "portable"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Save(sibling, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	var exported bytes.Buffer
+	if err := source.Export(&exported); err != nil {
+		t.Fatal(err)
+	}
+	target, err := New(root, "snapshot-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Import(bytes.NewReader(exported.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := target.Save("unrelated/marker", map[string]string{"value": "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	missingSibling := []byte(fmt.Sprintf(`{
+		"format":"minisky-state",
+		"version":1,
+		"entries":{%q:{"value":"rejected"}}
+	}`, primary))
+	if err := target.Import(bytes.NewReader(missingSibling)); err == nil {
+		t.Fatal("snapshot relationship validation accepted absent sibling")
+	}
+	var marker map[string]string
+	if err := target.Load("unrelated/marker", &marker); err != nil ||
+		marker["value"] != "preserved" {
+		t.Fatalf("failed snapshot validation changed target: marker=%v err=%v", marker, err)
+	}
+}
+
+func TestPortablePipelineOrderingAndHashStability(t *testing.T) {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	prefix := fmt.Sprintf("ordering-pipeline-%d", sequence)
+	entryA := prefix + "/a"
+	entryB := prefix + "/b"
+	marker := prefix + "/marker"
+	var mu sync.Mutex
+	var calls []string
+	record := func(call string) {
+		mu.Lock()
+		calls = append(calls, call)
+		mu.Unlock()
+	}
+	for _, item := range []struct {
+		name  string
+		entry string
+	}{
+		{name: "a", entry: entryA},
+		{name: "b", entry: entryB},
+	} {
+		item := item
+		MustRegisterPortableEntryCodec(item.entry, PortableEntryCodec{
+			Export: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+				record("entry-codec-" + item.name)
+				return payload, nil
+			},
+			Import: func(_ EntryValidationContext, payload json.RawMessage) (json.RawMessage, error) {
+				record("entry-codec-" + item.name)
+				return payload, nil
+			},
+		})
+		MustRegisterEntryValidator(item.entry,
+			func(_ EntryValidationContext, _ json.RawMessage) error {
+				record("entry-validator-" + item.name)
+				return nil
+			})
+	}
+	for _, name := range []string{"zz", "aa"} {
+		name := name
+		MustRegisterSnapshotCodec(prefix+"/"+name,
+			func(context SnapshotValidationContext) error {
+				if _, exists := context.Entries[marker]; exists {
+					record("snapshot-codec-" + name)
+				}
+				return nil
+			})
+		MustRegisterSnapshotValidator(prefix+"/"+name,
+			func(context SnapshotValidationContext) error {
+				if _, exists := context.Entries[marker]; exists {
+					record("snapshot-validator-" + name)
+				}
+				return nil
+			})
+	}
+	root := t.TempDir()
+	source, err := New(root, "ordering-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []string{entryB, marker, entryA} {
+		if err := source.Save(entry, map[string]string{"value": entry}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var first bytes.Buffer
+	if err := source.Export(&first); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{
+		"entry-codec-a", "entry-codec-b",
+		"snapshot-codec-aa", "snapshot-codec-zz",
+		"entry-validator-a", "entry-validator-b",
+		"snapshot-validator-aa", "snapshot-validator-zz",
+	}
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	calls = nil
+	mu.Unlock()
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("export hook order=%v, want %v", got, expected)
+	}
+	for iteration := 0; iteration < 20; iteration++ {
+		var next bytes.Buffer
+		if err := source.Export(&next); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first.Bytes(), next.Bytes()) {
+			t.Fatalf("export %d was not byte-stable", iteration)
+		}
+	}
+
+	mu.Lock()
+	calls = nil
+	mu.Unlock()
+	target, err := New(root, "ordering-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Import(bytes.NewReader(first.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got = append([]string(nil), calls...)
+	mu.Unlock()
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("import hook order=%v, want %v", got, expected)
+	}
+}
+
+var portablePipelineTestSequence uint64
+
+func uniqueStateHookName(prefix string) string {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	return fmt.Sprintf("%s-%d/hook", prefix, sequence)
+}
+
+func TestDeterministicHookErrorSelectionAndConcurrentRegistration(t *testing.T) {
+	sequence := atomic.AddUint64(&portablePipelineTestSequence, 1)
+	prefix := fmt.Sprintf("deterministic-errors-%d", sequence)
+	marker := prefix + "/marker"
+	for _, name := range []string{"zz-error", "aa-error"} {
+		name := name
+		MustRegisterSnapshotValidator(prefix+"/"+name,
+			func(context SnapshotValidationContext) error {
+				if _, exists := context.Entries[marker]; exists {
+					return errors.New(name)
+				}
+				return nil
+			})
+	}
+	store, err := New(t.TempDir(), "deterministic-errors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := []byte(fmt.Sprintf(
+		`{"format":"minisky-state","version":1,"entries":{%q:{}}}`, marker))
+	for iteration := 0; iteration < 20; iteration++ {
+		err := store.Import(bytes.NewReader(snapshot))
+		if err == nil || !strings.Contains(err.Error(), "aa-error") ||
+			strings.Contains(err.Error(), "zz-error") {
+			t.Fatalf("import %d error=%v, want stable aa-error", iteration, err)
+		}
+	}
+
+	source, err := New(t.TempDir(), "concurrent-hooks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Save("concurrent-hooks/value", true); err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	for index := 0; index < 20; index++ {
+		index := index
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			name := fmt.Sprintf("%s/concurrent-%02d", prefix, index)
+			if err := RegisterSnapshotCodec(name, func(SnapshotValidationContext) error {
+				return nil
+			}); err != nil {
+				t.Errorf("RegisterSnapshotCodec(%s): %v", name, err)
+			}
+		}()
+		go func() {
+			defer wait.Done()
+			var exported bytes.Buffer
+			if err := source.Export(&exported); err != nil {
+				t.Errorf("Export(%d): %v", index, err)
+			}
+		}()
+	}
+	wait.Wait()
+
+	var successes atomic.Int32
+	for index := 0; index < 20; index++ {
+		wait.Add(1)
+		go func(capture int) {
+			defer wait.Done()
+			err := RegisterSnapshotValidator(prefix+"/one-winner",
+				func(SnapshotValidationContext) error {
+					if capture < 0 {
+						return errors.New("impossible")
+					}
+					return nil
+				})
+			if err == nil {
+				successes.Add(1)
+			}
+		}(index)
+	}
+	wait.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("concurrent same-name registrations succeeded %d times, want one",
+			successes.Load())
 	}
 }
 

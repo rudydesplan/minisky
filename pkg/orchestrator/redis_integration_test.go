@@ -15,8 +15,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"minisky/pkg/config"
 )
 
 func TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup(t *testing.T) {
@@ -36,20 +34,28 @@ func TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup(t *testing.T) {
 		t.Fatalf("collision-safe network setup failed: %v", err)
 	}
 	resourceID := "owned-" + profile
-	missingContainerResourceID := "missing-container-" + profile
-	collisionResourceID := "collision-" + profile
-	var collisionVolume string
+	foreignVolumeResourceID := "foreign-volume-" + profile
+	foreignContainerResourceID := "foreign-container-" + profile
+	var ownedSpec RedisBackendSpec
+	var foreignVolume string
+	var foreignContainer string
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		for _, id := range []string{resourceID, missingContainerResourceID} {
-			if err := manager.DeleteRedis(cleanupCtx, id); err != nil {
-				t.Errorf("cleanup Redis resource %q: %v", id, err)
+		if ownedSpec.VolumeIdentity != "" {
+			if err := manager.DeleteRedisExact(cleanupCtx, ownedSpec); err != nil {
+				t.Errorf("cleanup Redis resource %q: %v", resourceID, err)
 			}
 		}
-		if collisionVolume != "" {
-			if err := deleteDockerResource(cleanupCtx, manager, "/volumes/"+url.PathEscape(collisionVolume)); err != nil {
-				t.Errorf("cleanup collision volume %q: %v", collisionVolume, err)
+		if foreignContainer != "" {
+			if err := deleteDockerResource(cleanupCtx, manager,
+				"/containers/"+url.PathEscape(foreignContainer)+"?force=true"); err != nil {
+				t.Errorf("cleanup foreign container %q: %v", foreignContainer, err)
+			}
+		}
+		if foreignVolume != "" {
+			if err := deleteDockerResource(cleanupCtx, manager, "/volumes/"+url.PathEscape(foreignVolume)); err != nil {
+				t.Errorf("cleanup foreign volume %q: %v", foreignVolume, err)
 			}
 		}
 		if err := deleteOwnedRedisIntegrationNetwork(cleanupCtx, manager); err != nil {
@@ -57,33 +63,57 @@ func TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup(t *testing.T) {
 		}
 	})
 
-	valkeyImage := config.GetImageRegistry().Memorystore.Valkey.DefaultImage
-	endpoint, err := manager.ProvisionRedis(ctx, resourceID, valkeyImage)
+	ownedSpec = Redis72BackendSpec(resourceID)
+	endpoint, ownedSpec, err := manager.ProvisionRedisExact(ctx, ownedSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := manager.PublishRedisRuntime(ctx, ownedSpec); err != nil {
+		t.Fatal(err)
+	}
+	resolvedImageID := ownedSpec.ImageID
 	if err := redisSet(endpoint, "minisky-restart", "persisted"); err != nil {
 		t.Fatal(err)
 	}
 
 	containerName, _ := redisDockerNames(resourceID)
-	status, labels, err := manager.inspectContainer(containerName)
-	if err != nil || status != "running" || !isOwnedRedisResource(labels, resourceID) {
-		t.Fatalf("owned Redis inspect status=%q labels=%v err=%v", status, labels, err)
+	container, found, err := manager.inspectRedisContainer(ctx, containerName)
+	if err != nil || !found || container.State.Status != "running" {
+		t.Fatalf("owned Redis inspect found=%v status=%q err=%v", found, container.State.Status, err)
 	}
-	request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
-		"http://localhost/containers/"+containerName+"?force=true", nil)
-	response, err := manager.dockerClient.Do(request)
+	firstContainerID := container.ID
+	if err := validateRedisContainer(container, containerName, ownedVolumeName(resourceID), ownedSpec); err != nil {
+		t.Fatalf("owned Redis identity: %v", err)
+	}
+	if err := manager.Teardown(ctx); err != nil {
+		t.Fatalf("graceful MiniSky teardown: %v", err)
+	}
+	assertDockerResourceStatus(t, ctx, manager,
+		"/containers/"+url.PathEscape(containerName)+"/json", http.StatusNotFound)
+	assertDockerResourceStatus(t, ctx, manager,
+		"/volumes/"+url.PathEscape(ownedVolumeName(resourceID)), http.StatusOK)
+	assertDockerResourceStatus(t, ctx, manager,
+		"/networks/"+url.PathEscape(networkName), http.StatusNotFound)
+	manager, err = NewServiceManager()
+	if err != nil {
+		t.Fatalf("construct restarted service manager: %v", err)
+	}
+	if err := manager.EnsureNetwork(ctx); err != nil {
+		t.Fatalf("recreate owned network after process restart: %v", err)
+	}
+
+	endpoint, ownedSpec, owned, err := manager.ReconcileRedisExact(ctx, ownedSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
-		t.Fatalf("remove Redis container status = %d", response.StatusCode)
+	if !owned {
+		t.Fatal("persisted exact Redis volume was not reconciled")
 	}
-
-	endpoint, err = manager.ProvisionRedis(ctx, resourceID, valkeyImage)
-	if err != nil {
+	if ownedSpec.Generation != 2 || ownedSpec.ContainerID == firstContainerID {
+		t.Fatalf("restart runtime identity generation=%d container=%q first=%q",
+			ownedSpec.Generation, ownedSpec.ContainerID, firstContainerID)
+	}
+	if err := manager.PublishRedisRuntime(ctx, ownedSpec); err != nil {
 		t.Fatal(err)
 	}
 	value, err := redisGet(endpoint, "minisky-restart")
@@ -93,39 +123,52 @@ func TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup(t *testing.T) {
 	if value != "persisted" {
 		t.Fatalf("GET after restart = %q", value)
 	}
-	if err := manager.DeleteRedis(ctx, resourceID); err != nil {
+	replacement, found, err := manager.inspectRedisContainer(ctx, containerName)
+	if err != nil || !found || replacement.ID == firstContainerID {
+		t.Fatalf("container replacement found=%v first=%q replacement=%q err=%v",
+			found, firstContainerID, replacement.ID, err)
+	}
+	if err := manager.DeleteRedisExact(ctx, ownedSpec); err != nil {
 		t.Fatalf("cleanup owned Valkey backend: %v", err)
 	}
 
 	_, ownedVolume := redisDockerNames(resourceID)
 	assertDockerResourceStatus(t, ctx, manager, "/containers/"+url.PathEscape(containerName)+"/json", http.StatusNotFound)
 	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(ownedVolume), http.StatusNotFound)
+	ownedSpec = RedisBackendSpec{}
 
-	if _, err := manager.ProvisionRedis(ctx, missingContainerResourceID, valkeyImage); err != nil {
-		t.Fatalf("provision missing-container case: %v", err)
+	_, foreignVolume = redisDockerNames(foreignVolumeResourceID)
+	if err := createRedisCollisionVolume(ctx, manager, foreignVolume, profile); err != nil {
+		t.Fatalf("create deterministic foreign volume: %v", err)
 	}
-	missingContainer, missingVolume := redisDockerNames(missingContainerResourceID)
-	if err := deleteDockerResource(ctx, manager, "/containers/"+url.PathEscape(missingContainer)+"?force=true"); err != nil {
-		t.Fatalf("remove exact test container: %v", err)
+	if _, _, err := manager.ProvisionRedisExact(ctx, Redis72BackendSpec(foreignVolumeResourceID)); err == nil {
+		t.Fatal("foreign same-name Redis volume was adopted")
 	}
-	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(missingVolume), http.StatusOK)
-	if err := manager.DeleteRedis(ctx, missingContainerResourceID); err != nil {
-		t.Fatalf("restart-style orphan volume cleanup: %v", err)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(foreignVolume), http.StatusOK)
+	if err := manager.DeleteRedisExact(ctx, Redis72BackendSpec(foreignVolumeResourceID)); err == nil {
+		t.Fatal("foreign same-name Redis volume was deleted")
 	}
-	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(missingVolume), http.StatusNotFound)
+	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(foreignVolume), http.StatusOK)
 
-	_, collisionVolume = redisDockerNames(collisionResourceID)
-	if err := createRedisCollisionVolume(ctx, manager, collisionVolume, profile); err != nil {
-		t.Fatalf("create exact test collision volume: %v", err)
+	foreignContainer, _ = redisDockerNames(foreignContainerResourceID)
+	if err := createRedisCollisionContainer(ctx, manager, foreignContainer, resolvedImageID); err != nil {
+		t.Fatalf("create deterministic foreign container: %v", err)
 	}
-	if _, err := manager.ProvisionRedis(ctx, collisionResourceID, valkeyImage); err == nil {
-		t.Fatal("unowned Redis volume collision was adopted")
+	if _, _, err := manager.ProvisionRedisExact(ctx, Redis72BackendSpec(foreignContainerResourceID)); err == nil {
+		t.Fatal("foreign same-name Redis container was adopted")
 	}
-	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(collisionVolume), http.StatusOK)
-	if err := manager.DeleteRedis(ctx, collisionResourceID); err == nil {
-		t.Fatal("unowned Redis volume collision was deleted")
+	assertDockerResourceStatus(t, ctx, manager,
+		"/containers/"+url.PathEscape(foreignContainer)+"/json", http.StatusOK)
+	if err := manager.DeleteRedisExact(ctx, Redis72BackendSpec(foreignContainerResourceID)); err == nil {
+		t.Fatal("foreign same-name Redis container was deleted")
 	}
-	assertDockerResourceStatus(t, ctx, manager, "/volumes/"+url.PathEscape(collisionVolume), http.StatusOK)
+	assertDockerResourceStatus(t, ctx, manager,
+		"/containers/"+url.PathEscape(foreignContainer)+"/json", http.StatusOK)
+}
+
+func ownedVolumeName(resourceID string) string {
+	_, volumeName := redisDockerNames(resourceID)
+	return volumeName
 }
 
 func acquireMiniSkyDockerIntegrationLock(t *testing.T) {
@@ -198,6 +241,41 @@ func createRedisCollisionVolume(
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
 		return fmt.Errorf("create collision volume returned %d", response.StatusCode)
+	}
+	return nil
+}
+
+func createRedisCollisionContainer(
+	ctx context.Context,
+	manager *ServiceManager,
+	name string,
+	imageID string,
+) error {
+	payload, err := json.Marshal(map[string]any{
+		"Image": imageID,
+		"Cmd":   []string{"valkey-server"},
+		"Labels": map[string]string{
+			"managed-by": "integration-test",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/containers/create?name="+url.QueryEscape(name), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := manager.doDocker(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		return fmt.Errorf("create collision container returned %d: %s",
+			response.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }

@@ -556,6 +556,46 @@ func TestCurrentMemcacheServiceGateHasRequiredEvidenceState(t *testing.T) {
 	}
 }
 
+func TestCurrentRedisServiceGateRendersLocalUncommittedBoundary(t *testing.T) {
+	services, _, err := truth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gates, err := evidence.ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := selectRedisServiceGate(services, gates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := renderRedisServiceGate(gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"`local-passed-uncommitted`",
+		"`phase15-redis`",
+		"source SHA-256",
+		"diff SHA-256",
+		"Google provider `7.41.0`",
+		"`make test-redis-integration`",
+		"CI is `configured-unverified`",
+		"no portable AOF export",
+		"cooperative Docker daemon",
+		"before resolved provenance is persisted",
+		"restart neither adopts nor automatically removes",
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Errorf("Redis rendering lacks %q:\n%s", required, rendered)
+		}
+	}
+	if strings.Contains(rendered, "immutable source commit") ||
+		strings.Contains(rendered, "CI is `ci-passed`") {
+		t.Fatal("Redis local uncommitted evidence was rendered as committed or CI-passed")
+	}
+}
+
 func TestRenderMemcacheServiceGateUsesMachineEvidence(t *testing.T) {
 	gate := validMemcacheServiceGate()
 	rendered, err := renderMemcacheServiceGate(gate)
