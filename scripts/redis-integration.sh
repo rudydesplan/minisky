@@ -7,6 +7,18 @@ if [[ "${MINISKY_REDIS_INTEGRATION:-}" != "1" ]]; then
   exit 2
 fi
 
+overall_timeout_seconds="${MINISKY_REDIS_TIMEOUT_SECONDS:-900}"
+profile="${MINISKY_REDIS_PROFILE:-redis-integration-$$-$(date +%s)}"
+
+if [[ ! "${overall_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MINISKY_REDIS_TIMEOUT_SECONDS must be a positive integer." >&2
+  exit 1
+fi
+if [[ ! "${profile}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$ ]]; then
+  echo "MINISKY_REDIS_PROFILE is invalid." >&2
+  exit 1
+fi
+
 for command in curl docker go python3 terraform; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
@@ -27,7 +39,6 @@ foreign_volume=""
 foreign_volume_created=""
 foreign_volume_mount=""
 foreign_container_id=""
-overall_timeout_seconds="${MINISKY_REDIS_TIMEOUT_SECONDS:-900}"
 terraform_timeout_seconds=240
 in_cleanup=0
 shared_lock_acquired=0
@@ -37,16 +48,6 @@ tracked_network_ids=()
 tracked_volumes=()
 initial_network_absence_proven=0
 current_network_id=""
-profile="${MINISKY_REDIS_PROFILE:-redis-integration-$$-$(date +%s)}"
-
-if [[ ! "${overall_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "MINISKY_REDIS_TIMEOUT_SECONDS must be a positive integer." >&2
-  exit 1
-fi
-if [[ ! "${profile}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$ ]]; then
-  echo "MINISKY_REDIS_PROFILE is invalid." >&2
-  exit 1
-fi
 overall_deadline_epoch=$(($(date +%s) + overall_timeout_seconds))
 
 run_bounded() {
