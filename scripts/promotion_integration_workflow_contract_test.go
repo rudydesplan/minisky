@@ -301,7 +301,7 @@ func TestPromotionIntegrationWorkflowRejectsMutations(t *testing.T) {
 		}},
 		{name: "integration prerequisite removed", mutate: func(workflows promotionWorkflowSet) {
 			promotionJob(workflows.promotion, "phase19-heavy-backend-integration")["needs"] =
-				[]any{"quality", "phase18-25-evidence"}
+				[]any{"promotion-assets", "phase18-25-evidence"}
 		}},
 		{name: "unsafe integration added to prerequisite", mutate: func(workflows promotionWorkflowSet) {
 			promotionJob(workflows.promotion, "sdk-smoke-validate")["steps"] = append(
@@ -310,8 +310,8 @@ func TestPromotionIntegrationWorkflowRejectsMutations(t *testing.T) {
 			)
 		}},
 		{name: "prerequisite has expression false gate", mutate: func(workflows promotionWorkflowSet) {
-			stepByName(promotionJob(workflows.promotion, "quality"),
-				"Check Go formatting")["if"] = "${{ 1 != 1 }}"
+			stepByName(promotionJob(workflows.promotion, "promotion-assets"),
+				"Build promotion UI")["if"] = "${{ 1 != 1 }}"
 		}},
 		{name: "prerequisite has dispatch only gate", mutate: func(workflows promotionWorkflowSet) {
 			stepByName(promotionJob(workflows.promotion, "terraform-validate"),
@@ -323,8 +323,15 @@ func TestPromotionIntegrationWorkflowRejectsMutations(t *testing.T) {
 				"Verify air-gapped bundle workflow")["run"] = "true"
 		}},
 		{name: "preparation artifact removed", mutate: func(workflows promotionWorkflowSet) {
-			removePromotionStep(promotionJob(workflows.promotion, "quality"),
+			removePromotionStep(promotionJob(workflows.promotion, "promotion-assets"),
 				"Share promotion UI assets")
+		}},
+		{name: "duplicate promotion Go quality restored", mutate: func(workflows promotionWorkflowSet) {
+			job := promotionJob(workflows.promotion, "promotion-assets")
+			job["steps"] = append(job["steps"].([]any), map[string]any{
+				"name": "Duplicate Go quality",
+				"run":  "go test -race ./cmd/... ./pkg/... ./ui",
+			})
 		}},
 		{name: "job timeout removed", mutate: func(workflows promotionWorkflowSet) {
 			delete(promotionJob(workflows.promotion, "phase18-25-sdk-integration"), "timeout-minutes")
@@ -343,7 +350,7 @@ func TestPromotionIntegrationWorkflowRejectsMutations(t *testing.T) {
 			mustMap(promotionJob(workflows.promotion, "phase18-25-terraform-integration")["strategy"])["fail-fast"] = true
 		}},
 		{name: "matrix parallelism changed", mutate: func(workflows promotionWorkflowSet) {
-			mustMap(promotionJob(workflows.promotion, "phase18-25-terraform-integration")["strategy"])["max-parallel"] = 5
+			mustMap(promotionJob(workflows.promotion, "phase18-25-terraform-integration")["strategy"])["max-parallel"] = 4
 		}},
 		{name: "matrix owner omitted", mutate: func(workflows promotionWorkflowSet) {
 			matrix := mustMap(mustMap(
@@ -446,7 +453,7 @@ func validatePromotionArchitecture(workflows promotionWorkflowSet) []string {
 
 	jobs := mustMap(promotion["jobs"])
 	requiredJobs := append([]string{
-		"quality",
+		"promotion-assets",
 		"sdk-smoke-validate",
 		"phase18-25-evidence",
 		"terraform-validate",
@@ -488,8 +495,8 @@ func validatePromotionArchitecture(workflows promotionWorkflowSet) []string {
 		}
 	}
 
-	if mustMap(jobs["prepare"]) != nil {
-		problems = append(problems, "legacy prepare job remains instead of the in-workflow quality prerequisite")
+	if mustMap(jobs["quality"]) != nil {
+		problems = append(problems, "promotion workflow retains the duplicate full quality job")
 	}
 	problems = append(problems, validatePromotionPrerequisites(promotion)...)
 	problems = append(problems, validateAuthoritativePrerequisiteParity(promotion, workflows.ci)...)
@@ -527,8 +534,8 @@ func validatePromotionArchitecture(workflows promotionWorkflowSet) []string {
 	if value, ok := matrix["fail-fast"].(bool); !ok || value {
 		problems = append(problems, "Terraform matrix fail-fast must be false")
 	}
-	if value, ok := integer(matrix["max-parallel"]); !ok || value != 4 {
-		problems = append(problems, "Terraform matrix max-parallel must be 4")
+	if value, ok := integer(matrix["max-parallel"]); !ok || value != 12 {
+		problems = append(problems, "Terraform matrix max-parallel must be 12")
 	}
 	include := mustMap(matrix["matrix"])["include"]
 	entries, _ := include.([]any)
@@ -597,9 +604,9 @@ func validatePromotionArchitecture(workflows promotionWorkflowSet) []string {
 func validatePromotionPrerequisites(workflow map[string]any) []string {
 	var problems []string
 	for _, name := range promotionIntegrationJobs {
-		want := []string{"quality", "sdk-smoke-validate", "phase18-25-evidence"}
+		want := []string{"promotion-assets", "sdk-smoke-validate", "phase18-25-evidence"}
 		if name == "phase18-25-terraform-integration" {
-			want = []string{"quality", "phase18-25-evidence", "terraform-validate"}
+			want = []string{"promotion-assets", "phase18-25-evidence", "terraform-validate"}
 		}
 		if got := stringSlice(promotionJob(workflow, name)["needs"]); !sameStringSet(got, want) {
 			problems = append(problems, fmt.Sprintf("%s needs = %v, want %v", name, got, want))
@@ -607,19 +614,9 @@ func validatePromotionPrerequisites(workflow map[string]any) []string {
 	}
 
 	requiredCommands := map[string][]string{
-		"quality": {
-			"python3 .claude/skills/validate.py",
+		"promotion-assets": {
 			"npm ci",
-			"npm run lint",
-			"npm test",
-			"npm audit --audit-level=high",
 			"npm run build",
-			"make check-docs-truth",
-			`test -z "$(gofmt -l cmd pkg ui)"`,
-			"go vet ./cmd/... ./pkg/... ./ui",
-			"go test -race ./cmd/... ./pkg/... ./ui",
-			"go test -count=1 ./scripts",
-			"go build -trimpath ./cmd/minisky",
 		},
 		"sdk-smoke-validate": {
 			"python -m pip install --requirement sdk-smoke/python/requirements.txt",
@@ -633,6 +630,26 @@ func validatePromotionPrerequisites(workflow map[string]any) []string {
 			"terraform init -backend=false -input=false -lockfile=readonly",
 			"terraform validate",
 		},
+	}
+	assets := promotionJob(workflow, "promotion-assets")
+	if timeout, ok := integer(assets["timeout-minutes"]); !ok || timeout != 10 {
+		problems = append(problems, "promotion asset preparation timeout must be 10 minutes")
+	}
+	if firstStepUsing(assets, setupGoAction) != nil {
+		problems = append(problems, "promotion asset preparation must not set up Go")
+	}
+	for _, command := range []string{
+		"make check-docs-truth",
+		`test -z "$(gofmt -l cmd pkg ui)"`,
+		"go vet ./cmd/... ./pkg/... ./ui",
+		"go test -race ./cmd/... ./pkg/... ./ui",
+		"go test -count=1 ./scripts",
+		"go build -trimpath ./cmd/minisky",
+	} {
+		if jobHasActiveCommand(assets, command) {
+			problems = append(problems,
+				fmt.Sprintf("promotion asset preparation duplicates CI command %q", command))
+		}
 	}
 	for jobName, commands := range requiredCommands {
 		job := promotionJob(workflow, jobName)
@@ -668,7 +685,7 @@ func validatePromotionPrerequisites(workflow map[string]any) []string {
 
 func validateAuthoritativePrerequisiteParity(promotion, ci map[string]any) []string {
 	var problems []string
-	for _, jobName := range []string{"quality", "terraform-validate"} {
+	for _, jobName := range []string{"terraform-validate"} {
 		authoritative := commandStepsByName(promotionJob(ci, jobName))
 		candidate := commandStepsByName(promotionJob(promotion, jobName))
 		if len(candidate) != len(authoritative) {
@@ -725,16 +742,16 @@ func sameScalarMap(got, want map[string]any) bool {
 
 func validatePromotionArtifactFlow(workflow map[string]any) []string {
 	var problems []string
-	quality := promotionJob(workflow, "quality")
-	upload := firstStepUsing(quality, uploadAction)
+	assets := promotionJob(workflow, "promotion-assets")
+	upload := firstStepUsing(assets, uploadAction)
 	if upload == nil {
-		problems = append(problems, "quality prerequisite does not produce the promotion UI artifact")
+		problems = append(problems, "promotion asset prerequisite does not produce the UI artifact")
 	} else {
 		with := mustMap(upload["with"])
 		if scalarString(with["name"]) != "promotion-ui-dist" ||
 			scalarString(with["path"]) != "ui/dist" ||
 			scalarString(with["if-no-files-found"]) != "error" {
-			problems = append(problems, "quality promotion UI artifact contract is incorrect")
+			problems = append(problems, "promotion UI artifact contract is incorrect")
 		}
 	}
 	for _, name := range promotionIntegrationJobs {

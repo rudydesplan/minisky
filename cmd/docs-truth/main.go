@@ -20,16 +20,22 @@ import (
 )
 
 const (
-	serviceCatalogStart  = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
-	serviceCatalogEnd    = "<!-- END GENERATED SERVICE CATALOG -->"
-	phaseSummaryStart    = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
-	phaseSummaryEnd      = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
-	readmeCountStart     = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
-	readmeCountEnd       = "<!-- END GENERATED REGISTRY COUNT -->"
-	platformSummaryStart = "<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->"
-	platformSummaryEnd   = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
-	memcacheSummaryStart = "<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->"
-	memcacheSummaryEnd   = "<!-- END GENERATED MEMCACHED SERVICE GATE -->"
+	serviceCatalogStart   = "<!-- BEGIN GENERATED SERVICE CATALOG -->"
+	serviceCatalogEnd     = "<!-- END GENERATED SERVICE CATALOG -->"
+	phaseSummaryStart     = "<!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->"
+	phaseSummaryEnd       = "<!-- END GENERATED PHASE 18-25 SUMMARY -->"
+	readmeCountStart      = "<!-- BEGIN GENERATED REGISTRY COUNT -->"
+	readmeCountEnd        = "<!-- END GENERATED REGISTRY COUNT -->"
+	platformSummaryStart  = "<!-- BEGIN GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	platformSummaryEnd    = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
+	memcacheSummaryStart  = "<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->"
+	memcacheSummaryEnd    = "<!-- END GENERATED MEMCACHED SERVICE GATE -->"
+	emulatorBoundaryStart = "<!-- BEGIN GENERATED STORAGE PUBSUB BOUNDARY -->"
+	emulatorBoundaryEnd   = "<!-- END GENERATED STORAGE PUBSUB BOUNDARY -->"
+	certificationStart    = "<!-- BEGIN GENERATED STABLE SNAPSHOT CERTIFICATION -->"
+	certificationEnd      = "<!-- END GENERATED STABLE SNAPSHOT CERTIFICATION -->"
+	promotionSummaryStart = "<!-- BEGIN GENERATED PR22 PROMOTION EVIDENCE -->"
+	promotionSummaryEnd   = "<!-- END GENERATED PR22 PROMOTION EVIDENCE -->"
 )
 
 func main() {
@@ -76,6 +82,46 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return err
 	}
+	cloudSQLGate, err := selectCloudSQLServiceGate(services, serviceGates)
+	if err != nil {
+		return err
+	}
+	emulatorGates, err := evidence.EmulatorBoundaryGates()
+	if err != nil {
+		return err
+	}
+	emulatorGate, err := selectStoragePubSubBoundaryGate(emulatorGates)
+	if err != nil {
+		return err
+	}
+	qualityGates, err := evidence.QualityGates()
+	if err != nil {
+		return err
+	}
+	windowsGate, err := selectWindowsStateMarkerGate(qualityGates)
+	if err != nil {
+		return err
+	}
+	certificationSummary, err := renderStableSnapshotCertification(
+		cloudSQLGate,
+		emulatorGate,
+		windowsGate,
+	)
+	if err != nil {
+		return err
+	}
+	promotionRevision, err := evidence.CurrentPromotionRevision()
+	if err != nil {
+		return err
+	}
+	batchGates, err := evidence.BatchGates()
+	if err != nil {
+		return err
+	}
+	promotionSummary, err := renderPromotionSummary(promotionRevision, batchGates, memcacheGate)
+	if err != nil {
+		return err
+	}
 	catalog, err := renderServiceCatalog(services, inventory)
 	if err != nil {
 		return err
@@ -106,6 +152,22 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	updatedDocs, err = replaceStoragePubSubBoundary(updatedDocs, emulatorGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
+	updatedDocs, err = replaceGeneratedSection(
+		updatedDocs, certificationStart, certificationEnd, certificationSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
+	updatedDocs, err = replaceGeneratedSection(
+		updatedDocs, promotionSummaryStart, promotionSummaryEnd, promotionSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
 	if err := validateHandwrittenClaims(updatedDocs); err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
@@ -125,6 +187,12 @@ func generate(root string, check bool) error {
 	}
 	if err := validateMemcacheClaims(updatedDocs, string(stateModel), updatedTerraform); err != nil {
 		return fmt.Errorf("Memcached documentation truth: %w", err)
+	}
+	if err := validateStoragePubSubClaims(updatedDocs, string(stateModel)); err != nil {
+		return fmt.Errorf("Storage/PubSub documentation truth: %w", err)
+	}
+	if err := validateTerraformPromotionClaims(updatedTerraform, batchGates); err != nil {
+		return fmt.Errorf("Terraform promotion documentation truth: %w", err)
 	}
 
 	readmePath := filepath.Join(root, "README.md")
@@ -146,8 +214,24 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
+	updatedReadme, err = replaceStoragePubSubBoundary(updatedReadme, emulatorGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	updatedReadme, err = replaceGeneratedSection(
+		updatedReadme, certificationStart, certificationEnd, certificationSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
 	updatedReadme, err = replaceGeneratedSection(
 		updatedReadme, phaseSummaryStart, phaseSummaryEnd, summary,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	updatedReadme, err = replaceGeneratedSection(
+		updatedReadme, promotionSummaryStart, promotionSummaryEnd, promotionSummary,
 	)
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
@@ -161,6 +245,30 @@ func generate(root string, check bool) error {
 	if err := validatePhase12Claims(updatedReadme, platformGates); err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
+	if err := validateCloudSQLClaims(
+		updatedReadme,
+		updatedDocs,
+		string(stateModel),
+		updatedTerraform,
+		cloudSQLGate,
+	); err != nil {
+		return fmt.Errorf("Cloud SQL documentation truth: %w", err)
+	}
+	if err := validatePromotionWorkflowClaims(
+		updatedReadme,
+		updatedDocs,
+		updatedTerraform,
+	); err != nil {
+		return fmt.Errorf("promotion workflow documentation truth: %w", err)
+	}
+	if err := validateStableCertificationClaims(
+		[]string{updatedReadme, updatedDocs, updatedTerraform},
+		cloudSQLGate,
+		emulatorGate,
+		windowsGate,
+	); err != nil {
+		return fmt.Errorf("stable certification documentation truth: %w", err)
+	}
 	for _, path := range []string{
 		filepath.Join(root, "docs", "minisky-roadmap-completion-plan.canvas.tsx"),
 		filepath.Join(root, "docs", "adr", "0012-local-observability-and-request-replay.md"),
@@ -171,6 +279,15 @@ func generate(root string, check bool) error {
 		}
 		if err := validatePhase12Claims(string(document), platformGates); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
+		}
+		if strings.HasSuffix(path, ".canvas.tsx") {
+			if err := validateRoadmapCertificationClaims(
+				string(document),
+				cloudSQLGate,
+				windowsGate,
+			); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
 		}
 	}
 
@@ -243,6 +360,77 @@ func selectMemcacheServiceGate(
 	return gate, nil
 }
 
+func selectCloudSQLServiceGate(
+	services []registry.Service,
+	gates []evidence.ServiceGate,
+) (evidence.ServiceGate, error) {
+	var matches []evidence.ServiceGate
+	for _, gate := range gates {
+		if gate.ID == "cloudsql-restart-recovery" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Cloud SQL restart recovery gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	registered := false
+	for _, service := range services {
+		if service.Domain == gate.Domain {
+			registered = true
+			break
+		}
+	}
+	if !registered || gate.Domain != "sqladmin.googleapis.com" {
+		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery gate does not reference the registered SQL Admin domain")
+	}
+	if gate.Status != evidence.EvidenceLocalPassedUncommitted ||
+		gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
+		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery must use stable uncommitted source/diff provenance")
+	}
+	if gate.CI.Status != evidence.EvidenceConfiguredUnverified ||
+		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "cloudsql-restart-integration" ||
+		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
+		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery CI must remain configured-unverified without external provenance")
+	}
+	return gate, nil
+}
+
+func selectWindowsStateMarkerGate(
+	gates []evidence.QualityGate,
+) (evidence.QualityGate, error) {
+	var matches []evidence.QualityGate
+	for _, gate := range gates {
+		if gate.ID == "windows-state-markers" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.QualityGate{}, fmt.Errorf(
+			"Windows state-marker gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	if !stringSetEqual(gate.RequiredBy, []string{"quality"}) ||
+		gate.LocalPrerequisites.Status != evidence.EvidenceLocalPassedUncommitted ||
+		gate.LocalPrerequisites.SourceSHA256 == "" ||
+		gate.LocalPrerequisites.DiffSHA256 == "" {
+		return evidence.QualityGate{}, errors.New("Windows state-marker local prerequisites lack bounded stable-snapshot evidence")
+	}
+	if gate.NativeCI.Status != evidence.EvidenceConfiguredUnverified ||
+		gate.NativeCI.Workflow != ".github/workflows/ci.yml" ||
+		gate.NativeCI.Job != "windows-state-markers" ||
+		gate.NativeCI.RunURL != "" || gate.NativeCI.JobURL != "" || gate.NativeCI.Commit != "" {
+		return evidence.QualityGate{}, errors.New("Windows native state-marker evidence must remain configured-unverified")
+	}
+	return gate, nil
+}
+
 func validateMemcacheLocal(check evidence.EvidenceCheck) error {
 	if err := evidence.ValidateEvidenceCheck(check); err != nil {
 		return fmt.Errorf("Memcached local evidence: %w", err)
@@ -274,12 +462,12 @@ func validateMemcacheCI(check evidence.EvidenceCheck) error {
 	}
 	switch check.Status {
 	case evidence.EvidenceConfiguredUnverified:
-		if check.RunURL != "" || check.Commit != "" {
-			return errors.New("Memcached configured CI evidence must not include a run URL or commit")
+		if check.RunURL != "" || check.JobURL != "" || check.Commit != "" {
+			return errors.New("Memcached configured CI evidence must not include a run URL, job URL, or commit")
 		}
 	case evidence.EvidenceCIPassed:
-		if check.RunURL == "" || check.Commit == "" {
-			return errors.New("Memcached ci-passed evidence requires an immutable run URL and commit")
+		if check.RunURL == "" || check.JobURL == "" || check.Commit == "" {
+			return errors.New("Memcached ci-passed evidence requires immutable run URL, job URL, and commit")
 		}
 	default:
 		return fmt.Errorf(
@@ -336,9 +524,11 @@ func renderMemcacheServiceGate(gate evidence.ServiceGate) (string, error) {
 		)
 	case evidence.EvidenceCIPassed:
 		ciStatement = fmt.Sprintf(
-			"CI is `ci-passed` in [GitHub Actions run %s](%s) on commit `%s`.",
+			"CI is `ci-passed` in [GitHub Actions run %s](%s) "+
+				"([job](%s)) on commit `%s`.",
 			path.Base(gate.CI.RunURL),
 			gate.CI.RunURL,
+			gate.CI.JobURL,
 			gate.CI.Commit,
 		)
 	default:
@@ -366,6 +556,495 @@ func replaceMemcacheServiceGate(document string, gate evidence.ServiceGate) (str
 		memcacheSummaryEnd,
 		summary,
 	)
+}
+
+func selectStoragePubSubBoundaryGate(
+	gates []evidence.EmulatorBoundaryGate,
+) (evidence.EmulatorBoundaryGate, error) {
+	var matches []evidence.EmulatorBoundaryGate
+	for _, gate := range gates {
+		if gate.ID == "storage-persistence-pubsub-session" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.EmulatorBoundaryGate{}, fmt.Errorf(
+			"Storage/PubSub boundary gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	if len(gate.Domains) != 2 ||
+		!stringSetEqual(gate.Domains, []string{"storage.googleapis.com", "pubsub.googleapis.com"}) {
+		return evidence.EmulatorBoundaryGate{}, errors.New(
+			"Storage/PubSub boundary gate must cover exactly Storage and Pub/Sub",
+		)
+	}
+	if gate.Status != evidence.EvidenceLocalPassedUncommitted ||
+		gate.SourceCommit != "" ||
+		gate.SourceSHA256 == "" ||
+		gate.DiffSHA256 == "" ||
+		gate.CI.Status != evidence.EvidenceConfiguredUnverified {
+		return evidence.EmulatorBoundaryGate{}, errors.New(
+			"Storage/PubSub boundary must remain uncommitted local evidence with configured-unverified CI",
+		)
+	}
+	return gate, nil
+}
+
+func renderStoragePubSubBoundary(gate evidence.EmulatorBoundaryGate) (string, error) {
+	if _, err := selectStoragePubSubBoundaryGate([]evidence.EmulatorBoundaryGate{gate}); err != nil {
+		return "", err
+	}
+	requiredTest := false
+	for _, reference := range gate.References {
+		for _, test := range reference.Tests {
+			if test == "TestStoragePersistenceAndPubSubSessionBoundaries" {
+				requiredTest = true
+			}
+		}
+	}
+	if !requiredTest {
+		return "", errors.New("Storage/PubSub boundary gate is missing its live lifecycle test")
+	}
+	return fmt.Sprintf(
+		"**Generated Storage/Pub/Sub boundary truth:** The `%s` working-tree gate runs "+
+			"`make %s`, `%s`, and `TestStoragePersistenceAndPubSubSessionBoundaries`. "+
+			"Stable snapshot source SHA-256: `%s`; diff SHA-256: `%s`. "+
+			"CI is `%s` in `%s` job `%s`; this uncommitted gate has no external run URL or commit.\n\n"+
+			"The exact pinned public Pub/Sub image is acquired against the active daemon with an "+
+			"isolated anonymous Docker configuration, then checked for immutable digest syntax, "+
+			"`linux/amd64` platform execution, and advertised `--data-dir` capability. "+
+			"Storage uses a profile-scoped runtime bind mount. Buckets and objects survive "+
+			"exact-owned Storage emulator-container replacement. Pub/Sub resources and messages "+
+			"last only for one official emulator session: MiniSky process crash/restart continuity "+
+			"is supported only while the same exact-owned Pub/Sub container remains alive. "+
+			"Replacing the Pub/Sub backend/container loses topics, subscriptions, and queued messages. "+
+			"Graceful MiniSky shutdown tears down managed Docker resources and is not a Pub/Sub continuity path.\n\n"+
+			"Storage and Pub/Sub runtime data remain outside metadata export/import. This gate does "+
+			"not claim exactly-once delivery, portable data export, IAM, HA, security, or full GCP parity. "+
+			"Its Docker cleanup evidence assumes cooperative, exclusive use of the managed resource names. "+
+			"Docker volume deletion accepts only a mutable name, not a conditional immutable identity: "+
+			"MiniSky revalidates exact ownership and identity immediately before deletion and fails closed, "+
+			"but a foreign replacement in the final inspect-to-delete interval cannot be excluded atomically. "+
+			"This is a bounded cleanup invariant, not a hostile-daemon security boundary. Public registry/network "+
+			"access remains required; the global unowned image cache may retain an authorized pull; Pub/Sub remains "+
+			"amd64/emulation/session-only. Five unrelated local volumes and a pre-existing lock observed during "+
+			"certification are not product evidence.\n",
+		gate.Status,
+		gate.MakeTarget,
+		gate.Script,
+		gate.SourceSHA256,
+		gate.DiffSHA256,
+		gate.CI.Status,
+		gate.CI.Workflow,
+		gate.CI.Job,
+	), nil
+}
+
+func renderStableSnapshotCertification(
+	cloudSQL evidence.ServiceGate,
+	storagePubSub evidence.EmulatorBoundaryGate,
+	windows evidence.QualityGate,
+) (string, error) {
+	sourceSHA := cloudSQL.SourceSHA256
+	diffSHA := cloudSQL.DiffSHA256
+	if sourceSHA == "" || diffSHA == "" ||
+		storagePubSub.SourceSHA256 != sourceSHA ||
+		storagePubSub.DiffSHA256 != diffSHA ||
+		windows.LocalPrerequisites.SourceSHA256 != sourceSHA ||
+		windows.LocalPrerequisites.DiffSHA256 != diffSHA {
+		return "", errors.New("stable certification gates do not share exact source/diff fingerprints")
+	}
+	if cloudSQL.Status != evidence.EvidenceLocalPassedUncommitted ||
+		storagePubSub.Status != evidence.EvidenceLocalPassedUncommitted ||
+		windows.NativeCI.Status != evidence.EvidenceConfiguredUnverified {
+		return "", errors.New("stable certification statuses are inconsistent")
+	}
+	return fmt.Sprintf(
+		"**Generated stable-snapshot certification:** The uncommitted working tree is identified by "+
+			"source SHA-256 `%s` and diff SHA-256 `%s`; historical HEAD and PR #22 remain separate evidence.\n\n"+
+			"- Cloud SQL restart recovery is `%s`: live `POSTGRES_16` row survival passed through "+
+			"same-container restart and volume-only recovery, followed by exact cleanup; the bounded "+
+			"Terraform apply/no-drift/destroy lifecycle also passed. CI is `%s` with no external URL or commit.\n"+
+			"- Storage/Pub/Sub is `%s`: anonymous acquisition and immutable digest/platform/capability "+
+			"checks passed before Storage replacement persistence, Pub/Sub session-loss boundaries, and exact cleanup. "+
+			"CI is `%s` with no external URL or commit.\n"+
+			"- Native `windows-state-markers` is `%s`. Local cross-compilation and workflow contracts passed, "+
+			"and the authoritative `quality` aggregate requires the job, but no native Windows test pass is claimed.\n\n"+
+			"Delivery still requires commit, push, and external CI for these working-tree gates. "+
+			"PR #22 URLs apply only to their exact historical commit.\n",
+		sourceSHA,
+		diffSHA,
+		cloudSQL.Status,
+		cloudSQL.CI.Status,
+		storagePubSub.Status,
+		storagePubSub.CI.Status,
+		windows.NativeCI.Status,
+	), nil
+}
+
+func replaceStoragePubSubBoundary(
+	document string,
+	gate evidence.EmulatorBoundaryGate,
+) (string, error) {
+	summary, err := renderStoragePubSubBoundary(gate)
+	if err != nil {
+		return "", err
+	}
+	return replaceGeneratedSection(
+		document,
+		emulatorBoundaryStart,
+		emulatorBoundaryEnd,
+		summary,
+	)
+}
+
+func renderPromotionSummary(
+	revision evidence.PromotionRevision,
+	gates []evidence.BatchGate,
+	memcache evidence.ServiceGate,
+) (string, error) {
+	if revision.Commit == "" || revision.GeneralCI.Status != evidence.EvidenceCIPassed ||
+		revision.CriticalReliability.Status != evidence.EvidenceCIPassed {
+		return "", errors.New("promotion revision lacks exact general and critical CI passes")
+	}
+	if memcache.CI.Status != evidence.EvidenceCIPassed ||
+		memcache.CI.Commit != revision.Commit ||
+		memcache.CI.JobURL == "" {
+		return "", errors.New("promotion revision lacks the matching Memcached CI pass")
+	}
+	promotionRun := ""
+	var terraformJobs []string
+	var sdkJobs []string
+	addJob := func(label string, check evidence.EvidenceCheck, destination *[]string) error {
+		if check.Status != evidence.EvidenceCIPassed ||
+			check.Commit != revision.Commit ||
+			check.RunURL == "" ||
+			check.JobURL == "" {
+			return fmt.Errorf("%s is not a job-linked CI pass on %s", label, revision.Commit)
+		}
+		if promotionRun == "" {
+			promotionRun = check.RunURL
+		} else if promotionRun != check.RunURL {
+			return fmt.Errorf("%s belongs to a different promotion run", label)
+		}
+		*destination = append(*destination, fmt.Sprintf("[%s job](%s)", label, check.JobURL))
+		return nil
+	}
+	for _, gate := range gates {
+		for _, check := range gate.TerraformChecks {
+			if err := addJob(check.MatrixID, check.CI, &terraformJobs); err != nil {
+				return "", err
+			}
+		}
+		if err := addJob(gate.ID+" SDK", gate.CI, &sdkJobs); err != nil {
+			return "", err
+		}
+		if gate.BackendCI.Status != "" {
+			if err := addJob(gate.ID+" backend", gate.BackendCI, &sdkJobs); err != nil {
+				return "", err
+			}
+		}
+	}
+	if len(terraformJobs) != 12 || len(sdkJobs) != 7 {
+		return "", fmt.Errorf(
+			"promotion revision has %d Terraform and %d SDK/backend job links, want 12 and 7",
+			len(terraformJobs),
+			len(sdkJobs),
+		)
+	}
+	sort.Strings(terraformJobs)
+	sort.Strings(sdkJobs)
+	return fmt.Sprintf(
+		"**Generated PR #22 promotion truth:** Exact source revision `%s` passed "+
+			"[general CI run %s](%s) ([job](%s)), "+
+			"[critical reliability run %s](%s) ([job](%s)), and "+
+			"[the bounded promotion run %s](%s). The Memcached lifecycle passed in the "+
+			"critical run ([job](%s)).\n\n"+
+			"All 12 Terraform jobs passed: %s.\n\n"+
+			"All seven SDK/backend jobs passed: %s.\n\n"+
+			"These immutable records apply only to that source revision. The current working-tree "+
+			"promotion workflow does not retain a duplicate full-quality job: authoritative quality "+
+			"checks remain in the separate general CI workflow, while `promotion-assets` builds and "+
+			"shares `ui/dist` for the integration jobs. PR #22's URLs do not verify those current "+
+			"workflow changes. The uncommitted Storage/Pub/Sub boundary gate is not attributed to "+
+			"these historical runs.\n",
+		revision.Commit,
+		path.Base(revision.GeneralCI.RunURL),
+		revision.GeneralCI.RunURL,
+		revision.GeneralCI.JobURL,
+		path.Base(revision.CriticalReliability.RunURL),
+		revision.CriticalReliability.RunURL,
+		revision.CriticalReliability.JobURL,
+		path.Base(promotionRun),
+		promotionRun,
+		memcache.CI.JobURL,
+		strings.Join(terraformJobs, ", "),
+		strings.Join(sdkJobs, ", "),
+	), nil
+}
+
+func validateStoragePubSubClaims(serviceCompatibility, stateModel string) error {
+	for name, document := range map[string]string{
+		"service compatibility": serviceCompatibility,
+		"state model":           stateModel,
+	} {
+		lower := strings.ToLower(document)
+		for _, forbidden := range []string{
+			"storage is unmounted",
+			"storage runtime is unmounted",
+			"pub/sub survives backend replacement",
+			"pub/sub survives container replacement",
+			"pubsub survives backend replacement",
+			"pubsub survives container replacement",
+		} {
+			if strings.Contains(lower, forbidden) {
+				return fmt.Errorf("%s contains false emulator claim %q", name, forbidden)
+			}
+		}
+	}
+	for _, required := range []string{
+		"Storage uses a profile-scoped runtime bind mount",
+		"Replacing the Pub/Sub backend/container loses topics, subscriptions, and queued messages",
+		"Graceful MiniSky shutdown tears down managed Docker resources",
+		"Storage and Pub/Sub runtime data remain outside metadata export/import",
+	} {
+		if !strings.Contains(serviceCompatibility, required) {
+			return fmt.Errorf("service compatibility is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"profile-scoped runtime bind mount",
+		"same exact-owned Pub/Sub container remains alive",
+		"loses topics, subscriptions, and queued messages",
+		"outside metadata export/import",
+	} {
+		if !strings.Contains(stateModel, required) {
+			return fmt.Errorf("state model is missing %q", required)
+		}
+	}
+	return nil
+}
+
+func validateCloudSQLClaims(
+	readme string,
+	serviceCompatibility string,
+	stateModel string,
+	terraformCompatibility string,
+	gate evidence.ServiceGate,
+) error {
+	documents := map[string]string{
+		"README":                  readme,
+		"service compatibility":   serviceCompatibility,
+		"state model":             stateModel,
+		"Terraform compatibility": terraformCompatibility,
+	}
+	for name, document := range documents {
+		lower := strings.ToLower(strings.Join(strings.Fields(document), " "))
+		for _, stale := range []string{
+			"database files live only in containers",
+			"database files remain container runtime data",
+			"add profile-scoped named volumes for database data",
+			"not sql data durability",
+			"local post-review gate status is pending",
+			"local post-review status remains pending",
+			"pending local post-review verification",
+			"cloud sql restart recovery is pending",
+		} {
+			if strings.Contains(lower, stale) {
+				return fmt.Errorf("%s retains stale Cloud SQL claim %q", name, stale)
+			}
+		}
+	}
+	required := map[string][]string{
+		"README": {
+			"exact-owned named volume",
+			"volume-only replacement",
+			"protocol and authenticated readiness",
+			"Cloud SQL restart recovery is `local-passed-uncommitted`",
+			"source SHA-256 `" + gate.SourceSHA256 + "`",
+			"diff SHA-256 `" + gate.DiffSHA256 + "`",
+			"CI is `configured-unverified`",
+		},
+		"service compatibility": {
+			"exact-owned named volume",
+			"same-container restart",
+			"volume-only replacement",
+			"Cloud SQL restart recovery is `local-passed-uncommitted`",
+		},
+		"state model": {
+			"immutable image and volume identities",
+			"same-container restart",
+			"volume-only replacement",
+			"`POSTGRES_16`, `POSTGRES_17`, and `POSTGRES_18`",
+			"protocol and authenticated readiness",
+			"legacy metadata without complete runtime provenance fails closed",
+			"outside metadata export/import",
+			"final inspect-to-delete interval cannot be made atomic",
+		},
+		"Terraform compatibility": {
+			"`cloudsql-restart-integration`",
+			"`local-passed-uncommitted`",
+			"source SHA-256 `" + gate.SourceSHA256 + "`",
+			"diff SHA-256 `" + gate.DiffSHA256 + "`",
+			"CI is `configured-unverified`",
+			"no external run URL or commit",
+		},
+	}
+	for name, phrases := range required {
+		document := strings.ToLower(strings.Join(strings.Fields(documents[name]), " "))
+		for _, phrase := range phrases {
+			if !strings.Contains(document, strings.ToLower(phrase)) {
+				return fmt.Errorf("%s is missing Cloud SQL claim %q", name, phrase)
+			}
+		}
+	}
+	return nil
+}
+
+func validatePromotionWorkflowClaims(documents ...string) error {
+	for _, document := range documents {
+		normalized := strings.Join(strings.Fields(document), " ")
+		lower := strings.ToLower(normalized)
+		for _, stale := range []string{
+			"while retaining the quality",
+			"promotion workflow while retaining the quality",
+			"workflow exclusively owns seven sdk/backend gates. it replaces 20 misleading manual shadows from the general ci workflow while retaining the quality",
+		} {
+			if strings.Contains(lower, stale) {
+				return fmt.Errorf("documentation conflates historical and current promotion behavior: %q", stale)
+			}
+		}
+	}
+	joined := strings.Join(documents, "\n")
+	for _, required := range []string{
+		"current working-tree promotion workflow does not retain a duplicate full-quality job",
+		"authoritative quality checks remain in the separate general CI workflow",
+		"`promotion-assets` builds and shares `ui/dist`",
+		"PR #22's URLs do not verify those current workflow changes",
+	} {
+		if !strings.Contains(joined, required) {
+			return fmt.Errorf("documentation is missing current promotion workflow claim %q", required)
+		}
+	}
+	return nil
+}
+
+func validateStableCertificationClaims(
+	documents []string,
+	cloudSQL evidence.ServiceGate,
+	storagePubSub evidence.EmulatorBoundaryGate,
+	windows evidence.QualityGate,
+) error {
+	joined := strings.Join(documents, "\n")
+	for _, required := range []string{
+		"source SHA-256 `" + cloudSQL.SourceSHA256 + "`",
+		"diff SHA-256 `" + cloudSQL.DiffSHA256 + "`",
+		"Cloud SQL restart recovery is `local-passed-uncommitted`",
+		"Storage/Pub/Sub is `local-passed-uncommitted`",
+		"Native `windows-state-markers` is `configured-unverified`",
+		"authoritative `quality` aggregate requires the job",
+		"no native Windows test pass is claimed",
+		"PR #22 URLs apply only to their exact historical commit",
+	} {
+		if !strings.Contains(joined, required) {
+			return fmt.Errorf("stable certification documentation is missing %q", required)
+		}
+	}
+	lower := strings.ToLower(joined)
+	for _, forbidden := range []string{
+		"native windows tests passed",
+		"windows-state-markers` is `local-passed",
+		"cloud sql restart recovery is pending",
+	} {
+		if strings.Contains(lower, forbidden) {
+			return fmt.Errorf("stable certification documentation conflates status with %q", forbidden)
+		}
+	}
+	if cloudSQL.SourceSHA256 != storagePubSub.SourceSHA256 ||
+		cloudSQL.DiffSHA256 != storagePubSub.DiffSHA256 ||
+		cloudSQL.SourceSHA256 != windows.LocalPrerequisites.SourceSHA256 ||
+		cloudSQL.DiffSHA256 != windows.LocalPrerequisites.DiffSHA256 {
+		return errors.New("stable certification machine evidence fingerprints disagree")
+	}
+	return nil
+}
+
+func validateRoadmapCertificationClaims(
+	document string,
+	cloudSQL evidence.ServiceGate,
+	windows evidence.QualityGate,
+) error {
+	normalized := strings.Join(strings.Fields(document), " ")
+	for _, required := range []string{
+		cloudSQL.SourceSHA256,
+		cloudSQL.DiffSHA256,
+		"<Code>local-passed-uncommitted</Code> Cloud SQL recovery",
+		"uncommitted Storage/Pub/Sub boundary gate is also <Code>local-passed-uncommitted</Code>",
+		"<Code>windows-state-markers</Code> remains <Code>configured-unverified</Code>",
+		"cross-compilation and workflow contracts are not a native Windows test pass",
+		"Commit and push",
+	} {
+		if !strings.Contains(normalized, required) {
+			return fmt.Errorf("roadmap is missing stable certification claim %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"Storage/Pub/Sub boundary remains uncommitted local evidence only",
+		"windows-state-markers</Code> is <Code>local-passed",
+	} {
+		if strings.Contains(normalized, forbidden) {
+			return fmt.Errorf("roadmap retains stale certification claim %q", forbidden)
+		}
+	}
+	return nil
+}
+
+func validateTerraformPromotionClaims(
+	document string,
+	gates []evidence.BatchGate,
+) error {
+	var matches []evidence.TerraformCheck
+	for _, gate := range gates {
+		for _, check := range gate.TerraformChecks {
+			if check.Domain == "binaryauthorization.googleapis.com" {
+				matches = append(matches, check)
+			}
+		}
+	}
+	if len(matches) != 1 {
+		return fmt.Errorf(
+			"Binary Authorization Terraform check count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	check := matches[0]
+	if check.CI.Status != evidence.EvidenceCIPassed ||
+		check.CI.JobURL == "" ||
+		check.CI.Commit == "" {
+		return errors.New("Binary Authorization Terraform evidence is not an immutable CI pass")
+	}
+	normalized := strings.Join(strings.Fields(document), " ")
+	required := fmt.Sprintf(
+		"Binary Authorization Terraform leg is `ci-passed` in "+
+			"[binary-authorization job](%s) on exact source revision `%s`",
+		check.CI.JobURL,
+		check.CI.Commit,
+	)
+	if !strings.Contains(normalized, required) {
+		return errors.New("Terraform compatibility does not match Binary Authorization CI evidence")
+	}
+	lower := strings.ToLower(normalized)
+	for _, stale := range []string{
+		"gate is recorded as `local-passed` only",
+		"there is no claimed ci run url or commit",
+	} {
+		if strings.Contains(lower, stale) {
+			return fmt.Errorf("Terraform compatibility retains stale Binary Authorization claim %q", stale)
+		}
+	}
+	return nil
 }
 
 func renderRegistryCount(services []registry.Service) (string, error) {
@@ -825,6 +1504,22 @@ func formatTests(packagePath string, tests []string) string {
 
 func escapeCell(value string) string {
 	return strings.ReplaceAll(value, "|", "\\|")
+}
+
+func stringSetEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	values := make(map[string]bool, len(left))
+	for _, value := range left {
+		values[value] = true
+	}
+	for _, value := range right {
+		if !values[value] {
+			return false
+		}
+	}
+	return true
 }
 
 func replaceGeneratedSection(document, start, end, generated string) (string, error) {

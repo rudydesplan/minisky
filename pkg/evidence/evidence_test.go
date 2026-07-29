@@ -160,23 +160,28 @@ func TestPhase15MemcacheGateIsCompleteAndReferenceable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gates) != 1 {
-		t.Fatalf("service gates = %d, want only the bounded Phase 15 Memcached gate", len(gates))
+	if len(gates) != 2 {
+		t.Fatalf("service gates = %d, want Memcached and Cloud SQL", len(gates))
 	}
-	gate := gates[0]
+	var gate ServiceGate
+	for _, candidate := range gates {
+		if candidate.ID == "phase15-memcached" {
+			gate = candidate
+			break
+		}
+	}
 	if gate.ID != "phase15-memcached" || gate.Phase != 15 ||
 		gate.Domain != "memcache.googleapis.com" || gate.ProviderVersion != "7.41.0" {
 		t.Fatalf("Memcached gate identity is incomplete: %+v", gate)
 	}
-	if gate.Status != EvidenceLocalPassedUncommitted ||
+	if gate.Status != EvidenceLocalPassed ||
 		gate.Script != "scripts/memcache-integration.sh" ||
 		gate.MakeTarget != "test-memcache-integration" {
 		t.Fatalf("Memcached local gate is not the exact guarded lifecycle: %+v", gate.EvidenceCheck)
 	}
-	if gate.SourceCommit != "" || gate.RunURL != "" || gate.Commit != "" ||
-		!strings.Contains(gate.Note, "uncommitted working tree") ||
-		!strings.Contains(gate.Note, "non-promotable") {
-		t.Fatalf("Memcached working-tree evidence overstates immutable provenance: %+v", gate.EvidenceCheck)
+	if gate.SourceCommit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" ||
+		gate.RunURL != "" || gate.Commit != "" {
+		t.Fatalf("Memcached local evidence has incorrect immutable provenance: %+v", gate.EvidenceCheck)
 	}
 	requiredDimensions := []string{
 		"sdk-create",
@@ -204,19 +209,324 @@ func TestPhase15MemcacheGateIsCompleteAndReferenceable(t *testing.T) {
 	if err := validateEvidenceCheck(root, gate.ID, gate.EvidenceCheck, cache); err != nil {
 		t.Error(err)
 	}
-	if gate.CI.Status != EvidenceConfiguredUnverified || gate.CI.Note == "" {
-		t.Fatalf("Memcached CI status is not configured-unverified: %+v", gate.CI)
+	if gate.CI.Status != EvidenceCIPassed || gate.CI.Note == "" {
+		t.Fatalf("Memcached CI status is not ci-passed: %+v", gate.CI)
 	}
 	if gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
 		gate.CI.Job != "memcache-integration" {
 		t.Fatalf("Memcached CI configuration hook is incomplete: %+v", gate.CI)
 	}
 	if len(gate.CI.References) != 0 || gate.CI.Script != "" || gate.CI.MakeTarget != "" ||
-		gate.CI.RunURL != "" || gate.CI.Commit != "" || gate.CI.SourceCommit != "" {
-		t.Fatalf("unverified Memcached CI evidence contains execution provenance: %+v", gate.CI)
+		gate.CI.RunURL == "" || gate.CI.JobURL == "" ||
+		gate.CI.Commit != gate.SourceCommit || gate.CI.SourceCommit != "" {
+		t.Fatalf("Memcached CI evidence lacks exact execution provenance: %+v", gate.CI)
 	}
 	if err := validateEvidenceCheck(root, gate.ID+" ci", gate.CI, cache); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestCloudSQLRestartRecoveryGateUsesStableUncommittedProvenance(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gate ServiceGate
+	for _, candidate := range gates {
+		if candidate.ID == "cloudsql-restart-recovery" {
+			gate = candidate
+			break
+		}
+	}
+	if gate.ID == "" || gate.Domain != "sqladmin.googleapis.com" ||
+		gate.ProviderVersion != "7.41.0" {
+		t.Fatalf("Cloud SQL gate identity is incomplete: %+v", gate)
+	}
+	if gate.Status != EvidenceLocalPassedUncommitted ||
+		gate.SourceCommit != "" ||
+		gate.SourceSHA256 != "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25" ||
+		gate.DiffSHA256 != "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033" {
+		t.Fatalf("Cloud SQL stable local provenance is incomplete: %+v", gate.EvidenceCheck)
+	}
+	requiredDimensions := []string{
+		"postgres16-same-container-row-survival",
+		"postgres16-volume-only-row-recovery",
+		"exact-docker-cleanup",
+		"terraform-apply",
+		"terraform-no-drift",
+		"terraform-destroy",
+	}
+	if !stringSetEqual(gate.Dimensions, requiredDimensions) {
+		t.Errorf("Cloud SQL dimensions = %q, want exactly %q", gate.Dimensions, requiredDimensions)
+	}
+	assertGateSourceAssertions(t, root, gate.Dimensions, gate.Assertions)
+	cache := make(map[string]string)
+	if err := validateEvidenceCheck(root, gate.ID, gate.EvidenceCheck, cache); err != nil {
+		t.Error(err)
+	}
+	if gate.CI.Status != EvidenceConfiguredUnverified ||
+		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "cloudsql-restart-integration" ||
+		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
+		t.Fatalf("Cloud SQL CI evidence overstates external provenance: %+v", gate.CI)
+	}
+}
+
+func TestStoragePubSubBoundaryGateIsBoundedAndReferenceable(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := EmulatorBoundaryGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 {
+		t.Fatalf("emulator boundary gates = %d, want one", len(gates))
+	}
+	gate := gates[0]
+	if gate.ID != "storage-persistence-pubsub-session" ||
+		!stringSetEqual(gate.Domains, []string{"storage.googleapis.com", "pubsub.googleapis.com"}) {
+		t.Fatalf("unexpected emulator boundary identity: %+v", gate)
+	}
+	if gate.Status != EvidenceLocalPassedUncommitted ||
+		gate.SourceCommit != "" ||
+		gate.SourceSHA256 != "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25" ||
+		gate.DiffSHA256 != "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033" ||
+		gate.Script != "scripts/storage-persistence-pubsub-session-integration.sh" ||
+		gate.MakeTarget != "test-storage-persistence-pubsub-session" {
+		t.Fatalf("unexpected local emulator boundary evidence: %+v", gate.EvidenceCheck)
+	}
+	if gate.CI.Status != EvidenceConfiguredUnverified ||
+		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "storage-persistence-pubsub-session" ||
+		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
+		t.Fatalf("emulator boundary CI overstates external provenance: %+v", gate.CI)
+	}
+	requiredDimensions := []string{
+		"storage-profile-runtime-bind-mount",
+		"storage-exact-owned-container-replacement",
+		"pubsub-anonymous-pinned-image-acquisition",
+		"pubsub-platform-capability-validation",
+		"pubsub-same-container-process-restart",
+		"pubsub-container-replacement-data-loss",
+		"metadata-export-exclusion",
+		"profile-isolation",
+		"exact-owned-cleanup",
+	}
+	if !stringSetEqual(gate.Dimensions, requiredDimensions) {
+		t.Fatalf("boundary dimensions = %q, want %q", gate.Dimensions, requiredDimensions)
+	}
+	cache := make(map[string]string)
+	for _, reference := range gate.References {
+		assertTestReferences(t, root, cache, gate.ID, reference.Package, reference.Tests)
+	}
+	for dimension, assertions := range gate.Assertions {
+		for _, assertion := range assertions {
+			source, ok := cache[assertion.Path]
+			if !ok {
+				data, err := os.ReadFile(filepath.Join(root, assertion.Path))
+				if err != nil {
+					t.Errorf("%s assertion source %q: %v", dimension, assertion.Path, err)
+					continue
+				}
+				source = string(data)
+				if strings.HasSuffix(assertion.Path, ".sh") {
+					source = strings.Join(activeShellLines(source), "\n")
+				}
+				cache[assertion.Path] = source
+			}
+			for _, fragment := range assertion.Contains {
+				if !strings.Contains(source, fragment) {
+					t.Errorf("%s is not actively asserted by %s fragment %q", dimension, assertion.Path, fragment)
+				}
+			}
+		}
+	}
+	assertStoragePubSubExactCleanup(t, root)
+}
+
+func TestWindowsStateMarkersRemainNativeConfiguredUnverified(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := QualityGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 {
+		t.Fatalf("quality gates = %d, want windows-state-markers", len(gates))
+	}
+	gate := gates[0]
+	if gate.ID != "windows-state-markers" ||
+		!stringSetEqual(gate.RequiredBy, []string{"quality"}) {
+		t.Fatalf("Windows quality gate identity is incomplete: %+v", gate)
+	}
+	if gate.LocalPrerequisites.Status != EvidenceLocalPassedUncommitted ||
+		gate.LocalPrerequisites.SourceSHA256 != "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25" ||
+		gate.LocalPrerequisites.DiffSHA256 != "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033" {
+		t.Fatalf("Windows local prerequisites lack stable snapshot provenance: %+v", gate.LocalPrerequisites)
+	}
+	cache := make(map[string]string)
+	if err := validateEvidenceCheck(root, gate.ID+" local prerequisites", gate.LocalPrerequisites, cache); err != nil {
+		t.Error(err)
+	}
+	if gate.NativeCI.Status != EvidenceConfiguredUnverified ||
+		gate.NativeCI.Workflow != ".github/workflows/ci.yml" ||
+		gate.NativeCI.Job != "windows-state-markers" ||
+		gate.NativeCI.RunURL != "" || gate.NativeCI.JobURL != "" || gate.NativeCI.Commit != "" {
+		t.Fatalf("Windows native CI evidence overstates execution: %+v", gate.NativeCI)
+	}
+}
+
+func assertStoragePubSubExactCleanup(t *testing.T, root string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(
+		root,
+		"scripts",
+		"storage-persistence-pubsub-session-integration.sh",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+
+	for _, inventoryFunction := range []string{"owned_containers", "owned_networks", "owned_volumes"} {
+		body := shellFunctionSource(t, source, inventoryFunction)
+		for _, required := range []string{
+			`local target_profile="${1:?profile is required}"`,
+			`--filter "label=managed-by=minisky"`,
+			`--filter "label=minisky.profile=${target_profile}"`,
+		} {
+			if !strings.Contains(body, required) {
+				t.Errorf("%s lacks exact-owned inventory fragment %q", inventoryFunction, required)
+			}
+		}
+		if strings.Contains(body, "|| true") {
+			t.Errorf("%s swallows Docker inventory failures", inventoryFunction)
+		}
+	}
+
+	cleanupExact := shellFunctionSource(t, source, "cleanup_exact_profile")
+	for _, inventoryFunction := range []string{"owned_containers", "owned_networks", "owned_volumes"} {
+		fragment := `inventory="$(` + inventoryFunction + ` "${target_profile}")"`
+		if count := strings.Count(cleanupExact, fragment); count != 2 {
+			t.Errorf("cleanup_exact_profile calls %s %d times, want removal plus verification", inventoryFunction, count)
+		}
+	}
+	for _, required := range []string{
+		`docker rm -f -v "${resource}"`,
+		`docker network rm "${resource}"`,
+		`docker volume rm "${resource}"`,
+		`--format '{{ index .Labels "managed-by" }}|{{ index .Labels "minisky.profile" }}'`,
+		`[[ "${volume_identity}" != "minisky|${target_profile}" ]]`,
+		"no conditional immutable-ID delete",
+		`return "${failed}"`,
+	} {
+		if !strings.Contains(cleanupExact, required) {
+			t.Errorf("cleanup_exact_profile lacks executable cleanup fragment %q", required)
+		}
+	}
+	volumeInspect := strings.Index(cleanupExact, `volume_identity="$(docker volume inspect`)
+	volumeRemove := strings.Index(cleanupExact, `docker volume rm "${resource}"`)
+	if volumeInspect < 0 || volumeRemove < 0 || volumeInspect > volumeRemove {
+		t.Error("cleanup_exact_profile does not re-inspect volume ownership immediately before name-based removal")
+	}
+	if strings.Contains(cleanupExact, "|| true") {
+		t.Error("cleanup_exact_profile swallows Docker cleanup or verification failures")
+	}
+
+	cleanup := shellFunctionSource(t, source, "cleanup")
+	for _, required := range []string{
+		`for cleanup_profile in "${profile}" "${profile}-isolated"; do`,
+		`if ! cleanup_exact_profile "${cleanup_profile}"; then`,
+	} {
+		if !strings.Contains(cleanup, required) {
+			t.Errorf("cleanup lacks bounded profile cleanup fragment %q", required)
+		}
+	}
+}
+
+func shellFunctionSource(t *testing.T, source, name string) string {
+	t.Helper()
+	marker := name + "() {"
+	start := strings.Index(source, marker)
+	if start < 0 {
+		t.Fatalf("shell function %s is absent", name)
+	}
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("shell function %s is unterminated", name)
+	}
+	return source[start : start+end+2]
+}
+
+func TestPR22PromotionRevisionMatchesEveryRequiredJob(t *testing.T) {
+	revision, err := CurrentPromotionRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const commit = "8e16d147b0127bd3120eae106aa0da1fb59a52c9"
+	if revision.Commit != commit {
+		t.Fatalf("promotion commit=%q want %q", revision.Commit, commit)
+	}
+	if revision.GeneralCI.Job != "quality" {
+		t.Errorf("general CI workflow job=%q want quality", revision.GeneralCI.Job)
+	}
+	if revision.CriticalReliability.Job != "state-durability" {
+		t.Errorf(
+			"critical reliability workflow job=%q want state-durability",
+			revision.CriticalReliability.Job,
+		)
+	}
+	gates, err := BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terraformJobs := 0
+	sdkBackendJobs := 0
+	assertPromotionCheck := func(name string, check EvidenceCheck) {
+		t.Helper()
+		if check.Status != EvidenceCIPassed ||
+			check.Commit != commit ||
+			check.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30416460053" ||
+			check.JobURL == "" {
+			t.Errorf("%s lacks exact PR #22 promotion provenance: %+v", name, check)
+		}
+	}
+	for _, gate := range gates {
+		for _, check := range gate.TerraformChecks {
+			terraformJobs++
+			assertPromotionCheck(check.MatrixID, check.CI)
+		}
+		sdkBackendJobs++
+		assertPromotionCheck(gate.ID+" SDK", gate.CI)
+		if gate.BackendCI.Status != "" {
+			sdkBackendJobs++
+			assertPromotionCheck(gate.ID+" backend", gate.BackendCI)
+		}
+	}
+	if terraformJobs != 12 || sdkBackendJobs != 7 {
+		t.Fatalf("promotion jobs=%d Terraform/%d SDK-backend, want 12/7", terraformJobs, sdkBackendJobs)
+	}
+}
+
+func TestTerraformCompatibilityParallelismMatchesWorkflow(t *testing.T) {
+	root := repositoryRoot(t)
+	job := readTerraformWorkflowJob(
+		t,
+		filepath.Join(root, ".github", "workflows", "promotion-integration.yml"),
+	)
+	if job.Strategy.MaxParallel == nil {
+		t.Fatal("promotion Terraform matrix has no max-parallel value")
+	}
+	data, err := os.ReadFile(filepath.Join(root, "docs", "terraform-compatibility.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := strings.Join(strings.Fields(string(data)), " ")
+	want := fmt.Sprintf("maximum parallelism is `%d`", *job.Strategy.MaxParallel)
+	if !strings.Contains(document, want) {
+		t.Errorf("Terraform compatibility does not contain workflow-derived %q", want)
+	}
+	if strings.Contains(document, "four-way parallelism") {
+		t.Fatal("Terraform compatibility retains stale four-way parallelism")
 	}
 }
 
@@ -233,11 +543,13 @@ func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
 				"sdk-create": {{Path: "scripts/memcache-integration.sh", Contains: []string{"run_sdk create"}}},
 			},
 			EvidenceCheck: EvidenceCheck{
-				Status:     EvidenceLocalPassedUncommitted,
-				References: []TestReference{{Package: "sdk-smoke/memcache", Tests: []string{"TestGeneratedClientUsesCanonicalFullDomainLifecyclePaths"}}},
-				Script:     "scripts/memcache-integration.sh",
-				MakeTarget: "test-memcache-integration",
-				Note:       "passed locally in an uncommitted working tree",
+				Status:       EvidenceLocalPassedUncommitted,
+				References:   []TestReference{{Package: "sdk-smoke/memcache", Tests: []string{"TestGeneratedClientUsesCanonicalFullDomainLifecyclePaths"}}},
+				Script:       "scripts/memcache-integration.sh",
+				MakeTarget:   "test-memcache-integration",
+				SourceSHA256: strings.Repeat("a", 64),
+				DiffSHA256:   strings.Repeat("b", 64),
+				Note:         "passed locally in an uncommitted working tree",
 			},
 			CI: EvidenceCheck{
 				Status:   EvidenceConfiguredUnverified,
@@ -291,6 +603,9 @@ func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
 			g[0].SourceCommit = "7022f1b"
 		}},
 		{name: "uncommitted local pass with source commit", mutate: func(g []ServiceGate) { g[0].SourceCommit = strings.Repeat("a", 40) }},
+		{name: "uncommitted local pass without source fingerprint", mutate: func(g []ServiceGate) { g[0].SourceSHA256 = "" }},
+		{name: "uncommitted local pass without diff fingerprint", mutate: func(g []ServiceGate) { g[0].DiffSHA256 = "" }},
+		{name: "uncommitted local pass with invalid fingerprint", mutate: func(g []ServiceGate) { g[0].DiffSHA256 = "25318c4d" }},
 		{name: "uncommitted local pass with CI provenance", mutate: func(g []ServiceGate) {
 			g[0].RunURL = "https://github.com/rudydesplan/minisky/actions/runs/123456"
 			g[0].Commit = strings.Repeat("a", 40)
@@ -340,6 +655,8 @@ func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
 	immutable := valid()
 	immutable[0].Status = EvidenceLocalPassed
 	immutable[0].SourceCommit = strings.Repeat("a", 40)
+	immutable[0].SourceSHA256 = ""
+	immutable[0].DiffSHA256 = ""
 	if _, err := loadServiceGates(encode(t, immutable)); err != nil {
 		t.Fatalf("future immutable local pass rejected: %v", err)
 	}
@@ -363,9 +680,19 @@ func assertServiceGateAssertions(t *testing.T, root string, gate ServiceGate) {
 	if count := strings.Count(body, gate.Script); count != 1 {
 		t.Fatalf("Make target %q maps to %q %d times, want exactly once", gate.MakeTarget, gate.Script, count)
 	}
+	assertGateSourceAssertions(t, root, gate.Dimensions, gate.Assertions)
+}
+
+func assertGateSourceAssertions(
+	t *testing.T,
+	root string,
+	dimensions []string,
+	assertionsByDimension map[string][]GateAssertion,
+) {
+	t.Helper()
 	cache := make(map[string]string)
-	for _, dimension := range gate.Dimensions {
-		assertions := gate.Assertions[dimension]
+	for _, dimension := range dimensions {
+		assertions := assertionsByDimension[dimension]
 		if len(assertions) == 0 {
 			t.Errorf("dimension %q has no active gate assertion", dimension)
 			continue
@@ -398,7 +725,12 @@ func TestEvidenceStatusVocabularyIsClosed(t *testing.T) {
 	validCommit := strings.Repeat("a", 40)
 	checks := []EvidenceCheck{
 		{Status: EvidenceLocalPassed, SourceCommit: validCommit, Note: "immutable local"},
-		{Status: EvidenceLocalPassedUncommitted, Note: "uncommitted local"},
+		{
+			Status:       EvidenceLocalPassedUncommitted,
+			SourceSHA256: strings.Repeat("a", 64),
+			DiffSHA256:   strings.Repeat("b", 64),
+			Note:         "uncommitted local",
+		},
 		{Status: EvidenceCIPassed, RunURL: validRun, Commit: validCommit, Note: "ci"},
 		{Status: EvidenceConfiguredUnverified, Note: "configured"},
 		{Status: EvidenceOptionalUnverified, Note: "optional"},
@@ -665,16 +997,14 @@ func TestBatchGateEvidenceIsCompleteAndReferenceable(t *testing.T) {
 			gate.RealBackendDocker.Status != backendStatus ||
 			gate.StrictIAM.Status != EvidenceLocalPassed ||
 			gate.Cleanup.Status != cleanupStatus ||
-			gate.CI.Status != EvidenceConfiguredUnverified {
+			gate.CI.Status != EvidenceCIPassed {
 			t.Errorf("%s overstates or conflates batch evidence: %+v", gate.ID, gate)
 		}
 		if gate.CI.Workflow != ".github/workflows/promotion-integration.yml" ||
-			gate.CI.RunURL != "" || gate.CI.Commit != "" {
-			t.Errorf("%s promotion evidence is not configured-unverified: %+v", gate.ID, gate.CI)
-		}
-		if !hasPathFilteredPromotionWording(gate.CI.Note) {
-			t.Errorf("%s promotion evidence does not describe path-filtered triggers: %q",
-				gate.ID, gate.CI.Note)
+			gate.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30416460053" ||
+			gate.CI.JobURL == "" ||
+			gate.CI.Commit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" {
+			t.Errorf("%s promotion evidence lacks exact pass provenance: %+v", gate.ID, gate.CI)
 		}
 		for _, check := range gate.TerraformChecks {
 			if prior := terraformCheckByDomain[check.Domain]; prior != "" {
@@ -800,15 +1130,13 @@ func TestTerraformClaimsMapExactlyOnceToRequiredCI(t *testing.T) {
 				t.Errorf("%s reuses integration script %q", check.Domain, check.Script)
 			}
 			seenScripts[check.Script] = true
-			if check.CI.Status != EvidenceConfiguredUnverified ||
+			if check.CI.Status != EvidenceCIPassed ||
 				check.CI.Workflow != ".github/workflows/promotion-integration.yml" ||
 				check.CI.Job != "phase18-25-terraform-integration" ||
-				check.CI.RunURL != "" || check.CI.Commit != "" {
-				t.Errorf("%s overstates or incompletely records configured CI: %+v", check.Domain, check.CI)
-			}
-			if !hasPathFilteredPromotionWording(check.CI.Note) {
-				t.Errorf("%s configured CI does not describe path-filtered triggers: %q",
-					check.Domain, check.CI.Note)
+				check.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30416460053" ||
+				check.CI.JobURL == "" ||
+				check.CI.Commit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" {
+				t.Errorf("%s lacks exact promotion CI provenance: %+v", check.Domain, check.CI)
 			}
 			entry, ok := matrixByID[check.MatrixID]
 			if !ok {
@@ -1035,7 +1363,7 @@ func TestTerraformWorkflowTriggerContractRejectsInactiveMutations(t *testing.T) 
 	}
 }
 
-func TestREADMEPrioritizesExactHeadTerraformMatrixEvidence(t *testing.T) {
+func TestREADMEPrioritizesExactHeadStoragePubSubEvidence(t *testing.T) {
 	root := repositoryRoot(t)
 	data, err := os.ReadFile(filepath.Join(root, "README.md"))
 	if err != nil {
@@ -1053,7 +1381,12 @@ func TestREADMEPrioritizesExactHeadTerraformMatrixEvidence(t *testing.T) {
 		t.Fatal("README priority list is malformed")
 	}
 	priorityOne := strings.Join(strings.Fields(priorities[first:second]), " ")
-	for _, want := range []string{"exact-head external run", "all 12 required", "immutable run URL", "full commit"} {
+	for _, want := range []string{
+		"Storage/Pub/Sub session-boundary gate",
+		"exact-head critical CI pass",
+		"existing PR #22 runs must not be attributed",
+		"uncommitted gate",
+	} {
 		if !strings.Contains(priorityOne, want) {
 			t.Errorf("README priority one does not contain %q: %s", want, priorityOne)
 		}
@@ -1326,12 +1659,12 @@ func validateTerraformWorkflowJob(job terraformWorkflowJob) []string {
 	}
 	add(job.Name == "Terraform 7.41.0 (${{ matrix.domain }})", "Terraform job name = %q", job.Name)
 	add(job.If == "", "Terraform job must not have an event or dispatch gate: %q", job.If)
-	add(stringSetEqual(job.Needs, []string{"quality", "phase18-25-evidence", "terraform-validate"}),
+	add(stringSetEqual(job.Needs, []string{"promotion-assets", "phase18-25-evidence", "terraform-validate"}),
 		"Terraform job needs = %q", job.Needs)
 	add(job.Strategy.FailFast != nil && !*job.Strategy.FailFast,
 		"Terraform strategy fail-fast must be explicit false")
-	add(job.Strategy.MaxParallel != nil && *job.Strategy.MaxParallel == 4,
-		"Terraform strategy max-parallel must be 4")
+	add(job.Strategy.MaxParallel != nil && *job.Strategy.MaxParallel == 12,
+		"Terraform strategy max-parallel must be 12")
 	add(job.RunsOn == "ubuntu-latest", "Terraform runs-on = %q", job.RunsOn)
 	add(job.TimeoutMinutes == "${{ matrix.timeout_minutes }}",
 		"Terraform timeout-minutes = %q", job.TimeoutMinutes)
@@ -1580,18 +1913,16 @@ func TestPhase19HeavyBackendCIIsExplicitAndIsolated(t *testing.T) {
 			break
 		}
 	}
-	if phase19.BackendCI.Status != EvidenceConfiguredUnverified ||
+	if phase19.BackendCI.Status != EvidenceCIPassed ||
 		phase19.BackendCI.Workflow != ".github/workflows/promotion-integration.yml" ||
 		phase19.BackendCI.Job != "phase19-heavy-backend-integration" ||
 		phase19.BackendCI.MakeTarget != "test-phase19-heavy-backend" {
-		t.Fatalf("Phase 19 heavy backend promotion evidence is not configured truthfully: %+v", phase19.BackendCI)
+		t.Fatalf("Phase 19 heavy backend promotion evidence is incomplete: %+v", phase19.BackendCI)
 	}
-	if phase19.BackendCI.RunURL != "" || phase19.BackendCI.Commit != "" {
-		t.Fatalf("unverified promotion evidence records an external pass: %+v", phase19.BackendCI)
-	}
-	if !hasPathFilteredPromotionWording(phase19.BackendCI.Note) {
-		t.Fatalf("Phase 19 backend evidence does not describe path-filtered triggers: %q",
-			phase19.BackendCI.Note)
+	if phase19.BackendCI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30416460053" ||
+		phase19.BackendCI.JobURL == "" ||
+		phase19.BackendCI.Commit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" {
+		t.Fatalf("Phase 19 backend evidence lacks exact external pass provenance: %+v", phase19.BackendCI)
 	}
 
 	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "promotion-integration.yml"))
@@ -2630,20 +2961,22 @@ func TestPhase25BinaryAuthorizationClaimsStayTruthful(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var checkNote string
+	var terraformCheck *TerraformCheck
 	for _, gate := range gates {
 		if gate.ID != "phase24-25" {
 			continue
 		}
 		for _, check := range gate.TerraformChecks {
 			if check.Domain == "binaryauthorization.googleapis.com" {
-				checkNote = check.Note
+				current := check
+				terraformCheck = &current
 			}
 		}
 	}
-	if checkNote == "" {
+	if terraformCheck == nil || terraformCheck.Note == "" {
 		t.Fatal("Binary Authorization Terraform evidence note is missing")
 	}
+	checkNote := terraformCheck.Note
 	for _, want := range []string{
 		"allow/deny observations before restart",
 		"after restart, policy persistence and zero drift",
@@ -2652,11 +2985,15 @@ func TestPhase25BinaryAuthorizationClaimsStayTruthful(t *testing.T) {
 		"without creating a durable audit record or log",
 		"attestation/global/cluster evaluation returns explicit UNSUPPORTED",
 		"not GKE or production admission security",
-		"no CI pass is recorded",
 	} {
 		if !strings.Contains(checkNote, want) {
 			t.Errorf("Binary Authorization Terraform note does not contain %q: %s", want, checkNote)
 		}
+	}
+	if terraformCheck.CI.Status != EvidenceCIPassed ||
+		terraformCheck.CI.Commit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" ||
+		terraformCheck.CI.JobURL == "" {
+		t.Errorf("Binary Authorization Terraform CI lacks exact pass provenance: %+v", terraformCheck.CI)
 	}
 	for _, stale := range []string{
 		"records audit",
@@ -2755,7 +3092,7 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 	}
 	source := strings.Join(strings.Fields(string(data)), " ")
 	for _, want := range []string{
-		"12 Terraform legs plus seven SDK/backend gates exactly once",
+		"all 12 Terraform legs and seven SDK/backend gates",
 		"Twelve bounded provider lifecycles now pass",
 		"google_binary_authorization_policy",
 		"matching import returns 0",
@@ -2770,10 +3107,11 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 		"returns explicit UNSUPPORTED",
 		"not GKE or production admission security",
 		"dedicated path-aware, weekly, and manually runnable promotion workflow",
-		"configured-unverified with no run URL or commit",
-		"CI run 30384072102",
-		"source commit 7035b25b056e03334656029af1e5c1259ab91765",
-		"Main CI run 30387050664",
+		"PR #22",
+		"promotion run 30416460053",
+		"8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+		"19/19 passed",
+		"uncommitted Storage/Pub/Sub boundary gate",
 		"Commit 852d9e3",
 		"same stable Workflow execution identity",
 		"no duplicate execution resource",

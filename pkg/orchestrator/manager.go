@@ -56,6 +56,8 @@ type ServiceManager struct {
 	serverlessReady   func(string, time.Duration) error
 	emulatorReady     func(string, time.Duration) error
 	memcachedReady    func(context.Context, string, string, time.Duration) error
+	cloudSQLReady     func(context.Context, string, string, time.Duration) error
+	cloudSQLAuthReady func(context.Context, string, map[string]string, string, time.Duration) error
 	memcacheUncertain map[string]error
 }
 
@@ -161,8 +163,10 @@ func NewServiceManager() (*ServiceManager, error) {
 		serverlessReady:   waitUntilHTTPReady,
 		emulatorReady:     waitUntilHTTPReady,
 		memcachedReady:    waitUntilMemcachedReady,
+		cloudSQLReady:     waitUntilCloudSQLReady,
 		memcacheUncertain: make(map[string]error),
 	}
+	sm.cloudSQLAuthReady = sm.waitUntilCloudSQLAuthenticatedReady
 	transport := &http.Transport{
 		DialContext: sm.dialDocker,
 	}
@@ -1398,7 +1402,7 @@ func isOwnedRedisResource(labels map[string]string, resourceID string) bool {
 		labels["minisky.resource"] == resourceID
 }
 
-// ProvisionCloudSQLVM starts a fully-interactive PostgreSQL or MySQL docker database data plane.
+// buildResourceLabels returns exact ownership labels for one Cloud Build workspace.
 func buildResourceLabels(resourceID string) map[string]string {
 	labels := ownedDockerLabels()
 	labels["minisky.service"] = "cloudbuild"
@@ -2081,174 +2085,235 @@ func waitUntilPostgresReady(ctx context.Context, endpoint string, timeout time.D
 	}
 }
 
-func (sm *ServiceManager) ProvisionCloudSQLVM(ctx context.Context, project, instanceName string, version string, rootPassword string) (string, bool, error) {
-	var image string
-	var env []string
-	var expPort string
-
-	reg := config.GetImageRegistry()
-	if strings.HasPrefix(version, "POSTGRES") {
-		// Version can be "POSTGRES_18", "POSTGRES_17", or just "POSTGRES"
-		vparts := strings.Split(version, "_")
-		if len(vparts) > 1 {
-			targetV := vparts[1]
-			for _, v := range reg.Sql.Postgres.Versions {
-				if v.Version == targetV {
-					image = v.Image
-					break
-				}
-			}
-		}
-		if image == "" {
-			image = reg.Sql.Postgres.DefaultImage
-		}
-		env = append(sm.standardEnv(),
-			"POSTGRES_PASSWORD="+rootPassword,
-			"PGDATA=/var/lib/postgresql/data",
-		)
-		expPort = "5432/tcp"
-	} else if strings.HasPrefix(version, "MYSQL") {
-		vparts := strings.Split(version, "_")
-		if len(vparts) > 1 {
-			targetV := vparts[1]
-			// Handle legacy version strings like MYSQL_8_0
-			if len(vparts) > 2 {
-				targetV = vparts[1] + "." + vparts[2]
-			}
-			for _, v := range reg.Sql.Mysql.Versions {
-				if v.Version == targetV || strings.HasPrefix(v.Version, vparts[1]) {
-					image = v.Image
-					break
-				}
-			}
-		}
-		if image == "" {
-			image = reg.Sql.Mysql.DefaultImage
-		}
-		env = append(sm.standardEnv(), "MYSQL_ROOT_PASSWORD="+rootPassword)
-		expPort = "3306/tcp"
-	} else {
-		return "", false, fmt.Errorf("unsupported database version: %s", version)
-	}
-
-	containerName, volName, resourceID := cloudSQLDockerNames(project, instanceName)
-	resourceLabels := ownedDockerLabels()
-	resourceLabels["minisky.service"] = "cloudsql"
-	resourceLabels["minisky.resource"] = resourceID
-	log.Printf("[Orchestrator] Provisioning Cloud SQL VM: %s (image: %s)", containerName, image)
-
-	exists, err := sm.ImageExistsPublic(image)
+func (sm *ServiceManager) ProvisionCloudSQLVM(
+	ctx context.Context,
+	requested CloudSQLBackendSpec,
+) (string, CloudSQLBackendSpec, bool, error) {
+	spec, runtimeConfig, err := resolveCloudSQLBackendSpec(requested)
 	if err != nil {
-		log.Printf("[Orchestrator] Image check error for %s: %v", image, err)
+		return "", requested, false, err
 	}
-	if !exists {
-		if err := sm.pullImageInternal(ctx, image); err != nil {
-			return "", false, fmt.Errorf("pull Cloud SQL image %q: %w", image, err)
-		}
-	} else {
-		log.Printf("[Orchestrator] Image '%s' already exists locally, skipping pull.", image)
-	}
+	containerName, volumeName, _ := cloudSQLDockerNames(spec.Project, spec.Instance)
+	log.Printf("[Orchestrator] Provisioning Cloud SQL VM: %s (image: %s)", containerName, spec.Image)
 
-	status, labels, err := sm.inspectContainer(containerName)
+	status, _, err := sm.inspectContainerContext(ctx, containerName)
 	if err != nil {
-		return "", false, fmt.Errorf("inspect Cloud SQL container: %w", err)
+		return "", spec, false, fmt.Errorf("inspect Cloud SQL container: %w", err)
 	}
 	if status != "not_found" {
-		if !exactLabels(labels, resourceLabels) {
-			return "", false, fmt.Errorf("Cloud SQL container %q exists but is not owned by this profile and resource", containerName)
-		}
-		return "", false, fmt.Errorf("owned Cloud SQL container %q already exists", containerName)
+		return "", spec, false, fmt.Errorf("Cloud SQL container %q already exists", containerName)
 	}
-
-	// Volumes - mount a docker volume for persistence
-	volumeCreated, err := sm.ensureCloudSQLVolume(ctx, volName, resourceLabels)
+	if !requested.CreationIntent || requested.ImageID == "" {
+		return "", spec, false, errors.New(
+			"Cloud SQL creation intent and immutable image ID must be persisted before provisioning",
+		)
+	}
+	imageID, err := sm.inspectCloudSQLImageID(ctx, spec.Image)
 	if err != nil {
-		return "", false, err
+		return "", spec, false, err
 	}
-
-	var mountTarget string
-	if strings.HasPrefix(version, "MYSQL") {
-		mountTarget = "/var/lib/mysql"
-	} else {
-		mountTarget = "/var/lib/postgresql/data"
+	if imageID != requested.ImageID {
+		return "", spec, false, fmt.Errorf(
+			"Cloud SQL image %q resolved to %q, want authorized immutable image ID %q",
+			spec.Image,
+			imageID,
+			requested.ImageID,
+		)
 	}
+	resourceLabels := cloudSQLLabels(spec)
 
+	_, err = sm.ensureCloudSQLVolume(ctx, volumeName, resourceLabels)
+	if err != nil {
+		return "", spec, false, err
+	}
+	volume, volumeFound, err := sm.inspectExactCloudSQLVolume(ctx, volumeName, resourceLabels)
+	if err != nil || !volumeFound {
+		if err != nil {
+			return "", spec, false, err
+		}
+		return "", spec, false, fmt.Errorf("created Cloud SQL volume %q is absent", volumeName)
+	}
+	spec.VolumeIdentity = volume.identity()
 	payload := map[string]interface{}{
-		"Image": image,
-		"Env":   env,
+		"Image": spec.ImageID,
+		"Env":   append(sm.standardEnv(), runtimeConfig.Env...),
 		"ExposedPorts": map[string]interface{}{
-			expPort: struct{}{},
+			runtimeConfig.ContainerPort: struct{}{},
 		},
 		"HostConfig": map[string]interface{}{
 			"NetworkMode": networkName,
 			"PortBindings": map[string]interface{}{
-				expPort: []map[string]string{
-					{"HostIp": "127.0.0.1", "HostPort": "0"},
-				},
+				runtimeConfig.ContainerPort: []map[string]string{{
+					"HostIp": "127.0.0.1", "HostPort": "0",
+				}},
 			},
 			"Binds": []string{
-				fmt.Sprintf("%s:%s", volName, mountTarget),
+				fmt.Sprintf("%s:%s", volumeName, runtimeConfig.MountTarget),
 			},
 		},
 		"Labels": resourceLabels,
 	}
-
-	b, _ := json.Marshal(payload)
-	cReq, _ := http.NewRequest("POST", "http://localhost/containers/create?name="+containerName, bytes.NewBuffer(b))
-	cReq.Header.Set("Content-Type", "application/json")
-	resp, err := sm.dockerClient.Do(cReq)
+	encoded, err := json.Marshal(payload)
 	if err != nil {
-		if volumeCreated {
-			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
-		}
-		return "", false, fmt.Errorf("create SQL container: %v", err)
+		return "", spec, false, fmt.Errorf("encode Cloud SQL container: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		if volumeCreated {
-			_ = sm.deleteCloudSQLVolume(ctx, volName, resourceLabels)
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", false, fmt.Errorf("failed to create SQL container %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	if err := sm.startContainer(containerName); err != nil {
-		return "", true, fmt.Errorf("start SQL container: %v", err)
-	}
-
-	config := ContainerConfig{Name: containerName, ContainerPort: expPort}
-	internalURL, err := sm.discoverInternalURL(config)
+	createRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://localhost/containers/create?name="+url.QueryEscape(containerName),
+		bytes.NewReader(encoded),
+	)
 	if err != nil {
-		return "", true, fmt.Errorf("port discovery: %v", err)
+		return "", spec, false, err
 	}
-
-	log.Printf("[Orchestrator] ✅ SQL Instance '%s' ONLINE at %s", instanceName, internalURL)
-	return internalURL, true, nil
+	createRequest.Header.Set("Content-Type", "application/json")
+	response, err := sm.doDocker(createRequest)
+	if err != nil {
+		return "", spec, false, fmt.Errorf("create SQL container: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return "", spec, false, fmt.Errorf(
+			"create SQL container returned HTTP %d: %s",
+			response.StatusCode,
+			strings.TrimSpace(string(detail)),
+		)
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		return "", spec, true, fmt.Errorf("decode created SQL container: %w", err)
+	}
+	if !dockerContainerIDPattern.MatchString(created.ID) {
+		return "", spec, true, fmt.Errorf("created SQL container returned invalid immutable ID %q", created.ID)
+	}
+	createdContainer, found, inspectErr := sm.inspectCloudSQLContainer(ctx, created.ID)
+	if inspectErr != nil || !found {
+		cleanupErr := sm.removeCreatedCloudSQLContainer(ctx, created.ID, resourceLabels)
+		if inspectErr != nil {
+			return "", spec, true, errors.Join(
+				fmt.Errorf("inspect created SQL container before start: %w", inspectErr),
+				cleanupErr,
+			)
+		}
+		return "", spec, true, errors.Join(
+			errors.New("created SQL container disappeared before start"),
+			cleanupErr,
+		)
+	}
+	if err := validateCloudSQLContainer(
+		createdContainer,
+		runtimeConfig,
+		volumeName,
+		resourceLabels,
+	); err != nil {
+		return "", spec, true, errors.Join(
+			err,
+			sm.removeCreatedCloudSQLContainer(ctx, created.ID, resourceLabels),
+		)
+	}
+	revalidatedVolume, found, volumeErr := sm.inspectExactCloudSQLVolume(ctx, volumeName, resourceLabels)
+	if volumeErr != nil || !found || revalidatedVolume.identity() != spec.VolumeIdentity {
+		cleanupErr := sm.removeCreatedCloudSQLContainer(ctx, created.ID, resourceLabels)
+		if volumeErr != nil {
+			return "", spec, true, errors.Join(volumeErr, cleanupErr)
+		}
+		return "", spec, true, errors.Join(
+			errors.New("Cloud SQL volume identity changed before container start"),
+			cleanupErr,
+		)
+	}
+	if err := sm.startContainerContext(ctx, created.ID); err != nil {
+		return "", spec, true, fmt.Errorf("start SQL container: %w", err)
+	}
+	container, found, err := sm.inspectCloudSQLContainer(ctx, created.ID)
+	if err != nil {
+		return "", spec, true, fmt.Errorf("inspect started SQL container: %w", err)
+	}
+	if !found {
+		return "", spec, true, errors.New("created SQL container disappeared after start")
+	}
+	if err := validateCloudSQLContainer(
+		container,
+		runtimeConfig,
+		volumeName,
+		resourceLabels,
+	); err != nil {
+		return "", spec, true, err
+	}
+	internalURL, err := cloudSQLEndpoint(container, runtimeConfig.ContainerPort)
+	if err != nil {
+		return "", spec, true, fmt.Errorf("port discovery: %w", err)
+	}
+	ready := sm.cloudSQLReady
+	if ready == nil {
+		ready = waitUntilCloudSQLReady
+	}
+	address := strings.TrimPrefix(internalURL, "http://")
+	if err := ready(ctx, address, spec.DatabaseVersion, 30*time.Second); err != nil {
+		return "", spec, true, fmt.Errorf("Cloud SQL initial readiness failed: %w", err)
+	}
+	authReady := sm.cloudSQLAuthReady
+	if authReady == nil {
+		authReady = sm.waitUntilCloudSQLAuthenticatedReady
+	}
+	if err := authReady(
+		ctx,
+		container.ID,
+		resourceLabels,
+		spec.DatabaseVersion,
+		30*time.Second,
+	); err != nil {
+		return "", spec, true, fmt.Errorf("Cloud SQL initial authenticated readiness failed: %w", err)
+	}
+	log.Printf("[Orchestrator] ✅ SQL Instance '%s' ONLINE at %s", spec.Instance, internalURL)
+	return internalURL, spec, true, nil
 }
 
 // DeleteCloudSQLVM stops and forcefully removes a Cloud SQL node.
-func (sm *ServiceManager) DeleteCloudSQLVM(project, instanceName string) error {
+func (sm *ServiceManager) DeleteCloudSQLVM(spec CloudSQLBackendSpec) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return sm.DeleteCloudSQLVMContext(ctx, project, instanceName)
+	return sm.DeleteCloudSQLVMContext(ctx, spec)
 }
 
-func (sm *ServiceManager) DeleteCloudSQLVMContext(ctx context.Context, project, instanceName string) error {
-	containerName, volumeName, resourceID := cloudSQLDockerNames(project, instanceName)
-	expected := ownedDockerLabels()
-	expected["minisky.service"] = "cloudsql"
-	expected["minisky.resource"] = resourceID
-	log.Printf("[Orchestrator] Tearing down Cloud SQL VM: %s", containerName)
-	status, labels, err := sm.inspectContainer(containerName)
+func (sm *ServiceManager) DeleteCloudSQLVMContext(ctx context.Context, requested CloudSQLBackendSpec) error {
+	spec, runtimeConfig, err := resolveCloudSQLBackendSpec(requested)
 	if err != nil {
 		return err
 	}
-	if status != "not_found" {
-		if !exactLabels(labels, expected) {
-			return fmt.Errorf("refusing to delete unowned Cloud SQL container %q", containerName)
+	if requested.Image == "" {
+		return errors.New("Cloud SQL persisted image is required for deletion")
+	}
+	if requested.ImageID == "" ||
+		(requested.VolumeIdentity == "" && !requested.CreationIntent) {
+		return errors.New("Cloud SQL immutable image and volume identities are required for deletion")
+	}
+	containerName, volumeName, _ := cloudSQLDockerNames(spec.Project, spec.Instance)
+	expected := cloudSQLLabels(spec)
+	log.Printf("[Orchestrator] Tearing down Cloud SQL VM: %s", containerName)
+	volume, volumeFound, err := sm.inspectExactCloudSQLVolume(ctx, volumeName, expected)
+	if err != nil {
+		return err
+	}
+	if volumeFound && spec.VolumeIdentity == "" && spec.CreationIntent {
+		spec.VolumeIdentity = volume.identity()
+	}
+	if volumeFound && volume.identity() != spec.VolumeIdentity {
+		return fmt.Errorf("refusing to delete Cloud SQL volume %q with changed immutable identity", volumeName)
+	}
+	container, found, err := sm.inspectCloudSQLContainer(ctx, containerName)
+	if err != nil {
+		return err
+	}
+	if found {
+		if err := validateCloudSQLContainer(container, runtimeConfig, volumeName, expected); err != nil {
+			return fmt.Errorf("refusing to delete incompatible Cloud SQL container %q: %w", containerName, err)
 		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
-			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
+			"http://localhost/containers/"+url.PathEscape(container.ID)+"?force=true", nil)
 		resp, err := sm.dockerClient.Do(req)
 		if err != nil {
 			return err
@@ -2258,25 +2323,44 @@ func (sm *ServiceManager) DeleteCloudSQLVMContext(ctx context.Context, project, 
 			return fmt.Errorf("delete Cloud SQL container returned %d", resp.StatusCode)
 		}
 	}
-	return sm.deleteCloudSQLVolume(ctx, volumeName, expected)
+	return sm.deleteCloudSQLVolume(ctx, volumeName, expected, spec.VolumeIdentity)
 }
 
 // ExecuteCloudSQLAdmin applies a bounded database or user mutation to the
 // exact profile-owned Cloud SQL container. Command arguments are never logged.
 func (sm *ServiceManager) ExecuteCloudSQLAdmin(
 	ctx context.Context,
-	project, instanceName, version, action, name, password string,
+	requested CloudSQLBackendSpec,
+	action, name, password string,
 ) error {
-	command, err := cloudSQLAdminCommand(version, action, name, password)
+	spec, runtimeConfig, err := resolveCloudSQLBackendSpec(requested)
+	if err != nil {
+		return err
+	}
+	if requested.Image == "" {
+		return errors.New("Cloud SQL persisted image is required for administration")
+	}
+	if requested.ImageID == "" {
+		return errors.New("Cloud SQL immutable image ID is required for administration")
+	}
+	command, err := cloudSQLAdminCommand(spec.DatabaseVersion, action, name, password)
 	if err != nil {
 		return err
 	}
 
-	containerName, _, resourceID := cloudSQLDockerNames(project, instanceName)
-	expected := ownedDockerLabels()
-	expected["minisky.service"] = "cloudsql"
-	expected["minisky.resource"] = resourceID
-	return sm.runOwnedCloudSQLCommand(ctx, containerName, expected, command)
+	containerName, volumeName, _ := cloudSQLDockerNames(spec.Project, spec.Instance)
+	expected := cloudSQLLabels(spec)
+	container, found, err := sm.inspectCloudSQLContainer(ctx, containerName)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("Cloud SQL container %q is absent", containerName)
+	}
+	if err := validateCloudSQLContainer(container, runtimeConfig, volumeName, expected); err != nil {
+		return err
+	}
+	return sm.runOwnedCloudSQLCommand(ctx, container.ID, expected, command)
 }
 
 func cloudSQLAdminCommand(version, action, name, password string) ([]string, error) {
@@ -2328,11 +2412,11 @@ func cloudSQLAdminCommand(version, action, name, password string) ([]string, err
 
 func (sm *ServiceManager) runOwnedCloudSQLCommand(
 	ctx context.Context,
-	containerName string,
+	containerID string,
 	expectedLabels map[string]string,
 	command []string,
 ) error {
-	status, labels, err := sm.inspectContainer(containerName)
+	status, labels, err := sm.inspectContainerContext(ctx, containerID)
 	if err != nil {
 		return fmt.Errorf("inspect Cloud SQL command target: %w", err)
 	}
@@ -2347,7 +2431,7 @@ func (sm *ServiceManager) runOwnedCloudSQLCommand(
 		return err
 	}
 	createRequest, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://localhost/containers/"+url.PathEscape(containerName)+"/exec", bytes.NewReader(payload))
+		"http://localhost/containers/"+url.PathEscape(containerID)+"/exec", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -2473,7 +2557,12 @@ func (sm *ServiceManager) ensureCloudSQLVolume(ctx context.Context, name string,
 	return true, nil
 }
 
-func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string, labels map[string]string) error {
+func (sm *ServiceManager) deleteCloudSQLVolume(
+	ctx context.Context,
+	name string,
+	labels map[string]string,
+	expectedIdentity ...string,
+) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		"http://localhost/volumes/"+url.PathEscape(name), nil)
 	if err != nil {
@@ -2492,9 +2581,7 @@ func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string,
 		resp.Body.Close()
 		return fmt.Errorf("inspect Cloud SQL volume returned %d", status)
 	}
-	var volume struct {
-		Labels map[string]string `json:"Labels"`
-	}
+	var volume cloudSQLVolumeInspect
 	err = json.NewDecoder(resp.Body).Decode(&volume)
 	resp.Body.Close()
 	if err != nil {
@@ -2502,6 +2589,12 @@ func (sm *ServiceManager) deleteCloudSQLVolume(ctx context.Context, name string,
 	}
 	if !exactLabels(volume.Labels, labels) {
 		return fmt.Errorf("refusing to delete unowned Cloud SQL volume %q", name)
+	}
+	if len(expectedIdentity) > 0 && expectedIdentity[0] != "" {
+		if volume.Name != name || volume.CreatedAt == "" || volume.Mountpoint == "" ||
+			volume.identity() != expectedIdentity[0] {
+			return fmt.Errorf("refusing to delete Cloud SQL volume %q with changed immutable identity", name)
+		}
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, "http://localhost/volumes/"+url.PathEscape(name), nil)
 	resp, err = sm.dockerClient.Do(req)

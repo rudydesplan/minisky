@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strings"
 )
 
 type GeneratedClientBoundary string
@@ -77,8 +78,11 @@ type EvidenceCheck struct {
 	Workflow     string          `json:"workflow,omitempty"`
 	Job          string          `json:"job,omitempty"`
 	RunURL       string          `json:"runUrl,omitempty"`
+	JobURL       string          `json:"jobUrl,omitempty"`
 	Commit       string          `json:"commit,omitempty"`
 	SourceCommit string          `json:"sourceCommit,omitempty"`
+	SourceSHA256 string          `json:"sourceSha256,omitempty"`
+	DiffSHA256   string          `json:"diffSha256,omitempty"`
 	Note         string          `json:"note"`
 }
 
@@ -94,6 +98,20 @@ type PlatformGate struct {
 
 //go:embed platform_gates.json
 var platformGatesJSON []byte
+
+// QualityGate separates locally verified prerequisites from a native CI gate.
+// In particular, cross-compilation and workflow contracts are not evidence that
+// native-platform tests executed.
+type QualityGate struct {
+	ID                 string        `json:"id"`
+	Name               string        `json:"name"`
+	RequiredBy         []string      `json:"requiredBy"`
+	LocalPrerequisites EvidenceCheck `json:"localPrerequisites"`
+	NativeCI           EvidenceCheck `json:"nativeCI"`
+}
+
+//go:embed quality_gates.json
+var qualityGatesJSON []byte
 
 // ServiceGate records a bounded service lifecycle without adding the service
 // to the default-off Phase 18-25 promotion inventory.
@@ -116,6 +134,34 @@ type ServiceGate struct {
 
 //go:embed service_gates.json
 var serviceGatesJSON []byte
+
+// EmulatorBoundaryGate records a bounded lifecycle shared by passthrough
+// emulators without implying that either service has a metadata adapter.
+type EmulatorBoundaryGate struct {
+	ID         string                     `json:"id"`
+	Name       string                     `json:"name"`
+	Domains    []string                   `json:"domains"`
+	Dimensions []string                   `json:"dimensions"`
+	Assertions map[string][]GateAssertion `json:"assertions"`
+	CI         EvidenceCheck              `json:"ci"`
+	EvidenceCheck
+}
+
+//go:embed emulator_boundaries.json
+var emulatorBoundariesJSON []byte
+
+// PromotionRevision records the non-promotion checks that must agree with the
+// per-job promotion evidence before documentation can call one revision green.
+type PromotionRevision struct {
+	ID                  string        `json:"id"`
+	PullRequestURL      string        `json:"pullRequestUrl"`
+	Commit              string        `json:"commit"`
+	GeneralCI           EvidenceCheck `json:"generalCI"`
+	CriticalReliability EvidenceCheck `json:"criticalReliability"`
+}
+
+//go:embed promotion_revision.json
+var promotionRevisionJSON []byte
 
 // TerraformCheck records one provider lifecycle for exactly one service
 // domain. Terraform evidence is intentionally not represented as a batch-wide
@@ -247,10 +293,158 @@ func PlatformGates() ([]PlatformGate, error) {
 	return gates, nil
 }
 
+// QualityGates returns native quality requirements without converting local
+// cross-compilation or workflow-contract checks into native execution claims.
+func QualityGates() ([]QualityGate, error) {
+	var gates []QualityGate
+	if err := json.Unmarshal(qualityGatesJSON, &gates); err != nil {
+		return nil, fmt.Errorf("decode quality gates: %w", err)
+	}
+	seen := make(map[string]bool, len(gates))
+	for _, gate := range gates {
+		if gate.ID == "" || gate.Name == "" || len(gate.RequiredBy) == 0 {
+			return nil, fmt.Errorf("quality gate has incomplete identity: %+v", gate)
+		}
+		if seen[gate.ID] {
+			return nil, fmt.Errorf("duplicate quality gate %q", gate.ID)
+		}
+		seen[gate.ID] = true
+		if err := ValidateEvidenceCheck(gate.LocalPrerequisites); err != nil {
+			return nil, fmt.Errorf("%s local prerequisites: %w", gate.ID, err)
+		}
+		if gate.LocalPrerequisites.Status != EvidenceLocalPassedUncommitted {
+			return nil, fmt.Errorf("%s local prerequisites must be local-passed-uncommitted", gate.ID)
+		}
+		if err := ValidateEvidenceCheck(gate.NativeCI); err != nil {
+			return nil, fmt.Errorf("%s native CI: %w", gate.ID, err)
+		}
+		if gate.NativeCI.Status != EvidenceConfiguredUnverified ||
+			gate.NativeCI.Workflow == "" || gate.NativeCI.Job == "" {
+			return nil, fmt.Errorf("%s native CI must remain configured-unverified", gate.ID)
+		}
+	}
+	return gates, nil
+}
+
 // ServiceGates returns bounded service evidence that is independent of the
 // experimental Phase 18-25 promotion matrix.
 func ServiceGates() ([]ServiceGate, error) {
 	return loadServiceGates(serviceGatesJSON)
+}
+
+// EmulatorBoundaryGates returns bounded passthrough-emulator lifecycle truth.
+func EmulatorBoundaryGates() ([]EmulatorBoundaryGate, error) {
+	var gates []EmulatorBoundaryGate
+	if err := json.Unmarshal(emulatorBoundariesJSON, &gates); err != nil {
+		return nil, fmt.Errorf("decode emulator boundary gates: %w", err)
+	}
+	seen := make(map[string]bool, len(gates))
+	for _, gate := range gates {
+		if gate.ID == "" || gate.Name == "" || len(gate.Domains) < 2 {
+			return nil, fmt.Errorf("emulator boundary gate has incomplete identity: %+v", gate)
+		}
+		if seen[gate.ID] {
+			return nil, fmt.Errorf("duplicate emulator boundary gate %q", gate.ID)
+		}
+		seen[gate.ID] = true
+		domains := make(map[string]bool, len(gate.Domains))
+		for _, domain := range gate.Domains {
+			if domain == "" || domains[domain] {
+				return nil, fmt.Errorf("%s has an empty or duplicate domain %q", gate.ID, domain)
+			}
+			domains[domain] = true
+		}
+		dimensions := make(map[string]bool, len(gate.Dimensions))
+		for _, dimension := range gate.Dimensions {
+			if dimension == "" || dimensions[dimension] {
+				return nil, fmt.Errorf("%s has an empty or duplicate lifecycle dimension %q", gate.ID, dimension)
+			}
+			dimensions[dimension] = true
+		}
+		if len(dimensions) == 0 || len(gate.Assertions) != len(dimensions) {
+			return nil, fmt.Errorf("%s assertion dimensions do not exactly match lifecycle dimensions", gate.ID)
+		}
+		for dimension, assertions := range gate.Assertions {
+			if !dimensions[dimension] || len(assertions) == 0 {
+				return nil, fmt.Errorf("%s has invalid assertions for dimension %q", gate.ID, dimension)
+			}
+			for _, assertion := range assertions {
+				if assertion.Path == "" || len(assertion.Contains) == 0 {
+					return nil, fmt.Errorf("%s dimension %q has an incomplete gate assertion", gate.ID, dimension)
+				}
+				for _, fragment := range assertion.Contains {
+					if fragment == "" {
+						return nil, fmt.Errorf("%s dimension %q has an empty assertion fragment", gate.ID, dimension)
+					}
+				}
+			}
+		}
+		if err := ValidateEvidenceCheck(gate.EvidenceCheck); err != nil {
+			return nil, fmt.Errorf("%s local evidence: %w", gate.ID, err)
+		}
+		if gate.Status != EvidenceLocalPassedUncommitted || gate.SourceCommit != "" ||
+			gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
+			return nil, fmt.Errorf("%s must remain local-passed-uncommitted with stable source/diff fingerprints and no commit", gate.ID)
+		}
+		if gate.Script == "" || gate.MakeTarget == "" || len(gate.References) == 0 {
+			return nil, fmt.Errorf("%s local evidence requires script, Make target, and references", gate.ID)
+		}
+		if err := ValidateEvidenceCheck(gate.CI); err != nil {
+			return nil, fmt.Errorf("%s CI evidence: %w", gate.ID, err)
+		}
+		if gate.CI.Status != EvidenceConfiguredUnverified ||
+			gate.CI.Workflow == "" || gate.CI.Job == "" {
+			return nil, fmt.Errorf("%s CI must remain configured-unverified with workflow and job", gate.ID)
+		}
+	}
+	return gates, nil
+}
+
+// CurrentPromotionRevision returns the immutable companion checks for the
+// externally verified promotion revision.
+func CurrentPromotionRevision() (PromotionRevision, error) {
+	var revision PromotionRevision
+	if err := json.Unmarshal(promotionRevisionJSON, &revision); err != nil {
+		return PromotionRevision{}, fmt.Errorf("decode promotion revision: %w", err)
+	}
+	if revision.ID == "" || !fullCommitPattern.MatchString(revision.Commit) {
+		return PromotionRevision{}, fmt.Errorf("promotion revision has incomplete identity")
+	}
+	prURL, err := url.Parse(revision.PullRequestURL)
+	if err != nil || prURL.Scheme != "https" || prURL.Host != "github.com" ||
+		prURL.Path != "/"+GitHubRepository+"/pull/22" || prURL.RawQuery != "" ||
+		prURL.Fragment != "" || prURL.User != nil {
+		return PromotionRevision{}, fmt.Errorf("promotion revision requires the immutable PR #22 URL")
+	}
+	for name, check := range map[string]EvidenceCheck{
+		"general CI":           revision.GeneralCI,
+		"critical reliability": revision.CriticalReliability,
+	} {
+		if err := ValidateEvidenceCheck(check); err != nil {
+			return PromotionRevision{}, fmt.Errorf("promotion revision %s: %w", name, err)
+		}
+		if check.Status != EvidenceCIPassed || check.Commit != revision.Commit ||
+			check.JobURL == "" {
+			return PromotionRevision{}, fmt.Errorf(
+				"promotion revision %s must be a job-linked CI pass on %s",
+				name,
+				revision.Commit,
+			)
+		}
+	}
+	if revision.GeneralCI.Workflow != ".github/workflows/ci.yml" ||
+		revision.GeneralCI.Job != "quality" {
+		return PromotionRevision{}, fmt.Errorf(
+			"promotion revision general CI must identify workflow job quality",
+		)
+	}
+	if revision.CriticalReliability.Workflow != ".github/workflows/critical-integration.yml" ||
+		revision.CriticalReliability.Job != "state-durability" {
+		return PromotionRevision{}, fmt.Errorf(
+			"promotion revision critical reliability must identify workflow job state-durability",
+		)
+	}
+	return revision, nil
 }
 
 func loadServiceGates(data []byte) ([]ServiceGate, error) {
@@ -311,8 +505,8 @@ func loadServiceGates(data []byte) ([]ServiceGate, error) {
 				return nil, fmt.Errorf("%s immutable local evidence requires a full source commit", gate.ID)
 			}
 		case EvidenceLocalPassedUncommitted:
-			if gate.SourceCommit != "" {
-				return nil, fmt.Errorf("%s uncommitted local evidence must not include a source commit", gate.ID)
+			if gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
+				return nil, fmt.Errorf("%s uncommitted local evidence requires stable source/diff fingerprints and no source commit", gate.ID)
 			}
 		default:
 			return nil, fmt.Errorf(
@@ -356,9 +550,13 @@ func loadServiceGates(data []byte) ([]ServiceGate, error) {
 
 var (
 	fullCommitPattern      = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	sha256Pattern          = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	providerVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	actionsRunPattern      = regexp.MustCompile(
 		`^/` + regexp.QuoteMeta(GitHubRepository) + `/actions/runs/[0-9]+$`,
+	)
+	actionsJobPattern = regexp.MustCompile(
+		`^/` + regexp.QuoteMeta(GitHubRepository) + `/actions/runs/[0-9]+/job/[0-9]+$`,
 	)
 )
 
@@ -370,6 +568,16 @@ func ValidateEvidenceCheck(check EvidenceCheck) error {
 	}
 	if check.SourceCommit != "" && !fullCommitPattern.MatchString(check.SourceCommit) {
 		return fmt.Errorf("source commit requires a lowercase 40-hex commit")
+	}
+	if (check.SourceSHA256 == "") != (check.DiffSHA256 == "") {
+		return fmt.Errorf("stable local source and diff SHA-256 fingerprints must be recorded together")
+	}
+	if check.SourceSHA256 != "" &&
+		(!sha256Pattern.MatchString(check.SourceSHA256) || !sha256Pattern.MatchString(check.DiffSHA256)) {
+		return fmt.Errorf("stable local source and diff fingerprints require lowercase 64-hex SHA-256 values")
+	}
+	if check.SourceSHA256 != "" && check.Status != EvidenceLocalPassedUncommitted {
+		return fmt.Errorf("%s must not include stable uncommitted source fingerprints", check.Status)
 	}
 	switch check.Status {
 	case EvidenceCIPassed:
@@ -385,10 +593,21 @@ func ValidateEvidenceCheck(check EvidenceCheck) error {
 		if !fullCommitPattern.MatchString(check.Commit) {
 			return fmt.Errorf("ci-passed requires a lowercase 40-hex commit")
 		}
+		if check.JobURL != "" {
+			jobURL, err := url.Parse(check.JobURL)
+			if err != nil || jobURL.Scheme != "https" || jobURL.Host != "github.com" ||
+				!actionsJobPattern.MatchString(jobURL.Path) || jobURL.RawQuery != "" ||
+				jobURL.Fragment != "" || jobURL.User != nil {
+				return fmt.Errorf("ci-passed job URL must identify a %s GitHub Actions job", GitHubRepository)
+			}
+			if !strings.HasPrefix(jobURL.Path, runURL.Path+"/job/") {
+				return fmt.Errorf("ci-passed job URL must belong to its recorded run")
+			}
+		}
 	case EvidenceLocalPassed, EvidenceLocalPassedUncommitted, EvidenceConfiguredUnverified, EvidenceOptionalUnverified,
 		EvidenceNotApplicable, EvidenceAbsent:
-		if check.RunURL != "" || check.Commit != "" {
-			return fmt.Errorf("%s must not include CI run or commit fields", check.Status)
+		if check.RunURL != "" || check.JobURL != "" || check.Commit != "" {
+			return fmt.Errorf("%s must not include CI run, job, or commit fields", check.Status)
 		}
 		if check.SourceCommit != "" && check.Status != EvidenceLocalPassed {
 			return fmt.Errorf("%s must not include a local source commit", check.Status)

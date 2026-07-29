@@ -2,6 +2,7 @@ package cloudsql
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,10 +28,10 @@ func TestCloudSQLMetadataRehydratesWithoutContainerRecreation(t *testing.T) {
 	}
 	api.backend = backend
 	key := instanceKey("project", "sql")
-	api.instances[key] = &DatabaseInstance{
-		Name: "sql", Project: "project", State: "RUNNABLE", DatabaseVersion: "POSTGRES_15",
+	seedRunnableCloudSQL(api, key, &DatabaseInstance{
+		Name: "sql", Project: "project", State: "RUNNABLE", DatabaseVersion: "POSTGRES_18",
 		IpAddresses: []IpMapping{{Type: "PRIMARY", IpAddress: "127.0.0.1:5432"}},
-	}
+	})
 	for _, request := range []struct {
 		path string
 		body string
@@ -43,6 +44,10 @@ func TestCloudSQLMetadataRehydratesWithoutContainerRecreation(t *testing.T) {
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("POST %s = %d, body %s", request.path, recorder.Code, recorder.Body.String())
 		}
+	}
+	delete(api.runtimes, key)
+	if err := api.persistMetadata(); err != nil {
+		t.Fatal(err)
 	}
 
 	restarted, err := NewAPIWithStore(opMgr, nil, store)
@@ -63,6 +68,42 @@ func TestCloudSQLMetadataRehydratesWithoutContainerRecreation(t *testing.T) {
 	}
 	if got := restarted.users[key]; len(got) != 1 || got[0].Name != "app-user" {
 		t.Fatalf("restored users = %#v", got)
+	}
+}
+
+func TestCloudSQLPortableMetadataOmitsRuntimeTokensAndPasswords(t *testing.T) {
+	store, err := state.New(t.TempDir(), "secure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIWithStore(orchestrator.NewOperationManager(), nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := instanceKey("project", "sql")
+	seedRunnableCloudSQL(api, key, &DatabaseInstance{
+		Name: "sql", Project: "project", State: "RUNNABLE", DatabaseVersion: "POSTGRES_18",
+	})
+	api.users[key] = []*User{{
+		Name: "app", Project: "project", Instance: "sql", Password: "portable-secret",
+	}}
+	if err := api.persistMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot bytes.Buffer
+	if err := store.Export(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	payload := snapshot.String()
+	if strings.Contains(payload, "portable-secret") || strings.Contains(payload, "runtimeToken") {
+		t.Fatalf("portable Cloud SQL metadata contains secret provenance: %s", payload)
+	}
+	var exported state.Snapshot
+	if err := json.Unmarshal(snapshot.Bytes(), &exported); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported.Entries[cloudSQLStateEntry]), "ownershipFingerprint") {
+		t.Fatal("portable metadata lost non-secret ownership fingerprint")
 	}
 }
 

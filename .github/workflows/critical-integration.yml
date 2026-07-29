@@ -12,6 +12,10 @@ on:
       - "pkg/router/**"
       - "pkg/shims/**"
       - "pkg/state/**"
+      - "pkg/config/images.json"
+      - "scripts/storage-persistence-pubsub-session-integration.sh"
+      - "scripts/emulator_data_durability_contract_test.go"
+      - "scripts/cloudsql_restart_contract_test.go"
       - "scripts/state-durability-integration.sh"
       - "scripts/kind-integration.sh"
       - "scripts/terraform-integration.sh"
@@ -46,6 +50,10 @@ on:
       - "pkg/router/**"
       - "pkg/shims/**"
       - "pkg/state/**"
+      - "pkg/config/images.json"
+      - "scripts/storage-persistence-pubsub-session-integration.sh"
+      - "scripts/emulator_data_durability_contract_test.go"
+      - "scripts/cloudsql_restart_contract_test.go"
       - "scripts/state-durability-integration.sh"
       - "scripts/kind-integration.sh"
       - "scripts/terraform-integration.sh"
@@ -173,6 +181,28 @@ jobs:
         env:
           MINISKY_STATE_DURABILITY_INTEGRATION: "1"
         run: ./scripts/state-durability-integration.sh
+
+  cloudsql-restart-integration:
+    name: cloudsql-restart-integration
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded Cloud SQL restart integration
+        run: make test-cloudsql-restart-integration
 
   kind-lifecycle:
     name: Critical Kind lifecycle
@@ -484,6 +514,192 @@ jobs:
         with:
           name: critical-phase16-subnetwork-terraform-${{ github.run_id }}-${{ github.run_attempt }}
           path: critical-phase16-subnetwork-terraform.log
+          if-no-files-found: error
+          retention-days: 7
+
+  storage-persistence-pubsub-session:
+    name: Critical Storage persistence and PubSub session boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MINISKY_EMULATOR_BOUNDARY_PROFILE: emulator-boundary-${{ github.run_id }}-${{ github.run_attempt }}
+      MINISKY_STORAGE_TEST_IMAGE: fsouza/fake-gcs-server:latest@sha256:91afded49de804aa61b5f3eb6c7cd65205acf9e5c5e047cf0ba7d9507af806c8
+      MINISKY_PUBSUB_TEST_IMAGE: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators@sha256:f098583c0387cf0fe4c64068ed1e1cf0dbc73e04f0621642b9a7e1f8b26ca287
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI from lockfile
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run guarded Storage persistence and PubSub session gate
+        env:
+          MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR: ${{ runner.temp }}/storage-persistence-pubsub-session-diagnostics
+        run: |
+          set -o pipefail
+          mkdir -p "${MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR}"
+          make test-storage-persistence-pubsub-session 2>&1 | tee critical-storage-persistence-pubsub-session.log
+
+      - name: Capture Storage and PubSub boundary diagnostics
+        if: ${{ failure() || cancelled() }}
+        env:
+          MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR: ${{ runner.temp }}/storage-persistence-pubsub-session-diagnostics
+        run: |
+          mkdir -p "${MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR}"
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            printf 'profile=%s\n' "${MINISKY_EMULATOR_BOUNDARY_PROFILE}"
+            docker version 2>&1 || true
+            docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>&1 || true
+            docker network ls 2>&1 || true
+            docker volume ls 2>&1 || true
+          } >"${MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR}/ci-docker-inventory.txt"
+          for diagnostic_profile in "${MINISKY_EMULATOR_BOUNDARY_PROFILE}" "${MINISKY_EMULATOR_BOUNDARY_PROFILE}-isolated"; do
+            while IFS= read -r container; do
+              test -n "${container}" || continue
+              docker inspect "${container}" \
+                >"${MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR}/ci-container-${container}-inspect.json" 2>&1 || true
+              docker logs "${container}" \
+                >"${MINISKY_EMULATOR_BOUNDARY_DIAGNOSTICS_DIR}/ci-container-${container}.log" 2>&1 || true
+            done < <(docker ps -aq \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${diagnostic_profile}" 2>/dev/null || true)
+          done
+
+      - name: Clean exact-owned Storage and PubSub boundary resources
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -Eeuo pipefail
+          cleanup_exact_profile() {
+            local cleanup_profile="${1:?profile is required}"
+            local inventory
+            local resource
+            local manager
+            local actual_profile
+            local failed=0
+
+            if inventory="$(docker ps -aq \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              while IFS= read -r resource; do
+                test -n "${resource}" || continue
+                if ! manager="$(docker inspect --format '{{ index .Config.Labels "managed-by" }}' "${resource}")" ||
+                  ! actual_profile="$(docker inspect --format '{{ index .Config.Labels "minisky.profile" }}' "${resource}")" ||
+                  ! test "${manager}" = "minisky" ||
+                  ! test "${actual_profile}" = "${cleanup_profile}" ||
+                  ! docker rm -f -v "${resource}"; then
+                  failed=1
+                fi
+              done <<<"${inventory}"
+            else
+              echo "Unable to inventory exact-owned containers for profile ${cleanup_profile}." >&2
+              failed=1
+            fi
+
+            if inventory="$(docker network ls -q \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              while IFS= read -r resource; do
+                test -n "${resource}" || continue
+                if ! manager="$(docker network inspect --format '{{ index .Labels "managed-by" }}' "${resource}")" ||
+                  ! actual_profile="$(docker network inspect --format '{{ index .Labels "minisky.profile" }}' "${resource}")" ||
+                  ! test "${manager}" = "minisky" ||
+                  ! test "${actual_profile}" = "${cleanup_profile}" ||
+                  ! docker network rm "${resource}"; then
+                  failed=1
+                fi
+              done <<<"${inventory}"
+            else
+              echo "Unable to inventory exact-owned networks for profile ${cleanup_profile}." >&2
+              failed=1
+            fi
+
+            if inventory="$(docker volume ls -q \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              while IFS= read -r resource; do
+                test -n "${resource}" || continue
+                if ! manager="$(docker volume inspect --format '{{ index .Labels "managed-by" }}' "${resource}")" ||
+                  ! actual_profile="$(docker volume inspect --format '{{ index .Labels "minisky.profile" }}' "${resource}")" ||
+                  ! test "${manager}" = "minisky" ||
+                  ! test "${actual_profile}" = "${cleanup_profile}" ||
+                  ! docker volume rm "${resource}"; then
+                  failed=1
+                fi
+              done <<<"${inventory}"
+            else
+              echo "Unable to inventory exact-owned volumes for profile ${cleanup_profile}." >&2
+              failed=1
+            fi
+
+            if ! inventory="$(docker ps -aq \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              echo "Unable to verify exact-owned container cleanup for profile ${cleanup_profile}." >&2
+              failed=1
+            elif test -n "${inventory}"; then
+              echo "Exact-owned containers remain after cleanup for profile ${cleanup_profile}: ${inventory}" >&2
+              failed=1
+            fi
+            if ! inventory="$(docker network ls -q \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              echo "Unable to verify exact-owned network cleanup for profile ${cleanup_profile}." >&2
+              failed=1
+            elif test -n "${inventory}"; then
+              echo "Exact-owned networks remain after cleanup for profile ${cleanup_profile}: ${inventory}" >&2
+              failed=1
+            fi
+            if ! inventory="$(docker volume ls -q \
+              --filter "label=managed-by=minisky" \
+              --filter "label=minisky.profile=${cleanup_profile}")"; then
+              echo "Unable to verify exact-owned volume cleanup for profile ${cleanup_profile}." >&2
+              failed=1
+            elif test -n "${inventory}"; then
+              echo "Exact-owned volumes remain after cleanup for profile ${cleanup_profile}: ${inventory}" >&2
+              failed=1
+            fi
+
+            return "${failed}"
+          }
+          {
+            cleanup_failed=0
+            for cleanup_profile in "${MINISKY_EMULATOR_BOUNDARY_PROFILE}" "${MINISKY_EMULATOR_BOUNDARY_PROFILE}-isolated"; do
+              if ! cleanup_exact_profile "${cleanup_profile}"; then
+                cleanup_failed=1
+              fi
+            done
+            test "${cleanup_failed}" -eq 0
+          } 2>&1 | tee critical-storage-persistence-pubsub-session-cleanup.log
+
+      - name: Retain Storage and PubSub boundary diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-storage-persistence-pubsub-session-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            critical-storage-persistence-pubsub-session.log
+            critical-storage-persistence-pubsub-session-cleanup.log
+            ${{ runner.temp }}/storage-persistence-pubsub-session-diagnostics
           if-no-files-found: error
           retention-days: 7
 

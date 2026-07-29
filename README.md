@@ -38,12 +38,28 @@ slice rather than a broad GCP/Memcached parity claim.
   experimental and default-off. See [Service Compatibility](docs/service-compatibility.md).
 <!-- END GENERATED REGISTRY COUNT -->
 <!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
-**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed` at immutable source commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9` with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`.
 
 Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
 
-CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+CI is `ci-passed` in [GitHub Actions run 30416460134](https://github.com/rudydesplan/minisky/actions/runs/30416460134) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974)) on commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9`. This evidence does not claim broad GCP parity or promote service fidelity.
 <!-- END GENERATED MEMCACHED SERVICE GATE -->
+<!-- BEGIN GENERATED STORAGE PUBSUB BOUNDARY -->
+**Generated Storage/Pub/Sub boundary truth:** The `local-passed-uncommitted` working-tree gate runs `make test-storage-persistence-pubsub-session`, `scripts/storage-persistence-pubsub-session-integration.sh`, and `TestStoragePersistenceAndPubSubSessionBoundaries`. Stable snapshot source SHA-256: `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`; diff SHA-256: `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`. CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `storage-persistence-pubsub-session`; this uncommitted gate has no external run URL or commit.
+
+The exact pinned public Pub/Sub image is acquired against the active daemon with an isolated anonymous Docker configuration, then checked for immutable digest syntax, `linux/amd64` platform execution, and advertised `--data-dir` capability. Storage uses a profile-scoped runtime bind mount. Buckets and objects survive exact-owned Storage emulator-container replacement. Pub/Sub resources and messages last only for one official emulator session: MiniSky process crash/restart continuity is supported only while the same exact-owned Pub/Sub container remains alive. Replacing the Pub/Sub backend/container loses topics, subscriptions, and queued messages. Graceful MiniSky shutdown tears down managed Docker resources and is not a Pub/Sub continuity path.
+
+Storage and Pub/Sub runtime data remain outside metadata export/import. This gate does not claim exactly-once delivery, portable data export, IAM, HA, security, or full GCP parity. Its Docker cleanup evidence assumes cooperative, exclusive use of the managed resource names. Docker volume deletion accepts only a mutable name, not a conditional immutable identity: MiniSky revalidates exact ownership and identity immediately before deletion and fails closed, but a foreign replacement in the final inspect-to-delete interval cannot be excluded atomically. This is a bounded cleanup invariant, not a hostile-daemon security boundary. Public registry/network access remains required; the global unowned image cache may retain an authorized pull; Pub/Sub remains amd64/emulation/session-only. Five unrelated local volumes and a pre-existing lock observed during certification are not product evidence.
+<!-- END GENERATED STORAGE PUBSUB BOUNDARY -->
+<!-- BEGIN GENERATED STABLE SNAPSHOT CERTIFICATION -->
+**Generated stable-snapshot certification:** The uncommitted working tree is identified by source SHA-256 `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25` and diff SHA-256 `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`; historical HEAD and PR #22 remain separate evidence.
+
+- Cloud SQL restart recovery is `local-passed-uncommitted`: live `POSTGRES_16` row survival passed through same-container restart and volume-only recovery, followed by exact cleanup; the bounded Terraform apply/no-drift/destroy lifecycle also passed. CI is `configured-unverified` with no external URL or commit.
+- Storage/Pub/Sub is `local-passed-uncommitted`: anonymous acquisition and immutable digest/platform/capability checks passed before Storage replacement persistence, Pub/Sub session-loss boundaries, and exact cleanup. CI is `configured-unverified` with no external URL or commit.
+- Native `windows-state-markers` is `configured-unverified`. Local cross-compilation and workflow contracts passed, and the authoritative `quality` aggregate requires the job, but no native Windows test pass is claimed.
+
+Delivery still requires commit, push, and external CI for these working-tree gates. PR #22 URLs apply only to their exact historical commit.
+<!-- END GENERATED STABLE SNAPSHOT CERTIFICATION -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
   and operational views. Dashboard exposure is not service-fidelity or
   Terraform-compatibility evidence.
@@ -60,8 +76,17 @@ CI is `configured-unverified` in `.github/workflows/critical-integration.yml` jo
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 0/6; configured but unverified: 6/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 12/12; configured but unverified: 0/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
+<!-- BEGIN GENERATED PR22 PROMOTION EVIDENCE -->
+**Generated PR #22 promotion truth:** Exact source revision `8e16d147b0127bd3120eae106aa0da1fb59a52c9` passed [general CI run 30416460163](https://github.com/rudydesplan/minisky/actions/runs/30416460163) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460163/job/90463937205)), [critical reliability run 30416460134](https://github.com/rudydesplan/minisky/actions/runs/30416460134) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90464017548)), and [the bounded promotion run 30416460053](https://github.com/rudydesplan/minisky/actions/runs/30416460053). The Memcached lifecycle passed in the critical run ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974)).
+
+All 12 Terraform jobs passed: [alloydb job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961998), [binary-authorization job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962058), [composer job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962071), [document-ai job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962053), [eventarc job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962021), [filestore job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961994), [identity-platform job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962019), [managed-kafka job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961989), [org-policy job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962085), [service-directory job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962025), [storage-transfer job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962027), [workflows job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962052).
+
+All seven SDK/backend jobs passed: [phase18-25 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961861), [phase19 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961867), [phase19 backend job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961865), [phase20 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961883), [phase21-22 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961884), [phase23 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961893), [phase24-25 SDK job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464961869).
+
+These immutable records apply only to that source revision. The current working-tree promotion workflow does not retain a duplicate full-quality job: authoritative quality checks remain in the separate general CI workflow, while `promotion-assets` builds and shares `ui/dist` for the integration jobs. PR #22's URLs do not verify those current workflow changes. The uncommitted Storage/Pub/Sub boundary gate is not attributed to these historical runs.
+<!-- END GENERATED PR22 PROMOTION EVIDENCE -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
 `501 UNIMPLEMENTED` with the opt-in and evidence status. To inspect the existing
@@ -82,8 +107,9 @@ restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 The complete Go race suite, documentation truth checks, and package/strict-IAM
 evidence pass in the current working tree. All six Phase 18–25
 generated-client workflows passed create, restart, terminal observation,
-delete, and cleanup locally. These are `local-passed-uncommitted` claims until
-the branch has immutable external evidence.
+delete, and cleanup locally. The generated PR #22 section above records the
+matching immutable external evidence for all required promotion legs without
+promoting any experimental service.
 The guarded `make test-phase18-event-delivery` gate additionally publishes two
 exact raw `PublishRequest` payloads with unique nonces through the canonical
 public Pub/Sub gateway and observes matching Eventarc-triggered Workflow
@@ -113,16 +139,8 @@ boundaries; GCP-shaped errors; project isolation; sensitive-data absence; and
 control-plane/network cleanup. Phase 24–25 passed security/network resource
 lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
 GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
-restart truth, and cleanup. Historical predecessor CI passed all six
-generated-client jobs on commit
-`62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its Linux
-ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. On commit
-`d657e4b0b77a34ddb615124db2d82da810238502`,
-[run 30287887431](https://github.com/rudydesplan/minisky/actions/runs/30287887431)
-passed the Phase 19 Kafka/Airflow backend gate, corrected GoReleaser validation,
-Linux AMD64 release snapshot, both native Linux package jobs, and the native
-Linux ARM64, macOS ARM64, and Windows AMD64 CGO jobs. Two bounded Phase 18
-provider gates now cover default-off `google_workflows_workflow` and
+restart truth, and cleanup. Two bounded Phase 18 provider gates cover
+default-off `google_workflows_workflow` and
 `google_eventarc_trigger` control-plane lifecycles. Both pass apply, restart,
 no-drift, destroy, and durable `404` cleanup; Eventarc additionally passes
 canonical import, while provider 7.41.0 does not support Workflows import. The
@@ -180,17 +198,19 @@ global-policy, and cluster-rule evaluation each returns explicit `UNSUPPORTED`.
 This is Terraform compatibility evidence and local emulation, not fidelity
 promotion, GKE admission, or production admission security. Binary
 Authorization remains experimental and default-off. This Phase 25 Terraform
-gate has local-pass evidence only; no CI run or commit is claimed. A required
-path-aware, weekly, and manually runnable promotion workflow now owns every
-machine-readable Phase 18–25 gate exactly once: 12 Terraform legs and seven
-SDK/backend gates. It replaces 20 manual shadows from the general CI workflow
-while retaining the quality, SDK compilation, offline evidence, Terraform
-validation, cleanup, timeout, and diagnostics contracts. Composer, Managed
-Kafka, and AlloyDB matrix entries derive, pull, and inspect exact
+gate has immutable PR #22 CI evidence recorded by the generated promotion
+section. At that exact historical revision, the bounded promotion run passed
+all 12 Terraform legs and seven SDK/backend gates. The current working-tree
+promotion workflow continues to own those integration legs but does not retain
+a duplicate full-quality job: authoritative quality checks remain in the
+separate general CI workflow, while `promotion-assets` builds and shares
+`ui/dist` for the integration jobs. PR #22's URLs do not verify those current
+workflow changes. SDK compilation, offline evidence, Terraform validation,
+cleanup, timeout, and diagnostics remain explicit promotion prerequisites.
+Composer,
+Managed Kafka, and AlloyDB matrix entries derive, pull, and inspect exact
 tag-plus-SHA256 image references from their guarded scripts before execution;
-entries without backend images remain lightweight. The new promotion workflow
-has not run externally, so its CI checks remain `configured-unverified`; no run
-URL or commit is recorded for it.
+entries without backend images remain lightweight.
 Unsupported methods return canonical 501
 responses rather than simulated success; Cloud CDN/Armor remains within the
 Compute domain and does not claim full GCP data-plane parity.
@@ -359,9 +379,19 @@ On macOS, keep the exact-line filter and replace
 - Artifact Registry persists repositories and bounded terminal operation
   outcomes. Package/version views come from Registry v2; blobs and manifests
   are not part of metadata export/import.
-- Cloud SQL persists instance, database, and user metadata. Restored instances
-  are metadata-only with stale endpoints removed. The guarded provider gate
-  covers one PostgreSQL lifecycle, not SQL data durability or broad API parity.
+- Cloud SQL persists instance, database, user, and non-secret runtime metadata.
+  Database files use an exact-owned named volume. Complete immutable local
+  provenance permits same-container restart and volume-only replacement around
+  that same proven volume; stale endpoints are cleared, and a loopback endpoint
+  is exposed only after protocol and authenticated readiness. Passwords, the
+  local provenance marker, Docker volume, and database contents remain outside
+  metadata export/import. The guarded PostgreSQL 16 recovery and bounded
+  Terraform lifecycle are `local-passed-uncommitted` at the exact source/diff
+  fingerprints in the generated certification above. CI remains
+  `configured-unverified`; no external run or commit is claimed for the
+  working tree. Cleanup assumes cooperative use of managed Docker names and has
+  the non-atomic volume-deletion boundary documented in
+  [`docs/state-model.md`](docs/state-model.md).
 - Compute covers bounded instance CRUD, one custom IPv4
   network/subnetwork/owned bridge, and a classic global HTTP load balancer with
   one unmanaged zonal group and default-service routing. Managed/regional
@@ -786,35 +816,26 @@ bounded slice is not production federation or a production-ready Phase 17.
 
 ### Current completion priorities
 
-As of 2026-07-28, PR
-[#21](https://github.com/rudydesplan/minisky/pull/21) has historical evidence at
-source commit `7035b25b056e03334656029af1e5c1259ab91765`: its prior 12-entry
-Terraform matrix passed in [CI run
-30384072102](https://github.com/rudydesplan/minisky/actions/runs/30384072102),
-and [critical run
-30384072295](https://github.com/rudydesplan/minisky/actions/runs/30384072295)
-passed. Those runs belong to that commit and the prior workflow layout; they do
-not verify this new uncommitted branch or the new promotion workflow.
-
-After merge, [main CI run
-30387050664](https://github.com/rudydesplan/minisky/actions/runs/30387050664)
-failed its Go race suite at merge commit
-`f0712219f62dc711244af9db904da20362437a49` because a restarted Cloud Deploy
-operation did not retain its terminal permission-denial result. That failure
-motivated the shared durability fix above, but no external run has yet proved
-the fix. Current status is therefore `local-passed-uncommitted` for the
-reliability work and `configured-unverified` for the new promotion workflow.
+As of 2026-07-29, the generated PR #22 promotion section records one exact
+source revision with general CI, critical reliability, Memcached, all 12
+Terraform legs, and all seven SDK/backend jobs green. Those immutable URLs do
+not verify subsequent uncommitted work.
 
 The next evidence milestones are:
 
 The bounded Memcached lifecycle is no longer a deferred implementation
-priority. Its machine-readable service gate above owns the local and CI evidence
-wording and does not change the unresolved Phase 18–25 matrix requirement below.
+priority. Its machine-readable service gate above owns the local and CI
+evidence wording.
 
-1. obtain one exact-head external run of the new promotion workflow in which
-   all 12 required Terraform legs and seven SDK/backend gates pass, then record
-   its immutable run URL and full commit without promoting any domain beyond
-   its bounded claim;
+The repaired Cloud SQL named-volume restart gate and Storage/Pub/Sub boundary
+gate have stable-snapshot `local-passed-uncommitted` evidence. They now require
+commit, push, and exact-head external CI before their
+`configured-unverified` CI statuses can change. Native Windows state-marker
+execution remains separately `configured-unverified`.
+
+1. commit the bounded Storage/Pub/Sub session-boundary gate and obtain its own
+   exact-head critical CI pass; the existing PR #22 runs must not be attributed
+   to that uncommitted gate;
 2. keep the 12 existing Phase 18–25 Terraform claims domain-scoped, and add any
    further claim only with provider apply, restart, import where supported,
    no-drift, destroy, and cleanup evidence;

@@ -46,6 +46,9 @@ func (dir *pinnedDirectory) openFile(name string, flags int, perm os.FileMode) (
 func (dir *pinnedDirectory) openRegularFileForRead(string) (*os.File, error) {
 	return nil, ErrSafeOwnershipUnsupported
 }
+func (dir *pinnedDirectory) openRegularFileForRemoval(string) (*os.File, error) {
+	return nil, ErrSafeOwnershipUnsupported
+}
 func (dir *pinnedDirectory) openDirectory(name string, create bool) (*pinnedDirectory, error) {
 	return nil, ErrSafeOwnershipUnsupported
 }
@@ -93,5 +96,8 @@ func (dir *pinnedDirectory) remove(name string) error {
 		return nil
 	}
 	return err
+}
+func (dir *pinnedDirectory) removeOpenFile(_ *os.File, name string) error {
+	return dir.remove(name)
 }
 func (dir *pinnedDirectory) sync() error { return syncDirectory(dir.path) }

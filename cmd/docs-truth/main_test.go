@@ -135,9 +135,9 @@ func TestRenderPhaseSummaryDoesNotPromotePackageTests(t *testing.T) {
 		"configured but unverified: 0/6",
 		"Restart gates passed locally: 6/6",
 		"cleanup gates passed locally: 6/6",
-		"CI gates passed: 0/6; configured but unverified: 6/6",
-		"Heavy backend CI gates passed: 0/1; configured but unverified: 1/1",
-		"Terraform CI gates passed: 0/12; configured but unverified: 12/12",
+		"CI gates passed: 6/6; configured but unverified: 0/6",
+		"Heavy backend CI gates passed: 1/1; configured but unverified: 0/1",
+		"Terraform CI gates passed: 12/12; configured but unverified: 0/12",
 		"Admission replay gates passed locally: 1/1",
 		"Package and IAM passes do not promote compatibility",
 	} {
@@ -389,6 +389,7 @@ func futureMemcacheServiceGate() evidence.ServiceGate {
 		Workflow: ".github/workflows/critical-integration.yml",
 		Job:      "memcache-integration",
 		RunURL:   "https://github.com/rudydesplan/minisky/actions/runs/123456",
+		JobURL:   "https://github.com/rudydesplan/minisky/actions/runs/123456/job/654321",
 		Commit:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		Note:     "future immutable pass",
 	}
@@ -489,7 +490,7 @@ func TestSelectMemcacheServiceGateValidatesInventory(t *testing.T) {
 				malformed.CI.Commit = "0123456789abcdef0123456789abcdef01234567"
 				return malformed
 			}()},
-			wantError: "must not include CI run or commit fields",
+			wantError: "must not include CI run, job, or commit fields",
 		},
 		{
 			name:     "CI pass without immutable provenance",
@@ -541,17 +542,17 @@ func TestCurrentMemcacheServiceGateHasRequiredEvidenceState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gate.Status != evidence.EvidenceLocalPassedUncommitted {
-		t.Fatalf("local status=%q want local-passed-uncommitted", gate.Status)
+	if gate.Status != evidence.EvidenceLocalPassed {
+		t.Fatalf("local status=%q want local-passed", gate.Status)
 	}
-	if gate.SourceCommit != "" {
-		t.Fatalf("uncommitted local evidence contains source commit %q", gate.SourceCommit)
+	if gate.SourceCommit != "8e16d147b0127bd3120eae106aa0da1fb59a52c9" {
+		t.Fatalf("local evidence source commit=%q", gate.SourceCommit)
 	}
-	if gate.CI.Status != evidence.EvidenceConfiguredUnverified {
-		t.Fatalf("CI status=%q want configured-unverified", gate.CI.Status)
+	if gate.CI.Status != evidence.EvidenceCIPassed {
+		t.Fatalf("CI status=%q want ci-passed", gate.CI.Status)
 	}
-	if gate.CI.RunURL != "" || gate.CI.Commit != "" {
-		t.Fatalf("configured CI contains pass provenance: run=%q commit=%q", gate.CI.RunURL, gate.CI.Commit)
+	if gate.CI.RunURL == "" || gate.CI.JobURL == "" || gate.CI.Commit != gate.SourceCommit {
+		t.Fatalf("CI lacks exact pass provenance: %+v", gate.CI)
 	}
 }
 
@@ -594,6 +595,7 @@ func TestRenderMemcacheServiceGateFutureCIPassUsesProvenance(t *testing.T) {
 	for _, want := range []string{
 		"CI is `ci-passed`",
 		"[GitHub Actions run 123456](" + gate.CI.RunURL + ")",
+		"([job](" + gate.CI.JobURL + "))",
 		"`" + gate.CI.Commit + "`",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -620,7 +622,7 @@ func TestMemcacheEvidenceTransitionsRenderAcrossDocumentsWithoutChangingPhaseAgg
 	}
 	const (
 		markers        = memcacheSummaryStart + "\nstale\n" + memcacheSummaryEnd
-		phaseAggregate = "Terraform CI gates passed: 0/12; configured but unverified: 12/12."
+		phaseAggregate = "Terraform CI gates passed: 12/12; configured but unverified: 0/12."
 	)
 	for _, transition := range []struct {
 		name   string
@@ -629,16 +631,14 @@ func TestMemcacheEvidenceTransitionsRenderAcrossDocumentsWithoutChangingPhaseAgg
 		forbid []string
 	}{
 		{
-			name: "current uncommitted local pass",
+			name: "current immutable CI pass",
 			gate: currentGate,
 			wants: []string{
-				"`local-passed-uncommitted`",
-				"in the current working tree",
-				"non-promotable",
-				"no immutable source revision evidence",
-				"CI is `configured-unverified`",
+				"`local-passed`",
+				"at immutable source commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9`",
+				"CI is `ci-passed`",
 			},
-			forbid: []string{"at immutable source commit", "CI is `ci-passed`"},
+			forbid: []string{"`local-passed-uncommitted`", "non-promotable", "`configured-unverified`"},
 		},
 		{
 			name: "future immutable local pass",
@@ -792,6 +792,318 @@ func TestMemcacheDocumentationClaimsStayConsistent(t *testing.T) {
 	}
 }
 
+func TestStoragePubSubBoundaryRenderingAndClaimsStayBounded(t *testing.T) {
+	gates, err := evidence.EmulatorBoundaryGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := selectStoragePubSubBoundaryGate(gates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := renderStoragePubSubBoundary(gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"`local-passed-uncommitted`",
+		"`make test-storage-persistence-pubsub-session`",
+		"`scripts/storage-persistence-pubsub-session-integration.sh`",
+		"`TestStoragePersistenceAndPubSubSessionBoundaries`",
+		"source SHA-256: `" + gate.SourceSHA256 + "`",
+		"diff SHA-256: `" + gate.DiffSHA256 + "`",
+		"isolated anonymous Docker configuration",
+		"immutable digest syntax",
+		"`linux/amd64` platform execution",
+		"advertised `--data-dir` capability",
+		"Storage uses a profile-scoped runtime bind mount",
+		"survive exact-owned Storage emulator-container replacement",
+		"same exact-owned Pub/Sub container remains alive",
+		"Replacing the Pub/Sub backend/container loses topics, subscriptions, and queued messages",
+		"Graceful MiniSky shutdown tears down managed Docker resources",
+		"outside metadata export/import",
+		"does not claim exactly-once delivery, portable data export, IAM, HA, security, or full GCP parity",
+		"assumes cooperative, exclusive use of the managed resource names",
+		"Docker volume deletion accepts only a mutable name",
+		"revalidates exact ownership and identity immediately before deletion and fails closed",
+		"final inspect-to-delete interval cannot be excluded atomically",
+		"not a hostile-daemon security boundary",
+		"global unowned image cache may retain an authorized pull",
+		"amd64/emulation/session-only",
+		"Five unrelated local volumes and a pre-existing lock",
+		"CI is `configured-unverified`",
+		"no external run URL or commit",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("Storage/PubSub rendering is missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, forbidden := range []string{
+		"Pub/Sub survives backend replacement",
+		"Pub/Sub survives container replacement",
+		"Storage is unmounted",
+	} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("Storage/PubSub rendering contains false claim %q", forbidden)
+		}
+	}
+
+	root := filepath.Clean(filepath.Join("..", ".."))
+	read := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	service := read("docs/service-compatibility.md")
+	state := read("docs/state-model.md")
+	if err := validateStoragePubSubClaims(service, state); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		service string
+		state   string
+	}{
+		{
+			name:    "rejects PubSub container replacement survival",
+			service: service + "\nPub/Sub survives container replacement.",
+			state:   state,
+		},
+		{
+			name:    "rejects unmounted Storage",
+			service: service,
+			state:   state + "\nStorage is unmounted.",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateStoragePubSubClaims(test.service, test.state); err == nil {
+				t.Fatal("false emulator persistence claim was accepted")
+			}
+		})
+	}
+}
+
+func TestPR22PromotionRenderingUsesExactRunAndJobProvenance(t *testing.T) {
+	revision, err := evidence.CurrentPromotionRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gates, err := evidence.BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	services, _, err := truth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceGates, err := evidence.ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	memcache, err := selectMemcacheServiceGate(services, serviceGates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := renderPromotionSummary(revision, gates, memcache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		revision.Commit,
+		"[general CI run 30416460163](" + revision.GeneralCI.RunURL + ")",
+		"([job](" + revision.GeneralCI.JobURL + "))",
+		"[critical reliability run 30416460134](" + revision.CriticalReliability.RunURL + ")",
+		"([job](" + memcache.CI.JobURL + "))",
+		"[the bounded promotion run 30416460053]",
+		"All 12 Terraform jobs passed",
+		"[binary-authorization job]",
+		"All seven SDK/backend jobs passed",
+		"[phase19 backend job]",
+		"current working-tree promotion workflow does not retain a duplicate full-quality job",
+		"authoritative quality checks remain in the separate general CI workflow",
+		"`promotion-assets` builds and shares `ui/dist`",
+		"PR #22's URLs do not verify those current workflow changes",
+		"uncommitted Storage/Pub/Sub boundary gate is not attributed",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("promotion rendering is missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestCloudSQLDocumentationClaimsStayCurrentAndBounded(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	readme := read("README.md")
+	service := read("docs/service-compatibility.md")
+	state := read("docs/state-model.md")
+	terraform := read("docs/terraform-compatibility.md")
+	services, _, err := truth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gates, err := evidence.ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := selectCloudSQLServiceGate(services, gates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCloudSQLClaims(readme, service, state, terraform, gate); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		readme    string
+		service   string
+		state     string
+		terraform string
+	}{
+		{
+			name:      "rejects container-only state",
+			readme:    readme,
+			service:   service,
+			state:     state + "\nCloud SQL database files live only in containers.",
+			terraform: terraform,
+		},
+		{
+			name:      "rejects future named-volume wording",
+			readme:    readme,
+			service:   service,
+			state:     state + "\nAdd profile-scoped named volumes for database data.",
+			terraform: terraform,
+		},
+		{
+			name:      "rejects pending status after stable pass",
+			readme:    readme + "\nCloud SQL restart recovery is pending.",
+			service:   service,
+			state:     state,
+			terraform: terraform,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateCloudSQLClaims(
+				test.readme,
+				test.service,
+				test.state,
+				test.terraform,
+				gate,
+			); err == nil {
+				t.Fatal("stale Cloud SQL documentation was accepted")
+			}
+		})
+	}
+}
+
+func TestStableCertificationRenderingPreventsStatusConflation(t *testing.T) {
+	services, _, err := truth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceGates, err := evidence.ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloudSQL, err := selectCloudSQLServiceGate(services, serviceGates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emulatorGates, err := evidence.EmulatorBoundaryGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storagePubSub, err := selectStoragePubSubBoundaryGate(emulatorGates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualityGates, err := evidence.QualityGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows, err := selectWindowsStateMarkerGate(qualityGates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := renderStableSnapshotCertification(cloudSQL, storagePubSub, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"source SHA-256 `" + cloudSQL.SourceSHA256 + "`",
+		"diff SHA-256 `" + cloudSQL.DiffSHA256 + "`",
+		"Cloud SQL restart recovery is `local-passed-uncommitted`",
+		"Storage/Pub/Sub is `local-passed-uncommitted`",
+		"Native `windows-state-markers` is `configured-unverified`",
+		"authoritative `quality` aggregate requires the job",
+		"no native Windows test pass is claimed",
+		"PR #22 URLs apply only to their exact historical commit",
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Errorf("stable certification rendering is missing %q:\n%s", required, rendered)
+		}
+	}
+	for _, forbidden := range []string{
+		"Native Windows tests passed",
+		"windows-state-markers` is `local-passed",
+		"Cloud SQL restart recovery is pending",
+	} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("stable certification rendering conflates status with %q", forbidden)
+		}
+	}
+	if err := validateStableCertificationClaims(
+		[]string{rendered},
+		cloudSQL,
+		storagePubSub,
+		windows,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStableCertificationClaims(
+		[]string{rendered + "\nNative Windows tests passed."},
+		cloudSQL,
+		storagePubSub,
+		windows,
+	); err == nil {
+		t.Fatal("native Windows execution conflation was accepted")
+	}
+}
+
+func TestPromotionWorkflowDocsSeparateHistoricalAndCurrentTruth(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	documents := []string{
+		read("README.md"),
+		read("docs/service-compatibility.md"),
+		read("docs/terraform-compatibility.md"),
+	}
+	if err := validatePromotionWorkflowClaims(documents...); err != nil {
+		t.Fatal(err)
+	}
+	documents[0] += "\nThe promotion workflow owns every gate while retaining the quality contracts."
+	if err := validatePromotionWorkflowClaims(documents...); err == nil {
+		t.Fatal("historical/current promotion provenance conflation was accepted")
+	}
+}
+
 func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	read := func(path string) string {
@@ -839,6 +1151,9 @@ func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
 		"no durable audit record or log is created",
 		"returns explicit `UNSUPPORTED`",
 		"not service fidelity promotion, GKE admission, or production admission security",
+		"Binary Authorization Terraform leg is `ci-passed`",
+		"[binary-authorization job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962058)",
+		"exact source revision `8e16d147b0127bd3120eae106aa0da1fb59a52c9`",
 	} {
 		if !strings.Contains(terraformDocs, want) {
 			t.Errorf("Terraform documentation does not contain %q", want)
@@ -847,9 +1162,9 @@ func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
 
 	serviceDocs := strings.Join(strings.Fields(read("docs/service-compatibility.md")), " ")
 	for _, want := range []string{
-		"Binary Authorization Terraform claim is an independent Phase 24–25 `local-passed` check",
-		"no recorded CI run URL or commit",
-		"does not inherit the generated-client batch CI status",
+		"Binary Authorization Terraform claim remains an independent Phase 24–25 bounded check",
+		"binary-authorization job",
+		"recorded promotion pass does not promote the service",
 		"experimental/default-off support",
 		"pre-restart allow/deny observation",
 		"restart persistence/no-drift",
@@ -886,11 +1201,62 @@ func TestBinaryAuthorizationTerraformDocsStayBounded(t *testing.T) {
 			"records only the local advisory outcome",
 			"allow/deny observations survive restart",
 			"dry-run audit permits deployment and records",
+			"The gate is recorded as `local-passed` only",
+			"there is no claimed CI run URL or commit",
 		} {
 			if strings.Contains(document, stale) {
 				t.Errorf("%s retains misleading wording %q", name, stale)
 			}
 		}
+	}
+}
+
+func TestTerraformPromotionClaimsFollowMachineEvidence(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	data, err := os.ReadFile(filepath.Join(root, "docs", "terraform-compatibility.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gates, err := evidence.BatchGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(data)
+	if err := validateTerraformPromotionClaims(document, gates); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name     string
+		mutation func(string) string
+	}{
+		{
+			name: "rejects local-only contradiction",
+			mutation: func(value string) string {
+				return strings.Replace(
+					value,
+					"The Binary Authorization Terraform leg is\n`ci-passed`",
+					"The gate is recorded as `local-passed` only",
+					1,
+				)
+			},
+		},
+		{
+			name: "rejects mismatched job provenance",
+			mutation: func(value string) string {
+				return strings.Replace(
+					value,
+					"/job/90464962058",
+					"/job/1",
+					1,
+				)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateTerraformPromotionClaims(test.mutation(document), gates); err == nil {
+				t.Fatal("contradictory Terraform promotion documentation was accepted")
+			}
+		})
 	}
 }
 

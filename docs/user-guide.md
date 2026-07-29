@@ -145,9 +145,16 @@ doc_ref.set({"name": "Alice", "active": True})
 MiniSky supports a bounded MySQL/PostgreSQL instance lifecycle plus persisted
 instance, database, and user control-plane metadata. The guarded Terraform gate
 proves create/read/no-drift/destroy for one PostgreSQL instance, database, and
-user. Restored instances are `SUSPENDED`/`METADATA_ONLY` with stale endpoints
-removed until explicitly reconciled; container database files are not included
-in state export.
+user. A complete local runtime record can reconcile the same exact-owned
+container or recreate a missing container around its exact-owned named volume;
+stale endpoints are removed until protocol and authenticated readiness pass.
+The local provenance marker, Docker volume, database files, and credentials are
+not included in state export/import. Legacy or imported metadata without that
+local provenance remains `SUSPENDED`/`METADATA_ONLY` and cannot authorize
+backend recovery. The PostgreSQL 16 named-volume restart gate is
+`local-passed-uncommitted` at the stable source/diff fingerprints recorded in
+the generated README certification; native CI remains configured but
+unverified, with no external run or commit.
 - **Access**: While the owned backend is running, use the loopback port shown in
   the **Database Topology** dashboard.
 

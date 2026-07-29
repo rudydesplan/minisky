@@ -5,10 +5,155 @@ package state
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestWindowsPinnedLocalMarkerLifecycle(t *testing.T) {
+	store, err := New(t.TempDir(), "markers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		namespace = ".cloudsql-local-runtime"
+		name      = "generation"
+	)
+	first := []byte("first-generation\n")
+	second := []byte("second-generation\n")
+
+	if err := store.WriteLocalMarker(namespace, name, first); err != nil {
+		t.Fatalf("WriteLocalMarker: %v", err)
+	}
+	payload, found, err := store.ReadLocalMarker(namespace, name)
+	if err != nil || !found || !bytes.Equal(payload, first) {
+		t.Fatalf("ReadLocalMarker found=%t payload=%q err=%v", found, payload, err)
+	}
+	if err := store.RemoveLocalMarker(namespace, name, second); !errors.Is(err, ErrMarkerMismatch) {
+		t.Fatalf("mismatched RemoveLocalMarker error=%v, want ErrMarkerMismatch", err)
+	}
+	payload, found, err = store.ReadLocalMarker(namespace, name)
+	if err != nil || !found || !bytes.Equal(payload, first) {
+		t.Fatalf("mismatched removal changed marker found=%t payload=%q err=%v", found, payload, err)
+	}
+	if err := store.RemoveLocalMarker(namespace, name, first); err != nil {
+		t.Fatalf("matching RemoveLocalMarker: %v", err)
+	}
+	if err := store.RemoveLocalMarker(namespace, name, first); err != nil {
+		t.Fatalf("repeated RemoveLocalMarker: %v", err)
+	}
+	if _, found, err := store.ReadLocalMarker(namespace, name); err != nil || found {
+		t.Fatalf("removed marker found=%t err=%v", found, err)
+	}
+}
+
+func TestWindowsPinnedLocalMarkerRemovalDeletesOpenedObject(t *testing.T) {
+	store, err := New(t.TempDir(), "markers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		namespace = ".cloudsql-local-runtime"
+		name      = "generation"
+	)
+	original := []byte("original-generation\n")
+	replacement := []byte("replacement-generation\n")
+	if err := store.WriteLocalMarker(namespace, name, original); err != nil {
+		t.Fatalf("WriteLocalMarker: %v", err)
+	}
+
+	profileDir, err := openPinnedDirectory(store.ProfileDir())
+	if err != nil {
+		t.Fatalf("open profile directory: %v", err)
+	}
+	defer profileDir.close()
+	markerDir, err := profileDir.openDirectory(namespace, false)
+	if err != nil {
+		t.Fatalf("open marker directory: %v", err)
+	}
+	defer markerDir.close()
+
+	directory := filepath.Join(store.ProfileDir(), namespace)
+	if err := os.Rename(directory, directory+".replaced"); err == nil {
+		t.Fatal("marker directory replacement succeeded while its handle was pinned")
+	}
+
+	file, err := markerDir.openRegularFileForRemoval(name)
+	if err != nil {
+		t.Fatalf("open marker for removal: %v", err)
+	}
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		file.Close()
+		t.Fatalf("read opened marker: %v", err)
+	}
+	if !bytes.Equal(payload, original) {
+		file.Close()
+		t.Fatalf("opened marker payload=%q, want %q", payload, original)
+	}
+
+	marker := filepath.Join(directory, name)
+	retired := filepath.Join(directory, "retired-generation")
+	if err := os.Rename(marker, retired); err != nil {
+		file.Close()
+		t.Fatalf("replace marker after opening deletion handle: %v", err)
+	}
+	if err := os.WriteFile(marker, replacement, 0o600); err != nil {
+		file.Close()
+		t.Fatalf("write replacement marker: %v", err)
+	}
+	if err := markerDir.removeOpenFile(file, name); err != nil {
+		file.Close()
+		t.Fatalf("remove opened marker object: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close removed marker: %v", err)
+	}
+
+	if payload, err := os.ReadFile(marker); err != nil || !bytes.Equal(payload, replacement) {
+		t.Fatalf("replacement marker changed: payload=%q err=%v", payload, err)
+	}
+	if _, err := os.Stat(retired); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opened marker object still exists: %v", err)
+	}
+}
+
+func TestWindowsPinnedLocalMarkerRejectsReparsePoint(t *testing.T) {
+	store, err := New(t.TempDir(), "markers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		namespace = ".cloudsql-local-runtime"
+		name      = "generation"
+	)
+	payload := []byte("generation\n")
+	if err := store.WriteLocalMarker(namespace, name, payload); err != nil {
+		t.Fatalf("WriteLocalMarker: %v", err)
+	}
+
+	marker := filepath.Join(store.ProfileDir(), namespace, name)
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, marker); err != nil {
+		t.Skipf("creating symlink requires Windows developer mode or privilege: %v", err)
+	}
+	if _, _, err := store.ReadLocalMarker(namespace, name); err == nil {
+		t.Fatal("ReadLocalMarker followed a reparse point")
+	}
+	if err := store.RemoveLocalMarker(namespace, name, payload); err == nil {
+		t.Fatal("RemoveLocalMarker followed a reparse point")
+	}
+	if got, err := os.ReadFile(external); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("external marker changed: payload=%q err=%v", got, err)
+	}
+}
 
 func TestWindowsPinnedDirectoriesSupportStateLifecycle(t *testing.T) {
 	root := t.TempDir()

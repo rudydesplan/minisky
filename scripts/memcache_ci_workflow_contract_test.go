@@ -203,14 +203,14 @@ func TestRequiredCIJobsRejectStaticBypasses(t *testing.T) {
 		name   string
 		mutate func(map[string]any)
 	}{
-		{name: "quality job condition", mutate: func(workflow map[string]any) {
-			mustMap(mustMap(workflow["jobs"])["quality"])["if"] = "${{ github.ref == 'never' }}"
+		{name: "scripts job condition", mutate: func(workflow map[string]any) {
+			mustMap(mustMap(workflow["jobs"])["quality-scripts"])["if"] = "${{ github.ref == 'never' }}"
 		}},
 		{name: "terraform job false condition", mutate: func(workflow map[string]any) {
 			mustMap(mustMap(workflow["jobs"])["terraform-validate"])["if"] = false
 		}},
 		{name: "scripts test step condition", mutate: func(workflow map[string]any) {
-			stepByName(mustMap(mustMap(workflow["jobs"])["quality"]), "Test integration script contracts")["if"] =
+			stepByName(mustMap(mustMap(workflow["jobs"])["quality-scripts"]), "Test integration script contracts")["if"] =
 				"${{ success() && false }}"
 		}},
 		{name: "shellcheck step condition", mutate: func(workflow map[string]any) {
@@ -218,7 +218,7 @@ func TestRequiredCIJobsRejectStaticBypasses(t *testing.T) {
 				"${{ always() }}"
 		}},
 		{name: "scripts test set plus e", mutate: func(workflow map[string]any) {
-			step := stepByName(mustMap(mustMap(workflow["jobs"])["quality"]), "Test integration script contracts")
+			step := stepByName(mustMap(mustMap(workflow["jobs"])["quality-scripts"]), "Test integration script contracts")
 			step["run"] = "set +e\n" + scalarString(step["run"])
 		}},
 		{name: "shellcheck masked with true", mutate: func(workflow map[string]any) {
@@ -226,7 +226,7 @@ func TestRequiredCIJobsRejectStaticBypasses(t *testing.T) {
 			step["run"] = scalarString(step["run"]) + " || true"
 		}},
 		{name: "scripts test backgrounded", mutate: func(workflow map[string]any) {
-			step := stepByName(mustMap(mustMap(workflow["jobs"])["quality"]), "Test integration script contracts")
+			step := stepByName(mustMap(mustMap(workflow["jobs"])["quality-scripts"]), "Test integration script contracts")
 			step["run"] = "(\n" + scalarString(step["run"]) + "\n) &"
 		}},
 		{name: "shellcheck status overwritten", mutate: func(workflow map[string]any) {
@@ -369,7 +369,7 @@ func validateRequiredCIJobs(workflow map[string]any) []string {
 		step    string
 		command string
 	}{
-		{job: "quality", step: "Test integration script contracts", command: "go test -count=1 ./scripts"},
+		{job: "quality-scripts", step: "Test integration script contracts", command: "go test -count=1 ./scripts"},
 		{job: "terraform-validate", step: "Validate Memcached integration script", command: "bash -n scripts/memcache-integration.sh"},
 		{job: "terraform-validate", step: "Validate Memcached integration script", command: "shellcheck scripts/memcache-integration.sh"},
 	}

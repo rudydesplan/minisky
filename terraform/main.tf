@@ -129,7 +129,7 @@ resource "google_sql_database_instance" "fidelity" {
   count = local.use_minisky && var.enable_fidelity_cloudsql_resources ? 1 : 0
 
   name             = "minisky-fidelity"
-  database_version = "POSTGRES_15"
+  database_version = "POSTGRES_16"
   region           = var.region
 
   settings {

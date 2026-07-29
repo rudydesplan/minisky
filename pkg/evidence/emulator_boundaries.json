@@ -1,0 +1,156 @@
+[
+  {
+    "id": "storage-persistence-pubsub-session",
+    "name": "Storage persistence and Pub/Sub emulator-session boundary",
+    "domains": [
+      "storage.googleapis.com",
+      "pubsub.googleapis.com"
+    ],
+    "dimensions": [
+      "storage-profile-runtime-bind-mount",
+      "storage-exact-owned-container-replacement",
+      "pubsub-anonymous-pinned-image-acquisition",
+      "pubsub-platform-capability-validation",
+      "pubsub-same-container-process-restart",
+      "pubsub-container-replacement-data-loss",
+      "metadata-export-exclusion",
+      "profile-isolation",
+      "exact-owned-cleanup"
+    ],
+    "assertions": {
+      "storage-profile-runtime-bind-mount": [
+        {
+          "path": "pkg/orchestrator/manager.go",
+          "contains": [
+            "case \"storage.googleapis.com\":",
+            "hostPath := filepath.Join(config.GetRuntimeDir(), runtimeName)",
+            "ensureCommandFlag(command, \"-filesystem-root\", \"/data\")"
+          ]
+        }
+      ],
+      "storage-exact-owned-container-replacement": [
+        {
+          "path": "pkg/orchestrator/emulator_persistence_integration_test.go",
+          "contains": [
+            "removeDurableEmulatorContainer(ctx, domain, emulator)",
+            "object after restart"
+          ]
+        }
+      ],
+      "pubsub-anonymous-pinned-image-acquisition": [
+        {
+          "path": "scripts/storage-persistence-pubsub-session-integration.sh",
+          "contains": [
+            "pinned_public_pubsub_image=\"gcr.io/google.com/cloudsdktool/cloud-sdk:emulators@sha256:",
+            "docker-anonymous",
+            "'{\"auths\":{}}'",
+            "--host \"${docker_host}\"",
+            "pull --platform \"${pubsub_required_platform}\" \"${pubsub_image}\""
+          ]
+        }
+      ],
+      "pubsub-platform-capability-validation": [
+        {
+          "path": "scripts/storage-persistence-pubsub-session-integration.sh",
+          "contains": [
+            "pubsub_required_platform=\"linux/amd64\"",
+            "docker image inspect --format '{{.Os}}/{{.Architecture}}'",
+            "gcloud beta emulators pubsub start --help",
+            "\"--data-dir\""
+          ]
+        }
+      ],
+      "pubsub-same-container-process-restart": [
+        {
+          "path": "pkg/orchestrator/emulator_persistence_integration_test.go",
+          "contains": [
+            "Pub/Sub emulator container changed across daemon process restart",
+            "Pub/Sub topic did not survive MiniSky daemon restart with emulator alive",
+            "Pub/Sub session-continuity response"
+          ]
+        }
+      ],
+      "pubsub-container-replacement-data-loss": [
+        {
+          "path": "pkg/orchestrator/emulator_persistence_integration_test.go",
+          "contains": [
+            "Pub/Sub --data-dir stores env.yaml launch configuration, not topics, subscriptions, or messages",
+            "exact-owned Pub/Sub emulator replacement loses topic, subscription, and queued message state"
+          ]
+        }
+      ],
+      "metadata-export-exclusion": [
+        {
+          "path": "pkg/orchestrator/emulator_persistence_integration_test.go",
+          "contains": [
+            "portable metadata export contains emulator runtime payload"
+          ]
+        },
+        {
+          "path": "scripts/storage-persistence-pubsub-session-integration.sh",
+          "contains": [
+            "TestDurableEmulatorRuntimeDataIsExcludedFromMetadataExport"
+          ]
+        }
+      ],
+      "profile-isolation": [
+        {
+          "path": "pkg/orchestrator/emulator_persistence_integration_test.go",
+          "contains": [
+            "isolationProfile := profile + \"-isolated\"",
+            "assertGoogleAPINotFound"
+          ]
+        }
+      ],
+      "exact-owned-cleanup": [
+        {
+          "path": "scripts/storage-persistence-pubsub-session-integration.sh",
+          "contains": [
+            "cleanup_exact_profile() {",
+            "--filter \"label=managed-by=minisky\"",
+            "--filter \"label=minisky.profile=${target_profile}\"",
+            "docker volume inspect",
+            "--format '{{ index .Labels \"managed-by\" }}|{{ index .Labels \"minisky.profile\" }}'",
+            "no conditional immutable-ID delete",
+            "for cleanup_profile in \"${profile}\" \"${profile}-isolated\"; do",
+            "if ! cleanup_exact_profile \"${cleanup_profile}\"; then"
+          ]
+        }
+      ]
+    },
+    "status": "local-passed-uncommitted",
+    "references": [
+      {
+        "package": "pkg/orchestrator",
+        "tests": [
+          "TestStoragePersistenceAndPubSubSessionBoundaries",
+          "TestEnsureDurableEmulatorAllowsVendorLabelsButRejectsOwnershipAndMountMismatch",
+          "TestRemoveDurableEmulatorRequiresExactOwnershipBeforeCleanup",
+          "TestDurableEmulatorRuntimeDataIsExcludedFromMetadataExport"
+        ]
+      },
+      {
+        "package": "scripts",
+        "tests": [
+          "TestStoragePersistencePubSubSessionScriptContract",
+          "TestStoragePersistencePubSubSessionScriptRejectsMutableImagesBeforeMutation",
+          "TestStoragePersistencePubSubSessionPublicPullBypassesStaleCredentialHelper",
+          "TestStoragePersistencePubSubSessionReportsPubSubPlatformPrerequisite",
+          "TestStoragePersistencePubSubSessionMakeTargetContract",
+          "TestCriticalStoragePersistencePubSubSessionWorkflowContract"
+        ]
+      }
+    ],
+    "script": "scripts/storage-persistence-pubsub-session-integration.sh",
+    "makeTarget": "test-storage-persistence-pubsub-session",
+    "sourceSha256": "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25",
+    "diffSha256": "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033",
+    "note": "Stable uncommitted snapshot evidence proves that the exact pinned public Pub/Sub image is acquired with an isolated anonymous Docker configuration against the active daemon, then validated for immutable digest syntax, linux/amd64 platform execution (including emulation where available), and advertised --data-dir capability. Cloud Storage buckets and objects use a profile-scoped host runtime bind mount and survive exact-owned emulator-container replacement. Official Pub/Sub topics, subscriptions, and queued messages survive a MiniSky process crash/restart only while the same exact-owned Pub/Sub container remains alive; replacement loses all three. Exact-owned cleanup passed. Public registry/network access remains required, the global unowned image cache may retain an authorized pull, Pub/Sub remains amd64/emulation/session-only, and five unrelated local volumes plus a pre-existing lock observed during certification are not product evidence. Storage and Pub/Sub runtime data remain outside metadata export/import; no exactly-once, portable export, IAM, HA, security, or full-parity claim is made.",
+    "ci": {
+      "status": "configured-unverified",
+      "workflow": ".github/workflows/critical-integration.yml",
+      "job": "storage-persistence-pubsub-session",
+      "note": "The required pull-request and main-branch Storage persistence and Pub/Sub session-boundary job is configured in the working tree, but no external run URL, job URL, or commit exists for this uncommitted gate."
+    }
+  }
+]
