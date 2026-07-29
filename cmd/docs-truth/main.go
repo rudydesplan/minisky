@@ -30,6 +30,8 @@ const (
 	platformSummaryEnd    = "<!-- END GENERATED PHASE 12 PLATFORM SUMMARY -->"
 	memcacheSummaryStart  = "<!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->"
 	memcacheSummaryEnd    = "<!-- END GENERATED MEMCACHED SERVICE GATE -->"
+	redisSummaryStart     = "<!-- BEGIN GENERATED REDIS SERVICE GATE -->"
+	redisSummaryEnd       = "<!-- END GENERATED REDIS SERVICE GATE -->"
 	emulatorBoundaryStart = "<!-- BEGIN GENERATED STORAGE PUBSUB BOUNDARY -->"
 	emulatorBoundaryEnd   = "<!-- END GENERATED STORAGE PUBSUB BOUNDARY -->"
 	certificationStart    = "<!-- BEGIN GENERATED STABLE SNAPSHOT CERTIFICATION -->"
@@ -79,6 +81,10 @@ func generate(root string, check bool) error {
 		return err
 	}
 	memcacheGate, err := selectMemcacheServiceGate(services, serviceGates)
+	if err != nil {
+		return err
+	}
+	redisGate, err := selectRedisServiceGate(services, serviceGates)
 	if err != nil {
 		return err
 	}
@@ -152,6 +158,10 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
 	}
+	updatedDocs, err = replaceRedisServiceGate(updatedDocs, redisGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", docsPath, err)
+	}
 	updatedDocs, err = replaceStoragePubSubBoundary(updatedDocs, emulatorGate)
 	if err != nil {
 		return fmt.Errorf("%s: %w", docsPath, err)
@@ -185,6 +195,10 @@ func generate(root string, check bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", terraformPath, err)
 	}
+	updatedTerraform, err = replaceRedisServiceGate(updatedTerraform, redisGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", terraformPath, err)
+	}
 	if err := validateMemcacheClaims(updatedDocs, string(stateModel), updatedTerraform); err != nil {
 		return fmt.Errorf("Memcached documentation truth: %w", err)
 	}
@@ -211,6 +225,10 @@ func generate(root string, check bool) error {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
 	updatedReadme, err = replaceMemcacheServiceGate(updatedReadme, memcacheGate)
+	if err != nil {
+		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	updatedReadme, err = replaceRedisServiceGate(updatedReadme, redisGate)
 	if err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
 	}
@@ -244,6 +262,15 @@ func generate(root string, check bool) error {
 	}
 	if err := validatePhase12Claims(updatedReadme, platformGates); err != nil {
 		return fmt.Errorf("%s: %w", readmePath, err)
+	}
+	if err := validateRedisClaims(
+		updatedReadme,
+		updatedDocs,
+		string(stateModel),
+		updatedTerraform,
+		redisGate,
+	); err != nil {
+		return fmt.Errorf("Redis documentation truth: %w", err)
 	}
 	if err := validateCloudSQLClaims(
 		updatedReadme,
@@ -286,6 +313,9 @@ func generate(root string, check bool) error {
 				cloudSQLGate,
 				windowsGate,
 			); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			if err := validateRoadmapRedisClaims(string(document), redisGate); err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 		}
@@ -358,6 +388,214 @@ func selectMemcacheServiceGate(
 		return evidence.ServiceGate{}, err
 	}
 	return gate, nil
+}
+
+func selectRedisServiceGate(
+	services []registry.Service,
+	gates []evidence.ServiceGate,
+) (evidence.ServiceGate, error) {
+	var matches []evidence.ServiceGate
+	for _, gate := range gates {
+		if gate.ID == "phase15-redis" {
+			matches = append(matches, gate)
+		}
+	}
+	if len(matches) != 1 {
+		return evidence.ServiceGate{}, fmt.Errorf(
+			"Redis service gate count is %d, want exactly one",
+			len(matches),
+		)
+	}
+	gate := matches[0]
+	registered := false
+	for _, service := range services {
+		if service.Domain == gate.Domain {
+			registered = true
+			break
+		}
+	}
+	if !registered || gate.Domain != "redis.googleapis.com" {
+		return evidence.ServiceGate{}, errors.New(
+			"Redis service gate must reference the registered Redis domain",
+		)
+	}
+	if gate.Phase != 15 || gate.ProviderVersion != "7.41.0" ||
+		gate.Script != "scripts/redis-integration.sh" ||
+		gate.MakeTarget != "test-redis-integration" ||
+		len(gate.Dimensions) == 0 {
+		return evidence.ServiceGate{}, errors.New("Redis service gate is missing required lifecycle metadata")
+	}
+	if err := evidence.ValidateEvidenceCheck(gate.EvidenceCheck); err != nil {
+		return evidence.ServiceGate{}, fmt.Errorf("Redis local evidence: %w", err)
+	}
+	switch gate.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		if gate.SourceCommit != "" || gate.SourceSHA256 != "" || gate.DiffSHA256 != "" {
+			return evidence.ServiceGate{}, errors.New("configured Redis evidence must not include source provenance")
+		}
+	case evidence.EvidenceLocalPassedUncommitted:
+		if gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
+			return evidence.ServiceGate{}, errors.New("uncommitted Redis pass requires stable source/diff provenance")
+		}
+	case evidence.EvidenceLocalPassed:
+		if gate.SourceCommit == "" {
+			return evidence.ServiceGate{}, errors.New("immutable Redis pass requires a source commit")
+		}
+	default:
+		return evidence.ServiceGate{}, fmt.Errorf("unsupported Redis local evidence status %q", gate.Status)
+	}
+	if err := evidence.ValidateEvidenceCheck(gate.CI); err != nil {
+		return evidence.ServiceGate{}, fmt.Errorf("Redis CI evidence: %w", err)
+	}
+	if gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "redis-integration" {
+		return evidence.ServiceGate{}, errors.New("Redis CI evidence does not identify its required job")
+	}
+	if gate.CI.Status == evidence.EvidenceConfiguredUnverified {
+		if gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
+			return evidence.ServiceGate{}, errors.New("configured Redis CI evidence includes pass provenance")
+		}
+	} else if gate.CI.Status != evidence.EvidenceCIPassed ||
+		gate.CI.RunURL == "" || gate.CI.JobURL == "" || gate.CI.Commit == "" {
+		return evidence.ServiceGate{}, errors.New("Redis CI evidence status is unsupported or incomplete")
+	}
+	return gate, nil
+}
+
+func renderRedisServiceGate(gate evidence.ServiceGate) (string, error) {
+	if _, err := selectRedisServiceGate(
+		[]registry.Service{{Domain: "redis.googleapis.com"}},
+		[]evidence.ServiceGate{gate},
+	); err != nil {
+		return "", err
+	}
+	var local string
+	switch gate.Status {
+	case evidence.EvidenceConfiguredUnverified:
+		local = fmt.Sprintf(
+			"Gate `%s` is `%s`: `%s` (`make %s`) is implemented, but no complete local pass is recorded.",
+			gate.ID,
+			gate.Status,
+			gate.Script,
+			gate.MakeTarget,
+		)
+	case evidence.EvidenceLocalPassedUncommitted:
+		local = fmt.Sprintf(
+			"Gate `%s` is `%s` at source SHA-256 `%s` and diff SHA-256 `%s` via `%s` (`make %s`).",
+			gate.ID,
+			gate.Status,
+			gate.SourceSHA256,
+			gate.DiffSHA256,
+			gate.Script,
+			gate.MakeTarget,
+		)
+	case evidence.EvidenceLocalPassed:
+		local = fmt.Sprintf(
+			"Gate `%s` is `%s` at immutable source commit `%s` via `%s` (`make %s`).",
+			gate.ID,
+			gate.Status,
+			gate.SourceCommit,
+			gate.Script,
+			gate.MakeTarget,
+		)
+	}
+	var ci string
+	if gate.CI.Status == evidence.EvidenceConfiguredUnverified {
+		ci = "CI is `configured-unverified`; no external run URL or commit is recorded."
+	} else {
+		ci = fmt.Sprintf(
+			"CI is `ci-passed` in [the recorded run](%s) ([job](%s)) at commit `%s`.",
+			gate.CI.RunURL,
+			gate.CI.JobURL,
+			gate.CI.Commit,
+		)
+	}
+	dimensions := make([]string, len(gate.Dimensions))
+	for index, dimension := range gate.Dimensions {
+		dimensions[index] = "`" + dimension + "`"
+	}
+	return fmt.Sprintf(
+		"**Generated Redis durability-gate truth:** %s Google provider `%s`.\n\n"+
+			"Lifecycle dimensions (%d): %s.\n\n"+
+			"%s Boundaries: no portable AOF export, HA/failover, TLS/IAM/VPC/PSC, Redis Cluster, "+
+			"or hostile-daemon guarantee. Exact volume deletion remains a cooperative Docker daemon, "+
+			"non-atomic re-inspect/delete boundary. A process or host crash after a Docker create "+
+			"side effect but before resolved provenance is persisted can leave exact-labelled resources; "+
+			"deterministic names and labels aid explicit cleanup, but restart neither adopts nor "+
+			"automatically removes them.\n",
+		local,
+		gate.ProviderVersion,
+		len(dimensions),
+		strings.Join(dimensions, ", "),
+		ci,
+	), nil
+}
+
+func replaceRedisServiceGate(document string, gate evidence.ServiceGate) (string, error) {
+	summary, err := renderRedisServiceGate(gate)
+	if err != nil {
+		return "", err
+	}
+	return replaceGeneratedSection(document, redisSummaryStart, redisSummaryEnd, summary)
+}
+
+func validateRedisClaims(
+	readme string,
+	serviceCompatibility string,
+	stateModel string,
+	terraformCompatibility string,
+	gate evidence.ServiceGate,
+) error {
+	summary, err := renderRedisServiceGate(gate)
+	if err != nil {
+		return err
+	}
+	for name, document := range map[string]string{
+		"README":                  readme,
+		"service compatibility":   serviceCompatibility,
+		"Terraform compatibility": terraformCompatibility,
+	} {
+		if strings.Count(document, redisSummaryStart) != 1 ||
+			strings.Count(document, redisSummaryEnd) != 1 ||
+			!strings.Contains(document, strings.TrimSpace(summary)) {
+			return fmt.Errorf("%s does not contain exactly one current generated Redis gate", name)
+		}
+	}
+	normalizedState := strings.ToLower(strings.Join(strings.Fields(stateModel), " "))
+	for _, required := range []string{
+		"redis backend metadata",
+		"aof volume contents are not portable",
+		"cooperative docker daemon",
+		"before resolved provenance is persisted",
+		"restart neither adopts nor automatically removes",
+	} {
+		if !strings.Contains(normalizedState, required) {
+			return fmt.Errorf("state model is missing Redis boundary %q", required)
+		}
+	}
+	return nil
+}
+
+func validateRoadmapRedisClaims(document string, gate evidence.ServiceGate) error {
+	required := []string{
+		"phase15-redis",
+		string(gate.Status),
+		"configured-unverified",
+		"portable AOF",
+		"cooperative Docker daemon",
+		"pre-persistence crash",
+	}
+	for _, fragment := range required {
+		if !strings.Contains(document, fragment) {
+			return fmt.Errorf("roadmap canvas is missing Redis boundary %q", fragment)
+		}
+	}
+	if gate.Status == evidence.EvidenceConfiguredUnverified &&
+		(strings.Contains(document, "Redis phase15-redis is local-passed") ||
+			strings.Contains(document, "Redis phase15-redis is ci-passed")) {
+		return errors.New("roadmap canvas overstates configured Redis evidence")
+	}
+	return nil
 }
 
 func selectCloudSQLServiceGate(

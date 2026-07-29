@@ -102,7 +102,7 @@ func TestDeleteRedisPropagatesCallerCancellationToInspect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- manager.DeleteRedis(ctx, "resource")
+		result <- manager.DeleteRedisExact(ctx, Redis72BackendSpec("resource"))
 	}()
 	<-seen
 	cancel()
@@ -120,6 +120,21 @@ func TestDeleteRedisCleansExactOwnedVolumeWhenContainerIsMissing(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "redis-orphan-cleanup")
 	const resourceID = "resource"
 	containerName, volumeName := redisDockerNames(resourceID)
+	volume := redisVolumeInspect{
+		Name:       volumeName,
+		CreatedAt:  "2026-07-29T00:00:00Z",
+		Mountpoint: "/var/lib/docker/volumes/" + volumeName + "/_data",
+		Labels: map[string]string{
+			"managed-by":       "minisky",
+			"minisky.profile":  "redis-orphan-cleanup",
+			"minisky.service":  "memorystore-redis",
+			"minisky.resource": resourceID,
+		},
+	}
+	spec := Redis72BackendSpec(resourceID)
+	spec.VolumeIdentity, _ = volume.identity()
+	spec.VolumeProvenance = "sha256:" + strings.Repeat("a", 64)
+	volume.Labels["minisky.volume-identity"] = spec.VolumeProvenance
 	var volumeDeletes int
 	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch {
@@ -127,13 +142,8 @@ func TestDeleteRedisCleansExactOwnedVolumeWhenContainerIsMissing(t *testing.T) {
 			request.URL.Path == "/containers/"+containerName+"/json":
 			return dockerResponse(http.StatusNotFound, `{}`), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/volumes/"+volumeName:
-			labels, _ := json.Marshal(map[string]any{"Labels": map[string]string{
-				"managed-by":       "minisky",
-				"minisky.profile":  "redis-orphan-cleanup",
-				"minisky.service":  "memorystore-redis",
-				"minisky.resource": resourceID,
-			}})
-			return dockerResponse(http.StatusOK, string(labels)), nil
+			payload, _ := json.Marshal(volume)
+			return dockerResponse(http.StatusOK, string(payload)), nil
 		case request.Method == http.MethodDelete && request.URL.Path == "/volumes/"+volumeName:
 			volumeDeletes++
 			return dockerResponse(http.StatusNoContent, ``), nil
@@ -141,95 +151,42 @@ func TestDeleteRedisCleansExactOwnedVolumeWhenContainerIsMissing(t *testing.T) {
 			return nil, fmt.Errorf("unexpected Docker request %s %s", request.Method, request.URL)
 		}
 	})}}
-	if err := manager.DeleteRedis(context.Background(), resourceID); err != nil {
+	manager.registerRedisRuntime(redisRuntimeIdentity{Spec: spec})
+	if err := manager.DeleteRedisExact(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
 	if volumeDeletes != 1 {
 		t.Fatalf("volume deletes = %d, want 1", volumeDeletes)
 	}
+	if runtimes := manager.redisRuntimeSnapshot(); len(runtimes) != 0 {
+		t.Fatalf("successful delete retained Redis runtime provenance: %#v", runtimes)
+	}
 }
 
-func TestProvisionRedisPropagatesCallerCancellationThroughDockerStages(t *testing.T) {
-	t.Setenv("MINISKY_PROFILE", "redis-context-stages")
-	const resourceID = "resource"
-	const image = "redis:test"
-	containerName, volumeName := redisDockerNames(resourceID)
-	stages := []struct {
-		name          string
-		method        string
-		path          string
-		volumeMissing bool
-	}{
-		{name: "image inspect", method: http.MethodGet, path: "/images/" + image + "/json"},
-		{name: "volume inspect", method: http.MethodGet, path: "/volumes/" + volumeName},
-		{name: "volume create", method: http.MethodPost, path: "/volumes/create", volumeMissing: true},
-		{name: "container create", method: http.MethodPost, path: "/containers/create"},
-		{name: "container start", method: http.MethodPost, path: "/containers/" + containerName + "/start"},
+func TestProvisionRedisExactPropagatesCallerCancellationToInventory(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	manager := &ServiceManager{
+		dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			reached <- struct{}{}
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		})},
 	}
-	for _, stage := range stages {
-		t.Run(stage.name, func(t *testing.T) {
-			reached := make(chan struct{}, 1)
-			manager := &ServiceManager{
-				dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-					if request.Method == stage.method && request.URL.Path == stage.path {
-						reached <- struct{}{}
-						select {
-						case <-request.Context().Done():
-							return nil, request.Context().Err()
-						case <-time.After(500 * time.Millisecond):
-							return nil, errors.New("caller context was not propagated")
-						}
-					}
-					switch {
-					case request.Method == http.MethodGet &&
-						request.URL.Path == "/containers/"+containerName+"/json":
-						return dockerResponse(http.StatusNotFound, `{}`), nil
-					case request.Method == http.MethodGet && request.URL.Path == "/images/"+image+"/json":
-						return dockerResponse(http.StatusOK, `{}`), nil
-					case request.Method == http.MethodGet && request.URL.Path == "/volumes/"+volumeName:
-						if stage.volumeMissing {
-							return dockerResponse(http.StatusNotFound, `{}`), nil
-						}
-						labels, _ := json.Marshal(map[string]any{"Labels": map[string]string{
-							"managed-by":       "minisky",
-							"minisky.profile":  "redis-context-stages",
-							"minisky.service":  "memorystore-redis",
-							"minisky.resource": resourceID,
-						}})
-						return dockerResponse(http.StatusOK, string(labels)), nil
-					case request.Method == http.MethodPost && request.URL.Path == "/volumes/create":
-						return dockerResponse(http.StatusCreated, `{}`), nil
-					case request.Method == http.MethodPost && request.URL.Path == "/containers/create":
-						return dockerResponse(http.StatusCreated, `{}`), nil
-					case request.Method == http.MethodPost &&
-						request.URL.Path == "/containers/"+containerName+"/start":
-						return dockerResponse(http.StatusNoContent, ``), nil
-					default:
-						return nil, fmt.Errorf("unexpected Docker request %s %s", request.Method, request.URL)
-					}
-				})},
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			result := make(chan error, 1)
-			go func() {
-				_, err := manager.ProvisionRedis(ctx, resourceID, image)
-				result <- err
-			}()
-			select {
-			case <-reached:
-			case <-time.After(time.Second):
-				t.Fatalf("stage was not reached")
-			}
-			cancel()
-			select {
-			case err := <-result:
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("error = %v, want context cancellation", err)
-				}
-			case <-time.After(200 * time.Millisecond):
-				t.Fatal("Redis provisioning did not stop after caller cancellation")
-			}
-		})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := manager.ProvisionRedisExact(ctx, Redis72BackendSpec("resource"))
+		result <- err
+	}()
+	<-reached
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context cancellation", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Redis provisioning did not stop after caller cancellation")
 	}
 }
 
@@ -887,6 +844,59 @@ func TestTeardownDeletesCapturedContainerAndNetworkIDs(t *testing.T) {
 		!slices.Contains(mutations, "DELETE /containers/container%2Fid") ||
 		!slices.Contains(mutations, "DELETE /networks/network%2Fid") {
 		t.Fatalf("immutable-ID mutations = %#v", mutations)
+	}
+}
+
+func TestTeardownRejectsEndpointsWithoutRuntimeProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		labels  string
+		wantErr bool
+	}{
+		{
+			name:    "copied exact labels",
+			labels:  `{"managed-by":"minisky","minisky.profile":"teardown-redis","minisky.service":"memorystore-redis","minisky.resource":"redis-resource"}`,
+			wantErr: true,
+		},
+		{
+			name:    "foreign endpoint",
+			labels:  `{"managed-by":"other","minisky.profile":"teardown-redis","minisky.service":"memorystore-redis","minisky.resource":"redis-resource"}`,
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("MINISKY_PROFILE", "teardown-redis")
+			t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+			mutated := false
+			manager := &ServiceManager{dockerTimeout: dockerRequestTimeout}
+			manager.dockerClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				switch {
+				case request.Method == http.MethodGet && request.URL.Path == "/networks/minisky-net":
+					return dockerResponse(http.StatusOK, `{
+						"Id":"network-id",
+						"Labels":{"managed-by":"minisky","minisky.profile":"teardown-redis"},
+						"Containers":{"redis-container-id":{"Name":"minisky-redis-retained"}}
+					}`), nil
+				case request.Method == http.MethodGet && request.URL.Path == "/containers/redis-container-id/json":
+					return dockerResponse(http.StatusOK, `{"Id":"redis-container-id","Config":{"Labels":`+test.labels+`}}`), nil
+				case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/containers/"):
+					return dockerResponse(http.StatusNotFound, `{"message":"No such container"}`), nil
+				case request.Method == http.MethodPost || request.Method == http.MethodDelete:
+					mutated = true
+					return dockerResponse(http.StatusNoContent, ""), nil
+				default:
+					t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
+					return nil, nil
+				}
+			})}
+			err := manager.Teardown(context.Background())
+			if test.wantErr && err == nil {
+				t.Fatal("foreign retained endpoint was accepted")
+			}
+			if mutated {
+				t.Fatal("retained network endpoint reached destructive teardown")
+			}
+		})
 	}
 }
 
@@ -1744,20 +1754,25 @@ func TestEmulatorAdditionalPortsAreLoopbackPublished(t *testing.T) {
 
 func TestRedisProvisioningRefusesUnownedExistingVolume(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "redis-test")
+	spec := Redis72BackendSpec("resource")
+	const runtimeImageID = "sha256:c86d9fab6d31c4b40bc4f1e4c5f41ce66c9b4f904f48873812f30b93424ab408"
 	manager := &ServiceManager{dockerClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch {
 		case strings.Contains(request.URL.Path, "/containers/"):
 			return dockerResponse(http.StatusNotFound, `{}`), nil
 		case strings.Contains(request.URL.Path, "/images/"):
-			return dockerResponse(http.StatusOK, `{}`), nil
+			return dockerResponse(http.StatusOK, fmt.Sprintf(
+				`{"Id":%q,"RepoDigests":[%q],"Os":"linux","Architecture":"amd64"}`,
+				runtimeImageID, spec.RepoDigest)), nil
 		case strings.Contains(request.URL.Path, "/volumes/"):
-			return dockerResponse(http.StatusOK, `{"Labels":{"managed-by":"someone-else"}}`), nil
+			return dockerResponse(http.StatusOK,
+				`{"Name":"foreign","CreatedAt":"2026-07-29T00:00:00Z","Mountpoint":"/foreign","Labels":{"managed-by":"someone-else"}}`), nil
 		default:
 			t.Fatalf("unexpected Docker request %s %s", request.Method, request.URL)
 			return nil, nil
 		}
 	})}}
-	if _, err := manager.ProvisionRedis(context.Background(), "resource", "redis:test"); err == nil {
+	if _, _, err := manager.ProvisionRedisExact(context.Background(), spec); err == nil {
 		t.Fatal("unowned existing Redis volume was adopted")
 	}
 }

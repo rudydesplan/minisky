@@ -160,8 +160,8 @@ func TestPhase15MemcacheGateIsCompleteAndReferenceable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gates) != 2 {
-		t.Fatalf("service gates = %d, want Memcached and Cloud SQL", len(gates))
+	if len(gates) != 3 {
+		t.Fatalf("service gates = %d, want Memcached, Redis, and Cloud SQL", len(gates))
 	}
 	var gate ServiceGate
 	for _, candidate := range gates {
@@ -272,6 +272,38 @@ func TestCloudSQLRestartRecoveryGatePreservesLocalFingerprintsAndRecordsPR23CI(t
 		gate.CI.JobURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797" ||
 		gate.CI.Commit != "794b68439c59bfa0dd35b37962049a1a3e510ea1" {
 		t.Fatalf("Cloud SQL CI evidence lacks exact PR #23 provenance: %+v", gate.CI)
+	}
+}
+
+func TestPhase15RedisGateHasLocalUncommittedEvidence(t *testing.T) {
+	root := repositoryRoot(t)
+	gates, err := ServiceGates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gate ServiceGate
+	for _, candidate := range gates {
+		if candidate.ID == "phase15-redis" {
+			gate = candidate
+			break
+		}
+	}
+	if gate.ID == "" || gate.Phase != 15 || gate.Domain != "redis.googleapis.com" ||
+		gate.ProviderVersion != "7.41.0" {
+		t.Fatalf("Redis gate identity is incomplete: %+v", gate)
+	}
+	if gate.Status != EvidenceLocalPassedUncommitted ||
+		gate.Script != "scripts/redis-integration.sh" ||
+		gate.MakeTarget != "test-redis-integration" ||
+		gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
+		t.Fatalf("Redis local gate status lacks uncommitted source evidence: %+v", gate.EvidenceCheck)
+	}
+	assertServiceGateAssertions(t, root, gate)
+	if gate.CI.Status != EvidenceConfiguredUnverified ||
+		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
+		gate.CI.Job != "redis-integration" ||
+		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
+		t.Fatalf("Redis CI gate has unsupported pass provenance: %+v", gate.CI)
 	}
 }
 
@@ -610,7 +642,7 @@ func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
 		}},
 		{name: "empty assertion path", mutate: func(g []ServiceGate) { g[0].Assertions["sdk-create"][0].Path = "" }},
 		{name: "empty assertion fragment", mutate: func(g []ServiceGate) { g[0].Assertions["sdk-create"][0].Contains = []string{""} }},
-		{name: "invalid local status", mutate: func(g []ServiceGate) { g[0].Status = EvidenceConfiguredUnverified }},
+		{name: "invalid local status", mutate: func(g []ServiceGate) { g[0].Status = EvidenceOptionalUnverified }},
 		{name: "immutable local pass without source commit", mutate: func(g []ServiceGate) { g[0].Status = EvidenceLocalPassed }},
 		{name: "invalid immutable local source commit", mutate: func(g []ServiceGate) {
 			g[0].Status = EvidenceLocalPassed
@@ -673,6 +705,13 @@ func TestLoadServiceGatesRejectsMalformedInventories(t *testing.T) {
 	immutable[0].DiffSHA256 = ""
 	if _, err := loadServiceGates(encode(t, immutable)); err != nil {
 		t.Fatalf("future immutable local pass rejected: %v", err)
+	}
+	configured := valid()
+	configured[0].Status = EvidenceConfiguredUnverified
+	configured[0].SourceSHA256 = ""
+	configured[0].DiffSHA256 = ""
+	if _, err := loadServiceGates(encode(t, configured)); err != nil {
+		t.Fatalf("configured local gate rejected: %v", err)
 	}
 }
 

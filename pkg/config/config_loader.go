@@ -9,6 +9,11 @@ import (
 	"sync"
 )
 
+const (
+	Redis72ValkeyImage    = "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b"
+	Redis72ValkeyPlatform = "linux/amd64"
+)
+
 // GetMiniskyDir returns the absolute path to the global .minisky directory (typically ~/.minisky)
 func GetMiniskyDir() string {
 	home, err := os.UserHomeDir()
@@ -121,9 +126,10 @@ type MemoryEngineConfig struct {
 }
 
 type MemoryVersion struct {
-	Version string `json:"version"`
-	Label   string `json:"label"`
-	Image   string `json:"image"`
+	Version  string `json:"version"`
+	Label    string `json:"label"`
+	Image    string `json:"image"`
+	Platform string `json:"platform,omitempty"`
 }
 
 type CloudBuildConfig struct {
@@ -188,7 +194,7 @@ func fallbackRegistry() *ImageRegistry {
 			MasterPorts:  []string{"8080/tcp"},
 		},
 		Memorystore: MemorystoreConfig{
-			Redis: MemoryEngineConfig{DefaultImage: "redis:latest"},
+			Redis: redis72FallbackConfig(),
 			Memcached: MemoryEngineConfig{
 				DefaultImage: "memcached:1.6.15-alpine",
 				Versions: []MemoryVersion{
@@ -196,7 +202,7 @@ func fallbackRegistry() *ImageRegistry {
 					{Version: "1.6.15", Label: "Memcached 1.6.15 (Provider API)", Image: "memcached:1.6.15-alpine"},
 				},
 			},
-			Valkey: MemoryEngineConfig{DefaultImage: "valkey/valkey:latest"},
+			Valkey: redis72FallbackConfig(),
 		},
 		CloudBuild: CloudBuildConfig{
 			DefaultBuilder: "ubuntu:26.04",
@@ -204,5 +210,17 @@ func fallbackRegistry() *ImageRegistry {
 		Composer: ComposerConfig{
 			AirflowImage: "apache/airflow:2.10.5-python3.12@sha256:6499a680a93463846d3a6be980e85d601dc97b0d81e82eed9ef5e5cb9da31b79",
 		},
+	}
+}
+
+func redis72FallbackConfig() MemoryEngineConfig {
+	return MemoryEngineConfig{
+		DefaultImage: Redis72ValkeyImage,
+		Versions: []MemoryVersion{{
+			Version:  "7.2",
+			Label:    "Valkey 7.2 (Redis 7.2 compatibility)",
+			Image:    Redis72ValkeyImage,
+			Platform: Redis72ValkeyPlatform,
+		}},
 	}
 }

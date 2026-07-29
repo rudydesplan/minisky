@@ -68,6 +68,13 @@ Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `
 
 CI is `ci-passed` in [GitHub Actions run 30416460134](https://github.com/rudydesplan/minisky/actions/runs/30416460134) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974)) on commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9`. This evidence does not claim broad GCP parity or promote service fidelity.
 <!-- END GENERATED MEMCACHED SERVICE GATE -->
+<!-- BEGIN GENERATED REDIS SERVICE GATE -->
+**Generated Redis durability-gate truth:** Gate `phase15-redis` is `local-passed-uncommitted` at source SHA-256 `ecf23998d307c1d0383dd0d424b667c4277b0091757ab00a795502db64a4def7` and diff SHA-256 `ccedf19e3aa4b0d825e3204fdfff632ae8f33d128a7754d89f61deb18e54426e` via `scripts/redis-integration.sh` (`make test-redis-integration`). Google provider `7.41.0`.
+
+Lifecycle dimensions (13): `immutable-image-identity`, `sdk-create-read-list-delete-lro`, `data-plane-set-get`, `process-restart-survival`, `container-replacement-survival`, `foreign-resource-refusal`, `export-boundary`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
+
+CI is `configured-unverified`; no external run URL or commit is recorded. Boundaries: no portable AOF export, HA/failover, TLS/IAM/VPC/PSC, Redis Cluster, or hostile-daemon guarantee. Exact volume deletion remains a cooperative Docker daemon, non-atomic re-inspect/delete boundary. A process or host crash after a Docker create side effect but before resolved provenance is persisted can leave exact-labelled resources; deterministic names and labels aid explicit cleanup, but restart neither adopts nor automatically removes them.
+<!-- END GENERATED REDIS SERVICE GATE -->
 
 ## Acceptance-tested resources
 

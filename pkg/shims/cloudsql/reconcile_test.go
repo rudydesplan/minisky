@@ -823,13 +823,9 @@ func TestCloudSQLImportOwnershipFailureDoesNotCreateRuntimeProvenance(t *testing
 
 func TestCloudSQLImportValidationFailureDoesNotCreateRuntimeProvenance(t *testing.T) {
 	t.Setenv("MINISKY_PROFILE", "shared")
-	source, err := state.New(t.TempDir(), "shared")
-	if err != nil {
-		t.Fatal(err)
-	}
 	key := instanceKey("project", "sql")
 	runtime := testCloudSQLRuntime("shared", "project", "sql")
-	if err := source.Save(cloudSQLStateEntry, cloudSQLMetadata{
+	metadataPayload, err := json.Marshal(cloudSQLMetadata{
 		Instances: map[string]*DatabaseInstance{
 			key: {Name: "sql", Project: "project", DatabaseVersion: "POSTGRES_18", State: "RUNNABLE"},
 		},
@@ -837,19 +833,38 @@ func TestCloudSQLImportValidationFailureDoesNotCreateRuntimeProvenance(t *testin
 			key: {{Name: "app", Project: "project", Instance: "sql", Password: "must-not-travel"}},
 		},
 		Runtimes: map[string]*cloudSQLRuntimeProvenance{key: runtime},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	var snapshot bytes.Buffer
-	if err := source.Export(&snapshot); err != nil {
+	snapshot, err := json.Marshal(state.Snapshot{
+		Format:  state.SnapshotFormat,
+		Version: state.Version,
+		Entries: map[string]json.RawMessage{
+			cloudSQLStateEntry: metadataPayload,
+		},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	target, err := state.New(t.TempDir(), "shared")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := target.Import(bytes.NewReader(snapshot.Bytes())); err == nil {
+	if err := target.Save("sentinel/metadata", map[string]string{"value": "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.Import(bytes.NewReader(snapshot)); err == nil {
 		t.Fatal("import accepted portable Cloud SQL password")
+	}
+	var sentinel map[string]string
+	if err := target.Load("sentinel/metadata", &sentinel); err != nil ||
+		sentinel["value"] != "preserved" {
+		t.Fatalf("failed import changed active profile: sentinel=%v err=%v", sentinel, err)
+	}
+	var imported cloudSQLMetadata
+	if err := target.Load(cloudSQLStateEntry, &imported); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("failed import installed Cloud SQL metadata: %#v err=%v", imported, err)
 	}
 	if _, err := os.Lstat(filepath.Join(target.ProfileDir(), cloudSQLLocalRuntimeDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("validation failure created runtime provenance: %v", err)

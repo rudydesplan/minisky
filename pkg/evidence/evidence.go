@@ -524,12 +524,17 @@ func loadServiceGates(data []byte) ([]ServiceGate, error) {
 			if gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
 				return nil, fmt.Errorf("%s uncommitted local evidence requires stable source/diff fingerprints and no source commit", gate.ID)
 			}
+		case EvidenceConfiguredUnverified:
+			if gate.SourceCommit != "" || gate.SourceSHA256 != "" || gate.DiffSHA256 != "" {
+				return nil, fmt.Errorf("%s configured local evidence must not include source provenance", gate.ID)
+			}
 		default:
 			return nil, fmt.Errorf(
-				"%s local evidence status must be %q or %q",
+				"%s local evidence status must be %q, %q, or %q",
 				gate.ID,
 				EvidenceLocalPassed,
 				EvidenceLocalPassedUncommitted,
+				EvidenceConfiguredUnverified,
 			)
 		}
 		if gate.Script == "" || gate.MakeTarget == "" || len(gate.References) == 0 {

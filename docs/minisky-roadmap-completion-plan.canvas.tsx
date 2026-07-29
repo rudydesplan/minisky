@@ -27,7 +27,7 @@ const phases = [
   ["12", "Platform diagnostics", "CI-verified bounded platform slice", "Recorded CI run 30337314745 proves W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown on commit 60e8215"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
-  ["15", "Data services", "CI-verified bounded slices", "Firestore, Datastore, and Spanner SDK data-plane behavior passes locally; Redis has a guarded provider lifecycle, and PR #22 records immutable Memcached lifecycle evidence"],
+  ["15", "Data services", "Mixed bounded evidence", "Firestore, Datastore, and Spanner SDK data-plane behavior passes locally; Redis gate phase15-redis is configured-unverified after a focused live Valkey recovery pass, and PR #22 records immutable Memcached lifecycle evidence"],
   ["16", "ML, monitoring, networking", "CI-verified bounded slices", "Linux critical CI proves persisted PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK + Terraform, and deterministic Vertex restart gates"],
   ["17", "CI/CD, plugins, enterprise", "CI-verified bounded slice", "Linux critical CI proves federated RBAC/quota/audit integration; production controls and external publication remain"],
   ["18", "Event workflows", "Experimental · promotion passed", "PR #22 passed the bounded Terraform and SDK jobs; deterministic replay remains local evidence and exactly-once external side effects remain unsupported"],
@@ -93,12 +93,12 @@ const waves = [
     title: "Wave 5 — Deepen data services",
     phases: "15",
     deliverables: [
-      "15.1 Memorystore: Redis and Memcached now have bounded persisted control planes, exact-owned Docker reconciliation, generated-client evidence, and guarded provider lifecycles.",
+      "15.1 Memorystore: Redis and Memcached have bounded persisted control planes, exact-owned Docker reconciliation, generated-client coverage, and guarded provider lifecycles; Redis full-gate and CI pass provenance remain unverified.",
       "15.2 Spanner: reuse the official emulator; add only the admin/LRO slice required by SDK and Terraform.",
       "15.3 Firestore: CRUD and queries with profile-scoped emulator export.",
       "15.4 Datastore: fix the working-directory mount and verify entity/index workflows.",
     ],
-    gate: "Accepted Phase 15 slices have local generated-client/backend evidence; claimed Redis and Memcached provider resources have guarded restart/no-drift/destroy lifecycles.",
+    gate: "Accepted Phase 15 slices require local generated-client/backend evidence. Redis phase15-redis remains configured-unverified until its complete restart/no-drift/destroy gate passes; Memcached retains immutable local and CI provenance.",
   },
   {
     title: "Wave 6 — Split the oversized advanced phase",
@@ -181,6 +181,38 @@ export default function MiniSkyRoadmapCompletionPlan() {
         <Code>windows-state-markers</Code> is <Code>ci-passed</Code> in
         https://github.com/rudydesplan/minisky/actions/runs/30431422742, and the authoritative
         <Code>quality</Code> aggregate also passed. PR #22 remains historical evidence for its exact earlier revision.
+        The separate Redis <Code>phase15-redis</Code> gate is <Code>configured-unverified</Code>. The authorized
+        post-endpoint-fix full run used source SHA-256 <Code>83cc7df57b8762719645f88445442335beacbc2e4475885a0053dc4dc0b049a8</Code>
+        and stopped because the bounded-command Python wrapper consumed standard input for its own source, leaving child
+        Python heredocs at EOF. The deterministic name generator returned no fields and Docker created an anonymous
+        marked fixture, so generated SDK creation reached create/read/list instead of refusing same-name reuse. Docker
+        events and fixture labels identified the cause. The wrapper now preserves stdin, controls a child process group,
+        and maps signal exits correctly. Two adversarial reviews produced ten accepted harness repairs covering
+        explicit conflict classification, isolated working directories, one canonical Docker endpoint, empty-profile
+        and initial-network absence proofs, immutable resource tracking, lock safety, diagnostic cleanup failure,
+        timeout and externally signaled process-group termination, and pre-readiness network tracking and cleanup.
+        The final authorized certification ran once with profile
+        <Code>redis-cert-final-20260729-133201-61531</Code>, source SHA-256
+        <Code>27addccde01d2d928c4f88a0d2467389dac8a04d163f7413af7ebd6e79feb848</Code>, and diff SHA-256
+        <Code>7117d183f15340cfe8b4897cb97ddf7df8e92b463f1050ba8fc8e676b1e8ec5b</Code>. Immutable image identity and all three
+        foreign-resource refusal/preservation fixtures passed. Generated SDK create then failed after 54.41 seconds
+        because Docker Desktop exposed the configured network mode before its pre-start inspect exposed the network
+        attachment. Cleanup failed closed; exact ownership and immutable volume identity were revalidated before removing
+        only the recorded container and volume, leaving no profile resources, network, or locks. The defect is fixed
+        test-first: immutable definition checks apply before start; after start, exact attachment visibility is polled
+        boundedly before readiness. Publication, reconciliation, admin deletion, and teardown require exactly one
+        <Code>minisky-net</Code> attachment matching the inspect-by-name and runtime-registry network identity, while
+        replacement compensation uses a fresh bounded context detached from request cancellation. No second full run occurred. Provision and reconciliation
+        remain provisional until the shim durably persists the resolved generation and explicitly publishes it. Failed
+        initial persistence removes the provisional container and new volume; failed replacement persistence removes only
+        the provisional container while preserving the prior durable spec and AOF volume. Graceful teardown fully
+        prevalidates all registered endpoints, clears each successfully removed immutable container independently, and
+        retains unresolved entries for retry while preserving the network on partial failure or late foreign attachment.
+        Copied labels, unknown endpoints, inspect failures, and runtime drift fail closed. A bounded pre-persistence crash after a Docker side effect can leave exact-labelled resources:
+        deterministic names and labels aid explicit cleanup, but restart neither adopts nor automatically removes them,
+        and exact cleanup is not claimed outside completed or successfully compensated operations. The failed gate was not rerun after these fixes, so no local or
+        external pass is attributed. AOF contents remain non-portable, and exact volume deletion assumes a
+        cooperative Docker daemon with a non-atomic final re-inspect/delete boundary.
       </Callout>
 
       <Callout tone="info" title="Recorded external evidence">
@@ -257,11 +289,12 @@ export default function MiniSkyRoadmapCompletionPlan() {
           </Text>
           <Text tone="secondary">
             Outside the Phase 18–25 matrix, <Code>pkg/evidence/service_gates.json</Code> is the source of truth for
-            dedicated Memcached and Cloud SQL lifecycle dimensions. Memcached&apos;s local and critical CI evidence
+            dedicated Memcached, Redis, and Cloud SQL lifecycle dimensions. Memcached&apos;s local and critical CI evidence
             remains pinned to PR #22&apos;s exact commit. Cloud SQL recovery is
             <Code>local-passed-uncommitted</Code> at the stable source/diff fingerprints, while PR #23&apos;s exact-head
-            critical job is <Code>ci-passed</Code>. Cache contents, production Cloud SQL HA/security, and broad GCP
-            parity remain unclaimed.
+            critical job is <Code>ci-passed</Code>. Redis <Code>phase15-redis</Code> and its required CI job remain
+            <Code>configured-unverified</Code>. Cache contents, portable AOF export, production Cloud SQL HA/security,
+            and broad GCP parity remain unclaimed.
           </Text>
         </Stack>
       </Grid>

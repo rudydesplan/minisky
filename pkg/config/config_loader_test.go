@@ -95,6 +95,37 @@ func TestComposerAirflowImageIsCanonicalDigestPinned(t *testing.T) {
 	}
 }
 
+func TestRedis72ValkeyImageIsCanonicalDigestPinned(t *testing.T) {
+	t.Parallel()
+
+	const want = "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b"
+	pinnedImage := regexp.MustCompile(`^[^[:space:]@]+:[^[:space:]@]+@sha256:[0-9a-f]{64}$`)
+	for name, registry := range map[string]*ImageRegistry{
+		"embedded": loadRegistry(),
+		"fallback": fallbackRegistry(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := registry.Memorystore.Valkey.DefaultImage; got != want {
+				t.Fatalf("Valkey default image = %q, want canonical linux/amd64 reference %q", got, want)
+			}
+			if !pinnedImage.MatchString(registry.Memorystore.Valkey.DefaultImage) {
+				t.Fatalf("Valkey default image is not tag-and-digest pinned: %q", registry.Memorystore.Valkey.DefaultImage)
+			}
+			for _, version := range registry.Memorystore.Valkey.Versions {
+				if version.Version != "7.2" {
+					continue
+				}
+				if version.Image != want || version.Platform != "linux/amd64" {
+					t.Fatalf("Valkey 7.2 immutable identity = %#v", version)
+				}
+			}
+			if got := registry.Memorystore.Redis.DefaultImage; got != want {
+				t.Fatalf("Redis fallback image = %q, want Valkey-backed canonical reference %q", got, want)
+			}
+		})
+	}
+}
+
 func TestEmbeddedMemcachedImagesMatchProviderVersions(t *testing.T) {
 	t.Parallel()
 	for name, registry := range map[string]*ImageRegistry{

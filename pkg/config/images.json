@@ -127,11 +127,14 @@
   },
   "memorystore": {
     "redis": {
-      "default_image": "redis:8.0-alpine",
+      "default_image": "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b",
       "versions": [
-        { "version": "8.0", "label": "Redis 8.0 (Latest)", "image": "redis:8.0-alpine" },
-        { "version": "7.4", "label": "Redis 7.4", "image": "redis:7.4-alpine" },
-        { "version": "7.2", "label": "Redis 7.2 (LTS)", "image": "redis:7.2-alpine" }
+        {
+          "version": "7.2",
+          "label": "Valkey 7.2 (Redis 7.2 compatibility)",
+            "image": "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b",
+          "platform": "linux/amd64"
+        }
       ]
     },
     "memcached": {
@@ -145,11 +148,14 @@
       ]
     },
     "valkey": {
-      "default_image": "valkey/valkey:9.0.3-alpine",
+      "default_image": "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b",
       "versions": [
-        { "version": "9.0", "label": "Valkey 9.0 (Latest)", "image": "valkey/valkey:9.0.3-alpine" },
-        { "version": "8.1", "label": "Valkey 8.1", "image": "valkey/valkey:8.1.6-alpine" },
-        { "version": "7.2", "label": "Valkey 7.2", "image": "valkey/valkey:7.2.12-alpine" }
+        {
+          "version": "7.2",
+          "label": "Valkey 7.2 (Redis 7.2 compatibility)",
+            "image": "valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b",
+          "platform": "linux/amd64"
+        }
       ]
     }
   },

@@ -229,5 +229,157 @@
       "commit": "794b68439c59bfa0dd35b37962049a1a3e510ea1",
       "note": "PR #23's required Cloud SQL restart recovery job completed successfully on the exact recorded source revision."
     }
+  },
+  {
+    "id": "phase15-redis",
+    "phase": 15,
+    "name": "Bounded Redis/Valkey SDK, AOF durability, and Terraform lifecycle",
+    "domain": "redis.googleapis.com",
+    "providerVersion": "7.41.0",
+    "dimensions": [
+      "immutable-image-identity",
+      "sdk-create-read-list-delete-lro",
+      "data-plane-set-get",
+      "process-restart-survival",
+      "container-replacement-survival",
+      "foreign-resource-refusal",
+      "export-boundary",
+      "terraform-apply",
+      "terraform-no-drift",
+      "terraform-restart",
+      "terraform-destroy",
+      "durable-404",
+      "exact-docker-cleanup"
+    ],
+    "assertions": {
+      "immutable-image-identity": [
+        {"path": "pkg/config/images.json", "contains": ["valkey/valkey:7.2.12-alpine@sha256:28ca383369c5497fb4d63092e852a1c9e23c5a0b5553bb8f0f54a0b7fa0ddd4b", "\"platform\": \"linux/amd64\""]},
+        {"path": "pkg/orchestrator/redis.go", "contains": ["inspectRedisImageIdentity", "spec.ImageID = imageID", "container.Config.Image != spec.ImageID", "redisServerCommand"]}
+      ],
+      "sdk-create-read-list-delete-lro": [
+        {"path": "sdk-smoke/redis/main.go", "contains": ["Instances.Create(", "Instances.Get(", "Instances.List(", "Instances.Delete(", "Operations.Get("]},
+        {"path": "scripts/redis-integration.sh", "contains": ["run_sdk create", "run_sdk verify", "run_sdk delete"]}
+      ],
+      "data-plane-set-get": [
+        {"path": "scripts/redis-integration.sh", "contains": ["assert_redis_value", "[b\"SET\"", "[b\"GET\"", "socket.create_connection"]}
+      ],
+      "process-restart-survival": [
+        {"path": "scripts/redis-integration.sh", "contains": ["stop_minisky", "start_minisky", "restarted_container_id", "MiniSky restart did not reconcile a fresh container around the exact Redis volume"]}
+      ],
+      "container-replacement-survival": [
+        {"path": "scripts/redis-integration.sh", "contains": ["remove_exact_redis_container", "replacement_container_id", "retain the exact AOF volume"]}
+      ],
+      "foreign-resource-refusal": [
+        {"path": "scripts/redis-integration.sh", "contains": ["require_ownership_conflict", "create_foreign_network", "assert_foreign_network_preserved", "create_foreign_volume", "assert_foreign_volume_preserved", "foreign_volume_created", "create_foreign_container", "assert_foreign_container_preserved", "foreign_volume_resource foreign_volume_container foreign_volume_name", "Redis deterministic foreign-volume names are incomplete."]}
+      ],
+      "export-boundary": [
+        {"path": "scripts/redis-integration.sh", "contains": ["state --profile \"${profile}\" export", "assert_export_boundary", "appendonly.aof", "/var/lib/docker/volumes/"]}
+      ],
+      "terraform-apply": [
+        {"path": "scripts/redis-integration.sh", "contains": ["terraform_dir=\"${repository_root}/terraform/redis\"", "terraform_bounded -chdir=\"${terraform_dir}\" apply"]},
+        {"path": "terraform/redis/main.tf", "contains": ["version = \"7.41.0\"", "resource \"google_redis_instance\" \"durability_gate\""]}
+      ],
+      "terraform-no-drift": [
+        {"path": "scripts/redis-integration.sh", "contains": ["drift_phase=\"post-apply\"", "plan -detailed-exitcode", "assert_no_drift"]}
+      ],
+      "terraform-restart": [
+        {"path": "scripts/redis-integration.sh", "contains": ["drift_phase=\"post-restart\"", "stop_minisky", "start_minisky", "assert_no_drift"]}
+      ],
+      "terraform-destroy": [
+        {"path": "scripts/redis-integration.sh", "contains": ["terraform_bounded -chdir=\"${terraform_dir}\" destroy", "-auto-approve -input=false"]}
+      ],
+      "durable-404": [
+        {"path": "scripts/redis-integration.sh", "contains": ["deleted_status=", "if [[ \"${deleted_status}\" != \"404\" ]]"]}
+      ],
+      "exact-docker-cleanup": [
+        {"path": "scripts/redis-integration.sh", "contains": ["assert_initial_network_absent", "track_current_network_if_present", "assert_profile_empty", "cleanup_tracked_resources", "tracked_container_ids", "tracked_network_ids", "tracked_volumes", "assert_no_exact_redis_resources", "assert_exact_cleanup", "--filter \"label=minisky.service=memorystore-redis\""]},
+        {"path": "pkg/orchestrator/redis.go", "contains": ["redisRuntimeIdentity", "PublishRedisRuntime", "DiscardRedisProvisional", "waitForRedisAttachment", "validateRedisContainerNetwork", "compensateRedisReplacementLocked", "validateRedisVolume(volume, volumeName, spec)", "validateRedisRuntimeSet", "validateRedisRuntimeIdentity", "teardownRedisRuntimes"]}
+      ]
+    },
+    "status": "local-passed-uncommitted",
+    "references": [
+      {
+        "package": "pkg/orchestrator",
+        "tests": [
+          "TestRedisImageInspectRejectsRepoDigestImageIDAndPlatformDrift",
+          "TestCreateRedisContainerAllowsPreStartNetworkAttachmentLag",
+          "TestRedisPostStartAttachmentVisibilityAndCompensation",
+          "TestProvisionAndReconcileRedisUseImmutableImageAndExactVolume",
+          "TestProvisionRedisCompensatesPostCreateValidationFailure",
+          "TestRedisProvisionRollbackPreservesSameNameReplacementVolume",
+          "TestRedisReconcileCompensationIgnoresExhaustedRequestContext",
+          "TestRedisAmbiguousContainerCreateRecovery",
+          "TestValkeyVolumeSurvivesOwnedContainerRestartAndCleanup",
+          "TestTeardownRejectsEndpointsWithoutRuntimeProvenance",
+          "TestRedisGracefulTeardownRemovesExactContainerRetainsVolumeAndRemovesNetwork",
+          "TestRedisGracefulTeardownFailsClosedOnIdentityDrift",
+          "TestRedisMixedNetworkAttachmentsFailClosedAcrossRuntimePaths",
+          "TestRedisRuntimeRegistryIsConcurrencySafe",
+          "TestRedisMultiRuntimeTeardownIsRetryable",
+          "TestRedisGracefulTeardownRemovesEmptyOwnedNetwork"
+        ]
+      },
+      {
+        "package": "pkg/shims/memorystore",
+        "tests": [
+          "TestRedisPersistsResolvedBackendIdentity",
+          "TestRedisPublishesRuntimeOnlyAfterDurableSave",
+          "TestRedisRehydrationPreservesPriorSpecWhenReplacementSaveFailsAndRetries",
+          "TestRedisMultiInstanceRehydrationRetainsPublishedUnchangedRuntime",
+          "TestRedisMutationTransactionHidesRejectedCreateFromConcurrentSaveAndRestart",
+          "TestRedisMutationTransactionRollsBackRejectedDeleteBeforeConcurrentSave",
+          "TestRedisPortableExportImportRedactsRuntimeProvenance",
+          "TestRedisSnapshotRequiresExplicitOperationSiblingEvenWhenEmpty",
+          "TestRedisPendingOperationPortableRoundTripBecomesInterrupted",
+          "TestRedisLegacyMetadataMigratesWithoutBackendAdoption",
+          "TestRedisLegacyMigrationBatchFailureLeavesOldSnapshotWhole",
+          "TestRedisLegacyMigrationPreservesConcurrentOperationCommit",
+          "TestRedisLegacyMigrationRejectsAmbiguousStateWithoutReplacement",
+          "TestRedisImportSemanticValidationPreservesPriorProfile",
+          "TestRedisImportRejectsNoncanonicalSemanticShapes",
+          "TestRedisValidationAcceptsHistoricalCreateAfterCompletedDelete",
+          "TestRedisValidationUsesLatestTerminalOutcomeIncludingFailures",
+          "TestRedisTerminalHistoryIsIsolatedPerResource",
+          "TestRedisOperationMappingSurvivesRestart"
+        ]
+      },
+      {
+        "package": "sdk-smoke/redis",
+        "tests": [
+          "TestGeneratedRedisClientUsesCanonicalLifecyclePaths"
+        ]
+      },
+      {
+        "package": "scripts",
+        "tests": [
+          "TestRedisIntegrationLifecycleContract",
+          "TestRedisRunBoundedPreservesCommandStandardInput",
+          "TestRedisInitialNetworkInspectionIsBoundedAndExact",
+          "TestRedisStartupTracksNetworkBeforeReadiness",
+          "TestRedisOwnershipConflictDispositionIsExact",
+          "TestRedisDockerEndpointSelectionIsCanonicalAndContextFree",
+          "TestRedisInvalidTimeoutDoesNotLeakLocks",
+          "TestRedisMiniSkyStartsFromIsolatedDirectory",
+          "TestRedisCleanupUsesOnlyTrackedImmutableResources",
+          "TestRedisForeignNetworkUnknownStateFailsCleanup",
+          "TestRedisPreflightRejectsExistingSameProfileResources",
+          "TestRedisProtocolAndReplacementAreExact",
+          "TestRedisForeignResourcesAreRefusedAndPreserved",
+          "TestRedisDedicatedTerraformFixturePinsProvider",
+          "TestRedisGateIsOwnedByMakeAndCriticalWorkflow"
+        ]
+      }
+    ],
+    "script": "scripts/redis-integration.sh",
+    "makeTarget": "test-redis-integration",
+    "sourceSha256": "ecf23998d307c1d0383dd0d424b667c4277b0091757ab00a795502db64a4def7",
+    "diffSha256": "ccedf19e3aa4b0d825e3204fdfff632ae8f33d128a7754d89f61deb18e54426e",
+    "note": "The definitive guarded local certification passed on profile redis-cert-final-20260729-1701 at commit c94a7d7781d959a08c8815f408e8f7abcf71c4c9 with stable pre-run complete-source SHA-256 ecf23998d307c1d0383dd0d424b667c4277b0091757ab00a795502db64a4def7 and tracked-diff SHA-256 ccedf19e3aa4b0d825e3204fdfff632ae8f33d128a7754d89f61deb18e54426e. The exact command was /usr/bin/time -p env MINISKY_REDIS_PROFILE=redis-cert-final-20260729-1701 MINISKY_REDIS_TIMEOUT_SECONDS=900 make test-redis-integration and completed in 93.66 seconds. It verified immutable Valkey linux/amd64 digest and image ID, foreign network/volume/container refusal and preservation, generated SDK create/get/list/delete with LRO polling, real RESP SET/GET, graceful MiniSky restart with a fresh exact container around the retained AOF volume, exact-owned container replacement with value survival, metadata export boundaries, Terraform Google provider 7.41.0 apply, immediate no drift, MiniSky restart/recovery, second no drift, data-plane survival, destroy, durable 404, exact resource cleanup, and lock release. Final inventory contained zero exact profile containers, volumes, networks, or integration locks. This is local uncommitted evidence only; no external CI run, URL, or commit provenance is claimed. Runtime implementation validates complete Docker provenance, a single immutable minisky-net attachment, and exact volume identity; provision and reconciliation remain provisional until durable persistence and explicit publication. Ambiguous ownership fails closed, and Docker volume deletion retains its documented non-atomic cooperative-daemon boundary.",
+    "ci": {
+      "status": "configured-unverified",
+      "workflow": ".github/workflows/critical-integration.yml",
+      "job": "redis-integration",
+      "note": "The required Redis durability job is configured but has no external run provenance."
+    }
   }
 ]

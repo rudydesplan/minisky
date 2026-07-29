@@ -55,10 +55,15 @@ type ServiceManager struct {
 	serverlessActive  map[ServerlessIdentity]struct{}
 	serverlessReady   func(string, time.Duration) error
 	emulatorReady     func(string, time.Duration) error
+	redisReady        func(context.Context, string, time.Duration) error
 	memcachedReady    func(context.Context, string, string, time.Duration) error
 	cloudSQLReady     func(context.Context, string, string, time.Duration) error
 	cloudSQLAuthReady func(context.Context, string, map[string]string, string, time.Duration) error
 	memcacheUncertain map[string]error
+	redisRuntimeMu    sync.RWMutex
+	redisRuntimes     map[string]redisRuntimeIdentity
+	redisProvisionals map[string]redisProvisionalRuntime
+	redisClosing      bool
 }
 
 type deadlineRoundTripper struct {
@@ -464,6 +469,9 @@ func (sm *ServiceManager) getContainerHostPortContext(
 // active profile. Name matches alone are never sufficient for destructive work.
 func (sm *ServiceManager) Teardown(ctx context.Context) error {
 	var failures error
+	sm.emulatorMu.Lock()
+	sm.redisClosing = true
+	sm.emulatorMu.Unlock()
 	reg := config.GetImageRegistry()
 	for domain, cfg := range reg.Emulators {
 		if isDurableEmulator(domain) {
@@ -492,6 +500,13 @@ func (sm *ServiceManager) Teardown(ctx context.Context) error {
 		}
 		log.Printf("[Orchestrator] Removed container '%s'", cfg.Name)
 	}
+	redisNetworkHandled, redisTeardownErr := sm.teardownRedisRuntimes(ctx)
+	if redisTeardownErr != nil {
+		failures = errors.Join(failures, fmt.Errorf("teardown Redis runtimes: %w", redisTeardownErr))
+	}
+	if redisNetworkHandled {
+		return failures
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/networks/"+networkName, nil)
 	if err != nil {
 		failures = errors.Join(failures, fmt.Errorf("build network inspect request: %w", err))
@@ -502,14 +517,21 @@ func (sm *ServiceManager) Teardown(ctx context.Context) error {
 		failures = errors.Join(failures, fmt.Errorf("inspect network %q: %w", networkName, err))
 	} else {
 		var network struct {
-			ID     string            `json:"Id"`
-			Labels map[string]string `json:"Labels"`
+			ID         string            `json:"Id"`
+			Labels     map[string]string `json:"Labels"`
+			Containers map[string]struct {
+				Name string `json:"Name"`
+			} `json:"Containers"`
 		}
 		if resp.StatusCode == http.StatusOK {
 			if decodeErr := json.NewDecoder(resp.Body).Decode(&network); decodeErr != nil {
 				failures = errors.Join(failures, fmt.Errorf("decode network %q ownership: %w", networkName, decodeErr))
 			} else if network.ID != "" && isOwnedDockerResource(network.Labels) {
-				if removeErr := sm.teardownDockerRequest(ctx, http.MethodDelete, "/networks/"+url.PathEscape(network.ID),
+				if len(network.Containers) != 0 {
+					failures = errors.Join(failures, fmt.Errorf(
+						"%w: network %q has %d unknown endpoints without registered runtime provenance",
+						ErrDockerOwnershipConflict, networkName, len(network.Containers)))
+				} else if removeErr := sm.teardownDockerRequest(ctx, http.MethodDelete, "/networks/"+url.PathEscape(network.ID),
 					http.StatusNoContent, http.StatusNotFound); removeErr != nil {
 					failures = errors.Join(failures, fmt.Errorf("remove network %q: %w", networkName, removeErr))
 				} else {
@@ -1167,227 +1189,6 @@ func (sm *ServiceManager) provisionComputeVM(ctx context.Context, containerName 
 	}
 
 	return sm.updatePortRegistry(containerName)
-}
-
-// ProvisionRedis creates or reconciles an owned Redis container with an owned
-// named volume. The only published endpoint is a Docker-assigned loopback port.
-func (sm *ServiceManager) ProvisionRedis(ctx context.Context, resourceID, image string) (string, error) {
-	containerName, volumeName := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainerContext(ctx, containerName)
-	if err != nil {
-		return "", err
-	}
-	if status != "not_found" {
-		if !isOwnedRedisResource(labels, resourceID) {
-			return "", fmt.Errorf("Redis container %q exists but is not owned by this profile and resource", containerName)
-		}
-		if status != "running" {
-			if err := sm.startContainerContext(ctx, containerName); err != nil {
-				return "", err
-			}
-		}
-		endpoint, err := sm.redisEndpoint(ctx, containerName)
-		if err != nil {
-			return "", err
-		}
-		if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
-			return "", err
-		}
-		return endpoint, nil
-	}
-
-	exists, err := sm.imageExistsContext(ctx, image)
-	if err != nil {
-		return "", fmt.Errorf("inspect Redis image: %w", err)
-	}
-	if !exists {
-		if err := sm.pullImageInternal(ctx, image); err != nil {
-			return "", fmt.Errorf("pull Redis image: %w", err)
-		}
-	}
-	resourceLabels := ownedDockerLabels()
-	resourceLabels["minisky.service"] = "memorystore-redis"
-	resourceLabels["minisky.resource"] = resourceID
-	volumeInspectRequest, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
-	if err != nil {
-		return "", fmt.Errorf("build Redis volume inspect request: %w", err)
-	}
-	volumeInspect, err := sm.doDocker(volumeInspectRequest)
-	if err != nil {
-		return "", fmt.Errorf("inspect Redis volume: %w", err)
-	}
-	if volumeInspect.StatusCode == http.StatusOK {
-		var existing struct {
-			Labels map[string]string `json:"Labels"`
-		}
-		decodeErr := json.NewDecoder(volumeInspect.Body).Decode(&existing)
-		volumeInspect.Body.Close()
-		if decodeErr != nil {
-			return "", fmt.Errorf("decode Redis volume ownership: %w", decodeErr)
-		}
-		if !isOwnedRedisResource(existing.Labels, resourceID) {
-			return "", fmt.Errorf("Redis volume %q exists but is not owned by this profile and resource", volumeName)
-		}
-	} else {
-		statusCode := volumeInspect.StatusCode
-		volumeInspect.Body.Close()
-		if statusCode != http.StatusNotFound {
-			return "", fmt.Errorf("inspect Redis volume returned %d", statusCode)
-		}
-		volumePayload, _ := json.Marshal(map[string]any{"Name": volumeName, "Labels": resourceLabels})
-		volumeRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-			"http://localhost/volumes/create", bytes.NewReader(volumePayload))
-		volumeRequest.Header.Set("Content-Type", "application/json")
-		volumeResponse, err := sm.doDocker(volumeRequest)
-		if err != nil {
-			return "", fmt.Errorf("create Redis volume: %w", err)
-		}
-		defer volumeResponse.Body.Close()
-		if volumeResponse.StatusCode != http.StatusCreated && volumeResponse.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(volumeResponse.Body)
-			return "", fmt.Errorf("create Redis volume returned %d: %s", volumeResponse.StatusCode, body)
-		}
-	}
-
-	const containerPort = "6379/tcp"
-	payload := map[string]any{
-		"Image":        image,
-		"Cmd":          []string{"redis-server", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"},
-		"ExposedPorts": map[string]any{containerPort: struct{}{}},
-		"HostConfig": map[string]any{
-			"NetworkMode": networkName,
-			"PortBindings": map[string]any{
-				containerPort: []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "0"}},
-			},
-			"Binds": []string{volumeName + ":/data"},
-		},
-		"Labels": resourceLabels,
-	}
-	encoded, _ := json.Marshal(payload)
-	createRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://localhost/containers/create?name="+url.QueryEscape(containerName), bytes.NewReader(encoded))
-	createRequest.Header.Set("Content-Type", "application/json")
-	createResponse, err := sm.doDocker(createRequest)
-	if err != nil {
-		return "", fmt.Errorf("create Redis container: %w", err)
-	}
-	defer createResponse.Body.Close()
-	if createResponse.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(createResponse.Body)
-		return "", fmt.Errorf("create Redis container returned %d: %s", createResponse.StatusCode, body)
-	}
-	if err := sm.startContainerContext(ctx, containerName); err != nil {
-		return "", err
-	}
-	endpoint, err := sm.redisEndpoint(ctx, containerName)
-	if err != nil {
-		return "", err
-	}
-	if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
-		return "", err
-	}
-	return endpoint, nil
-}
-
-// ReconcileRedis returns the loopback endpoint only when the existing backend
-// has exact profile and resource ownership labels.
-func (sm *ServiceManager) ReconcileRedis(ctx context.Context, resourceID string) (string, bool, error) {
-	containerName, _ := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainerContext(ctx, containerName)
-	if err != nil {
-		return "", false, err
-	}
-	if status == "not_found" {
-		return "", false, nil
-	}
-	if !isOwnedRedisResource(labels, resourceID) {
-		return "", false, nil
-	}
-	if status != "running" {
-		return "", true, fmt.Errorf("owned Redis container is %s", status)
-	}
-	endpoint, err := sm.redisEndpoint(ctx, containerName)
-	if err != nil {
-		return "", true, err
-	}
-	if err := waitUntilRedisReady(ctx, endpoint, 30*time.Second); err != nil {
-		return "", true, err
-	}
-	return endpoint, true, nil
-}
-
-// DeleteRedis removes only the exactly owned container and volume.
-func (sm *ServiceManager) DeleteRedis(ctx context.Context, resourceID string) error {
-	containerName, volumeName := redisDockerNames(resourceID)
-	status, labels, err := sm.inspectContainerContext(ctx, containerName)
-	if err != nil {
-		return err
-	}
-	if status != "not_found" {
-		if !isOwnedRedisResource(labels, resourceID) {
-			return fmt.Errorf("refusing to delete unowned Redis container %q", containerName)
-		}
-		request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
-			"http://localhost/containers/"+url.PathEscape(containerName)+"?force=true", nil)
-		response, err := sm.doDocker(request)
-		if err != nil {
-			return err
-		}
-		response.Body.Close()
-		if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
-			return fmt.Errorf("delete Redis container returned %d", response.StatusCode)
-		}
-	}
-
-	inspectRequest, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
-	if err != nil {
-		return err
-	}
-	inspectResponse, err := sm.doDocker(inspectRequest)
-	if err != nil {
-		return err
-	}
-	if inspectResponse.StatusCode == http.StatusNotFound {
-		inspectResponse.Body.Close()
-		return nil
-	}
-	if inspectResponse.StatusCode != http.StatusOK {
-		statusCode := inspectResponse.StatusCode
-		inspectResponse.Body.Close()
-		return fmt.Errorf("inspect Redis volume returned %d", statusCode)
-	}
-	var volume struct {
-		Labels map[string]string `json:"Labels"`
-	}
-	decodeErr := json.NewDecoder(inspectResponse.Body).Decode(&volume)
-	inspectResponse.Body.Close()
-	if decodeErr != nil {
-		return decodeErr
-	}
-	if !isOwnedRedisResource(volume.Labels, resourceID) {
-		return fmt.Errorf("refusing to delete unowned Redis volume %q", volumeName)
-	}
-	request, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
-		"http://localhost/volumes/"+url.PathEscape(volumeName), nil)
-	response, err := sm.doDocker(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("delete Redis volume returned %d", response.StatusCode)
-	}
-	return nil
-}
-
-func (sm *ServiceManager) redisEndpoint(ctx context.Context, containerName string) (string, error) {
-	port, err := sm.getContainerHostPortContext(ctx, containerName, "6379/tcp")
-	if err != nil {
-		return "", err
-	}
-	return net.JoinHostPort("127.0.0.1", port), nil
 }
 
 func redisDockerNames(resourceID string) (string, string) {
