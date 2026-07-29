@@ -1837,6 +1837,11 @@ func (api *API) updateSecurityPolicy(w http.ResponseWriter, r *http.Request, pro
 		return
 	}
 	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		if errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
+			message := api.failClosedControlPlaneConflict(err)
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
 		message := api.compensateControlPlaneCommit(previous, next, err)
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -1944,6 +1949,11 @@ func (api *API) routeSecurityPolicies(w http.ResponseWriter, r *http.Request, pa
 			return
 		}
 		if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+			if errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
+				message := api.failClosedControlPlaneConflict(err)
+				writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+				return
+			}
 			message := api.compensateControlPlaneCommit(previous, next, err)
 			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 			return
@@ -2057,6 +2067,11 @@ func (api *API) deleteSecurityPolicy(w http.ResponseWriter, project, name string
 		return
 	}
 	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		if errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
+			message := api.failClosedControlPlaneConflict(err)
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
 		message := api.compensateControlPlaneCommit(previous, next, err)
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -3511,6 +3526,11 @@ func (api *API) createLoadBalancerResource(
 		return
 	}
 	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		if errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
+			message := api.failClosedControlPlaneConflict(err)
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
 		message := api.compensateControlPlaneCommit(previous, next, err)
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -3614,6 +3634,11 @@ func (api *API) deleteLoadBalancerResource(
 		return
 	}
 	if err := api.opMgr.FinalizeDurable(op.Name, 0, ""); err != nil {
+		if errors.Is(err, orchestrator.ErrOperationTerminalConflict) {
+			message := api.failClosedControlPlaneConflict(err)
+			writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
+			return
+		}
 		message := api.compensateControlPlaneCommit(previous, next, err)
 		writeErrorStatus(w, http.StatusInternalServerError, "INTERNAL", message)
 		return
@@ -4135,7 +4160,7 @@ func (api *API) runFirewallOperation(operationName string, work func() error) {
 		}
 		if err := api.opMgr.FinalizeDurable(operationName, code, message); err != nil {
 			if workErr != nil {
-				api.setInitializationError(fmt.Errorf("firewall operation failed: %w; %v", workErr, err))
+				api.setInitializationError(fmt.Errorf("firewall operation failed: %w; persist terminal operation: %w", workErr, err))
 			} else {
 				api.setInitializationError(err)
 			}
@@ -4190,7 +4215,7 @@ func (api *API) rollbackFirewallMutation(
 
 func (api *API) failFirewallOperation(operationName string, mutationErr error) string {
 	if err := api.opMgr.FinalizeDurable(operationName, http.StatusInternalServerError, mutationErr.Error()); err != nil {
-		combined := fmt.Errorf("%w; persist failed operation: %v", mutationErr, err)
+		combined := fmt.Errorf("%w; persist failed operation: %w", mutationErr, err)
 		api.setInitializationError(combined)
 		return combined.Error()
 	}
@@ -4199,11 +4224,17 @@ func (api *API) failFirewallOperation(operationName string, mutationErr error) s
 
 func (api *API) failControlPlaneOperation(operationName string, mutationErr error) string {
 	if err := api.opMgr.FinalizeDurable(operationName, http.StatusInternalServerError, mutationErr.Error()); err != nil {
-		combined := fmt.Errorf("%w; persist failed operation: %v", mutationErr, err)
+		combined := fmt.Errorf("%w; persist failed operation: %w", mutationErr, err)
 		api.setInitializationError(combined)
 		return combined.Error()
 	}
 	return mutationErr.Error()
+}
+
+func (api *API) failClosedControlPlaneConflict(operationErr error) string {
+	conflict := fmt.Errorf("persist terminal operation: %w", operationErr)
+	api.setInitializationError(conflict)
+	return conflict.Error()
 }
 
 func (api *API) compensateControlPlaneCommit(previous, committed computeMetadata, operationErr error) string {

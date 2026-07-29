@@ -381,11 +381,22 @@ The regular `terraform-validate` job:
 2. initializes the pinned provider with the lock file in read-only mode; and
 3. runs `terraform validate`.
 
-The required `phase18-25-terraform-integration` job is a 12-entry matrix on
-pull requests and `main`. Each entry maps one machine-readable domain claim to
-one existing guarded Make target and integration script, checks out the
-workflow run revision, uses Terraform `1.15.8` with provider `7.41.0`, and runs
-in an isolated hosted runner. The matrix is fail-independent with four-way
+The dedicated `.github/workflows/promotion-integration.yml` workflow owns the
+required `phase18-25-terraform-integration` job: a 12-entry matrix on matching
+path-filtered pull requests and `main` pushes, plus one weekly schedule and
+input-free manual dispatch. The same workflow exclusively owns seven
+SDK/backend gates. It replaces 20 misleading manual shadows from the general CI
+workflow while retaining the quality, SDK compilation, offline evidence,
+Terraform validation, cleanup, timeout, and diagnostics prerequisites.
+To request a manual run, select **Phase 18-25 promotion integration** in GitHub
+Actions and choose **Run workflow**. The dispatch has no inputs and requests the
+full 12-leg Terraform matrix plus all seven SDK/backend gates; individual legs
+cannot be selected with dispatch booleans.
+
+Each Terraform entry maps one machine-readable domain claim to one existing
+guarded Make target and integration script, checks out the workflow run
+revision, uses Terraform `1.15.8` with provider `7.41.0`, and runs in an
+isolated hosted runner. The matrix is fail-independent with four-way
 parallelism; Docker/network-backed entries declare their prerequisite, while
 all entries retain per-script collision locks, temporary HOME/provider/state
 directories, invocation-owned cleanup, bounded timeouts, and seven-day failure
@@ -395,13 +406,22 @@ pull each exact content-addressed reference, then inspect that same reference
 for local availability before the scripts perform their own image checks. A
 successful digest pull is the portable verification; the gate does not compare
 the registry manifest digest to Docker's store-specific local image ID. The
-workflow rejects empty, malformed, or unpinned image declarations,
-while entries without backend images skip provisioning. Static evidence tests
-reject missing, duplicate, unpinned, or cross-wired
-claim/target/script/matrix mappings. These jobs are currently
-`configured-unverified`: no external passing run URL or commit has been
-recorded, so the existing 12 provider lifecycle claims remain local-pass
-evidence only.
+workflow rejects empty, malformed, or unpinned image declarations, while
+entries without backend images skip provisioning. Static evidence tests reject
+missing, duplicate, unpinned, or cross-wired claim/target/script/matrix
+mappings.
+
+PR #21's prior matrix passed in [CI run
+30384072102](https://github.com/rudydesplan/minisky/actions/runs/30384072102)
+at source commit `7035b25b056e03334656029af1e5c1259ab91765`; its
+[critical run
+30384072295](https://github.com/rudydesplan/minisky/actions/runs/30384072295)
+also passed. Those are historical records for the prior workflow layout, not
+evidence for this uncommitted branch. The new promotion workflow has not run
+externally, so all 12 of its Terraform CI checks and all seven SDK/backend CI
+checks remain `configured-unverified` with no run URL or commit. The provider
+lifecycle claims remain local evidence only and do not promote service
+fidelity.
 
 The regular `sdk-smoke-validate` job installs the pinned Python requirement,
 compiles the Go smoke with `go test`, and byte-compiles the Python smoke on
@@ -451,14 +471,15 @@ arbitrary mappings, non-RS256 signatures, Google trust roots or credential
 portability/revocation, undelete/soft-delete recovery, more than four delegates,
 `generateIdToken`, `signJwt`, and `signBlob` remain unsupported.
 
-The general Docker-backed `terraform-integration` job is opt-in because
-starting MiniSky requires a Docker network. A separate critical-integration
-workflow runs the guarded provider lifecycle with Cloud SQL, GKE, and Java
-switches enabled on scheduled, main-branch, and relevant path-triggered events.
-The general opt-in job runs for:
-
-- a pull request carrying the `terraform-integration` label; or
-- a manual workflow dispatch with `run_terraform_integration` enabled.
+The Docker-backed provider lifecycle runs as the `terraform-provider` job in
+`.github/workflows/critical-integration.yml`, with the Cloud SQL, GKE, and Java
+switches enabled. That workflow runs its legacy/high-risk gates automatically
+for matching path-filtered pull requests, matching `main` pushes, and its weekly
+schedule. To rerun it manually, select **Critical integration evidence** in
+GitHub Actions and choose **Run workflow**. Manual dispatch is input-free and
+runs the full workflow; it does not select individual jobs with booleans.
+This trigger description is not a claim of an external pass or branch
+protection.
 
 `scripts/terraform-integration.sh` refuses to run unless
 `MINISKY_TERRAFORM_INTEGRATION=1`, refuses to disturb existing MiniSky
@@ -470,13 +491,14 @@ no-drift plan, destroys the stack, and verifies that each enabled resource
 returns `404`. Redis and Spanner are excluded unless
 `MINISKY_TERRAFORM_PHASE15=1` is set.
 
-The separate opt-in `state-durability-integration` workflow runs the persisted
+The `state-durability` job in that same critical workflow runs the persisted
 BigQuery/IAM subset through create → restart → no-drift → metadata export →
 clean-profile import → no-drift → destroy. It intentionally excludes Storage
 because metadata snapshots do not archive Docker emulator data.
 
-The separate opt-in `phase13-wif-integration` workflow runs only on manual
-dispatch with `run_phase13_wif_integration` enabled. Its script requires
+The `workload-identity` job in the critical workflow runs the guarded Phase 13
+WIF lifecycle whenever that workflow is triggered, including an input-free
+manual full-workflow rerun. Its script requires
 `MINISKY_PHASE13_INTEGRATION=1`, refuses existing MiniSky Docker resources,
 uses isolated ports, home, profile state, provider data, and Terraform state,
 and cleans up owned resources. Because it is destructive to its isolated test

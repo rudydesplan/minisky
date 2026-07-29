@@ -164,8 +164,8 @@ func (api *API) SetPolicy(project string, policy Policy) error {
 	if api.initializationErr != nil {
 		return fmt.Errorf("%w: Binary Authorization persistence unavailable: %v", ErrPersistence, api.initializationErr)
 	}
-	policy = normalizePolicy(project, policy)
-	if err := validatePolicy(project, policy); err != nil {
+	policy, err := canonicalizePolicy(project, policy)
+	if err != nil {
 		return err
 	}
 	if err := api.authorizer.Authorize("binaryauthorization.policy.update", project+"/policy"); err != nil {
@@ -304,13 +304,6 @@ func (api *API) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			}
 			return
 		}
-		if policy.Name == "" {
-			policy.Name = project + "/policy"
-		}
-		if err := validatePolicy(project, policy); err != nil {
-			writeError(w, 400, "INVALID_ARGUMENT", err.Error())
-			return
-		}
 		if err := api.SetPolicy(project, policy); err != nil {
 			if errors.Is(err, ErrPermissionDenied) {
 				writeError(w, 403, "PERMISSION_DENIED", "permission denied")
@@ -434,11 +427,22 @@ func normalizePolicy(project string, policy Policy) Policy {
 	if policy.Name == "" {
 		policy.Name = project + "/policy"
 	}
+	if policy.GlobalPolicyEvaluationMode == "GLOBAL_POLICY_EVALUATION_MODE_UNSPECIFIED" {
+		policy.GlobalPolicyEvaluationMode = "DISABLE"
+	}
 	policy.DefaultAdmissionRule = normalizeAdmissionRule(policy.DefaultAdmissionRule)
 	for cluster, rule := range policy.ClusterAdmissionRules {
 		policy.ClusterAdmissionRules[cluster] = normalizeAdmissionRule(rule)
 	}
 	return policy
+}
+
+func canonicalizePolicy(project string, policy Policy) (Policy, error) {
+	policy = normalizePolicy(project, policy)
+	if err := validatePolicy(project, policy); err != nil {
+		return Policy{}, err
+	}
+	return policy, nil
 }
 
 func validateStateEntry(_ state.EntryValidationContext, payload json.RawMessage) error {
@@ -467,8 +471,8 @@ func validatePersistedPolicy(key string, policy Policy) (string, Policy, error) 
 	if !validProject(project) {
 		return "", Policy{}, errors.New("invalid persisted policy key")
 	}
-	policy = normalizePolicy(project, policy)
-	if err := validatePolicy(project, policy); err != nil {
+	policy, err := canonicalizePolicy(project, policy)
+	if err != nil {
 		return "", Policy{}, err
 	}
 	return project, policy, nil

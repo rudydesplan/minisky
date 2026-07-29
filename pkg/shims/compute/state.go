@@ -417,8 +417,12 @@ func (api *API) setInitializationError(err error) {
 
 func (api *API) initializationError() error {
 	api.initMu.RLock()
-	defer api.initMu.RUnlock()
-	return api.initializationErr
+	err := api.initializationErr
+	api.initMu.RUnlock()
+	if api.opMgr != nil {
+		err = errors.Join(err, api.opMgr.PersistenceError())
+	}
+	return err
 }
 
 func (api *API) PersistenceError() error {

@@ -375,10 +375,17 @@ func TestMemcacheDeleteCompensation(t *testing.T) {
 		if _, associated := api.metadataSnapshot().Operations[operationName]; !associated {
 			t.Fatal("failed delete lost operation provenance")
 		}
+		terminal := api.opMgr.Get(operationName)
 		backend.deleteErr = nil
 		restarted := mustMemcacheAPI(t, backend, store)
-		assertMemcacheTypedOperation(t, restarted, operationName,
-			"type.googleapis.com/google.protobuf.Empty", true)
+		assertMemcacheTerminalResultEqual(t, terminal, restarted.opMgr.Get(operationName))
+		assertMemcacheOperationError(t, restarted, operationName)
+		missing := memcacheRequest(restarted, http.MethodGet,
+			instancePath("test", "us-central1", "cache"), "")
+		assertRedisError(t, missing, http.StatusNotFound, "NOT_FOUND")
+		if _, associated := restarted.metadataSnapshot().Operations[operationName]; associated {
+			t.Fatal("resolved failed delete retained operation provenance")
+		}
 	})
 
 	t.Run("post-delete save failure reconciles without replay", func(t *testing.T) {
@@ -392,6 +399,7 @@ func TestMemcacheDeleteCompensation(t *testing.T) {
 		response := memcacheRequest(api, http.MethodDelete, instancePath("test", "us-central1", "cache"), "")
 		operationName := operationNameFromResponse(t, response)
 		waitForMemcacheOperationError(t, api, operationName)
+		terminal := api.opMgr.Get(operationName)
 		assertMemcacheState(t, api, "test", "us-central1", "cache", "DELETING")
 
 		store.mu.Lock()
@@ -402,8 +410,13 @@ func TestMemcacheDeleteCompensation(t *testing.T) {
 		deletesBeforeRestart := backend.deleteCalls
 		backend.mu.Unlock()
 		restarted := mustMemcacheAPI(t, backend, store)
+		assertMemcacheTerminalResultEqual(t, terminal, restarted.opMgr.Get(operationName))
+		assertMemcacheOperationError(t, restarted, operationName)
 		missing := memcacheRequest(restarted, http.MethodGet, instancePath("test", "us-central1", "cache"), "")
 		assertRedisError(t, missing, 404, "NOT_FOUND")
+		if _, associated := restarted.metadataSnapshot().Operations[operationName]; associated {
+			t.Fatal("authoritatively absent failed delete retained operation provenance")
+		}
 		backend.mu.Lock()
 		deletesAfterRestart := backend.deleteCalls
 		backend.mu.Unlock()

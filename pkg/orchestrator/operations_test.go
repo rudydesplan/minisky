@@ -473,7 +473,7 @@ func TestRunningPersistenceFailureIsObservableAndWorkContinues(t *testing.T) {
 	}
 }
 
-func TestSuccessfulTerminalPersistenceFailureBecomesInProcessError(t *testing.T) {
+func TestSuccessfulLegacyTerminalPersistenceFailureDoesNotPublish(t *testing.T) {
 	store := &injectedOperationStore{failOnSave: map[int]error{2: errors.New("terminal save failed")}}
 	manager, err := NewOperationManagerWithStore(store)
 	if err != nil {
@@ -487,14 +487,17 @@ func TestSuccessfulTerminalPersistenceFailureBecomesInProcessError(t *testing.T)
 	if err := manager.AdvanceDurable(op.Name, 100, StatusDone); err == nil {
 		t.Fatal("AdvanceDurable returned nil for injected terminal save failure")
 	}
-	done := manager.Get(op.Name)
-	if done == nil || !done.Done || done.Error == nil ||
-		!strings.Contains(done.Error.Message, "terminal state persistence failed") {
-		t.Fatalf("terminal persistence failure is not observable: %+v", done)
+	current := manager.Get(op.Name)
+	if current == nil || current.Done || current.Status == StatusDone || current.Error != nil {
+		t.Fatalf("terminal persistence failure published terminal state: %+v", current)
+	}
+	if manager.PersistenceError() == nil ||
+		!strings.Contains(manager.PersistenceError().Error(), "terminal save failed") {
+		t.Fatalf("terminal persistence failure is not sticky: %v", manager.PersistenceError())
 	}
 }
 
-func TestFailedTerminalPersistenceFailurePreservesWorkError(t *testing.T) {
+func TestFailedTerminalPersistenceFailureDoesNotPublishWorkError(t *testing.T) {
 	store := &injectedOperationStore{failOnSave: map[int]error{2: errors.New("terminal save failed")}}
 	manager, err := NewOperationManagerWithStore(store)
 	if err != nil {
@@ -509,10 +512,8 @@ func TestFailedTerminalPersistenceFailurePreservesWorkError(t *testing.T) {
 		t.Fatal("FailDurable returned nil for injected terminal save failure")
 	}
 	failed := manager.Get(op.Name)
-	if failed == nil || failed.Error == nil ||
-		!strings.Contains(failed.Error.Message, "backend unavailable") ||
-		!strings.Contains(failed.Error.Message, "terminal state persistence failed") {
-		t.Fatalf("work and persistence errors were not preserved: %+v", failed)
+	if failed == nil || failed.Done || failed.Status == StatusDone || failed.Error != nil {
+		t.Fatalf("failed terminal save published work error: %+v", failed)
 	}
 }
 

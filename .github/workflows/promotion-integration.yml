@@ -1,0 +1,924 @@
+name: Phase 18-25 promotion integration
+
+on:
+  pull_request:
+    paths:
+      - ".claude/skills/**"
+      - ".github/actions/**"
+      - ".github/workflows/**"
+      - ".gitlab/ci/minisky.yml"
+      - ".goreleaser.yaml"
+      - "README.md"
+      - "cmd/**"
+      - "deployments/docker-compose.yml"
+      - "docs/**"
+      - "pkg/**"
+      - "sdk-smoke/**"
+      - "scripts/**"
+      - "terraform/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
+      - "ui/index.html"
+      - "ui/eslint.config.*"
+      - "ui/package.json"
+      - "ui/package-lock.json"
+      - "ui/public/**"
+      - "ui/src/**"
+      - "ui/tsconfig*.json"
+      - "ui/vite.config.*"
+      - "ui/*.go"
+  push:
+    branches: [main]
+    paths:
+      - ".claude/skills/**"
+      - ".github/actions/**"
+      - ".github/workflows/**"
+      - ".gitlab/ci/minisky.yml"
+      - ".goreleaser.yaml"
+      - "README.md"
+      - "cmd/**"
+      - "deployments/docker-compose.yml"
+      - "docs/**"
+      - "pkg/**"
+      - "sdk-smoke/**"
+      - "scripts/**"
+      - "terraform/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
+      - "ui/index.html"
+      - "ui/eslint.config.*"
+      - "ui/package.json"
+      - "ui/package-lock.json"
+      - "ui/public/**"
+      - "ui/src/**"
+      - "ui/tsconfig*.json"
+      - "ui/vite.config.*"
+      - "ui/*.go"
+  schedule:
+    - cron: "41 6 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    promotion-integration-${{
+      github.event_name == 'pull_request' &&
+      format('pr-{0}', github.event.pull_request.number) ||
+      format('{0}-{1}-{2}', github.event_name, github.run_id, github.run_attempt)
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Test, lint, and build promotion assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Validate project agent skills
+        run: python3 .claude/skills/validate.py
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Lint UI
+        working-directory: ui
+        run: npm run lint
+
+      - name: Test UI
+        working-directory: ui
+        run: npm test
+
+      - name: Audit UI dependencies
+        working-directory: ui
+        run: npm audit --audit-level=high
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Share promotion UI assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Check generated documentation truth
+        run: make check-docs-truth
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l cmd pkg ui)"
+
+      - name: Vet Go code
+        run: go vet ./cmd/... ./pkg/... ./ui
+
+      - name: Test Go code with race detector
+        run: go test -race ./cmd/... ./pkg/... ./ui
+
+      - name: Test integration script contracts
+        run: go test -count=1 ./scripts
+
+      - name: Build MiniSky
+        run: go build -trimpath ./cmd/minisky
+
+      - name: Validate local action JavaScript
+        run: node --test .github/actions/setup-minisky/index.test.mjs && node --check .github/actions/setup-minisky/index.mjs && node --check .github/actions/setup-minisky/cleanup.mjs
+
+      - name: Start built artifact with local action
+        id: minisky
+        uses: ./.github/actions/setup-minisky
+        with:
+          binary: ./minisky
+          api-port: "18080"
+          ui-port: "18081"
+          profile: action-e2e
+          services: compute
+
+      - name: Verify action readiness output
+        run: |
+          test "${{ steps.minisky.outputs.endpoint }}" = "http://127.0.0.1:18080"
+          curl --fail --silent --show-error "${{ steps.minisky.outputs.endpoint }}/healthz"
+
+      - name: Validate CI and Compose templates
+        env:
+          MINISKY_IMAGE: ghcr.io/qamarudeenm/minisky:test
+        run: |
+          ruby -e "require 'yaml'; YAML.safe_load(File.read('.gitlab/ci/minisky.yml'), aliases: true)"
+          docker compose -f deployments/docker-compose.yml config >/dev/null
+
+  sdk-smoke-validate:
+    name: Compile promotion SDK smoke suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: sdk-smoke/python/requirements.txt
+
+      - name: Install pinned Python SDK dependency
+        run: python -m pip install --requirement sdk-smoke/python/requirements.txt
+
+      - name: Compile Go SDK smoke
+        run: go test ./sdk-smoke/go ./sdk-smoke/phase15 ./sdk-smoke/phase16 ./sdk-smoke/phase16-logging ./sdk-smoke/phase16-dns ./sdk-smoke/phase16-subnetwork ./sdk-smoke/phase16-vertex ./sdk-smoke/phase18-25 ./sdk-smoke/phase19 ./sdk-smoke/phase20 ./sdk-smoke/phase21-22 ./sdk-smoke/phase23 ./sdk-smoke/phase24-25
+
+      - name: Compile Python SDK smoke
+        run: python -m compileall -q sdk-smoke/python
+
+      - name: Compile Java SDK smoke in pinned container
+        run: make test-java-sdk-compile
+
+  phase18-25-evidence:
+    name: Phase 18-25 offline promotion evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 18-25 offline evidence
+        run: make test-phase18-25-evidence
+
+  terraform-validate:
+    name: Validate promotion Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize pinned providers
+        working-directory: terraform
+        run: terraform init -backend=false -input=false -lockfile=readonly
+
+      - name: Validate Terraform configuration
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Validate integration script syntax
+        run: |
+          bash -n scripts/terraform-integration.sh scripts/state-durability-integration.sh scripts/kind-integration.sh scripts/release-tag-policy.sh scripts/event-delivery-integration.sh scripts/install-pack.sh scripts/phase10-artifact-integration.sh scripts/phase11-distribution-test.sh scripts/phase12-observability-integration.sh scripts/phase12-observability-integration-test.sh scripts/phase13-wif-integration.sh scripts/phase17-enterprise-wif-integration.sh scripts/phase15-emulator-integration.sh scripts/phase16-monitoring-integration.sh scripts/phase16-logging-integration.sh scripts/phase16-dns-integration.sh scripts/phase16-subnetwork-integration.sh scripts/phase16-subnetwork-terraform-integration.sh scripts/phase16-vertex-integration.sh scripts/phase18-25-sdk-integration.sh scripts/phase18-eventarc-terraform-integration.sh scripts/phase18-workflows-terraform-integration.sh scripts/phase19-composer-terraform-integration.sh scripts/phase19-managed-kafka-terraform-integration.sh scripts/phase19-sdk-integration.sh scripts/phase20-alloydb-terraform-integration.sh scripts/phase20-filestore-terraform-integration.sh scripts/phase20-identity-platform-terraform-integration.sh scripts/phase20-storage-transfer-terraform-integration.sh scripts/phase20-sdk-integration.sh scripts/phase21-22-sdk-integration.sh scripts/phase21-service-directory-terraform-integration.sh scripts/phase23-document-ai-terraform-integration.sh scripts/phase23-sdk-integration.sh scripts/phase24-25-sdk-integration.sh scripts/phase24-org-policy-terraform-integration.sh scripts/phase25-binary-authorization-terraform-integration.sh scripts/linux-package-integration.sh scripts/airgap-bundle.sh scripts/airgap-bundle-test.sh
+          ./scripts/phase11-distribution-test.sh --self-test
+          make test-phase12-observability-contract
+          MINISKY_KIND_SELF_TEST=1 ./scripts/kind-integration.sh
+          MINISKY_RELEASE_TAG_POLICY_SELF_TEST=1 ./scripts/release-tag-policy.sh
+          MINISKY_PHASE16_SUBNETWORK_SELF_TEST=1 ./scripts/phase16-subnetwork-integration.sh
+          MINISKY_PHASE16_SUBNETWORK_TERRAFORM_SELF_TEST=1 ./scripts/phase16-subnetwork-terraform-integration.sh
+          set +e
+          env -u MINISKY_PHASE19_SDK_INTEGRATION ./scripts/phase19-sdk-integration.sh >phase19-refusal.log 2>&1
+          phase19_refusal_status=$?
+          set -e
+          test "${phase19_refusal_status}" -eq 2
+          grep -F "Refusing Phase 19 SDK integration" phase19-refusal.log >/dev/null
+          rm phase19-refusal.log
+          set +e
+          env -u MINISKY_PHASE20_SDK_INTEGRATION ./scripts/phase20-sdk-integration.sh >phase20-refusal.log 2>&1
+          phase20_refusal_status=$?
+          set -e
+          test "${phase20_refusal_status}" -eq 2
+          grep -F "Refusing Phase 20 SDK integration" phase20-refusal.log >/dev/null
+          rm phase20-refusal.log
+          set +e
+          env -u MINISKY_PHASE21_22_SDK_INTEGRATION ./scripts/phase21-22-sdk-integration.sh >phase21-22-refusal.log 2>&1
+          phase21_22_refusal_status=$?
+          set -e
+          test "${phase21_22_refusal_status}" -eq 2
+          grep -F "Refusing Phase 21-22 SDK integration" phase21-22-refusal.log >/dev/null
+          rm phase21-22-refusal.log
+          set +e
+          env -u MINISKY_PHASE23_SDK_INTEGRATION ./scripts/phase23-sdk-integration.sh >phase23-refusal.log 2>&1
+          phase23_refusal_status=$?
+          set -e
+          test "${phase23_refusal_status}" -eq 2
+          grep -F "Refusing Phase 23 SDK integration" phase23-refusal.log >/dev/null
+          rm phase23-refusal.log
+          set +e
+          env -u MINISKY_PHASE24_25_SDK_INTEGRATION ./scripts/phase24-25-sdk-integration.sh >phase24-25-refusal.log 2>&1
+          phase24_25_refusal_status=$?
+          set -e
+          test "${phase24_25_refusal_status}" -eq 2
+          grep -F "Refusing Phase 24-25 SDK integration" phase24-25-refusal.log >/dev/null
+          rm phase24-25-refusal.log
+
+      - name: Validate Memcached integration script
+        run: |
+          bash -n scripts/memcache-integration.sh
+          shellcheck scripts/memcache-integration.sh
+
+      - name: Verify air-gapped bundle workflow
+        run: ./scripts/airgap-bundle-test.sh
+
+  phase18-25-terraform-integration:
+    name: Terraform 7.41.0 (${{ matrix.domain }})
+    needs:
+      - quality
+      - phase18-25-evidence
+      - terraform-validate
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - id: workflows
+            domain: workflows.googleapis.com
+            make_target: test-phase18-workflows-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase18-workflows-terraform-integration.lock
+          - id: eventarc
+            domain: eventarc.googleapis.com
+            make_target: test-phase18-eventarc-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase18-eventarc-terraform-integration.lock
+          - id: composer
+            domain: composer.googleapis.com
+            make_target: test-phase19-composer-terraform
+            docker_required: true
+            required_images_script: scripts/phase19-composer-terraform-integration.sh
+            timeout_minutes: 25
+            lock_name: minisky-phase19-composer-terraform-integration.lock
+          - id: managed-kafka
+            domain: managedkafka.googleapis.com
+            make_target: test-phase19-managed-kafka-terraform
+            docker_required: true
+            required_images_script: scripts/phase19-managed-kafka-terraform-integration.sh
+            timeout_minutes: 25
+            lock_name: minisky-phase19-managed-kafka-terraform-integration.lock
+          - id: alloydb
+            domain: alloydb.googleapis.com
+            make_target: test-phase20-alloydb-terraform
+            docker_required: true
+            required_images_script: scripts/phase20-alloydb-terraform-integration.sh
+            timeout_minutes: 25
+            lock_name: minisky-phase20-alloydb-terraform-integration.lock
+          - id: filestore
+            domain: file.googleapis.com
+            make_target: test-phase20-filestore-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase20-filestore-terraform-integration.lock
+          - id: identity-platform
+            domain: identityplatform.googleapis.com
+            make_target: test-phase20-identity-platform-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase20-identity-platform-terraform-integration.lock
+          - id: storage-transfer
+            domain: storagetransfer.googleapis.com
+            make_target: test-phase20-storage-transfer-terraform
+            docker_required: true
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase20-storage-transfer-terraform.lock
+          - id: service-directory
+            domain: servicedirectory.googleapis.com
+            make_target: test-phase21-service-directory-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase21-service-directory-terraform-integration.lock
+          - id: document-ai
+            domain: documentai.googleapis.com
+            make_target: test-phase23-document-ai-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase23-document-ai-terraform-integration.lock
+          - id: org-policy
+            domain: orgpolicy.googleapis.com
+            make_target: test-phase24-org-policy-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase24-org-policy-terraform-integration.lock
+          - id: binary-authorization
+            domain: binaryauthorization.googleapis.com
+            make_target: test-phase25-binary-authorization-terraform
+            docker_required: false
+            required_images_script: none
+            timeout_minutes: 20
+            lock_name: minisky-phase25-binary-authorization-terraform-integration.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      CHECKPOINT_DISABLE: "1"
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Verify Docker availability
+        if: matrix.docker_required
+        run: docker info >/dev/null
+
+      - name: Provision pinned backend images
+        if: matrix.required_images_script != 'none'
+        run: scripts/provision-required-images.sh "${{ matrix.required_images_script }}"
+
+      - name: Run exact domain lifecycle
+        run: |
+          set -o pipefail
+          git rev-parse HEAD | tee "terraform-${{ matrix.id }}.commit"
+          make "${{ matrix.make_target }}" 2>&1 | tee "terraform-${{ matrix.id }}.log"
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/${{ matrix.lock_name }}"
+          test ! -d "${TMPDIR:-/tmp}/${{ matrix.lock_name }}"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'domain=%s\n' '${{ matrix.domain }}'
+            printf 'make_target=%s\n' '${{ matrix.make_target }}'
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            printf '%s\n' 'containers:'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            printf '%s\n' 'networks:'
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            printf '%s\n' 'volumes:'
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >"terraform-${{ matrix.id }}-diagnostics.txt"
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: terraform-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            terraform-${{ matrix.id }}.commit
+            terraform-${{ matrix.id }}.log
+            terraform-${{ matrix.id }}-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase18-25-sdk-integration:
+    name: Phase 18-25 generated Go client restart acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 18-25 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase18-25-sdk 2>&1 | tee phase18-25-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase18-25-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase18-25-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase18-25-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase18-25-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase18-25-sdk-integration.log
+            phase18-25-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase19-sdk-integration:
+    name: Phase 19 generated Go client restart acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 19 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase19-sdk 2>&1 | tee phase19-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase19-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase19-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase19-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase19-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase19-sdk-integration.log
+            phase19-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase19-heavy-backend-integration:
+    name: Phase 19 Kafka and Airflow backend acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PHASE19_HEAVY_PROFILE: phase19-heavy-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 19 heavy backend integration
+        env:
+          MINISKY_PHASE19_PROFILE: ${{ env.PHASE19_HEAVY_PROFILE }}
+          MINISKY_PHASE19_DIAGNOSTICS_DIR: ${{ runner.temp }}/phase19-heavy-diagnostics
+        run: |
+          set -o pipefail
+          make test-phase19-heavy-backend 2>&1 | tee phase19-heavy-backend-integration.log
+
+      - name: Remove exact-owned Phase 19 resources
+        if: always()
+        timeout-minutes: 2
+        env:
+          MINISKY_PHASE19_PROFILE: ${{ env.PHASE19_HEAVY_PROFILE }}
+        run: |
+          while IFS= read -r container; do
+            test -z "${container}" || docker rm -f -v "${container}"
+          done < <(docker ps -aq --filter "label=minisky.profile=${MINISKY_PHASE19_PROFILE}")
+          test -z "$(docker ps -aq --filter "label=minisky.profile=${MINISKY_PHASE19_PROFILE}")"
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase19-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase19-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase19-heavy-backend-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase19-heavy-backend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase19-heavy-backend-integration.log
+            phase19-heavy-backend-diagnostics.txt
+            ${{ runner.temp }}/phase19-heavy-diagnostics
+          if-no-files-found: error
+          retention-days: 7
+
+  phase20-sdk-integration:
+    name: Phase 20 Docker-backed generated Go client acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 20 Docker-backed generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase20-sdk 2>&1 | tee phase20-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase20-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase20-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase20-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase20-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase20-sdk-integration.log
+            phase20-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase21-22-sdk-integration:
+    name: Phase 21-22 Docker-isolated generated Go client acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 21-22 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase21-22-sdk 2>&1 | tee phase21-22-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase21-22-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase21-22-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase21-22-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase21-22-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase21-22-sdk-integration.log
+            phase21-22-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase23-sdk-integration:
+    name: Phase 23 Docker-isolated generated Go client acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker availability
+        run: docker info >/dev/null
+
+      - name: Run Phase 23 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase23-sdk 2>&1 | tee phase23-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase23-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase23-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase23-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase23-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase23-sdk-integration.log
+            phase23-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  phase24-25-sdk-integration:
+    name: Phase 24-25 generated Go client restart acceptance
+    needs:
+      - quality
+      - sdk-smoke-validate
+      - phase18-25-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promotion-ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Phase 24-25 generated-client integration
+        run: |
+          set -o pipefail
+          make test-phase24-25-sdk 2>&1 | tee phase24-25-sdk-integration.log
+
+      - name: Verify bounded lifecycle cleanup
+        if: always()
+        timeout-minutes: 2
+        run: |
+          rm -rf "${TMPDIR:-/tmp}/minisky-phase24-25-sdk-integration.lock"
+          test ! -d "${TMPDIR:-/tmp}/minisky-phase24-25-sdk-integration.lock"
+
+      - name: Capture bounded failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          {
+            printf 'run_sha=%s\n' '${{ github.sha }}'
+            if ! docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}' 2>/dev/null; then
+              printf '%s\n' 'Docker container inventory unavailable.'
+            fi
+            if ! docker network ls 2>/dev/null; then
+              printf '%s\n' 'Docker network inventory unavailable.'
+            fi
+            if ! docker volume ls 2>/dev/null; then
+              printf '%s\n' 'Docker volume inventory unavailable.'
+            fi
+          } >phase24-25-sdk-diagnostics.txt
+
+      - name: Retain failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase24-25-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            phase24-25-sdk-integration.log
+            phase24-25-sdk-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7

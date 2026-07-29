@@ -136,16 +136,17 @@ entire service API. Important boundaries:
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 0/6; configured but unverified: 6/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
-The Phase 18–25 domains marked `experimental` in the machine-readable
-manifest below are package-registered prototypes. The offline
+The Phase 18–25 domains marked `experimental` in the machine-readable manifest
+below are package-registered prototypes. The offline
 `make test-phase18-25-evidence` gate covers their canonical public selector,
 default-off/opt-in behavior, validation ordering, scoped IAM where applicable,
 and the package-local evidence referenced by
-`pkg/evidence/phase18_25.json`. All six generated-client gates passed
-locally. Phase 18–25 covered Workflows, Workflow Executions, Eventarc, and
+`pkg/evidence/phase18_25.json`. All six generated-client gates pass in the
+current working tree, so that evidence remains `local-passed-uncommitted`.
+Phase 18–25 covered Workflows, Workflow Executions, Eventarc, and
 exact-owned Docker-backed Batch execution. Phase 19 covered terminal/cancelled
 Dataflow, the Dataform hierarchy, explicit Pub/Sub Lite 501 behavior, Kafka
 protocol round-trip, and Airflow DAG triggering. Both gates passed restart and
@@ -166,7 +167,8 @@ Phase 24–25 gate covered security/network resource lifecycles, perimeter and
 proxy policy deny/allow enforcement, strict IAM and GCP-shaped errors, canonical
 Compute/network routing, restart truth, generated deletion, and exact cleanup.
 Its backend gate exercised two isolated loopback HTTP backends without claiming
-a Docker service backend. All six generated-client CI jobs passed on commit
+a Docker service backend. Historical predecessor CI passed all six
+generated-client jobs on commit
 `62d6fa245774f3ff3bdd9b82e19d1c617650d448` in
 [run 30285572232](https://github.com/rudydesplan/minisky/actions/runs/30285572232).
 The separate Phase 19 Kafka/Airflow backend job passed on commit
@@ -175,9 +177,22 @@ The separate Phase 19 Kafka/Airflow backend job passed on commit
 including its final exact-owned cleanup step. Bounded Terraform provider
 evidence is tracked per domain in the generated catalog below; all experimental
 domains remain default-off and do not claim Standard fidelity.
-The Binary Authorization Terraform claim is an independent Phase 24–25
-`local-passed` check with no recorded CI run URL or commit. It does not inherit
-the generated-client batch CI status and does not promote the service beyond
+PR #21's prior 12-entry Terraform matrix passed at source commit
+`7035b25b056e03334656029af1e5c1259ab91765` in
+[CI run 30384072102](https://github.com/rudydesplan/minisky/actions/runs/30384072102);
+[critical run
+30384072295](https://github.com/rudydesplan/minisky/actions/runs/30384072295)
+also passed for that commit. Those records predate the dedicated promotion
+workflow and do not verify this uncommitted branch.
+
+The new path-aware, weekly, and manually runnable promotion workflow owns the
+12 Terraform legs and seven SDK/backend gates exactly once after removing 20
+general-CI manual shadows. It has not run externally, so those CI dimensions
+remain `configured-unverified` with no run URL or commit. The Binary
+Authorization Terraform claim is an independent Phase 24–25 `local-passed`
+check. Its new promotion-workflow dimension has no recorded CI run URL or
+commit and does not inherit the generated-client batch CI status or historical
+prior-workflow matrix pass. It does not promote the service beyond
 experimental/default-off support.
 
 aiplatform.googleapis.com remains implemented for the existing Vertex

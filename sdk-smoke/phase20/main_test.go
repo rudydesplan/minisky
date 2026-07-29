@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	filestoreshim "minisky/pkg/shims/filestore"
+
+	file "google.golang.org/api/file/v1"
 	storage "google.golang.org/api/storage/v1"
 	storagetransfer "google.golang.org/api/storagetransfer/v1"
 )
@@ -114,6 +117,62 @@ func TestGeneratedClientsUseCanonicalFullDomainPaths(t *testing.T) {
 		if !seen[path] {
 			t.Errorf("generated client did not request %s", path)
 		}
+	}
+}
+
+func TestGeneratedFilestoreClientDecodesCapacityAfterRestart(t *testing.T) {
+	t.Setenv("MINISKY_STATE_DIR", t.TempDir())
+	t.Setenv("MINISKY_PROFILE", "phase20-filestore-json")
+	parent := "projects/demo/locations/us-central1"
+	name := parent + "/instances/files"
+	newServer := func() *httptest.Server {
+		api := filestoreshim.NewAPI(nil)
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			clone := r.Clone(r.Context())
+			clone.URL.Path = strings.TrimPrefix(clone.URL.Path, "/_minisky/file.googleapis.com")
+			api.ServeHTTP(w, clone)
+		}))
+	}
+
+	firstServer := newServer()
+	t.Cleanup(firstServer.Close)
+	firstClients, err := newGeneratedClients(context.Background(), firstServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := firstClients.file.Projects.Locations.Instances.Create(parent, &file.Instance{
+		Tier:       "BASIC_HDD",
+		FileShares: []*file.FileShareConfig{{Name: "share", CapacityGb: 1024}},
+	}).InstanceId("files").Do()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waitFileOperation(context.Background(), firstClients.file, operation.Name); err != nil {
+		t.Fatal(err)
+	}
+	firstServer.Close()
+
+	restartedServer := newServer()
+	t.Cleanup(restartedServer.Close)
+	restartedClients, err := newGeneratedClients(context.Background(), restartedServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := restartedClients.file.Projects.Locations.Instances.Get(name).Do()
+	if err != nil {
+		t.Fatalf("generated restart GET: %v", err)
+	}
+	if len(instance.FileShares) != 1 || instance.FileShares[0].CapacityGb != 1024 {
+		t.Fatalf("restart file shares = %#v", instance.FileShares)
+	}
+	collection, err := restartedClients.file.Projects.Locations.Instances.List(parent).Do()
+	if err != nil {
+		t.Fatalf("generated restart LIST: %v", err)
+	}
+	if len(collection.Instances) != 1 ||
+		len(collection.Instances[0].FileShares) != 1 ||
+		collection.Instances[0].FileShares[0].CapacityGb != 1024 {
+		t.Fatalf("restart instances = %#v", collection.Instances)
 	}
 }
 

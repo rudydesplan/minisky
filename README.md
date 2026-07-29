@@ -8,15 +8,16 @@ MiniSky provides a local gateway for custom Go shims and selected Docker-backed
 emulators. Core services (Compute, Storage, BigQuery, Pub/Sub, Cloud SQL, IAM)
 have verified Terraform and SDK slices. Phase 18–25 services remain default-off
 experimental surfaces with locally passing package, race, strict-IAM, and
-machine-readable evidence gates. All six Phase 18–25 guarded
-generated-client, restart, and cleanup workflows now pass locally, including
-Kafka/Airflow, the Phase 20 pinned PostgreSQL, Valkey, and Storage backends, and
-the later isolated local gateway/backend boundaries. All six corresponding
-GitHub Actions jobs passed on commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`
-in [run 30285572232](https://github.com/rudydesplan/minisky/actions/runs/30285572232);
-the complete native release-equivalent gate remains a promotion prerequisite. Once
-dependencies and required images are available locally, verified workflows can
-run offline; first use may pull lazily loaded emulator images.
+machine-readable evidence gates. The current uncommitted reliability milestone
+passes its supported local checks: shared durable operations persist terminal
+results before publishing them, reconcile post-commit save errors only through
+exact readback, preserve JSON metadata without numeric loss, and make matching
+terminal retries idempotent while rejecting conflicts. Compute and Memcached
+use that contract for their covered mutation, reconciliation, and polling
+paths. This is exactly-once operation-result publication, not exactly-once
+external side effects. Once dependencies and required images are available
+locally, verified workflows can run offline; first use may pull lazily loaded
+emulator images.
 
 The bounded Memorystore for Memcached milestone is tracked by the generated
 service-gate section below. It remains a deliberately narrow local emulator
@@ -59,7 +60,7 @@ CI is `configured-unverified` in `.github/workflows/critical-integration.yml` jo
 <!-- BEGIN GENERATED PHASE 18-25 SUMMARY -->
 **Generated truth:** 36 experimental; 36 default-off; 12 Terraform claims. Persistence inventory: file=22, hybrid=4, memory=4, static=6.
 
-Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 6/6; configured but unverified: 0/6. Heavy backend CI gates passed: 1/1; configured but unverified: 0/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
+Machine-readable promotion matrix: 6 batch gates and 12 per-domain Terraform checks. Package-unit gates passed locally: 6/6; strict-IAM gates passed locally: 6/6. Generated-client lifecycle gates passed locally: 6/6; configured but unverified: 0/6. Restart gates passed locally: 6/6; cleanup gates passed locally: 6/6; CI gates passed: 0/6; configured but unverified: 6/6. Heavy backend CI gates passed: 0/1; configured but unverified: 1/1. Terraform CI gates passed: 0/12; configured but unverified: 12/12. Admission replay gates passed locally: 1/1. Package and IAM passes do not promote compatibility; every inventoried service remains experimental until its required integration gates pass.
 <!-- END GENERATED PHASE 18-25 SUMMARY -->
 
 Their runtime handlers are disabled by default. Requests return canonical JSON
@@ -79,8 +80,10 @@ in `pkg/evidence/batch_gates.json` separately qualify package, generated-client,
 restart, backend/Docker, strict-IAM, Terraform, cleanup, and CI evidence.
 
 The complete Go race suite, documentation truth checks, and package/strict-IAM
-evidence pass locally. All six Phase 18–25 generated-client
-workflows passed create, restart, terminal observation, delete, and cleanup locally.
+evidence pass in the current working tree. All six Phase 18–25
+generated-client workflows passed create, restart, terminal observation,
+delete, and cleanup locally. These are `local-passed-uncommitted` claims until
+the branch has immutable external evidence.
 The guarded `make test-phase18-event-delivery` gate additionally publishes two
 exact raw `PublishRequest` payloads with unique nonces through the canonical
 public Pub/Sub gateway and observes matching Eventarc-triggered Workflow
@@ -110,9 +113,10 @@ boundaries; GCP-shaped errors; project isolation; sensitive-data absence; and
 control-plane/network cleanup. Phase 24–25 passed security/network resource
 lifecycles, perimeter and proxy deny/allow enforcement, strict IAM and
 GCP-shaped errors, canonical Compute routing, two isolated loopback backends,
-restart truth, and cleanup. All six external generated-client jobs passed on
-commit `62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its
-Linux ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. On commit
+restart truth, and cleanup. Historical predecessor CI passed all six
+generated-client jobs on commit
+`62d6fa245774f3ff3bdd9b82e19d1c617650d448`; the same run also passed its Linux
+ARM64, macOS ARM64, and Windows AMD64 native CGO jobs. On commit
 `d657e4b0b77a34ddb615124db2d82da810238502`,
 [run 30287887431](https://github.com/rudydesplan/minisky/actions/runs/30287887431)
 passed the Phase 19 Kafka/Airflow backend gate, corrected GoReleaser validation,
@@ -177,13 +181,16 @@ This is Terraform compatibility evidence and local emulation, not fidelity
 promotion, GKE admission, or production admission security. Binary
 Authorization remains experimental and default-off. This Phase 25 Terraform
 gate has local-pass evidence only; no CI run or commit is claimed. A required
-12-entry GitHub Actions matrix now maps every machine-readable Phase 18–25
-Terraform claim exactly once to its guarded Make target and script on pull
-requests and `main`. Composer, Managed Kafka, and AlloyDB matrix entries derive,
-pull, and inspect exact tag-plus-SHA256 image references from their guarded
-scripts before execution; entries without backend images remain lightweight.
-Those CI checks remain `configured-unverified` until an
-external run passes; no run URL or commit is recorded for them yet.
+path-aware, weekly, and manually runnable promotion workflow now owns every
+machine-readable Phase 18–25 gate exactly once: 12 Terraform legs and seven
+SDK/backend gates. It replaces 20 manual shadows from the general CI workflow
+while retaining the quality, SDK compilation, offline evidence, Terraform
+validation, cleanup, timeout, and diagnostics contracts. Composer, Managed
+Kafka, and AlloyDB matrix entries derive, pull, and inspect exact
+tag-plus-SHA256 image references from their guarded scripts before execution;
+entries without backend images remain lightweight. The new promotion workflow
+has not run externally, so its CI checks remain `configured-unverified`; no run
+URL or commit is recorded for it.
 Unsupported methods return canonical 501
 responses rather than simulated success; Cloud CDN/Armor remains within the
 Compute domain and does not claim full GCP data-plane parity.
@@ -422,7 +429,7 @@ require network access; the command does not prune global Docker resources.
 | :--- | :--- | :--- | :---: |
 | 6 | Service support/fidelity baseline and compatibility matrices | Manifest and docs agree on implemented/deferred status; implemented domains have an executable in-process or backend-gated contract, while deferred domains return deterministic unsupported responses | ✅ Baseline |
 | 7 | Terraform and SDK compatibility | The default opt-in fixture covers BigQuery, IAM, Storage, and cross-project Pub/Sub; bounded Phase-15 data and Phase-16 network resources are optional | ✅ Baseline |
-| 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; an opt-in gate verifies restart and metadata-only export/import | ✅ Foundation |
+| 8 | Durable state, profiles, and snapshots | Supported metadata survives restart; durable operations persist before publication, reconcile only exact committed readback, preserve JSON metadata, and keep terminal results immutable | ✅ Local reliability milestone |
 | 9 | Executable serverless and event delivery | A guarded Pack gate proves bounded Functions/Cloud Run event delivery and Cloud Tasks retry outcomes on Linux CI; Scheduler remains manual `:run` E2E | ✅ CI-verified bounded slice |
 | 10 | Networking and artifact fidelity | Compute load-balancer resources are stateful and route traffic; Artifact Registry reflects pushed packages and versions | ✅ Verified slice |
 | 11 | Unified diagnostics, CLI, and distribution | Headless commands use the API gateway; non-publishing GoReleaser, native package, and cross-platform CGO gates pass; external publication remains unverified | 🚧 CI-verified non-publishing slice |
@@ -468,9 +475,17 @@ require network access; the command does not prune global Docker resources.
 
 ### Phase 8 — Durable state and team workflows
 
-**Status (2026-07-25): guarded durability gate passed locally.** The persisted
-BigQuery/IAM subset passed create → restart → no-drift → export → clean-profile
-import → no-drift → destroy with run-scoped Docker ownership and cleanup.
+**Status (2026-07-28): local reliability milestone passed, uncommitted and not
+externally verified.** The persisted BigQuery/IAM subset still passes create →
+restart → no-drift → export → clean-profile import → no-drift → destroy. The
+shared durable operation manager now keeps terminal candidates hidden until
+their snapshots are durable, accepts an ambiguous post-commit error only when
+exact readback matches, preserves JSON metadata including large numeric values,
+and returns the same terminal result for matching retries while rejecting a
+conflict. Covered Compute and Memcached paths keep resource state, operation
+polling, restart reconciliation, and degraded-state behavior aligned with that
+contract. This does not provide exactly-once external effects or broaden any
+service's documented fidelity boundary.
 
 - Introduce a versioned state store with per-shim persistence adapters.
 - Rehydrate Compute, IAM, DNS, BigQuery metadata, Scheduler, Secret Manager,
@@ -772,17 +787,23 @@ bounded slice is not production federation or a production-ready Phase 17.
 ### Current completion priorities
 
 As of 2026-07-28, PR
-[#21](https://github.com/rudydesplan/minisky/pull/21) has a complete required
-CI and critical-integration pair for commit
-`60e82159d7fd80cf6472327b2cd14c2ae1465f23`: [CI run
-30337314745](https://github.com/rudydesplan/minisky/actions/runs/30337314745)
+[#21](https://github.com/rudydesplan/minisky/pull/21) has historical evidence at
+source commit `7035b25b056e03334656029af1e5c1259ab91765`: its prior 12-entry
+Terraform matrix passed in [CI run
+30384072102](https://github.com/rudydesplan/minisky/actions/runs/30384072102),
 and [critical run
-30337314786](https://github.com/rudydesplan/minisky/actions/runs/30337314786)
-both passed. Optional opt-in integration jobs skipped by the pull-request
-workflow are not converted into pass claims. The Binary Authorization
-Terraform lifecycle and the other eleven domain-scoped Terraform checks remain
-local-passed only; their required matrix is configured but has no external
-exact-head pass record.
+30384072295](https://github.com/rudydesplan/minisky/actions/runs/30384072295)
+passed. Those runs belong to that commit and the prior workflow layout; they do
+not verify this new uncommitted branch or the new promotion workflow.
+
+After merge, [main CI run
+30387050664](https://github.com/rudydesplan/minisky/actions/runs/30387050664)
+failed its Go race suite at merge commit
+`f0712219f62dc711244af9db904da20362437a49` because a restarted Cloud Deploy
+operation did not retain its terminal permission-denial result. That failure
+motivated the shared durability fix above, but no external run has yet proved
+the fix. Current status is therefore `local-passed-uncommitted` for the
+reliability work and `configured-unverified` for the new promotion workflow.
 
 The next evidence milestones are:
 
@@ -790,9 +811,10 @@ The bounded Memcached lifecycle is no longer a deferred implementation
 priority. Its machine-readable service gate above owns the local and CI evidence
 wording and does not change the unresolved Phase 18–25 matrix requirement below.
 
-1. obtain one exact-head external run in which all 12 required Phase 18–25
-   Terraform matrix entries pass, then record its immutable run URL and full
-   commit without promoting any domain beyond its bounded claim;
+1. obtain one exact-head external run of the new promotion workflow in which
+   all 12 required Terraform legs and seven SDK/backend gates pass, then record
+   its immutable run URL and full commit without promoting any domain beyond
+   its bounded claim;
 2. keep the 12 existing Phase 18–25 Terraform claims domain-scoped, and add any
    further claim only with provider apply, restart, import where supported,
    no-drift, destroy, and cleanup evidence;

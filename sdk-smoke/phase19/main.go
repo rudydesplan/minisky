@@ -403,8 +403,8 @@ func verifyDockerBackends(ctx context.Context, clients *generatedClients, cfg co
 	if err != nil {
 		return fmt.Errorf("restart Managed Kafka get: %w", err)
 	}
-	if cluster.State != "FAILED" {
-		return fmt.Errorf("restart Managed Kafka state=%q want=FAILED", clusterState(cluster))
+	if cluster.State != "ACTIVE" {
+		return fmt.Errorf("restart Managed Kafka state=%q want=ACTIVE", clusterState(cluster))
 	}
 	if _, err := clients.kafka.Projects.Locations.Clusters.Topics.Get(record.KafkaTopic).Context(ctx).Do(); err != nil {
 		return fmt.Errorf("restart Managed Kafka topic: %w", err)
@@ -413,10 +413,10 @@ func verifyDockerBackends(ctx context.Context, clients *generatedClients, cfg co
 	if err != nil {
 		return fmt.Errorf("restart Composer get: %w", err)
 	}
-	if environment.State != "ERROR" {
-		return fmt.Errorf("restart Composer state=%q want=ERROR", composerState(environment))
+	if environment.State != "RUNNING" {
+		return fmt.Errorf("restart Composer state=%q want=RUNNING", composerState(environment))
 	}
-	fmt.Println("generated-client restart verified durable Kafka/Composer metadata and explicit backend-disconnected states")
+	fmt.Println("generated-client restart verified durable Kafka/Composer metadata and exact-owned backend reconciliation")
 	return nil
 }
 

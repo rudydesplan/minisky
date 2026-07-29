@@ -104,7 +104,7 @@ assert_instance() {
 import json,sys
 i=json.load(open(sys.argv[1]))
 assert i["name"] == sys.argv[2] and i["tier"] == "BASIC_HDD" and i["state"] == "READY"
-assert i["fileShares"] == [{"name":"minisky","capacityGb":1024}]
+assert i["fileShares"] == [{"name":"minisky","capacityGb":"1024"}]
 assert i["networks"] == [{"network":"minisky-metadata-only","modes":["MODE_IPV4"]}]
 assert i["labels"]["goog-terraform-provisioned"] == "true"
 PY

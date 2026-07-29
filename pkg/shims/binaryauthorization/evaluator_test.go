@@ -2,14 +2,19 @@ package binaryauthorization
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	generatedbinauthz "google.golang.org/api/binaryauthorization/v1"
+	"google.golang.org/api/option"
 
 	"minisky/pkg/state"
 )
@@ -275,6 +280,164 @@ func TestProviderFieldsRoundTripWithoutAliasing(t *testing.T) {
 	if persisted.AdmissionWhitelistPatterns[0].NamePattern == "mutated" ||
 		persisted.ClusterAdmissionRules["us-central1-a.prod"].RequireAttestationsBy[0] == "mutated" {
 		t.Fatalf("response aliased active policy: %#v", persisted)
+	}
+}
+
+func TestRawPolicyEnumsNormalizeBeforeValidation(t *testing.T) {
+	store := &memoryStore{}
+	api, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{
+		"globalPolicyEvaluationMode":"GLOBAL_POLICY_EVALUATION_MODE_UNSPECIFIED",
+		"admissionWhitelistPatterns":[{"namePattern":"gcr.io/google_containers/*"}],
+		"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}
+	}`
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPut,
+		"/v1/projects/raw-enums/policy", strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var policy Policy
+	if err := json.Unmarshal(response.Body.Bytes(), &policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.GlobalPolicyEvaluationMode != "DISABLE" ||
+		len(policy.AdmissionWhitelistPatterns) != 1 ||
+		policy.AdmissionWhitelistPatterns[0].NamePattern != "gcr.io/google_containers/*" ||
+		policy.DefaultAdmissionRule.EvaluationMode != "ALWAYS_ALLOW" ||
+		policy.DefaultAdmissionRule.EnforcementMode != enforcedMode {
+		t.Fatalf("canonical policy=%#v", policy)
+	}
+	restarted, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := restarted.getPolicy("projects/raw-enums")
+	if !ok || persisted.GlobalPolicyEvaluationMode != "DISABLE" ||
+		len(persisted.AdmissionWhitelistPatterns) != 1 ||
+		persisted.DefaultAdmissionRule.EnforcementMode != enforcedMode {
+		t.Fatalf("restarted policy=%#v found=%t", persisted, ok)
+	}
+}
+
+func TestGeneratedClientPolicyShapesUseCanonicalValidation(t *testing.T) {
+	store := &memoryStore{}
+	api, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestBodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			t.Errorf("read generated request: %v", readErr)
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "read generated request")
+			return
+		}
+		requestBodies = append(requestBodies, string(body))
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		api.ServeHTTP(w, request)
+	}))
+	defer server.Close()
+	client, err := generatedbinauthz.NewService(context.Background(),
+		option.WithoutAuthentication(), option.WithEndpoint(server.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		project     string
+		policy      *generatedbinauthz.Policy
+		wantBody    string
+		wantEval    string
+		wantGlobal  string
+		wantPattern string
+	}{
+		{
+			name:    "phase 21-22 omitted enforcement mode",
+			project: "projects/generated-allow",
+			policy: &generatedbinauthz.Policy{
+				Name: "projects/generated-allow/policy",
+				DefaultAdmissionRule: &generatedbinauthz.AdmissionRule{
+					EvaluationMode: "ALWAYS_ALLOW",
+				},
+			},
+			wantBody: `{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW"},"name":"projects/generated-allow/policy"}` + "\n",
+			wantEval: "ALWAYS_ALLOW",
+		},
+		{
+			name:    "phase 24-25 legacy deny alias",
+			project: "projects/generated-deny",
+			policy: &generatedbinauthz.Policy{
+				Name: "projects/generated-deny/policy",
+				DefaultAdmissionRule: &generatedbinauthz.AdmissionRule{
+					EvaluationMode:  "DISALLOWED",
+					EnforcementMode: enforcedMode,
+				},
+			},
+			wantBody: `{"defaultAdmissionRule":{"enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG","evaluationMode":"DISALLOWED"},"name":"projects/generated-deny/policy"}` + "\n",
+			wantEval: "ALWAYS_DENY",
+		},
+		{
+			name:    "documented global mode and allowlist",
+			project: "projects/generated-documented",
+			policy: &generatedbinauthz.Policy{
+				Name:                       "projects/generated-documented/policy",
+				GlobalPolicyEvaluationMode: "GLOBAL_POLICY_EVALUATION_MODE_UNSPECIFIED",
+				AdmissionWhitelistPatterns: []*generatedbinauthz.AdmissionWhitelistPattern{{
+					NamePattern: "gcr.io/google_containers/*",
+				}},
+				DefaultAdmissionRule: &generatedbinauthz.AdmissionRule{
+					EvaluationMode:  "ALWAYS_ALLOW",
+					EnforcementMode: enforcedMode,
+				},
+			},
+			wantBody:    `{"admissionWhitelistPatterns":[{"namePattern":"gcr.io/google_containers/*"}],"defaultAdmissionRule":{"enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG","evaluationMode":"ALWAYS_ALLOW"},"globalPolicyEvaluationMode":"GLOBAL_POLICY_EVALUATION_MODE_UNSPECIFIED","name":"projects/generated-documented/policy"}` + "\n",
+			wantEval:    "ALWAYS_ALLOW",
+			wantGlobal:  "DISABLE",
+			wantPattern: "gcr.io/google_containers/*",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requestBodies = nil
+			got, err := client.Projects.UpdatePolicy(test.project+"/policy", test.policy).
+				Context(context.Background()).Do()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(requestBodies) != 1 || requestBodies[0] != test.wantBody {
+				t.Fatalf("generated request bodies=%q want=%q", requestBodies, test.wantBody)
+			}
+			if got.DefaultAdmissionRule == nil ||
+				got.DefaultAdmissionRule.EvaluationMode != test.wantEval ||
+				got.DefaultAdmissionRule.EnforcementMode != enforcedMode ||
+				got.GlobalPolicyEvaluationMode != test.wantGlobal {
+				t.Fatalf("canonical generated response=%#v", got)
+			}
+			if test.wantPattern != "" &&
+				(len(got.AdmissionWhitelistPatterns) != 1 ||
+					got.AdmissionWhitelistPatterns[0].NamePattern != test.wantPattern) {
+				t.Fatalf("generated allowlist response=%#v", got.AdmissionWhitelistPatterns)
+			}
+		})
+	}
+
+	restarted, err := NewAPIWithStore(store, AllowAllAuthorizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		policy, ok := restarted.getPolicy(test.project)
+		if !ok || policy.DefaultAdmissionRule.EvaluationMode != test.wantEval ||
+			policy.DefaultAdmissionRule.EnforcementMode != enforcedMode ||
+			policy.GlobalPolicyEvaluationMode != test.wantGlobal {
+			t.Fatalf("restarted project=%q policy=%#v found=%t", test.project, policy, ok)
+		}
 	}
 }
 
@@ -588,9 +751,10 @@ func TestInvalidProviderPolicyDoesNotMutate(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := []string{
-		`{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_DENY"}}`,
 		`{"defaultAdmissionRule":{"evaluationMode":"BOGUS","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
+		`{"defaultAdmissionRule":{"evaluationMode":"EVALUATION_MODE_UNSPECIFIED","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
 		`{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_DENY","enforcementMode":"BOGUS"}}`,
+		`{"defaultAdmissionRule":{"evaluationMode":"ALWAYS_DENY","enforcementMode":"ENFORCEMENT_MODE_UNSPECIFIED"}}`,
 		`{"globalPolicyEvaluationMode":"BOGUS","defaultAdmissionRule":{"evaluationMode":"ALWAYS_DENY","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
 		`{"defaultAdmissionRule":{"evaluationMode":"REQUIRE_ATTESTATION","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
 		`{"clusterAdmissionRules":{"bad cluster":{"evaluationMode":"ALWAYS_DENY","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}},"defaultAdmissionRule":{"evaluationMode":"ALWAYS_ALLOW","enforcementMode":"ENFORCED_BLOCK_AND_AUDIT_LOG"}}`,
@@ -601,6 +765,21 @@ func TestInvalidProviderPolicyDoesNotMutate(t *testing.T) {
 			"/v1/projects/demo/policy", strings.NewReader(body)))
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("body=%s status=%d response=%s", body, response.Code, response.Body.String())
+		}
+		var envelope struct {
+			Error struct {
+				Code    int           `json:"code"`
+				Status  string        `json:"status"`
+				Details []interface{} `json:"details"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("body=%s decode error envelope: %v", body, err)
+		}
+		if envelope.Error.Code != http.StatusBadRequest ||
+			envelope.Error.Status != "INVALID_ARGUMENT" ||
+			envelope.Error.Details == nil {
+			t.Fatalf("body=%s error envelope=%#v", body, envelope)
 		}
 		if got := api.Evaluate("projects/demo", "example/image"); !got.Allowed {
 			t.Fatalf("body=%s mutated policy: %#v", body, got)

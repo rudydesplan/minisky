@@ -193,6 +193,100 @@ func TestLocalShareDataSurvivesMetadataRestart(t *testing.T) {
 	}
 }
 
+func TestCapacityGbUsesJSONStringAcrossGetListAndRestart(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	root := t.TempDir()
+	api := newAPI(newTestAPI().opMgr, store)
+	api.dataRoot = root
+	create := httptest.NewRecorder()
+	api.ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/v1/projects/test/locations/us-central1/instances?instanceId=restart-json",
+		bytes.NewBufferString(`{"tier":"BASIC_HDD","fileShares":[{"name":"share1","capacityGb":"1024"}]}`)))
+	if create.Code != http.StatusOK {
+		t.Fatalf("create failed: %d %s", create.Code, create.Body.String())
+	}
+
+	restarted := newAPI(newTestAPI().opMgr, store)
+	restarted.dataRoot = root
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stage := range []struct {
+		name string
+		api  *API
+	}{
+		{name: "before restart", api: api},
+		{name: "after restart", api: restarted},
+	} {
+		t.Run(stage.name, func(t *testing.T) {
+			get := httptest.NewRecorder()
+			stage.api.ServeHTTP(get, httptest.NewRequest(http.MethodGet,
+				"/v1/projects/test/locations/us-central1/instances/restart-json", nil))
+			if get.Code != http.StatusOK {
+				t.Fatalf("get failed: %d %s", get.Code, get.Body.String())
+			}
+			var instance struct {
+				FileShares []struct {
+					CapacityGb json.RawMessage `json:"capacityGb"`
+				} `json:"fileShares"`
+			}
+			if err := json.Unmarshal(get.Body.Bytes(), &instance); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(instance.FileShares[0].CapacityGb); got != `"1024"` {
+				t.Fatalf("get capacityGb JSON = %s, want string", got)
+			}
+
+			list := httptest.NewRecorder()
+			stage.api.ServeHTTP(list, httptest.NewRequest(http.MethodGet,
+				"/v1/projects/test/locations/us-central1/instances", nil))
+			if list.Code != http.StatusOK {
+				t.Fatalf("list failed: %d %s", list.Code, list.Body.String())
+			}
+			var collection struct {
+				Instances []struct {
+					FileShares []struct {
+						CapacityGb json.RawMessage `json:"capacityGb"`
+					} `json:"fileShares"`
+				} `json:"instances"`
+			}
+			if err := json.Unmarshal(list.Body.Bytes(), &collection); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(collection.Instances[0].FileShares[0].CapacityGb); got != `"1024"` {
+				t.Fatalf("list capacityGb JSON = %s, want string", got)
+			}
+		})
+	}
+}
+
+func TestLegacyNumericCapacityStateLoadsAndEmitsJSONString(t *testing.T) {
+	name := "projects/test/locations/us-central1/instances/legacy"
+	store := &mockStore{data: map[string][]byte{
+		filestoreStateEntry: []byte(`{"instances":{"` + name + `":{"name":"` + name +
+			`","tier":"BASIC_HDD","state":"ERROR","fileShares":[{"name":"share1","capacityGb":1024}]}}}`),
+	}}
+	api := newAPI(newTestAPI().opMgr, store)
+	api.dataRoot = t.TempDir()
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.instances[name].FileShares[0].CapacityGb; got != 1024 {
+		t.Fatalf("loaded capacityGb = %d, want 1024", got)
+	}
+
+	get := httptest.NewRecorder()
+	api.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/"+name, nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("get failed: %d %s", get.Code, get.Body.String())
+	}
+	if strings.Contains(get.Body.String(), `"capacityGb":1024`) ||
+		!strings.Contains(get.Body.String(), `"capacityGb":"1024"`) {
+		t.Fatalf("capacityGb response is not a JSON string: %s", get.Body.String())
+	}
+}
+
 func TestRestartFailsClosedWhenOwnedShareTreeIsMissing(t *testing.T) {
 	store := &mockStore{data: make(map[string][]byte)}
 	name := "projects/test/locations/us-central1/instances/missing-data"

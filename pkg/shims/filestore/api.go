@@ -47,7 +47,7 @@ type Instance struct {
 // FileShare represents a file share configuration.
 type FileShare struct {
 	Name       string `json:"name"`
-	CapacityGb int64  `json:"capacityGb,omitempty"`
+	CapacityGb int64  `json:"capacityGb,omitempty,string"`
 }
 
 func (share *FileShare) UnmarshalJSON(data []byte) error {

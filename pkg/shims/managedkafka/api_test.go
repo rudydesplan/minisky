@@ -703,12 +703,11 @@ func TestClusterMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMetadata
 
 			operations := opMgr.List()
 			if len(operations) != 1 {
-				t.Fatalf("operations = %+v, want one reconciled operation", operations)
+				t.Fatalf("operations = %+v, want one pending operation", operations)
 			}
 			inProcess := operations[0]
-			if !inProcess.Done || inProcess.Error == nil ||
-				!strings.Contains(inProcess.Error.Message, "interrupted by MiniSky restart") {
-				t.Fatalf("in-process operation was not reconciled: %+v", inProcess)
+			if inProcess.Done || inProcess.Status != orchestrator.StatusPending || inProcess.Error != nil {
+				t.Fatalf("uncommitted terminal result was published in process: %+v", inProcess)
 			}
 
 			restartedOps, err := orchestrator.NewOperationManagerWithStore(operationStore)
@@ -717,8 +716,8 @@ func TestClusterMutationTerminalOperationSaveFailureReturnsErrorAndKeepsMetadata
 			}
 			durable := restartedOps.Get(inProcess.Name)
 			if durable == nil || !durable.Done || durable.Error == nil ||
-				durable.Error.Message != inProcess.Error.Message {
-				t.Fatalf("operation truth diverged across restart: in-process=%+v restarted=%+v", inProcess, durable)
+				!strings.Contains(durable.Error.Message, "interrupted by MiniSky restart") {
+				t.Fatalf("pending operation was not reconciled across restart: in-process=%+v restarted=%+v", inProcess, durable)
 			}
 
 			restarted := &API{
@@ -816,6 +815,44 @@ func TestPersistAndReload(t *testing.T) {
 		t.Fatalf("expected partitionCount=6, got %d", topic.PartitionCount)
 	}
 	api2.mu.RUnlock()
+}
+
+func TestReloadFailsClosedWithoutExactOwnedKafkaBackend(t *testing.T) {
+	store := &mockStore{data: make(map[string][]byte)}
+	name := "projects/p/locations/l/clusters/c1"
+	topicName := name + "/topics/t1"
+	if err := store.Save(managedKafkaStateEntry, managedKafkaMetadata{
+		Clusters: map[string]*Cluster{name: {
+			Name:             name,
+			State:            "ACTIVE",
+			BootstrapAddress: "127.0.0.1:19092",
+		}},
+		Topics: map[string]*Topic{topicName: {Name: topicName}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeKafkaBackend{}
+	api := &API{
+		opMgr:      orchestrator.NewOperationManager(),
+		stateStore: store,
+		clusters:   make(map[string]*Cluster),
+		topics:     make(map[string]*Topic),
+		backend:    backend,
+	}
+	if err := api.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	cluster := api.clusters[name]
+	if cluster == nil || cluster.State != "FAILED" || cluster.BootstrapAddress != "" {
+		t.Fatalf("rehydrated cluster = %+v, want fail-closed metadata without endpoint", cluster)
+	}
+	if api.topics[topicName] == nil {
+		t.Fatal("fail-closed restart lost durable topic metadata")
+	}
+	if backend.provisionCalls != 0 || backend.reconcileCalls != 1 {
+		t.Fatalf("restart provision calls = %d, reconcile calls = %d; want 0 and 1",
+			backend.provisionCalls, backend.reconcileCalls)
+	}
 }
 
 func TestReloadGivesEachKafkaResourceAFairReconcileBudget(t *testing.T) {
