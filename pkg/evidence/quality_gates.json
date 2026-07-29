@@ -22,10 +22,22 @@
       "note": "On the stable uncommitted snapshot, Windows cross-compilation and the workflow/quality-aggregate structural contracts passed locally. These checks prove that the focused test binary builds and that quality requires the native job; they do not execute TestWindowsPinnedLocalMarker on Windows."
     },
     "nativeCI": {
-      "status": "configured-unverified",
+      "status": "ci-passed",
       "workflow": ".github/workflows/ci.yml",
       "job": "windows-state-markers",
-      "note": "The required windows-latest state-marker lifecycle job is configured and is an authoritative dependency of the quality aggregate. No native Windows run URL, job URL, or commit is recorded for the uncommitted snapshot."
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422742",
+      "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90509292114",
+      "commit": "794b68439c59bfa0dd35b37962049a1a3e510ea1",
+      "note": "PR #23's required windows-latest state-marker lifecycle job completed successfully on the exact recorded source revision."
+    },
+    "authoritativeQuality": {
+      "status": "ci-passed",
+      "workflow": ".github/workflows/ci.yml",
+      "job": "quality",
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422742",
+      "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90510621655",
+      "commit": "794b68439c59bfa0dd35b37962049a1a3e510ea1",
+      "note": "PR #23's authoritative quality aggregate completed successfully in the same run after requiring the native Windows state-marker job."
     }
   }
 ]

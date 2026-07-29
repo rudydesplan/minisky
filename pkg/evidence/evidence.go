@@ -103,11 +103,12 @@ var platformGatesJSON []byte
 // In particular, cross-compilation and workflow contracts are not evidence that
 // native-platform tests executed.
 type QualityGate struct {
-	ID                 string        `json:"id"`
-	Name               string        `json:"name"`
-	RequiredBy         []string      `json:"requiredBy"`
-	LocalPrerequisites EvidenceCheck `json:"localPrerequisites"`
-	NativeCI           EvidenceCheck `json:"nativeCI"`
+	ID                   string        `json:"id"`
+	Name                 string        `json:"name"`
+	RequiredBy           []string      `json:"requiredBy"`
+	LocalPrerequisites   EvidenceCheck `json:"localPrerequisites"`
+	NativeCI             EvidenceCheck `json:"nativeCI"`
+	AuthoritativeQuality EvidenceCheck `json:"authoritativeQuality"`
 }
 
 //go:embed quality_gates.json
@@ -318,9 +319,23 @@ func QualityGates() ([]QualityGate, error) {
 		if err := ValidateEvidenceCheck(gate.NativeCI); err != nil {
 			return nil, fmt.Errorf("%s native CI: %w", gate.ID, err)
 		}
-		if gate.NativeCI.Status != EvidenceConfiguredUnverified ||
-			gate.NativeCI.Workflow == "" || gate.NativeCI.Job == "" {
-			return nil, fmt.Errorf("%s native CI must remain configured-unverified", gate.ID)
+		if gate.NativeCI.Status != EvidenceCIPassed ||
+			gate.NativeCI.Workflow == "" || gate.NativeCI.Job == "" ||
+			gate.NativeCI.JobURL == "" {
+			return nil, fmt.Errorf("%s native CI requires an immutable job-linked pass", gate.ID)
+		}
+		if err := ValidateEvidenceCheck(gate.AuthoritativeQuality); err != nil {
+			return nil, fmt.Errorf("%s authoritative quality: %w", gate.ID, err)
+		}
+		if gate.AuthoritativeQuality.Status != EvidenceCIPassed ||
+			gate.AuthoritativeQuality.Workflow == "" ||
+			gate.AuthoritativeQuality.Job == "" ||
+			gate.AuthoritativeQuality.JobURL == "" {
+			return nil, fmt.Errorf("%s authoritative quality requires an immutable job-linked pass", gate.ID)
+		}
+		if gate.AuthoritativeQuality.RunURL != gate.NativeCI.RunURL ||
+			gate.AuthoritativeQuality.Commit != gate.NativeCI.Commit {
+			return nil, fmt.Errorf("%s native and authoritative quality passes must share a run and commit", gate.ID)
 		}
 	}
 	return gates, nil
@@ -392,9 +407,10 @@ func EmulatorBoundaryGates() ([]EmulatorBoundaryGate, error) {
 		if err := ValidateEvidenceCheck(gate.CI); err != nil {
 			return nil, fmt.Errorf("%s CI evidence: %w", gate.ID, err)
 		}
-		if gate.CI.Status != EvidenceConfiguredUnverified ||
-			gate.CI.Workflow == "" || gate.CI.Job == "" {
-			return nil, fmt.Errorf("%s CI must remain configured-unverified with workflow and job", gate.ID)
+		if gate.CI.Status != EvidenceCIPassed ||
+			gate.CI.Workflow == "" || gate.CI.Job == "" ||
+			gate.CI.JobURL == "" {
+			return nil, fmt.Errorf("%s CI requires an immutable job-linked pass", gate.ID)
 		}
 	}
 	return gates, nil

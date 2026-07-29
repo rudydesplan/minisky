@@ -45,20 +45,20 @@ Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `
 CI is `ci-passed` in [GitHub Actions run 30416460134](https://github.com/rudydesplan/minisky/actions/runs/30416460134) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974)) on commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9`. This evidence does not claim broad GCP parity or promote service fidelity.
 <!-- END GENERATED MEMCACHED SERVICE GATE -->
 <!-- BEGIN GENERATED STORAGE PUBSUB BOUNDARY -->
-**Generated Storage/Pub/Sub boundary truth:** The `local-passed-uncommitted` working-tree gate runs `make test-storage-persistence-pubsub-session`, `scripts/storage-persistence-pubsub-session-integration.sh`, and `TestStoragePersistenceAndPubSubSessionBoundaries`. Stable snapshot source SHA-256: `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`; diff SHA-256: `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`. CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `storage-persistence-pubsub-session`; this uncommitted gate has no external run URL or commit.
+**Generated Storage/Pub/Sub boundary truth:** The `local-passed-uncommitted` working-tree gate runs `make test-storage-persistence-pubsub-session`, `scripts/storage-persistence-pubsub-session-integration.sh`, and `TestStoragePersistenceAndPubSubSessionBoundaries`. Stable snapshot source SHA-256: `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`; diff SHA-256: `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`. CI is `ci-passed` in [GitHub Actions run 30431422780](https://github.com/rudydesplan/minisky/actions/runs/30431422780) ([job](https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291773)) on exact PR #23 head commit `794b68439c59bfa0dd35b37962049a1a3e510ea1`; the stable local fingerprints remain separate from immutable CI provenance.
 
 The exact pinned public Pub/Sub image is acquired against the active daemon with an isolated anonymous Docker configuration, then checked for immutable digest syntax, `linux/amd64` platform execution, and advertised `--data-dir` capability. Storage uses a profile-scoped runtime bind mount. Buckets and objects survive exact-owned Storage emulator-container replacement. Pub/Sub resources and messages last only for one official emulator session: MiniSky process crash/restart continuity is supported only while the same exact-owned Pub/Sub container remains alive. Replacing the Pub/Sub backend/container loses topics, subscriptions, and queued messages. Graceful MiniSky shutdown tears down managed Docker resources and is not a Pub/Sub continuity path.
 
 Storage and Pub/Sub runtime data remain outside metadata export/import. This gate does not claim exactly-once delivery, portable data export, IAM, HA, security, or full GCP parity. Its Docker cleanup evidence assumes cooperative, exclusive use of the managed resource names. Docker volume deletion accepts only a mutable name, not a conditional immutable identity: MiniSky revalidates exact ownership and identity immediately before deletion and fails closed, but a foreign replacement in the final inspect-to-delete interval cannot be excluded atomically. This is a bounded cleanup invariant, not a hostile-daemon security boundary. Public registry/network access remains required; the global unowned image cache may retain an authorized pull; Pub/Sub remains amd64/emulation/session-only. Five unrelated local volumes and a pre-existing lock observed during certification are not product evidence.
 <!-- END GENERATED STORAGE PUBSUB BOUNDARY -->
 <!-- BEGIN GENERATED STABLE SNAPSHOT CERTIFICATION -->
-**Generated stable-snapshot certification:** The uncommitted working tree is identified by source SHA-256 `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25` and diff SHA-256 `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`; historical HEAD and PR #22 remain separate evidence.
+**Generated stable-snapshot certification:** The stable local certification remains identified by source SHA-256 `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25` and diff SHA-256 `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`. PR #23 exact-head commit `794b68439c59bfa0dd35b37962049a1a3e510ea1` has immutable CI evidence; historical PR #22 evidence remains separate.
 
-- Cloud SQL restart recovery is `local-passed-uncommitted`: live `POSTGRES_16` row survival passed through same-container restart and volume-only recovery, followed by exact cleanup; the bounded Terraform apply/no-drift/destroy lifecycle also passed. CI is `configured-unverified` with no external URL or commit.
-- Storage/Pub/Sub is `local-passed-uncommitted`: anonymous acquisition and immutable digest/platform/capability checks passed before Storage replacement persistence, Pub/Sub session-loss boundaries, and exact cleanup. CI is `configured-unverified` with no external URL or commit.
-- Native `windows-state-markers` is `configured-unverified`. Local cross-compilation and workflow contracts passed, and the authoritative `quality` aggregate requires the job, but no native Windows test pass is claimed.
+- Cloud SQL restart recovery is `local-passed-uncommitted`: live `POSTGRES_16` row survival passed through same-container restart and volume-only recovery, followed by exact cleanup; the bounded Terraform apply/no-drift/destroy lifecycle also passed. CI is `ci-passed` in [critical run 30431422780](https://github.com/rudydesplan/minisky/actions/runs/30431422780) ([Cloud SQL job](https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797)).
+- Storage/Pub/Sub is `local-passed-uncommitted`: anonymous acquisition and immutable digest/platform/capability checks passed before Storage replacement persistence, Pub/Sub session-loss boundaries, and exact cleanup. CI is `ci-passed` in the same [critical run 30431422780](https://github.com/rudydesplan/minisky/actions/runs/30431422780) ([Storage/Pub/Sub job](https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291773)).
+- Native `windows-state-markers` is `ci-passed` in [general CI run 30431422742](https://github.com/rudydesplan/minisky/actions/runs/30431422742) ([native job](https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90509292114)); the authoritative `quality` aggregate is also `ci-passed` ([quality job](https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90510621655)) in that exact run.
 
-Delivery still requires commit, push, and external CI for these working-tree gates. PR #22 URLs apply only to their exact historical commit.
+These exact-head PR #23 passes verify only the three listed gates and their documented boundaries. PR #22 URLs apply only to their exact historical commit.
 <!-- END GENERATED STABLE SNAPSHOT CERTIFICATION -->
 - **🖥️ Embedded Dashboard**: Management shell with Logging, Monitoring, terminal,
   and operational views. Dashboard exposure is not service-fidelity or
@@ -387,10 +387,13 @@ On macOS, keep the exact-line filter and replace
   local provenance marker, Docker volume, and database contents remain outside
   metadata export/import. The guarded PostgreSQL 16 recovery and bounded
   Terraform lifecycle are `local-passed-uncommitted` at the exact source/diff
-  fingerprints in the generated certification above. CI remains
-  `configured-unverified`; no external run or commit is claimed for the
-  working tree. Cleanup assumes cooperative use of managed Docker names and has
-  the non-atomic volume-deletion boundary documented in
+  fingerprints in the generated certification above. PR #23's exact-head
+  [critical run 30431422780](https://github.com/rudydesplan/minisky/actions/runs/30431422780)
+  passed the
+  [Cloud SQL job](https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797)
+  on commit `794b68439c59bfa0dd35b37962049a1a3e510ea1`. Cleanup assumes
+  cooperative use of managed Docker names and has the non-atomic
+  volume-deletion boundary documented in
   [`docs/state-model.md`](docs/state-model.md).
 - Compute covers bounded instance CRUD, one custom IPv4
   network/subnetwork/owned bridge, and a classic global HTTP load balancer with
@@ -816,10 +819,10 @@ bounded slice is not production federation or a production-ready Phase 17.
 
 ### Current completion priorities
 
-As of 2026-07-29, the generated PR #22 promotion section records one exact
-source revision with general CI, critical reliability, Memcached, all 12
-Terraform legs, and all seven SDK/backend jobs green. Those immutable URLs do
-not verify subsequent uncommitted work.
+As of 2026-07-29, the generated PR #22 promotion section remains historical
+evidence for its exact source revision. PR #23 separately records exact-head
+passes for Cloud SQL restart recovery, the Storage/Pub/Sub session boundary,
+native Windows state markers, and the authoritative quality aggregate.
 
 The next evidence milestones are:
 
@@ -827,15 +830,14 @@ The bounded Memcached lifecycle is no longer a deferred implementation
 priority. Its machine-readable service gate above owns the local and CI
 evidence wording.
 
-The repaired Cloud SQL named-volume restart gate and Storage/Pub/Sub boundary
-gate have stable-snapshot `local-passed-uncommitted` evidence. They now require
-commit, push, and exact-head external CI before their
-`configured-unverified` CI statuses can change. Native Windows state-marker
-execution remains separately `configured-unverified`.
+The Cloud SQL and Storage/Pub/Sub gates retain their stable-snapshot
+`local-passed-uncommitted` fingerprints as local certification provenance.
+Their immutable CI provenance is the exact PR #23 head commit, not the PR #22
+revision and not the later merge commit.
 
-1. commit the bounded Storage/Pub/Sub session-boundary gate and obtain its own
-   exact-head critical CI pass; the existing PR #22 runs must not be attributed
-   to that uncommitted gate;
+1. treat the PR #23 exact-head passes for Cloud SQL, Storage/Pub/Sub, native
+   Windows, and authoritative quality as bounded evidence only; PR #22 remains
+   historical evidence for its separate source revision;
 2. keep the 12 existing Phase 18–25 Terraform claims domain-scoped, and add any
    further claim only with provider apply, restart, import where supported,
    no-drift, destroy, and cleanup evidence;

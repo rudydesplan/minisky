@@ -221,10 +221,13 @@
     "diffSha256": "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033",
     "note": "The stable uncommitted snapshot passed the guarded live POSTGRES_16 recovery test: one SQL row survived same-container MiniSky restart and volume-only container replacement around the exact proven named volume, followed by exact-owned cleanup without altering an unrelated sentinel. The same certification passed the bounded Google provider 7.41.0 Cloud SQL apply, zero-drift plan, and destroy lifecycle. This is local source/diff fingerprint evidence, not a commit or external run.",
     "ci": {
-      "status": "configured-unverified",
+      "status": "ci-passed",
       "workflow": ".github/workflows/critical-integration.yml",
       "job": "cloudsql-restart-integration",
-      "note": "The required Cloud SQL restart recovery job is configured in the working tree, but no external run URL, job URL, or commit exists for this uncommitted gate."
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422780",
+      "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797",
+      "commit": "794b68439c59bfa0dd35b37962049a1a3e510ea1",
+      "note": "PR #23's required Cloud SQL restart recovery job completed successfully on the exact recorded source revision."
     }
   }
 ]

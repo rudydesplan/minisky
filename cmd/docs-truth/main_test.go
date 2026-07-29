@@ -831,8 +831,10 @@ func TestStoragePubSubBoundaryRenderingAndClaimsStayBounded(t *testing.T) {
 		"global unowned image cache may retain an authorized pull",
 		"amd64/emulation/session-only",
 		"Five unrelated local volumes and a pre-existing lock",
-		"CI is `configured-unverified`",
-		"no external run URL or commit",
+		"CI is `ci-passed`",
+		"[GitHub Actions run 30431422780](" + gate.CI.RunURL + ")",
+		"([job](" + gate.CI.JobURL + "))",
+		"`" + gate.CI.Commit + "`",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("Storage/PubSub rendering is missing %q:\n%s", want, rendered)
@@ -842,6 +844,7 @@ func TestStoragePubSubBoundaryRenderingAndClaimsStayBounded(t *testing.T) {
 		"Pub/Sub survives backend replacement",
 		"Pub/Sub survives container replacement",
 		"Storage is unmounted",
+		"`configured-unverified`",
 	} {
 		if strings.Contains(rendered, forbidden) {
 			t.Errorf("Storage/PubSub rendering contains false claim %q", forbidden)
@@ -1044,9 +1047,15 @@ func TestStableCertificationRenderingPreventsStatusConflation(t *testing.T) {
 		"diff SHA-256 `" + cloudSQL.DiffSHA256 + "`",
 		"Cloud SQL restart recovery is `local-passed-uncommitted`",
 		"Storage/Pub/Sub is `local-passed-uncommitted`",
-		"Native `windows-state-markers` is `configured-unverified`",
-		"authoritative `quality` aggregate requires the job",
-		"no native Windows test pass is claimed",
+		"PR #23 exact-head commit `" + cloudSQL.CI.Commit + "`",
+		"[critical run 30431422780](" + cloudSQL.CI.RunURL + ")",
+		"([Cloud SQL job](" + cloudSQL.CI.JobURL + "))",
+		"([Storage/Pub/Sub job](" + storagePubSub.CI.JobURL + "))",
+		"Native `windows-state-markers` is `ci-passed`",
+		"[general CI run 30431422742](" + windows.NativeCI.RunURL + ")",
+		"([native job](" + windows.NativeCI.JobURL + "))",
+		"authoritative `quality` aggregate is also `ci-passed`",
+		"([quality job](" + windows.AuthoritativeQuality.JobURL + "))",
 		"PR #22 URLs apply only to their exact historical commit",
 	} {
 		if !strings.Contains(rendered, required) {
@@ -1054,9 +1063,10 @@ func TestStableCertificationRenderingPreventsStatusConflation(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"Native Windows tests passed",
+		"`configured-unverified`",
 		"windows-state-markers` is `local-passed",
 		"Cloud SQL restart recovery is pending",
+		"PR #22 URLs verify PR #23",
 	} {
 		if strings.Contains(rendered, forbidden) {
 			t.Errorf("stable certification rendering conflates status with %q", forbidden)
@@ -1071,12 +1081,12 @@ func TestStableCertificationRenderingPreventsStatusConflation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := validateStableCertificationClaims(
-		[]string{rendered + "\nNative Windows tests passed."},
+		[]string{rendered + "\nPR #22 URLs verify PR #23."},
 		cloudSQL,
 		storagePubSub,
 		windows,
 	); err == nil {
-		t.Fatal("native Windows execution conflation was accepted")
+		t.Fatal("PR #22/PR #23 provenance conflation was accepted")
 	}
 }
 

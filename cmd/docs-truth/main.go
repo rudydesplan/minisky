@@ -391,11 +391,11 @@ func selectCloudSQLServiceGate(
 		gate.SourceCommit != "" || gate.SourceSHA256 == "" || gate.DiffSHA256 == "" {
 		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery must use stable uncommitted source/diff provenance")
 	}
-	if gate.CI.Status != evidence.EvidenceConfiguredUnverified ||
+	if gate.CI.Status != evidence.EvidenceCIPassed ||
 		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
 		gate.CI.Job != "cloudsql-restart-integration" ||
-		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
-		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery CI must remain configured-unverified without external provenance")
+		gate.CI.RunURL == "" || gate.CI.JobURL == "" || gate.CI.Commit == "" {
+		return evidence.ServiceGate{}, errors.New("Cloud SQL recovery CI requires exact immutable job provenance")
 	}
 	return gate, nil
 }
@@ -422,11 +422,19 @@ func selectWindowsStateMarkerGate(
 		gate.LocalPrerequisites.DiffSHA256 == "" {
 		return evidence.QualityGate{}, errors.New("Windows state-marker local prerequisites lack bounded stable-snapshot evidence")
 	}
-	if gate.NativeCI.Status != evidence.EvidenceConfiguredUnverified ||
+	if gate.NativeCI.Status != evidence.EvidenceCIPassed ||
 		gate.NativeCI.Workflow != ".github/workflows/ci.yml" ||
 		gate.NativeCI.Job != "windows-state-markers" ||
-		gate.NativeCI.RunURL != "" || gate.NativeCI.JobURL != "" || gate.NativeCI.Commit != "" {
-		return evidence.QualityGate{}, errors.New("Windows native state-marker evidence must remain configured-unverified")
+		gate.NativeCI.RunURL == "" || gate.NativeCI.JobURL == "" || gate.NativeCI.Commit == "" {
+		return evidence.QualityGate{}, errors.New("Windows native state-marker evidence requires exact immutable job provenance")
+	}
+	if gate.AuthoritativeQuality.Status != evidence.EvidenceCIPassed ||
+		gate.AuthoritativeQuality.Workflow != ".github/workflows/ci.yml" ||
+		gate.AuthoritativeQuality.Job != "quality" ||
+		gate.AuthoritativeQuality.RunURL != gate.NativeCI.RunURL ||
+		gate.AuthoritativeQuality.JobURL == "" ||
+		gate.AuthoritativeQuality.Commit != gate.NativeCI.Commit {
+		return evidence.QualityGate{}, errors.New("authoritative quality evidence must match the native state-marker run and commit")
 	}
 	return gate, nil
 }
@@ -584,9 +592,12 @@ func selectStoragePubSubBoundaryGate(
 		gate.SourceCommit != "" ||
 		gate.SourceSHA256 == "" ||
 		gate.DiffSHA256 == "" ||
-		gate.CI.Status != evidence.EvidenceConfiguredUnverified {
+		gate.CI.Status != evidence.EvidenceCIPassed ||
+		gate.CI.RunURL == "" ||
+		gate.CI.JobURL == "" ||
+		gate.CI.Commit == "" {
 		return evidence.EmulatorBoundaryGate{}, errors.New(
-			"Storage/PubSub boundary must remain uncommitted local evidence with configured-unverified CI",
+			"Storage/PubSub boundary requires uncommitted local evidence plus immutable CI provenance",
 		)
 	}
 	return gate, nil
@@ -611,7 +622,8 @@ func renderStoragePubSubBoundary(gate evidence.EmulatorBoundaryGate) (string, er
 		"**Generated Storage/Pub/Sub boundary truth:** The `%s` working-tree gate runs "+
 			"`make %s`, `%s`, and `TestStoragePersistenceAndPubSubSessionBoundaries`. "+
 			"Stable snapshot source SHA-256: `%s`; diff SHA-256: `%s`. "+
-			"CI is `%s` in `%s` job `%s`; this uncommitted gate has no external run URL or commit.\n\n"+
+			"CI is `%s` in [GitHub Actions run %s](%s) ([job](%s)) on exact PR #23 head commit `%s`; "+
+			"the stable local fingerprints remain separate from immutable CI provenance.\n\n"+
 			"The exact pinned public Pub/Sub image is acquired against the active daemon with an "+
 			"isolated anonymous Docker configuration, then checked for immutable digest syntax, "+
 			"`linux/amd64` platform execution, and advertised `--data-dir` capability. "+
@@ -637,8 +649,10 @@ func renderStoragePubSubBoundary(gate evidence.EmulatorBoundaryGate) (string, er
 		gate.SourceSHA256,
 		gate.DiffSHA256,
 		gate.CI.Status,
-		gate.CI.Workflow,
-		gate.CI.Job,
+		path.Base(gate.CI.RunURL),
+		gate.CI.RunURL,
+		gate.CI.JobURL,
+		gate.CI.Commit,
 	), nil
 }
 
@@ -658,29 +672,51 @@ func renderStableSnapshotCertification(
 	}
 	if cloudSQL.Status != evidence.EvidenceLocalPassedUncommitted ||
 		storagePubSub.Status != evidence.EvidenceLocalPassedUncommitted ||
-		windows.NativeCI.Status != evidence.EvidenceConfiguredUnverified {
+		cloudSQL.CI.Status != evidence.EvidenceCIPassed ||
+		storagePubSub.CI.Status != evidence.EvidenceCIPassed ||
+		windows.NativeCI.Status != evidence.EvidenceCIPassed ||
+		windows.AuthoritativeQuality.Status != evidence.EvidenceCIPassed {
 		return "", errors.New("stable certification statuses are inconsistent")
 	}
+	if cloudSQL.CI.Commit != storagePubSub.CI.Commit ||
+		cloudSQL.CI.Commit != windows.NativeCI.Commit ||
+		cloudSQL.CI.Commit != windows.AuthoritativeQuality.Commit {
+		return "", errors.New("stable certification CI commits disagree")
+	}
 	return fmt.Sprintf(
-		"**Generated stable-snapshot certification:** The uncommitted working tree is identified by "+
-			"source SHA-256 `%s` and diff SHA-256 `%s`; historical HEAD and PR #22 remain separate evidence.\n\n"+
+		"**Generated stable-snapshot certification:** The stable local certification remains identified by "+
+			"source SHA-256 `%s` and diff SHA-256 `%s`. PR #23 exact-head commit `%s` has immutable CI evidence; "+
+			"historical PR #22 evidence remains separate.\n\n"+
 			"- Cloud SQL restart recovery is `%s`: live `POSTGRES_16` row survival passed through "+
 			"same-container restart and volume-only recovery, followed by exact cleanup; the bounded "+
-			"Terraform apply/no-drift/destroy lifecycle also passed. CI is `%s` with no external URL or commit.\n"+
+			"Terraform apply/no-drift/destroy lifecycle also passed. CI is `%s` in [critical run %s](%s) "+
+			"([Cloud SQL job](%s)).\n"+
 			"- Storage/Pub/Sub is `%s`: anonymous acquisition and immutable digest/platform/capability "+
 			"checks passed before Storage replacement persistence, Pub/Sub session-loss boundaries, and exact cleanup. "+
-			"CI is `%s` with no external URL or commit.\n"+
-			"- Native `windows-state-markers` is `%s`. Local cross-compilation and workflow contracts passed, "+
-			"and the authoritative `quality` aggregate requires the job, but no native Windows test pass is claimed.\n\n"+
-			"Delivery still requires commit, push, and external CI for these working-tree gates. "+
+			"CI is `%s` in the same [critical run %s](%s) ([Storage/Pub/Sub job](%s)).\n"+
+			"- Native `windows-state-markers` is `%s` in [general CI run %s](%s) ([native job](%s)); "+
+			"the authoritative `quality` aggregate is also `%s` ([quality job](%s)) in that exact run.\n\n"+
+			"These exact-head PR #23 passes verify only the three listed gates and their documented boundaries. "+
 			"PR #22 URLs apply only to their exact historical commit.\n",
 		sourceSHA,
 		diffSHA,
+		cloudSQL.CI.Commit,
 		cloudSQL.Status,
 		cloudSQL.CI.Status,
+		path.Base(cloudSQL.CI.RunURL),
+		cloudSQL.CI.RunURL,
+		cloudSQL.CI.JobURL,
 		storagePubSub.Status,
 		storagePubSub.CI.Status,
+		path.Base(storagePubSub.CI.RunURL),
+		storagePubSub.CI.RunURL,
+		storagePubSub.CI.JobURL,
 		windows.NativeCI.Status,
+		path.Base(windows.NativeCI.RunURL),
+		windows.NativeCI.RunURL,
+		windows.NativeCI.JobURL,
+		windows.AuthoritativeQuality.Status,
+		windows.AuthoritativeQuality.JobURL,
 	), nil
 }
 
@@ -865,7 +901,10 @@ func validateCloudSQLClaims(
 			"Cloud SQL restart recovery is `local-passed-uncommitted`",
 			"source SHA-256 `" + gate.SourceSHA256 + "`",
 			"diff SHA-256 `" + gate.DiffSHA256 + "`",
-			"CI is `configured-unverified`",
+			"CI is `ci-passed`",
+			gate.CI.RunURL,
+			gate.CI.JobURL,
+			gate.CI.Commit,
 		},
 		"service compatibility": {
 			"exact-owned named volume",
@@ -888,8 +927,10 @@ func validateCloudSQLClaims(
 			"`local-passed-uncommitted`",
 			"source SHA-256 `" + gate.SourceSHA256 + "`",
 			"diff SHA-256 `" + gate.DiffSHA256 + "`",
-			"CI is `configured-unverified`",
-			"no external run URL or commit",
+			"CI is `ci-passed`",
+			gate.CI.RunURL,
+			gate.CI.JobURL,
+			gate.CI.Commit,
 		},
 	}
 	for name, phrases := range required {
@@ -943,9 +984,15 @@ func validateStableCertificationClaims(
 		"diff SHA-256 `" + cloudSQL.DiffSHA256 + "`",
 		"Cloud SQL restart recovery is `local-passed-uncommitted`",
 		"Storage/Pub/Sub is `local-passed-uncommitted`",
-		"Native `windows-state-markers` is `configured-unverified`",
-		"authoritative `quality` aggregate requires the job",
-		"no native Windows test pass is claimed",
+		"PR #23 exact-head commit `" + cloudSQL.CI.Commit + "`",
+		cloudSQL.CI.RunURL,
+		cloudSQL.CI.JobURL,
+		storagePubSub.CI.JobURL,
+		"Native `windows-state-markers` is `ci-passed`",
+		windows.NativeCI.RunURL,
+		windows.NativeCI.JobURL,
+		"authoritative `quality` aggregate is also `ci-passed`",
+		windows.AuthoritativeQuality.JobURL,
 		"PR #22 URLs apply only to their exact historical commit",
 	} {
 		if !strings.Contains(joined, required) {
@@ -954,9 +1001,10 @@ func validateStableCertificationClaims(
 	}
 	lower := strings.ToLower(joined)
 	for _, forbidden := range []string{
-		"native windows tests passed",
+		"native `windows-state-markers` is `configured-unverified`",
 		"windows-state-markers` is `local-passed",
 		"cloud sql restart recovery is pending",
+		"pr #22 urls verify pr #23",
 	} {
 		if strings.Contains(lower, forbidden) {
 			return fmt.Errorf("stable certification documentation conflates status with %q", forbidden)
@@ -965,7 +1013,10 @@ func validateStableCertificationClaims(
 	if cloudSQL.SourceSHA256 != storagePubSub.SourceSHA256 ||
 		cloudSQL.DiffSHA256 != storagePubSub.DiffSHA256 ||
 		cloudSQL.SourceSHA256 != windows.LocalPrerequisites.SourceSHA256 ||
-		cloudSQL.DiffSHA256 != windows.LocalPrerequisites.DiffSHA256 {
+		cloudSQL.DiffSHA256 != windows.LocalPrerequisites.DiffSHA256 ||
+		cloudSQL.CI.Commit != storagePubSub.CI.Commit ||
+		cloudSQL.CI.Commit != windows.NativeCI.Commit ||
+		cloudSQL.CI.Commit != windows.AuthoritativeQuality.Commit {
 		return errors.New("stable certification machine evidence fingerprints disagree")
 	}
 	return nil
@@ -981,10 +1032,13 @@ func validateRoadmapCertificationClaims(
 		cloudSQL.SourceSHA256,
 		cloudSQL.DiffSHA256,
 		"<Code>local-passed-uncommitted</Code> Cloud SQL recovery",
-		"uncommitted Storage/Pub/Sub boundary gate is also <Code>local-passed-uncommitted</Code>",
-		"<Code>windows-state-markers</Code> remains <Code>configured-unverified</Code>",
-		"cross-compilation and workflow contracts are not a native Windows test pass",
-		"Commit and push",
+		"Storage/Pub/Sub boundary gate remains <Code>local-passed-uncommitted</Code>",
+		"<Code>windows-state-markers</Code> is <Code>ci-passed</Code>",
+		"authoritative <Code>quality</Code> aggregate also passed",
+		cloudSQL.CI.Commit,
+		cloudSQL.CI.RunURL,
+		windows.NativeCI.RunURL,
+		"PR #22 remains historical evidence",
 	} {
 		if !strings.Contains(normalized, required) {
 			return fmt.Errorf("roadmap is missing stable certification claim %q", required)
@@ -993,6 +1047,7 @@ func validateRoadmapCertificationClaims(
 	for _, forbidden := range []string{
 		"Storage/Pub/Sub boundary remains uncommitted local evidence only",
 		"windows-state-markers</Code> is <Code>local-passed",
+		"windows-state-markers</Code> remains <Code>configured-unverified",
 	} {
 		if strings.Contains(normalized, forbidden) {
 			return fmt.Errorf("roadmap retains stale certification claim %q", forbidden)
