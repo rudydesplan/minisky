@@ -226,7 +226,7 @@ func TestPhase15MemcacheGateIsCompleteAndReferenceable(t *testing.T) {
 	}
 }
 
-func TestCloudSQLRestartRecoveryGateUsesStableUncommittedProvenance(t *testing.T) {
+func TestCloudSQLRestartRecoveryGatePreservesLocalFingerprintsAndRecordsPR23CI(t *testing.T) {
 	root := repositoryRoot(t)
 	gates, err := ServiceGates()
 	if err != nil {
@@ -265,11 +265,13 @@ func TestCloudSQLRestartRecoveryGateUsesStableUncommittedProvenance(t *testing.T
 	if err := validateEvidenceCheck(root, gate.ID, gate.EvidenceCheck, cache); err != nil {
 		t.Error(err)
 	}
-	if gate.CI.Status != EvidenceConfiguredUnverified ||
+	if gate.CI.Status != EvidenceCIPassed ||
 		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
 		gate.CI.Job != "cloudsql-restart-integration" ||
-		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
-		t.Fatalf("Cloud SQL CI evidence overstates external provenance: %+v", gate.CI)
+		gate.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422780" ||
+		gate.CI.JobURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797" ||
+		gate.CI.Commit != "794b68439c59bfa0dd35b37962049a1a3e510ea1" {
+		t.Fatalf("Cloud SQL CI evidence lacks exact PR #23 provenance: %+v", gate.CI)
 	}
 }
 
@@ -295,11 +297,13 @@ func TestStoragePubSubBoundaryGateIsBoundedAndReferenceable(t *testing.T) {
 		gate.MakeTarget != "test-storage-persistence-pubsub-session" {
 		t.Fatalf("unexpected local emulator boundary evidence: %+v", gate.EvidenceCheck)
 	}
-	if gate.CI.Status != EvidenceConfiguredUnverified ||
+	if gate.CI.Status != EvidenceCIPassed ||
 		gate.CI.Workflow != ".github/workflows/critical-integration.yml" ||
 		gate.CI.Job != "storage-persistence-pubsub-session" ||
-		gate.CI.RunURL != "" || gate.CI.JobURL != "" || gate.CI.Commit != "" {
-		t.Fatalf("emulator boundary CI overstates external provenance: %+v", gate.CI)
+		gate.CI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422780" ||
+		gate.CI.JobURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291773" ||
+		gate.CI.Commit != "794b68439c59bfa0dd35b37962049a1a3e510ea1" {
+		t.Fatalf("emulator boundary CI lacks exact PR #23 provenance: %+v", gate.CI)
 	}
 	requiredDimensions := []string{
 		"storage-profile-runtime-bind-mount",
@@ -344,7 +348,7 @@ func TestStoragePubSubBoundaryGateIsBoundedAndReferenceable(t *testing.T) {
 	assertStoragePubSubExactCleanup(t, root)
 }
 
-func TestWindowsStateMarkersRemainNativeConfiguredUnverified(t *testing.T) {
+func TestWindowsStateMarkersAndAuthoritativeQualityRecordPR23CI(t *testing.T) {
 	root := repositoryRoot(t)
 	gates, err := QualityGates()
 	if err != nil {
@@ -367,11 +371,21 @@ func TestWindowsStateMarkersRemainNativeConfiguredUnverified(t *testing.T) {
 	if err := validateEvidenceCheck(root, gate.ID+" local prerequisites", gate.LocalPrerequisites, cache); err != nil {
 		t.Error(err)
 	}
-	if gate.NativeCI.Status != EvidenceConfiguredUnverified ||
+	if gate.NativeCI.Status != EvidenceCIPassed ||
 		gate.NativeCI.Workflow != ".github/workflows/ci.yml" ||
 		gate.NativeCI.Job != "windows-state-markers" ||
-		gate.NativeCI.RunURL != "" || gate.NativeCI.JobURL != "" || gate.NativeCI.Commit != "" {
-		t.Fatalf("Windows native CI evidence overstates execution: %+v", gate.NativeCI)
+		gate.NativeCI.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422742" ||
+		gate.NativeCI.JobURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90509292114" ||
+		gate.NativeCI.Commit != "794b68439c59bfa0dd35b37962049a1a3e510ea1" {
+		t.Fatalf("Windows native CI lacks exact PR #23 provenance: %+v", gate.NativeCI)
+	}
+	if gate.AuthoritativeQuality.Status != EvidenceCIPassed ||
+		gate.AuthoritativeQuality.Workflow != ".github/workflows/ci.yml" ||
+		gate.AuthoritativeQuality.Job != "quality" ||
+		gate.AuthoritativeQuality.RunURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422742" ||
+		gate.AuthoritativeQuality.JobURL != "https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90510621655" ||
+		gate.AuthoritativeQuality.Commit != gate.NativeCI.Commit {
+		t.Fatalf("authoritative quality CI lacks matching PR #23 provenance: %+v", gate.AuthoritativeQuality)
 	}
 }
 
@@ -1363,7 +1377,7 @@ func TestTerraformWorkflowTriggerContractRejectsInactiveMutations(t *testing.T) 
 	}
 }
 
-func TestREADMEPrioritizesExactHeadStoragePubSubEvidence(t *testing.T) {
+func TestREADMESeparatesPR23GateEvidenceFromPR22History(t *testing.T) {
 	root := repositoryRoot(t)
 	data, err := os.ReadFile(filepath.Join(root, "README.md"))
 	if err != nil {
@@ -1382,10 +1396,12 @@ func TestREADMEPrioritizesExactHeadStoragePubSubEvidence(t *testing.T) {
 	}
 	priorityOne := strings.Join(strings.Fields(priorities[first:second]), " ")
 	for _, want := range []string{
-		"Storage/Pub/Sub session-boundary gate",
-		"exact-head critical CI pass",
-		"existing PR #22 runs must not be attributed",
-		"uncommitted gate",
+		"PR #23 exact-head passes",
+		"Cloud SQL",
+		"Storage/Pub/Sub",
+		"native Windows",
+		"authoritative quality",
+		"PR #22 remains historical",
 	} {
 		if !strings.Contains(priorityOne, want) {
 			t.Errorf("README priority one does not contain %q: %s", want, priorityOne)
@@ -3111,7 +3127,12 @@ func TestRoadmapCanvasReportsPerDomainTerraformTruth(t *testing.T) {
 		"promotion run 30416460053",
 		"8e16d147b0127bd3120eae106aa0da1fb59a52c9",
 		"19/19 passed",
-		"uncommitted Storage/Pub/Sub boundary gate",
+		"Storage/Pub/Sub boundary gate remains",
+		"PR #23 exact-head commit",
+		"794b68439c59bfa0dd35b37962049a1a3e510ea1",
+		"windows-state-markers</Code> is <Code>ci-passed",
+		"authoritative <Code>quality</Code> aggregate also passed",
+		"PR #22 remains historical evidence",
 		"Commit 852d9e3",
 		"same stable Workflow execution identity",
 		"no duplicate execution resource",

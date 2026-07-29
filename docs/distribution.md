@@ -72,15 +72,19 @@ the Windows job also passed its MinGW runtime DLL audit. This is CI evidence,
 not publication evidence: no release, image, package repository, tap, or bucket
 was published.
 
-That historical Windows AMD64 CGO run does not verify the new
-`windows-state-markers` lifecycle. In the current uncommitted workflow, the
-native `windows-latest` job is required by the authoritative `quality`
-aggregate but remains `configured-unverified`. Windows cross-compilation and
-workflow-contract tests passed locally at source SHA-256
+That historical Windows AMD64 CGO run does not verify the newer
+`windows-state-markers` lifecycle. PR #23's exact-head
+[general CI run 30431422742](https://github.com/rudydesplan/minisky/actions/runs/30431422742)
+passed the native
+[`windows-state-markers` job](https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90509292114)
+and its authoritative
+[`quality` aggregate](https://github.com/rudydesplan/minisky/actions/runs/30431422742/job/90510621655)
+on commit `794b68439c59bfa0dd35b37962049a1a3e510ea1`. Windows
+cross-compilation and workflow-contract tests also passed locally at source SHA-256
 `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`
 and diff SHA-256
 `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`;
-they do not constitute a native Windows test pass.
+those local prerequisites remain distinct from the immutable native CI pass.
 
 ## GHCR
 

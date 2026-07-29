@@ -20,10 +20,10 @@ import {
 const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
   ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; bounded Phase-15 provider slices are local-only"],
-  ["8", "Durable state", "CI-verified history · new local pass", "PR #22 proves the historical operation contract; stable snapshot 328b4cb… / diff 25318c4… locally passes Cloud SQL same-container and volume-only recovery, with external CI still unverified"],
+  ["8", "Durable state", "CI-verified bounded recovery", "Stable snapshot 328b4cb… / diff 25318c4… remains local certification; PR #23 exact-head critical CI passed Cloud SQL same-container and volume-only recovery plus the Storage/PubSub session boundary"],
   ["9", "Serverless and events", "CI-verified bounded slice", "Linux CI proves Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
-  ["11", "DX and distribution", "CI-verified distribution · marker pending", "Historical Windows AMD64 CGO evidence remains valid; the new required native windows-state-markers job is configured-unverified, although cross-compilation and workflow contracts pass locally"],
+  ["11", "DX and distribution", "CI-verified distribution and markers", "Historical Windows AMD64 CGO evidence remains separate; PR #23 exact-head CI passed native windows-state-markers and the authoritative quality aggregate"],
   ["12", "Platform diagnostics", "CI-verified bounded platform slice", "Recorded CI run 30337314745 proves W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown on commit 60e8215"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
@@ -39,7 +39,7 @@ const phases = [
 ];
 
 const priorities = [
-  ["1", "Deliver the stable local certification", "Commit and push source 328b4cb… / diff 25318c4…, then require exact-head Cloud SQL, Storage/PubSub, and native Windows CI", "PR #22 predates these working-tree gates and must not be attributed to them"],
+  ["1", "Preserve exact evidence boundaries", "Keep stable local fingerprints separate from PR #23 exact-head Cloud SQL, Storage/PubSub, native Windows, and quality CI provenance", "PR #22 remains historical evidence for its own revision"],
   ["2", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
   ["3", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
 ];
@@ -174,17 +174,21 @@ export default function MiniSkyRoadmapCompletionPlan() {
         broad GCP parity claim. Stable snapshot source SHA-256
         328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25 and diff SHA-256
         25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033 now record
-        <Code>local-passed-uncommitted</Code> Cloud SQL recovery. The uncommitted Storage/Pub/Sub boundary gate is
-        also <Code>local-passed-uncommitted</Code>. Native
-        <Code>windows-state-markers</Code> remains <Code>configured-unverified</Code>; cross-compilation and workflow
-        contracts are not a native Windows test pass.
+        <Code>local-passed-uncommitted</Code> Cloud SQL recovery. The Storage/Pub/Sub boundary gate remains
+        <Code>local-passed-uncommitted</Code>. PR #23 exact-head commit
+        794b68439c59bfa0dd35b37962049a1a3e510ea1 passed both gates in
+        https://github.com/rudydesplan/minisky/actions/runs/30431422780. Native
+        <Code>windows-state-markers</Code> is <Code>ci-passed</Code> in
+        https://github.com/rudydesplan/minisky/actions/runs/30431422742, and the authoritative
+        <Code>quality</Code> aggregate also passed. PR #22 remains historical evidence for its exact earlier revision.
       </Callout>
 
       <Callout tone="info" title="Recorded external evidence">
-        PR #22 passed general CI run 30416460163, critical reliability and Memcached in run 30416460134, and all 12
+        Historical PR #22 evidence passed general CI run 30416460163, critical reliability and Memcached in run 30416460134, and all 12
         Terraform plus seven SDK/backend jobs in promotion run 30416460053 at exact source revision
-        8e16d147b0127bd3120eae106aa0da1fb59a52c9. These records apply only to that revision and do not verify the
-        uncommitted Cloud SQL, Storage/PubSub, or native Windows gates.
+        8e16d147b0127bd3120eae106aa0da1fb59a52c9. Separately, PR #23 passed the bounded Cloud SQL and
+        Storage/PubSub jobs in critical run 30431422780 plus native Windows state markers and authoritative quality
+        in general CI run 30431422742 at exact head 794b68439c59bfa0dd35b37962049a1a3e510ea1.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -255,9 +259,9 @@ export default function MiniSkyRoadmapCompletionPlan() {
             Outside the Phase 18–25 matrix, <Code>pkg/evidence/service_gates.json</Code> is the source of truth for
             dedicated Memcached and Cloud SQL lifecycle dimensions. Memcached&apos;s local and critical CI evidence
             remains pinned to PR #22&apos;s exact commit. Cloud SQL recovery is
-            <Code>local-passed-uncommitted</Code> at the stable source/diff fingerprints, while its required external
-            job remains <Code>configured-unverified</Code>. Cache contents, production Cloud SQL HA/security, and
-            broad GCP parity remain unclaimed.
+            <Code>local-passed-uncommitted</Code> at the stable source/diff fingerprints, while PR #23&apos;s exact-head
+            critical job is <Code>ci-passed</Code>. Cache contents, production Cloud SQL HA/security, and broad GCP
+            parity remain unclaimed.
           </Text>
         </Stack>
       </Grid>

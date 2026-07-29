@@ -495,9 +495,12 @@ uncommitted snapshot is `local-passed-uncommitted` at source SHA-256
 `328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`
 and diff SHA-256
 `25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`.
-CI is `configured-unverified`; there is no external run URL or commit for this
-snapshot. The gate covers same-container restart, volume-only replacement with
-the exact proven named volume, protocol and authenticated readiness,
+CI is `ci-passed` in PR #23's exact-head
+[critical run 30431422780](https://github.com/rudydesplan/minisky/actions/runs/30431422780)
+([Cloud SQL job](https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291797))
+on commit `794b68439c59bfa0dd35b37962049a1a3e510ea1`. The gate covers
+same-container restart, volume-only replacement with the exact proven named
+volume, protocol and authenticated readiness,
 portable-snapshot exclusions, legacy fail-closed behavior, and exact cleanup.
 The same local certification passed the bounded provider apply, zero-drift
 plan, and destroy lifecycle. It does not claim broad Cloud SQL API,

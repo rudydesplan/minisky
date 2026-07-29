@@ -147,10 +147,13 @@
     "diffSha256": "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033",
     "note": "Stable uncommitted snapshot evidence proves that the exact pinned public Pub/Sub image is acquired with an isolated anonymous Docker configuration against the active daemon, then validated for immutable digest syntax, linux/amd64 platform execution (including emulation where available), and advertised --data-dir capability. Cloud Storage buckets and objects use a profile-scoped host runtime bind mount and survive exact-owned emulator-container replacement. Official Pub/Sub topics, subscriptions, and queued messages survive a MiniSky process crash/restart only while the same exact-owned Pub/Sub container remains alive; replacement loses all three. Exact-owned cleanup passed. Public registry/network access remains required, the global unowned image cache may retain an authorized pull, Pub/Sub remains amd64/emulation/session-only, and five unrelated local volumes plus a pre-existing lock observed during certification are not product evidence. Storage and Pub/Sub runtime data remain outside metadata export/import; no exactly-once, portable export, IAM, HA, security, or full-parity claim is made.",
     "ci": {
-      "status": "configured-unverified",
+      "status": "ci-passed",
       "workflow": ".github/workflows/critical-integration.yml",
       "job": "storage-persistence-pubsub-session",
-      "note": "The required pull-request and main-branch Storage persistence and Pub/Sub session-boundary job is configured in the working tree, but no external run URL, job URL, or commit exists for this uncommitted gate."
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422780",
+      "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30431422780/job/90509291773",
+      "commit": "794b68439c59bfa0dd35b37962049a1a3e510ea1",
+      "note": "PR #23's required Storage persistence and Pub/Sub session-boundary job completed successfully on the exact recorded source revision."
     }
   }
 ]
