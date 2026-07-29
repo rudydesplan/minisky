@@ -73,16 +73,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  quality:
-    name: Test, lint, and build promotion assets
+  promotion-assets:
+    name: Prepare promotion assets
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Validate project agent skills
-        run: python3 .claude/skills/validate.py
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -94,19 +91,7 @@ jobs:
         working-directory: ui
         run: npm ci
 
-      - name: Lint UI
-        working-directory: ui
-        run: npm run lint
-
-      - name: Test UI
-        working-directory: ui
-        run: npm test
-
-      - name: Audit UI dependencies
-        working-directory: ui
-        run: npm audit --audit-level=high
-
-      - name: Build UI
+      - name: Build promotion UI
         working-directory: ui
         run: npm run build
 
@@ -117,55 +102,6 @@ jobs:
           path: ui/dist
           if-no-files-found: error
           retention-days: 1
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: Check generated documentation truth
-        run: make check-docs-truth
-
-      - name: Check Go formatting
-        run: test -z "$(gofmt -l cmd pkg ui)"
-
-      - name: Vet Go code
-        run: go vet ./cmd/... ./pkg/... ./ui
-
-      - name: Test Go code with race detector
-        run: go test -race ./cmd/... ./pkg/... ./ui
-
-      - name: Test integration script contracts
-        run: go test -count=1 ./scripts
-
-      - name: Build MiniSky
-        run: go build -trimpath ./cmd/minisky
-
-      - name: Validate local action JavaScript
-        run: node --test .github/actions/setup-minisky/index.test.mjs && node --check .github/actions/setup-minisky/index.mjs && node --check .github/actions/setup-minisky/cleanup.mjs
-
-      - name: Start built artifact with local action
-        id: minisky
-        uses: ./.github/actions/setup-minisky
-        with:
-          binary: ./minisky
-          api-port: "18080"
-          ui-port: "18081"
-          profile: action-e2e
-          services: compute
-
-      - name: Verify action readiness output
-        run: |
-          test "${{ steps.minisky.outputs.endpoint }}" = "http://127.0.0.1:18080"
-          curl --fail --silent --show-error "${{ steps.minisky.outputs.endpoint }}/healthz"
-
-      - name: Validate CI and Compose templates
-        env:
-          MINISKY_IMAGE: ghcr.io/qamarudeenm/minisky:test
-        run: |
-          ruby -e "require 'yaml'; YAML.safe_load(File.read('.gitlab/ci/minisky.yml'), aliases: true)"
-          docker compose -f deployments/docker-compose.yml config >/dev/null
 
   sdk-smoke-validate:
     name: Compile promotion SDK smoke suites
@@ -295,12 +231,12 @@ jobs:
   phase18-25-terraform-integration:
     name: Terraform 7.41.0 (${{ matrix.domain }})
     needs:
-      - quality
+      - promotion-assets
       - phase18-25-evidence
       - terraform-validate
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 12
       matrix:
         include:
           - id: workflows
@@ -468,7 +404,7 @@ jobs:
   phase18-25-sdk-integration:
     name: Phase 18-25 generated Go client restart acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -530,7 +466,7 @@ jobs:
   phase19-sdk-integration:
     name: Phase 19 generated Go client restart acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -592,7 +528,7 @@ jobs:
   phase19-heavy-backend-integration:
     name: Phase 19 Kafka and Airflow backend acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -669,7 +605,7 @@ jobs:
   phase20-sdk-integration:
     name: Phase 20 Docker-backed generated Go client acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -734,7 +670,7 @@ jobs:
   phase21-22-sdk-integration:
     name: Phase 21-22 Docker-isolated generated Go client acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -799,7 +735,7 @@ jobs:
   phase23-sdk-integration:
     name: Phase 23 Docker-isolated generated Go client acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest
@@ -864,7 +800,7 @@ jobs:
   phase24-25-sdk-integration:
     name: Phase 24-25 generated Go client restart acceptance
     needs:
-      - quality
+      - promotion-assets
       - sdk-smoke-validate
       - phase18-25-evidence
     runs-on: ubuntu-latest

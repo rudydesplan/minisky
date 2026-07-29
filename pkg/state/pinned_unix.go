@@ -87,6 +87,10 @@ func (dir *pinnedDirectory) openRegularFileForRead(name string) (*os.File, error
 	return file, nil
 }
 
+func (dir *pinnedDirectory) openRegularFileForRemoval(name string) (*os.File, error) {
+	return dir.openRegularFileForRead(name)
+}
+
 func (dir *pinnedDirectory) openDirectory(name string, create bool) (*pinnedDirectory, error) {
 	open := func() (int, error) {
 		return unix.Openat(
@@ -187,6 +191,10 @@ func (dir *pinnedDirectory) remove(name string) error {
 		return nil
 	}
 	return err
+}
+
+func (dir *pinnedDirectory) removeOpenFile(_ *os.File, name string) error {
+	return dir.remove(name)
 }
 
 func (dir *pinnedDirectory) sync() error {

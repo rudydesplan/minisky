@@ -32,6 +32,7 @@ const (
 var (
 	ErrInvalidPath              = errors.New("invalid state path")
 	ErrLockNamespaceReplaced    = errors.New("state lock directory was replaced")
+	ErrMarkerMismatch           = errors.New("local state marker does not match")
 	ErrNotFound                 = errors.New("state entry not found")
 	ErrProfileInUse             = errors.New("state profile is in use")
 	ErrProfileReplaced          = errors.New("state profile directory was replaced")
@@ -139,10 +140,12 @@ type Store struct {
 	healthMu    sync.RWMutex
 	degradedErr error
 
-	beforeStateReplace    func()
-	beforeReadOnlyRecheck func()
-	beforeTransactionLock func()
-	effectiveWriteAccess  func(string) error
+	beforeStateReplace      func()
+	beforeReadOnlyRecheck   func()
+	beforeTransactionLock   func()
+	beforeLocalMarkerCommit func()
+	afterLocalMarkerCommit  func()
+	effectiveWriteAccess    func(string) error
 }
 
 // New creates a handle for a named profile rooted at root.

@@ -20,26 +20,26 @@ import {
 const phases = [
   ["6", "Fidelity baseline", "Implemented", "Domain contracts and canonical routing pass locally"],
   ["7", "Terraform and SDK", "Verified foundation", "Default apply/assert/no-drift/destroy passes; bounded Phase-15 provider slices are local-only"],
-  ["8", "Durable state", "Local reliability milestone", "Persist-before-publish terminal results, exact committed readback, lossless metadata, and immutable retries pass locally; external proof remains"],
+  ["8", "Durable state", "CI-verified history · new local pass", "PR #22 proves the historical operation contract; stable snapshot 328b4cb… / diff 25318c4… locally passes Cloud SQL same-container and volume-only recovery, with external CI still unverified"],
   ["9", "Serverless and events", "CI-verified bounded slice", "Linux CI proves Pack-backed Storage/Pub/Sub function and service delivery plus Tasks retry outcomes; Scheduler remains manual :run E2E"],
   ["10", "Networking and artifacts", "Verified bounded slice", "Terraform-managed HTTP traffic and repository-scoped push/list/delete pass locally"],
-  ["11", "DX and distribution", "CI-verified distribution slice", "GoReleaser Linux AMD64 snapshot, native amd64/arm64 deb/rpm, and Linux ARM64/macOS ARM64/Windows AMD64 CGO gates pass; publication remains external"],
+  ["11", "DX and distribution", "CI-verified distribution · marker pending", "Historical Windows AMD64 CGO evidence remains valid; the new required native windows-state-markers job is configured-unverified, although cross-compilation and workflow contracts pass locally"],
   ["12", "Platform diagnostics", "CI-verified bounded platform slice", "Recorded CI run 30337314745 proves W3C traces, structured logs, low-cardinality metrics, sanitized OTLP inspection, exporter degradation, replay bounds, and shutdown on commit 60e8215"],
   ["13", "Security simulation", "Verified local slice", "Static-JWKS RS256 WIF and up to four ordered delegates pass locally; production federation remains unsupported"],
   ["14", "Multi-tenancy", "Verified bounded local slice", "Cross-project Pub/Sub Terraform and Go SDK publish/pull/ack pass; shared backends remain bounded"],
-  ["15", "Data services", "Local-verified bounded slices", "Firestore, Datastore, and Spanner SDK data-plane behavior passes locally; Redis has a guarded provider lifecycle, while Memcached currently has non-promotable working-tree evidence without an immutable source revision"],
+  ["15", "Data services", "CI-verified bounded slices", "Firestore, Datastore, and Spanner SDK data-plane behavior passes locally; Redis has a guarded provider lifecycle, and PR #22 records immutable Memcached lifecycle evidence"],
   ["16", "ML, monitoring, networking", "CI-verified bounded slices", "Linux critical CI proves persisted PromQL, Logging, DNS/UDP, Subnetwork/IPAM SDK + Terraform, and deterministic Vertex restart gates"],
   ["17", "CI/CD, plugins, enterprise", "CI-verified bounded slice", "Linux critical CI proves federated RBAC/quota/audit integration; production controls and external publication remain"],
-  ["18", "Event workflows", "Experimental · replay locally proven", "Commit 852d9e3 proves deterministic post-admission restart with the same execution identity; external Terraform CI and exactly-once external side effects remain unverified"],
-  ["19", "Pipelines and streaming", "Experimental · promotion configured", "Composer and Managed Kafka local provider lifecycles have isolated required matrix entries with Docker prerequisites; the new workflow is externally unverified"],
-  ["20", "Extended databases", "Experimental · promotion configured", "Four bounded local provider lifecycles have isolated required matrix entries; production networking and external workflow proof remain outside the claims"],
-  ["21–22", "Observability and API management", "Experimental · promotion configured", "The local Service Directory hierarchy lifecycle has one required matrix entry; external workflow, deployment, and DNS parity remain unverified"],
-  ["23", "AI and ML services", "Experimental · promotion configured", "The local metadata-only Document AI lifecycle has one required matrix entry; processing, inference, and external workflow proof remain unsupported"],
-  ["24–25", "Security and networking", "Experimental · promotion configured", "Organization Policy and Binary Authorization local lifecycles have isolated required matrix entries without external or production enforcement claims"],
+  ["18", "Event workflows", "Experimental · promotion passed", "PR #22 passed the bounded Terraform and SDK jobs; deterministic replay remains local evidence and exactly-once external side effects remain unsupported"],
+  ["19", "Pipelines and streaming", "Experimental · promotion passed", "PR #22 passed Composer and Managed Kafka provider jobs plus SDK and Kafka/Airflow backend jobs; production service parity remains unsupported"],
+  ["20", "Extended databases", "Experimental · promotion passed", "PR #22 passed four bounded provider jobs and the Docker-backed SDK job; production networking remains outside the claims"],
+  ["21–22", "Observability and API management", "Experimental · promotion passed", "PR #22 passed the Service Directory provider job and SDK job; deployment and DNS parity remain unsupported"],
+  ["23", "AI and ML services", "Experimental · promotion passed", "PR #22 passed the metadata-only Document AI provider job and SDK job; processing and inference remain unsupported"],
+  ["24–25", "Security and networking", "Experimental · promotion passed", "PR #22 passed Organization Policy and Binary Authorization provider jobs plus the SDK job without claiming production enforcement"],
 ];
 
 const priorities = [
-  ["1", "Run the dedicated promotion workflow", "Require all 12 Terraform legs and seven SDK/backend gates to pass externally at one exact revision, then record its immutable run URL and commit", "Configured workflow and local passes are not external evidence"],
+  ["1", "Deliver the stable local certification", "Commit and push source 328b4cb… / diff 25318c4…, then require exact-head Cloud SQL, Storage/PubSub, and native Windows CI", "PR #22 predates these working-tree gates and must not be attributed to them"],
   ["2", "Promote services individually", "Retain all 36 Phase 18–25 domains as experimental and default-off until each promotion boundary passes", "Code existence and batch success do not establish fidelity"],
   ["3", "Prove a publishable release", "Run stable-tag archives, container digest evidence, and installed-artifact checks before publication claims", "GHCR tags, package repositories, taps, buckets, and the external action remain unprovisioned"],
 ];
@@ -132,7 +132,7 @@ const waves = [
       "Keep unsupported methods explicit while exact-owned Batch, Composer, Kafka, AlloyDB, and Valkey backends retain collision-safe cleanup and truthful failure behavior.",
       "Refresh the committed CodeGraph database whenever structural service or routing changes make the index stale.",
     ],
-    gate: "Offline evidence, docs truth, the full race suite, and all generated-client/restart/cleanup workflows pass in the current working tree. The dedicated promotion workflow owns 12 Terraform legs and seven SDK/backend gates exactly once, but has no external pass record.",
+    gate: "PR #22 passed general CI, critical reliability, Memcached, all 12 Terraform jobs, and all seven SDK/backend jobs at exact source revision 8e16d147b0127bd3120eae106aa0da1fb59a52c9.",
   },
 ];
 
@@ -144,7 +144,7 @@ export default function MiniSkyRoadmapCompletionPlan() {
       <Stack gap={8}>
         <Row align="center" justify="space-between" wrap>
           <H1>MiniSky roadmap completion plan</H1>
-          <Pill active>Repository audit · 2026-07-28</Pill>
+          <Pill active>Repository audit · 2026-07-29</Pill>
         </Row>
         <Text tone="secondary">
           A dependency-ordered plan grounded in <Code>README.md</Code>, <Code>PRODUCT.md</Code>,
@@ -160,27 +160,31 @@ export default function MiniSkyRoadmapCompletionPlan() {
         reconciliation, restart, and polling paths align with that contract. This is exactly-once operation-result
         publication, not exactly-once external side effects. Phase 18–25 services remain default-off experimental.
         Their package, strict-IAM, generated-client, restart, backend, cleanup, docs-truth, and race evidence passes in
-        the current working tree. The dedicated path-aware, weekly, and manually runnable promotion workflow replaces
-        20 general-CI manual shadows and owns 12 Terraform legs plus seven SDK/backend gates exactly once while
-        retaining prerequisite and failure contracts. That workflow has not run externally, so its status is
-        configured-unverified with no run URL or commit.
+        the current working tree. At exact source revision 8e16d147b0127bd3120eae106aa0da1fb59a52c9, PR #22&apos;s
+        dedicated path-aware, weekly, and manually runnable promotion workflow passed all 12 Terraform legs and seven
+        SDK/backend gates while general CI, critical reliability, and Memcached also passed.
         Commit 852d9e3 adds isolated public-gateway Pub/Sub → Eventarc → Workflows evidence with exact raw request
         nonce/argument/result checks, foreign-topic/project and strict-IAM bounds, and a deterministic post-admission
         pause. The live gate interrupts MiniSky after durable admission, then resumes the same stable Workflow
         execution identity to its exact terminal result with no duplicate execution resource and exact-owned cleanup.
         This proves idempotent admission/resource identity, not exactly-once external side effects, CloudEvents parity,
         OIDC, ordering, or transport provisioning.
-        Separately, the machine-readable Memcached service gate records a non-promotable working-tree pass with no
-        immutable source revision. It remains authoritative for the bounded dimensions, tool entry points, and CI
-        state, and makes no broad GCP parity claim.
+        Separately, the machine-readable Memcached service gate records its immutable local revision and critical CI
+        job URL. It remains authoritative for the bounded dimensions, tool entry points, and CI state, and makes no
+        broad GCP parity claim. Stable snapshot source SHA-256
+        328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25 and diff SHA-256
+        25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033 now record
+        <Code>local-passed-uncommitted</Code> Cloud SQL recovery. The uncommitted Storage/Pub/Sub boundary gate is
+        also <Code>local-passed-uncommitted</Code>. Native
+        <Code>windows-state-markers</Code> remains <Code>configured-unverified</Code>; cross-compilation and workflow
+        contracts are not a native Windows test pass.
       </Callout>
 
       <Callout tone="info" title="Recorded external evidence">
-        PR #21&apos;s prior 12-entry Terraform matrix passed in CI run 30384072102, and critical run 30384072295
-        passed, at source commit 7035b25b056e03334656029af1e5c1259ab91765. Those records belong to that commit and
-        prior workflow layout. Main CI run 30387050664 then failed the Go race suite at merge commit
-        f0712219f62dc711244af9db904da20362437a49; that failure motivated the durability fix but does not prove it
-        resolved. Neither the current uncommitted branch nor the new promotion workflow has external pass evidence.
+        PR #22 passed general CI run 30416460163, critical reliability and Memcached in run 30416460134, and all 12
+        Terraform plus seven SDK/backend jobs in promotion run 30416460053 at exact source revision
+        8e16d147b0127bd3120eae106aa0da1fb59a52c9. These records apply only to that revision and do not verify the
+        uncommitted Cloud SQL, Storage/PubSub, or native Windows gates.
       </Callout>
 
       <Grid columns="1fr 1fr 1fr" gap={12}>
@@ -190,11 +194,11 @@ export default function MiniSkyRoadmapCompletionPlan() {
         </Card>
         <Card>
           <CardHeader>Phase 18–25 gate</CardHeader>
-          <CardBody><H2>Local passed</H2><Text tone="secondary">Uncommitted offline evidence plus full Go race suite</Text></CardBody>
+          <CardBody><H2>Bounded evidence</H2><Text tone="secondary">Local matrices plus exact-revision PR #22 CI provenance</Text></CardBody>
         </Card>
         <Card>
           <CardHeader>Promotion status</CardHeader>
-          <CardBody><H2>Configured-unverified</H2><Text tone="secondary">Twelve Terraform legs and seven SDK/backend gates await one exact-revision external run</Text></CardBody>
+          <CardBody><H2>19/19 passed</H2><Text tone="secondary">Twelve Terraform jobs and seven SDK/backend jobs at one exact revision</Text></CardBody>
         </Card>
       </Grid>
 
@@ -210,9 +214,8 @@ export default function MiniSkyRoadmapCompletionPlan() {
           <Text tone="secondary">
             All six Phase 18–25 SDK/restart/cleanup workflows pass locally, including terminal exact-owned Batch
             cleanup, Phase 19&apos;s heavy Kafka/Airflow path, pinned Phase 20 backends, and isolated Phase 24–25
-            routing backends. Earlier workflow layouts passed the six GitHub jobs in run 30285572232 on commit
-            62d6fa2 and the explicit Phase 19 backend path in run 30287887431 on commit d657e4b. Those historical
-            runs do not transfer a pass to the new dedicated promotion workflow.
+            routing backends. PR #22 promotion run 30416460053 passed the matching 12 Terraform and seven SDK/backend
+            jobs at full commit 8e16d147b0127bd3120eae106aa0da1fb59a52c9.
           </Text>
           <Text tone="secondary">
             Commit 852d9e3&apos;s guarded Phase 18 public-gateway gate deterministically pauses after durable Eventarc
@@ -245,15 +248,16 @@ export default function MiniSkyRoadmapCompletionPlan() {
             DRYRUN_AUDIT_LOG_ONLY permits rollout and returns AUDIT; no durable audit record or log is created.
             Unsupported attestation, global-policy, and cluster-rule evaluation returns explicit UNSUPPORTED.
             This is local emulation, not GKE or production admission security. The Binary Authorization Terraform
-            check is local-passed only. Like the other eleven domain checks, its required matrix entry is
-            configured-unverified; it has no invented CI run URL or commit, and it does not promote service fidelity.
+            check passed in PR #22&apos;s exact-revision promotion run. Like the other eleven domain checks, that CI
+            pass remains bounded and does not promote service fidelity.
           </Text>
           <Text tone="secondary">
             Outside the Phase 18–25 matrix, <Code>pkg/evidence/service_gates.json</Code> is the source of truth for
-            the dedicated Memcached lifecycle dimensions, provider version, script/Make entry points, and local/CI
-            evidence state. Its current local pass belongs only to the uncommitted working tree, is non-promotable,
-            and has no immutable source revision evidence. Cache entries remain ephemeral; GCP networking, HA,
-            maintenance, security, and broad API parity remain unclaimed.
+            dedicated Memcached and Cloud SQL lifecycle dimensions. Memcached&apos;s local and critical CI evidence
+            remains pinned to PR #22&apos;s exact commit. Cloud SQL recovery is
+            <Code>local-passed-uncommitted</Code> at the stable source/diff fingerprints, while its required external
+            job remains <Code>configured-unverified</Code>. Cache contents, production Cloud SQL HA/security, and
+            broad GCP parity remain unclaimed.
           </Text>
         </Stack>
       </Grid>

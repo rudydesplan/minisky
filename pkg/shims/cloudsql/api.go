@@ -2,6 +2,9 @@ package cloudsql
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +21,10 @@ import (
 )
 
 func init() {
-	state.MustRegisterEntryValidator(cloudSQLStateEntry, state.StrictEntryValidator[cloudSQLMetadata](nil))
+	state.MustRegisterEntryValidator(
+		cloudSQLStateEntry,
+		state.StrictEntryValidator(validateCloudSQLMetadataImport),
+	)
 	registry.Register("sqladmin.googleapis.com", func(ctx *registry.Context) http.Handler {
 		return NewAPI(ctx.OpMgr, ctx.SvcMgr)
 	})
@@ -34,7 +40,7 @@ type DatabaseInstance struct {
 	Name            string           `json:"name"`
 	Project         string           `json:"project"`
 	SelfLink        string           `json:"selfLink"`
-	DatabaseVersion string           `json:"databaseVersion"` // e.g. POSTGRES_15, MYSQL_8_0
+	DatabaseVersion string           `json:"databaseVersion"` // e.g. POSTGRES_18, MYSQL_8_0
 	Region          string           `json:"region"`
 	State           string           `json:"state"` // PENDING_CREATE → RUNNABLE → SUSPENDED → DELETED
 	Settings        InstanceSettings `json:"settings"`
@@ -124,51 +130,205 @@ type SqlOperation struct {
 
 // API is the high-fidelity Cloud SQL (sqladmin v1) shim.
 type API struct {
-	mu         sync.RWMutex
-	persistMu  sync.Mutex
-	adminMu    sync.Mutex
-	opMgr      *orchestrator.OperationManager
-	svcMgr     *orchestrator.ServiceManager
-	backend    cloudSQLBackend
-	stateStore cloudSQLStore
-	initErr    error
-	instances  map[string]*DatabaseInstance // key: project:instanceName
-	databases  map[string][]*Database       // key: project:instanceName
-	users      map[string][]*User           // key: project:instanceName
+	mu                  sync.RWMutex
+	persistMu           sync.Mutex
+	adminMu             sync.Mutex
+	reconcileMu         sync.Mutex
+	opMgr               *orchestrator.OperationManager
+	svcMgr              *orchestrator.ServiceManager
+	backend             cloudSQLBackend
+	stateStore          cloudSQLStore
+	initErr             error
+	instances           map[string]*DatabaseInstance // key: project:instanceName
+	databases           map[string][]*Database       // key: project:instanceName
+	users               map[string][]*User           // key: project:instanceName
+	runtimes            map[string]*cloudSQLRuntimeProvenance
+	reconcile           map[string]struct{}
+	reconcileRetryAfter map[string]time.Time
+	reconcileNow        func() time.Time
+	reconcileSources    map[string]*DatabaseInstance
+	preservedInstances  map[string]*DatabaseInstance
+	restartDirty        bool
 }
 
 type cloudSQLBackend interface {
-	Create(context.Context, string, string, string, string) (string, bool, error)
-	Delete(context.Context, string, string) error
-	ExecuteAdmin(context.Context, string, string, string, string, string, string) error
+	Prepare(context.Context, cloudSQLBackendSpec) (cloudSQLBackendSpec, error)
+	Create(context.Context, cloudSQLBackendSpec) (cloudSQLCreateResult, error)
+	Reconcile(context.Context, cloudSQLBackendSpec) (cloudSQLCreateResult, error)
+	Delete(context.Context, cloudSQLBackendSpec) error
+	ExecuteAdmin(context.Context, cloudSQLBackendSpec, string, string, string) error
+}
+
+type cloudSQLBackendSpec struct {
+	Project                string
+	Instance               string
+	DatabaseVersion        string
+	OwnershipFingerprint   string
+	BootstrapPolicy        string
+	Image                  string
+	ImageID                string
+	VolumeIdentity         string
+	ImageAcquisitionIntent bool
+	CreationIntent         bool
+}
+
+type cloudSQLCreateResult struct {
+	Endpoint string
+	Created  bool
+	Spec     cloudSQLBackendSpec
 }
 
 type serviceManagerBackend struct {
 	manager *orchestrator.ServiceManager
 }
 
-func (b serviceManagerBackend) Create(ctx context.Context, project, name, version, password string) (string, bool, error) {
+func (b serviceManagerBackend) Prepare(
+	ctx context.Context,
+	spec cloudSQLBackendSpec,
+) (cloudSQLBackendSpec, error) {
 	if b.manager == nil {
-		return "", false, fmt.Errorf("Cloud SQL backend is unavailable")
+		return spec, fmt.Errorf("Cloud SQL backend is unavailable")
 	}
-	return b.manager.ProvisionCloudSQLVM(ctx, project, name, version, password)
+	resolved, err := b.manager.PrepareCloudSQLVM(ctx, orchestrator.CloudSQLBackendSpec{
+		Project:                spec.Project,
+		Instance:               spec.Instance,
+		DatabaseVersion:        spec.DatabaseVersion,
+		OwnershipFingerprint:   spec.OwnershipFingerprint,
+		BootstrapPolicy:        spec.BootstrapPolicy,
+		Image:                  spec.Image,
+		ImageID:                spec.ImageID,
+		VolumeIdentity:         spec.VolumeIdentity,
+		ImageAcquisitionIntent: spec.ImageAcquisitionIntent,
+		CreationIntent:         spec.CreationIntent,
+	})
+	return cloudSQLBackendSpec{
+		Project:                resolved.Project,
+		Instance:               resolved.Instance,
+		DatabaseVersion:        resolved.DatabaseVersion,
+		OwnershipFingerprint:   resolved.OwnershipFingerprint,
+		BootstrapPolicy:        resolved.BootstrapPolicy,
+		Image:                  resolved.Image,
+		ImageID:                resolved.ImageID,
+		VolumeIdentity:         resolved.VolumeIdentity,
+		ImageAcquisitionIntent: resolved.ImageAcquisitionIntent,
+		CreationIntent:         resolved.CreationIntent,
+	}, err
 }
 
-func (b serviceManagerBackend) Delete(ctx context.Context, project, name string) error {
+func (b serviceManagerBackend) Create(
+	ctx context.Context,
+	spec cloudSQLBackendSpec,
+) (cloudSQLCreateResult, error) {
+	if b.manager == nil {
+		return cloudSQLCreateResult{}, fmt.Errorf("Cloud SQL backend is unavailable")
+	}
+	endpoint, resolved, created, err := b.manager.ProvisionCloudSQLVM(
+		ctx,
+		orchestrator.CloudSQLBackendSpec{
+			Project:                spec.Project,
+			Instance:               spec.Instance,
+			DatabaseVersion:        spec.DatabaseVersion,
+			OwnershipFingerprint:   spec.OwnershipFingerprint,
+			BootstrapPolicy:        spec.BootstrapPolicy,
+			Image:                  spec.Image,
+			ImageID:                spec.ImageID,
+			VolumeIdentity:         spec.VolumeIdentity,
+			ImageAcquisitionIntent: spec.ImageAcquisitionIntent,
+			CreationIntent:         spec.CreationIntent,
+		},
+	)
+	return cloudSQLCreateResult{
+		Endpoint: endpoint,
+		Created:  created,
+		Spec: cloudSQLBackendSpec{
+			Project:                resolved.Project,
+			Instance:               resolved.Instance,
+			DatabaseVersion:        resolved.DatabaseVersion,
+			OwnershipFingerprint:   resolved.OwnershipFingerprint,
+			BootstrapPolicy:        resolved.BootstrapPolicy,
+			Image:                  resolved.Image,
+			ImageID:                resolved.ImageID,
+			VolumeIdentity:         resolved.VolumeIdentity,
+			ImageAcquisitionIntent: resolved.ImageAcquisitionIntent,
+			CreationIntent:         resolved.CreationIntent,
+		},
+	}, err
+}
+
+func (b serviceManagerBackend) Reconcile(
+	ctx context.Context,
+	spec cloudSQLBackendSpec,
+) (cloudSQLCreateResult, error) {
+	if b.manager == nil {
+		return cloudSQLCreateResult{Spec: spec}, fmt.Errorf("Cloud SQL backend is unavailable")
+	}
+	endpoint, resolved, err := b.manager.ReconcileCloudSQLVMResolved(ctx, orchestrator.CloudSQLBackendSpec{
+		Project:                spec.Project,
+		Instance:               spec.Instance,
+		DatabaseVersion:        spec.DatabaseVersion,
+		OwnershipFingerprint:   spec.OwnershipFingerprint,
+		BootstrapPolicy:        spec.BootstrapPolicy,
+		Image:                  spec.Image,
+		ImageID:                spec.ImageID,
+		VolumeIdentity:         spec.VolumeIdentity,
+		ImageAcquisitionIntent: spec.ImageAcquisitionIntent,
+		CreationIntent:         spec.CreationIntent,
+	})
+	return cloudSQLCreateResult{
+		Endpoint: endpoint,
+		Spec: cloudSQLBackendSpec{
+			Project:                resolved.Project,
+			Instance:               resolved.Instance,
+			DatabaseVersion:        resolved.DatabaseVersion,
+			OwnershipFingerprint:   resolved.OwnershipFingerprint,
+			BootstrapPolicy:        resolved.BootstrapPolicy,
+			Image:                  resolved.Image,
+			ImageID:                resolved.ImageID,
+			VolumeIdentity:         resolved.VolumeIdentity,
+			ImageAcquisitionIntent: resolved.ImageAcquisitionIntent,
+			CreationIntent:         resolved.CreationIntent,
+		},
+	}, err
+}
+
+func (b serviceManagerBackend) Delete(ctx context.Context, spec cloudSQLBackendSpec) error {
 	if b.manager == nil {
 		return fmt.Errorf("Cloud SQL backend is unavailable")
 	}
-	return b.manager.DeleteCloudSQLVMContext(ctx, project, name)
+	return b.manager.DeleteCloudSQLVMContext(ctx, orchestrator.CloudSQLBackendSpec{
+		Project:                spec.Project,
+		Instance:               spec.Instance,
+		DatabaseVersion:        spec.DatabaseVersion,
+		OwnershipFingerprint:   spec.OwnershipFingerprint,
+		BootstrapPolicy:        spec.BootstrapPolicy,
+		Image:                  spec.Image,
+		ImageID:                spec.ImageID,
+		VolumeIdentity:         spec.VolumeIdentity,
+		ImageAcquisitionIntent: spec.ImageAcquisitionIntent,
+		CreationIntent:         spec.CreationIntent,
+	})
 }
 
 func (b serviceManagerBackend) ExecuteAdmin(
 	ctx context.Context,
-	project, instance, version, action, name, password string,
+	spec cloudSQLBackendSpec,
+	action, name, password string,
 ) error {
 	if b.manager == nil {
 		return fmt.Errorf("Cloud SQL backend is unavailable")
 	}
-	return b.manager.ExecuteCloudSQLAdmin(ctx, project, instance, version, action, name, password)
+	return b.manager.ExecuteCloudSQLAdmin(ctx, orchestrator.CloudSQLBackendSpec{
+		Project:                spec.Project,
+		Instance:               spec.Instance,
+		DatabaseVersion:        spec.DatabaseVersion,
+		OwnershipFingerprint:   spec.OwnershipFingerprint,
+		BootstrapPolicy:        spec.BootstrapPolicy,
+		Image:                  spec.Image,
+		ImageID:                spec.ImageID,
+		VolumeIdentity:         spec.VolumeIdentity,
+		ImageAcquisitionIntent: spec.ImageAcquisitionIntent,
+		CreationIntent:         spec.CreationIntent,
+	}, action, name, password)
 }
 
 func NewAPI(opMgr *orchestrator.OperationManager, svcMgr *orchestrator.ServiceManager) *API {
@@ -203,13 +363,19 @@ func newAPIWithDependencies(
 	store cloudSQLStore,
 ) *API {
 	return &API{
-		opMgr:      opMgr,
-		svcMgr:     svcMgr,
-		backend:    backend,
-		stateStore: store,
-		instances:  make(map[string]*DatabaseInstance),
-		databases:  make(map[string][]*Database),
-		users:      make(map[string][]*User),
+		opMgr:               opMgr,
+		svcMgr:              svcMgr,
+		backend:             backend,
+		stateStore:          store,
+		instances:           make(map[string]*DatabaseInstance),
+		databases:           make(map[string][]*Database),
+		users:               make(map[string][]*User),
+		runtimes:            make(map[string]*cloudSQLRuntimeProvenance),
+		reconcile:           make(map[string]struct{}),
+		reconcileRetryAfter: make(map[string]time.Time),
+		reconcileNow:        time.Now,
+		reconcileSources:    make(map[string]*DatabaseInstance),
+		preservedInstances:  make(map[string]*DatabaseInstance),
 	}
 }
 
@@ -229,18 +395,31 @@ func newAPIWithDependencies(
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Shim: Cloud SQL] %s %s", r.Method, r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	path := r.URL.Path
+	if r.Method == http.MethodGet && strings.Contains(path, "/operations/") {
+		api.getOperation(w, r, path)
+		return
+	}
 	if api.PersistenceError() != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "Cloud SQL persistence is unavailable")
 		return
 	}
-
-	path := r.URL.Path
 	project := extractSegmentAfter(path, "projects")
+	if (r.Method == http.MethodGet && strings.Contains(path, "/instances")) ||
+		strings.Contains(path, "/databases") ||
+		strings.Contains(path, "/users") {
+		reconcileCtx, cancel := context.WithTimeout(r.Context(), cloudSQLRequestRetryBudget)
+		instance := extractSegmentAfter(path, "instances")
+		if instance == "" {
+			_ = api.reconcileRestored(reconcileCtx)
+		} else {
+			_ = api.reconcileRestoredKeys(reconcileCtx, instanceKey(project, instance))
+		}
+		cancel()
+	}
 
 	switch {
-	case strings.Contains(path, "/operations/"):
-		api.getOperation(w, r, path)
 	case strings.Contains(path, "/databases"):
 		instance := extractSegmentAfter(path, "instances")
 		api.routeDatabases(w, r, project, instance, path)
@@ -309,7 +488,13 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	}
 	dbVersion := body.DatabaseVersion
 	if dbVersion == "" {
-		dbVersion = "POSTGRES_15"
+		dbVersion = "POSTGRES_18"
+	}
+	image, err := orchestrator.CloudSQLImageForDatabaseVersion(dbVersion)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
 	}
 
 	// Fill in opinionated defaults for missing settings
@@ -331,6 +516,22 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	}
 	if settings.PricingPlan == "" {
 		settings.PricingPlan = "PER_USE"
+	}
+	if _, err := cloudSQLProfileDirectory(api.stateStore); err != nil {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		writeError(
+			w,
+			http.StatusPreconditionFailed,
+			"FAILED_PRECONDITION",
+			"Cloud SQL Docker-backed creation requires local profile provenance: "+err.Error(),
+		)
+		return
+	}
+	ownershipFingerprint, err := newCloudSQLOwnershipFingerprint()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "generate Cloud SQL runtime provenance: "+err.Error())
+		return
 	}
 
 	selfLink := fmt.Sprintf("https://sqladmin.googleapis.com/v1/projects/%s/instances/%s", project, body.Name)
@@ -362,19 +563,46 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	}
 
 	iKey := instanceKey(project, body.Name)
+	runtime := &cloudSQLRuntimeProvenance{
+		Profile:                cloudSQLProfile(api.stateStore),
+		Project:                project,
+		Instance:               body.Name,
+		DatabaseVersion:        dbVersion,
+		OwnershipFingerprint:   ownershipFingerprint,
+		BootstrapPolicy:        cloudSQLBootstrapPolicyV1,
+		Image:                  image,
+		ImageAcquisitionIntent: true,
+		Phase:                  cloudSQLRuntimePhaseImageAcquisitionIntent,
+	}
+	api.adminMu.Lock()
 	api.mu.Lock()
 	if _, exists := api.instances[iKey]; exists {
 		api.mu.Unlock()
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusConflict)
 		writeError(w, 409, "ALREADY_EXISTS", fmt.Sprintf("Instance '%s' already exists", body.Name))
 		return
 	}
 	api.instances[iKey] = inst
+	api.runtimes[iKey] = runtime
 	api.mu.Unlock()
+	if err := writeCloudSQLLocalProvenance(api.stateStore, iKey, ownershipFingerprint); err != nil {
+		api.mu.Lock()
+		delete(api.instances, iKey)
+		delete(api.runtimes, iKey)
+		api.mu.Unlock()
+		api.adminMu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		writeError(w, 500, "INTERNAL", "persist local Cloud SQL runtime provenance: "+err.Error())
+		return
+	}
 	if err := api.persistMetadata(); err != nil {
 		api.mu.Lock()
 		delete(api.instances, iKey)
+		delete(api.runtimes, iKey)
 		api.mu.Unlock()
+		_ = removeCloudSQLLocalProvenance(api.stateStore, iKey, ownershipFingerprint)
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist Cloud SQL instance metadata: "+err.Error())
 		return
@@ -394,6 +622,7 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 		if persistErr := api.persistMetadata(); persistErr != nil {
 			err = errors.Join(err, fmt.Errorf("persist degraded instance: %w", persistErr))
 		}
+		api.adminMu.Unlock()
 		w.WriteHeader(http.StatusInternalServerError)
 		writeError(w, 500, "INTERNAL", "persist operation metadata: "+err.Error())
 		return
@@ -402,37 +631,134 @@ func (api *API) createInstance(w http.ResponseWriter, r *http.Request, project s
 	api.opMgr.RunAsync(op.Name, func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		internalURL, created, err := api.backend.Create(ctx, project, body.Name, dbVersion, "minisky")
-		if err != nil {
-			log.Printf("[Shim: Cloud SQL] Provisioning failed: %v", err)
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			var cleanupErr error
-			if created {
-				cleanupErr = api.backend.Delete(cleanupCtx, project, body.Name)
-			}
-			cleanupCancel()
-			return api.rollbackCreate(iKey, err, cleanupErr)
+		defer api.adminMu.Unlock()
+		api.mu.RLock()
+		currentInstance := api.instances[iKey]
+		currentRuntime := api.runtimes[iKey]
+		generationCurrent := currentInstance != nil &&
+			currentInstance.State == "PENDING_CREATE" &&
+			currentRuntime != nil &&
+			currentRuntime.OwnershipFingerprint == ownershipFingerprint
+		api.mu.RUnlock()
+		if !generationCurrent {
+			return errors.New("Cloud SQL create generation changed before backend preparation")
 		}
-
+		prepared, err := api.backend.Prepare(ctx, runtime.backendSpec())
+		if err != nil {
+			return api.rollbackCreate(iKey, err, nil)
+		}
+		if prepared.Project != runtime.Project ||
+			prepared.Instance != runtime.Instance ||
+			prepared.DatabaseVersion != runtime.DatabaseVersion ||
+			prepared.OwnershipFingerprint != runtime.OwnershipFingerprint ||
+			prepared.BootstrapPolicy != runtime.BootstrapPolicy ||
+			prepared.Image != runtime.Image ||
+			prepared.ImageAcquisitionIntent != runtime.ImageAcquisitionIntent {
+			return api.rollbackCreate(
+				iKey,
+				errors.New("Cloud SQL backend preparation changed immutable creation identity"),
+				nil,
+			)
+		}
+		preparedRuntime := cloneCloudSQLRuntime(runtime)
+		preparedRuntime.applyBackendSpec(prepared)
+		preparedRuntime.Phase = cloudSQLRuntimePhaseCreateIntent
+		if !preparedRuntime.validFor(runtime.Profile, iKey, inst) {
+			return api.rollbackCreate(
+				iKey,
+				errors.New("Cloud SQL backend preparation returned incomplete immutable creation intent"),
+				nil,
+			)
+		}
 		api.mu.Lock()
-		if i, ok := api.instances[iKey]; ok {
-			i.State = "RUNNABLE"
-			i.BackendStatus = ""
-			// Extract ip:port from 'http://127.0.0.1:xxx'
-			addr := strings.TrimPrefix(internalURL, "http://")
-			i.IpAddresses = []IpMapping{
-				{Type: "PRIMARY", IpAddress: addr},
-			}
+		if current := api.runtimes[iKey]; current != nil &&
+			current.OwnershipFingerprint == ownershipFingerprint &&
+			api.instances[iKey] != nil &&
+			api.instances[iKey].State == "PENDING_CREATE" {
+			api.runtimes[iKey] = preparedRuntime
+		} else {
+			api.mu.Unlock()
+			return errors.New("Cloud SQL create generation changed after backend preparation")
 		}
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
+			return api.rollbackCreate(
+				iKey,
+				fmt.Errorf("persist Cloud SQL creation intent: %w", err),
+				nil,
+			)
+		}
+
+		result, err := api.backend.Create(ctx, prepared)
+		if err != nil {
+			log.Printf("[Shim: Cloud SQL] Provisioning failed: %v", err)
+			api.mu.Lock()
+			if current := api.runtimes[iKey]; current != nil && result.Spec.Project != "" {
+				current.applyBackendSpec(result.Spec)
+			}
+			if current := api.instances[iKey]; current != nil {
+				current.State = "SUSPENDED"
+				current.BackendStatus = "create reconciliation retryable: " + err.Error()
+				current.IpAddresses = nil
+			}
+			api.reconcile[iKey] = struct{}{}
+			api.mu.Unlock()
+			if persistErr := api.persistMetadata(); persistErr != nil {
+				degraded := fmt.Errorf("persist retryable Cloud SQL create: %w", persistErr)
+				api.mu.Lock()
+				api.initErr = degraded
+				api.mu.Unlock()
+				return errors.Join(err, degraded)
+			}
+			return err
+		}
+
+		addr, err := cloudSQLLoopbackAddress(result.Endpoint)
+		if err != nil {
+			return err
+		}
+
+		api.mu.RLock()
+		currentInstance = cloneDatabaseInstance(api.instances[iKey])
+		currentRuntime = cloneCloudSQLRuntime(api.runtimes[iKey])
+		api.mu.RUnlock()
+		if currentInstance == nil || currentRuntime == nil ||
+			currentRuntime.OwnershipFingerprint != ownershipFingerprint {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			cleanupErr := api.backend.Delete(cleanupCtx, result.Spec)
+			cleanupCancel()
+			return errors.Join(errors.New("Cloud SQL create generation changed before publication"), cleanupErr)
+		}
+		candidate := cloneDatabaseInstance(currentInstance)
+		candidate.State = "RUNNABLE"
+		candidate.BackendStatus = ""
+		candidate.IpAddresses = []IpMapping{{Type: "PRIMARY", IpAddress: addr}}
+		resolvedRuntime := cloneCloudSQLRuntime(currentRuntime)
+		if result.Spec.Project != "" {
+			resolvedRuntime.applyBackendSpec(result.Spec)
+		}
+
+		api.persistMu.Lock()
+		snapshot := api.snapshotMetadata()
+		snapshot.Instances[iKey] = candidate
+		snapshot.Runtimes[iKey] = resolvedRuntime
+		err = api.saveMetadataLocked(snapshot)
+		if err == nil {
+			api.mu.Lock()
+			api.instances[iKey] = candidate
+			api.runtimes[iKey] = resolvedRuntime
+			api.mu.Unlock()
+		}
+		api.persistMu.Unlock()
+		if err != nil {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			var cleanupErr error
-			if created {
-				cleanupErr = api.backend.Delete(cleanupCtx, project, body.Name)
+			if result.Created {
+				cleanupErr = api.backend.Delete(cleanupCtx, result.Spec)
 			}
 			cleanupCancel()
-			return api.rollbackCreate(iKey, fmt.Errorf("persist runnable instance: %w", err), cleanupErr)
+			rollbackErr := api.rollbackCreate(iKey, fmt.Errorf("persist runnable instance: %w", err), cleanupErr)
+			return rollbackErr
 		}
 		return nil
 	})
@@ -492,6 +818,21 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 
 	previousState := inst.State
 	previousBackendStatus := inst.BackendStatus
+	runtime := cloneCloudSQLRuntime(api.runtimes[key])
+	local, provenanceErr := cloudSQLHasLocalProvenance(api.stateStore, key, runtime)
+	preBackendOnly := runtime.preBackendFor(cloudSQLProfile(api.stateStore), key, inst)
+	backendOwned := runtime.validFor(cloudSQLProfile(api.stateStore), key, inst)
+	if provenanceErr != nil || !local || !preBackendOnly && !backendOwned {
+		api.mu.Unlock()
+		api.adminMu.Unlock()
+		message := "Cloud SQL deletion requires exact local runtime disposition"
+		if provenanceErr != nil {
+			message += ": " + provenanceErr.Error()
+		}
+		w.WriteHeader(http.StatusPreconditionFailed)
+		writeError(w, http.StatusPreconditionFailed, "FAILED_PRECONDITION", message)
+		return
+	}
 	inst.State = "PENDING_DELETE"
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
@@ -527,17 +868,20 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		defer api.adminMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		if err := api.backend.Delete(ctx, project, name); err != nil {
-			api.mu.Lock()
-			if current := api.instances[key]; current != nil {
-				current.State = "ERROR"
-				current.BackendStatus = err.Error()
+		if !preBackendOnly {
+			if err := api.backend.Delete(ctx, runtime.backendSpec()); err != nil {
+				api.mu.Lock()
+				if current := api.instances[key]; current != nil {
+					current.State = "ERROR"
+					current.BackendStatus = err.Error()
+					current.IpAddresses = nil
+				}
+				api.mu.Unlock()
+				if persistErr := api.persistMetadata(); persistErr != nil {
+					return fmt.Errorf("%w; persist failed deletion: %v", err, persistErr)
+				}
+				return err
 			}
-			api.mu.Unlock()
-			if persistErr := api.persistMetadata(); persistErr != nil {
-				return fmt.Errorf("%w; persist failed deletion: %v", err, persistErr)
-			}
-			return err
 		}
 
 		tombstone := cloneDatabaseInstance(inst)
@@ -549,15 +893,25 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 		delete(api.instances, key)
 		delete(api.databases, key)
 		delete(api.users, key)
+		delete(api.runtimes, key)
+		delete(api.reconcile, key)
+		delete(api.reconcileRetryAfter, key)
+		delete(api.reconcileSources, key)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err != nil {
 			tombstone.State = "ERROR"
 			tombstone.BackendStatus = "backend deleted; metadata removal persistence failed: " + err.Error()
+			if runtime == nil {
+				tombstone.BackendStatus = "metadata removal persistence failed: " + err.Error()
+			}
 			tombstone.IpAddresses = nil
 			api.mu.Lock()
 			api.instances[key] = tombstone
 			api.databases[key] = oldDatabases
 			api.users[key] = oldUsers
+			if runtime != nil {
+				api.runtimes[key] = runtime
+			}
 			api.mu.Unlock()
 			degradedErr := api.persistMetadata()
 			if degradedErr != nil {
@@ -568,6 +922,7 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 			}
 			return fmt.Errorf("persist deleted instance: %w", err)
 		}
+		_ = removeCloudSQLLocalProvenance(api.stateStore, key, runtime.OwnershipFingerprint)
 		return nil
 	})
 
@@ -579,14 +934,22 @@ func (api *API) deleteInstance(w http.ResponseWriter, r *http.Request, project, 
 func (api *API) rollbackCreate(key string, cause, cleanupErr error) error {
 	api.mu.RLock()
 	tombstone := cloneDatabaseInstance(api.instances[key])
+	runtime := cloneCloudSQLRuntime(api.runtimes[key])
 	api.mu.RUnlock()
 	if cleanupErr == nil {
 		api.mu.Lock()
 		delete(api.instances, key)
 		delete(api.databases, key)
 		delete(api.users, key)
+		delete(api.runtimes, key)
+		delete(api.reconcile, key)
+		delete(api.reconcileRetryAfter, key)
+		delete(api.reconcileSources, key)
 		api.mu.Unlock()
 		if err := api.persistMetadata(); err == nil {
+			if runtime != nil {
+				_ = removeCloudSQLLocalProvenance(api.stateStore, key, runtime.OwnershipFingerprint)
+			}
 			return cause
 		} else {
 			cleanupErr = fmt.Errorf("persist rollback: %w", err)
@@ -599,6 +962,9 @@ func (api *API) rollbackCreate(key string, cause, cleanupErr error) error {
 		tombstone.BackendStatus = combined.Error()
 		tombstone.IpAddresses = nil
 		api.instances[key] = tombstone
+	}
+	if runtime != nil {
+		api.runtimes[key] = runtime
 	}
 	api.mu.Unlock()
 	if err := api.persistMetadata(); err != nil {
@@ -1074,7 +1440,23 @@ func (api *API) executeAdmin(
 ) error {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	return api.backend.ExecuteAdmin(ctx, project, instance, version, action, name, password)
+	key := instanceKey(project, instance)
+	api.mu.RLock()
+	runtime := cloneCloudSQLRuntime(api.runtimes[key])
+	target := cloneDatabaseInstance(api.instances[key])
+	api.mu.RUnlock()
+	if runtime == nil || target == nil || target.DatabaseVersion != version ||
+		!runtime.validFor(cloudSQLProfile(api.stateStore), key, target) {
+		return errors.New("Cloud SQL runtime provenance is unavailable")
+	}
+	local, err := cloudSQLHasLocalProvenance(api.stateStore, key, runtime)
+	if err != nil {
+		return fmt.Errorf("verify Cloud SQL local runtime provenance: %w", err)
+	}
+	if !local {
+		return errors.New("Cloud SQL local runtime provenance is unavailable")
+	}
+	return api.backend.ExecuteAdmin(ctx, runtime.backendSpec(), action, name, password)
 }
 
 func removeDatabase(databases []*Database, name string) []*Database {
@@ -1137,4 +1519,21 @@ func writeError(w http.ResponseWriter, code int, status, message string) {
 
 func newEtag() string {
 	return fmt.Sprintf("SQLETAG%x", time.Now().UnixNano())
+}
+
+func newCloudSQLOwnershipFingerprint() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := cryptorand.Read(raw); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func validCloudSQLOwnershipFingerprint(fingerprint string) bool {
+	if len(fingerprint) != 64 || fingerprint != strings.ToLower(fingerprint) {
+		return false
+	}
+	decoded, err := hex.DecodeString(fingerprint)
+	return err == nil && len(decoded) == sha256.Size
 }

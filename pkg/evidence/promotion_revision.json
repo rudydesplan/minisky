@@ -1,0 +1,23 @@
+{
+  "id": "pr22-bounded-reliability-promotion",
+  "pullRequestUrl": "https://github.com/rudydesplan/minisky/pull/22",
+  "commit": "8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+  "generalCI": {
+    "status": "ci-passed",
+    "workflow": ".github/workflows/ci.yml",
+    "job": "quality",
+    "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460163",
+    "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460163/job/90463937205",
+    "commit": "8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+    "note": "PR #22's general Test, lint, and build job completed successfully on the exact recorded source revision."
+  },
+  "criticalReliability": {
+    "status": "ci-passed",
+    "workflow": ".github/workflows/critical-integration.yml",
+    "job": "state-durability",
+    "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460134",
+    "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90464017548",
+    "commit": "8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+    "note": "PR #22's critical state durability lifecycle completed successfully on the exact recorded source revision."
+  }
+}

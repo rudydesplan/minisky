@@ -62,11 +62,11 @@ constructs `google_service_account` through its IAM beta client, which is why
 the example overrides `iam_beta_custom_endpoint`.
 
 <!-- BEGIN GENERATED MEMCACHED SERVICE GATE -->
-**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed-uncommitted` in the current working tree with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`. This locally passing working-tree gate is non-promotable and has no immutable source revision evidence.
+**Generated Memcached service-gate truth:** The bounded lifecycle is `local-passed` at immutable source commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9` with Google provider `7.41.0`, `make test-memcache-integration`, and `scripts/memcache-integration.sh`.
 
 Lifecycle dimensions (16): `sdk-create`, `sdk-update`, `sdk-read`, `sdk-list`, `sdk-delete`, `data-plane-set`, `data-plane-get`, `daemon-restart`, `terraform-apply`, `terraform-no-drift`, `terraform-restart`, `terraform-import-normalization`, `terraform-post-import-no-drift`, `terraform-destroy`, `durable-404`, `exact-docker-cleanup`.
 
-CI is `configured-unverified` in `.github/workflows/critical-integration.yml` job `memcache-integration`; no external run URL or commit is recorded. This evidence does not claim broad GCP parity or promote service fidelity.
+CI is `ci-passed` in [GitHub Actions run 30416460134](https://github.com/rudydesplan/minisky/actions/runs/30416460134) ([job](https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974)) on commit `8e16d147b0127bd3120eae106aa0da1fb59a52c9`. This evidence does not claim broad GCP parity or promote service fidelity.
 <!-- END GENERATED MEMCACHED SERVICE GATE -->
 
 ## Acceptance-tested resources
@@ -318,9 +318,12 @@ record or log is created. Unsupported attestation, global-policy, and
 cluster-rule evaluation returns explicit `UNSUPPORTED`. This is Terraform
 lifecycle compatibility and local emulation, not service fidelity promotion,
 GKE admission, or production admission security. The service remains
-experimental and default-off. The gate is recorded as `local-passed`
-only—there is no claimed CI run URL or commit. Its guarded runner uses isolated
-temporary HOME, Terraform data/state, profile state, ports, sanitized
+experimental and default-off. The Binary Authorization Terraform leg is
+`ci-passed` in [binary-authorization
+job](https://github.com/rudydesplan/minisky/actions/runs/30416460053/job/90464962058)
+on exact source revision `8e16d147b0127bd3120eae106aa0da1fb59a52c9`.
+This bounded CI pass does not promote service fidelity. Its guarded runner uses
+isolated temporary HOME, Terraform data/state, profile state, ports, sanitized
 diagnostics, state backups, and EXIT/INT/TERM cleanup; it removes the temporary
 work directory and process lock on exit.
 
@@ -386,8 +389,13 @@ required `phase18-25-terraform-integration` job: a 12-entry matrix on matching
 path-filtered pull requests and `main` pushes, plus one weekly schedule and
 input-free manual dispatch. The same workflow exclusively owns seven
 SDK/backend gates. It replaces 20 misleading manual shadows from the general CI
-workflow while retaining the quality, SDK compilation, offline evidence,
-Terraform validation, cleanup, timeout, and diagnostics prerequisites.
+workflow. In the current working tree it does not retain a duplicate full
+quality job: authoritative docs-truth, formatting, vet, race, script-contract,
+and build checks remain in the separate general CI workflow.
+`promotion-assets` now builds and shares `ui/dist` for the integration jobs;
+SDK compilation, offline evidence, Terraform validation, cleanup, timeout, and
+diagnostics remain promotion prerequisites. This current workflow shape is
+separate from the exact historical PR #22 provenance below.
 To request a manual run, select **Phase 18-25 promotion integration** in GitHub
 Actions and choose **Run workflow**. The dispatch has no inputs and requests the
 full 12-leg Terraform matrix plus all seven SDK/backend gates; individual legs
@@ -396,14 +404,15 @@ cannot be selected with dispatch booleans.
 Each Terraform entry maps one machine-readable domain claim to one existing
 guarded Make target and integration script, checks out the workflow run
 revision, uses Terraform `1.15.8` with provider `7.41.0`, and runs in an
-isolated hosted runner. The matrix is fail-independent with four-way
-parallelism; Docker/network-backed entries declare their prerequisite, while
-all entries retain per-script collision locks, temporary HOME/provider/state
-directories, invocation-owned cleanup, bounded timeouts, and seven-day failure
-diagnostics. Composer, Managed Kafka, and AlloyDB expose their exact
-tag-plus-SHA256 image references from the guarded scripts; clean hosted runners
-pull each exact content-addressed reference, then inspect that same reference
-for local availability before the scripts perform their own image checks. A
+isolated hosted runner. The matrix is fail-independent and its configured
+maximum parallelism is `12`; Docker/network-backed entries declare their
+prerequisite, while all entries retain per-script collision locks, temporary
+HOME/provider/state directories, invocation-owned cleanup, bounded timeouts,
+and seven-day failure diagnostics. Composer, Managed Kafka, and AlloyDB expose
+their exact tag-plus-SHA256 image references from the guarded scripts; clean
+hosted runners pull each exact content-addressed reference, then inspect that
+same reference for local availability before the scripts perform their own
+image checks. A
 successful digest pull is the portable verification; the gate does not compare
 the registry manifest digest to Docker's store-specific local image ID. The
 workflow rejects empty, malformed, or unpinned image declarations, while
@@ -411,17 +420,15 @@ entries without backend images skip provisioning. Static evidence tests reject
 missing, duplicate, unpinned, or cross-wired claim/target/script/matrix
 mappings.
 
-PR #21's prior matrix passed in [CI run
-30384072102](https://github.com/rudydesplan/minisky/actions/runs/30384072102)
-at source commit `7035b25b056e03334656029af1e5c1259ab91765`; its
-[critical run
-30384072295](https://github.com/rudydesplan/minisky/actions/runs/30384072295)
-also passed. Those are historical records for the prior workflow layout, not
-evidence for this uncommitted branch. The new promotion workflow has not run
-externally, so all 12 of its Terraform CI checks and all seven SDK/backend CI
-checks remain `configured-unverified` with no run URL or commit. The provider
-lifecycle claims remain local evidence only and do not promote service
-fidelity.
+PR #22's promotion workflow passed all 12 Terraform matrix legs and all seven
+SDK/backend jobs at exact source revision
+`8e16d147b0127bd3120eae106aa0da1fb59a52c9` in [run
+30416460053](https://github.com/rudydesplan/minisky/actions/runs/30416460053).
+Per-job immutable URLs are recorded in `pkg/evidence/batch_gates.json` and
+rendered into the generated PR #22 sections in the README and service
+compatibility document. These bounded provider lifecycle passes do not promote
+service fidelity, and those historical URLs do not verify the current
+working-tree workflow changes.
 
 The regular `sdk-smoke-validate` job installs the pinned Python requirement,
 compiles the Go smoke with `go test`, and byte-compiles the Python smoke on
@@ -480,6 +487,21 @@ GitHub Actions and choose **Run workflow**. Manual dispatch is input-free and
 runs the full workflow; it does not select individual jobs with booleans.
 This trigger description is not a claim of an external pass or branch
 protection.
+
+The current working tree also configures the guarded
+`cloudsql-restart-integration` job, which runs
+`make test-cloudsql-restart-integration` against PostgreSQL 16. The stable
+uncommitted snapshot is `local-passed-uncommitted` at source SHA-256
+`328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25`
+and diff SHA-256
+`25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033`.
+CI is `configured-unverified`; there is no external run URL or commit for this
+snapshot. The gate covers same-container restart, volume-only replacement with
+the exact proven named volume, protocol and authenticated readiness,
+portable-snapshot exclusions, legacy fail-closed behavior, and exact cleanup.
+The same local certification passed the bounded provider apply, zero-drift
+plan, and destroy lifecycle. It does not claim broad Cloud SQL API,
+production-security, HA, backup, or cross-host data portability.
 
 `scripts/terraform-integration.sh` refuses to run unless
 `MINISKY_TERRAFORM_INTEGRATION=1`, refuses to disturb existing MiniSky

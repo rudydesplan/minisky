@@ -151,6 +151,62 @@ func (dir *pinnedDirectory) openRegularFileForRead(name string) (*os.File, error
 	return file, nil
 }
 
+func (dir *pinnedDirectory) openRegularFileForRemoval(name string) (*os.File, error) {
+	if !containedChildName(name) {
+		return nil, fmt.Errorf("%w: invalid child file %q", ErrInvalidPath, name)
+	}
+	objectName, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return nil, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		RootDirectory: windows.Handle(dir.file.Fd()),
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+	}
+	attributes.Length = uint32(unsafe.Sizeof(*attributes))
+	var (
+		handle         windows.Handle
+		ioStatus       windows.IO_STATUS_BLOCK
+		allocationSize int64
+	)
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_GENERIC_READ|windows.DELETE,
+		attributes,
+		&ioStatus,
+		&allocationSize,
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_OPEN,
+		windows.FILE_NON_DIRECTORY_FILE|
+			windows.FILE_SYNCHRONOUS_IO_NONALERT|
+			windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	if err != nil {
+		if status, ok := err.(windows.NTStatus); ok {
+			return nil, status.Errno()
+		}
+		return nil, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		windows.CloseHandle(handle)
+		return nil, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		windows.CloseHandle(handle)
+		return nil, fmt.Errorf("%w: reparse-point child %q", ErrInvalidPath, name)
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		windows.CloseHandle(handle)
+		return nil, fmt.Errorf("%w: child is a directory %q", ErrInvalidPath, name)
+	}
+	return os.NewFile(uintptr(handle), name), nil
+}
+
 func (dir *pinnedDirectory) openDirectory(name string, create bool) (*pinnedDirectory, error) {
 	if !containedChildName(name) {
 		return nil, fmt.Errorf("%w: invalid child directory %q", ErrInvalidPath, name)
@@ -304,6 +360,10 @@ func (dir *pinnedDirectory) remove(name string) error {
 		return err
 	}
 	defer file.Close()
+	return dir.removeOpenFile(file, name)
+}
+
+func (dir *pinnedDirectory) removeOpenFile(file *os.File, _ string) error {
 	deleteFile := byte(1)
 	return windows.SetFileInformationByHandle(
 		windows.Handle(file.Fd()),

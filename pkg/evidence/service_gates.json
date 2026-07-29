@@ -78,7 +78,7 @@
         {"path": "scripts/memcache-integration.sh", "contains": ["assert_no_memcache_container \"${sdk_backend_id}\"", "assert_no_memcache_container \"${tf_backend_id}\"", "--filter \"label=managed-by=minisky\"", "--filter \"label=minisky.profile=${profile}\"", "--filter \"label=minisky.service=memorystore-memcached\"", "--filter \"label=minisky.resource=${resource_id}\""]}
       ]
     },
-    "status": "local-passed-uncommitted",
+    "status": "local-passed",
     "references": [
       {
         "package": "sdk-smoke/memcache",
@@ -112,12 +112,119 @@
     ],
     "script": "scripts/memcache-integration.sh",
     "makeTarget": "test-memcache-integration",
-    "note": "In the current uncommitted working tree, make test-memcache-integration using scripts/memcache-integration.sh passed locally. The bounded evidence covers generated Go SDK create, update, read, list, and delete; Memcached data-plane set/get; daemon restart; Google provider 7.41.0 apply, no-drift, restart, import normalization, post-normalization no-drift, and destroy; durable 404 after restart; and exact profile/resource-owned Docker cleanup. This is non-promotable working-tree evidence only: it has no immutable source commit and does not claim an external CI pass or broader service fidelity.",
+    "sourceCommit": "8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+    "note": "At source commit 8e16d147b0127bd3120eae106aa0da1fb59a52c9, make test-memcache-integration using scripts/memcache-integration.sh passed locally. The bounded evidence covers generated Go SDK create, update, read, list, and delete; Memcached data-plane set/get; daemon restart; Google provider 7.41.0 apply, no-drift, restart, import normalization, post-normalization no-drift, and destroy; durable 404 after restart; and exact profile/resource-owned Docker cleanup. This does not claim broader service fidelity.",
+    "ci": {
+      "status": "ci-passed",
+      "workflow": ".github/workflows/critical-integration.yml",
+      "job": "memcache-integration",
+      "runUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460134",
+      "jobUrl": "https://github.com/rudydesplan/minisky/actions/runs/30416460134/job/90463936974",
+      "commit": "8e16d147b0127bd3120eae106aa0da1fb59a52c9",
+      "note": "The required Memcached lifecycle job passed in PR #22's critical integration run on the exact recorded source revision."
+    }
+  },
+  {
+    "id": "cloudsql-restart-recovery",
+    "phase": 4,
+    "name": "Bounded Cloud SQL named-volume restart recovery",
+    "domain": "sqladmin.googleapis.com",
+    "providerVersion": "7.41.0",
+    "dimensions": [
+      "postgres16-same-container-row-survival",
+      "postgres16-volume-only-row-recovery",
+      "exact-docker-cleanup",
+      "terraform-apply",
+      "terraform-no-drift",
+      "terraform-destroy"
+    ],
+    "assertions": {
+      "postgres16-same-container-row-survival": [
+        {
+          "path": "pkg/shims/cloudsql/restart_integration_test.go",
+          "contains": [
+            "databaseVersion\":\"POSTGRES_16\"",
+            "live-container restart read value",
+            "aliveInventory.ContainerID != createdInventory.ContainerID"
+          ]
+        }
+      ],
+      "postgres16-volume-only-row-recovery": [
+        {
+          "path": "pkg/shims/cloudsql/restart_integration_test.go",
+          "contains": [
+            "removeExactCloudSQLContainerRetainingVolume",
+            "volume-only recovery did not create a replacement container",
+            "volume-only recovery read value"
+          ]
+        }
+      ],
+      "exact-docker-cleanup": [
+        {
+          "path": "pkg/shims/cloudsql/restart_integration_test.go",
+          "contains": [
+            "cleanup exact-owned Cloud SQL resources",
+            "assertCloudSQLDockerInventory(",
+            "Cloud SQL deletion altered unrelated sentinel"
+          ]
+        }
+      ],
+      "terraform-apply": [
+        {
+          "path": "scripts/terraform-integration.sh",
+          "contains": [
+            "terraform -chdir=\"${terraform_dir}\" apply",
+            "enable_fidelity_cloudsql"
+          ]
+        }
+      ],
+      "terraform-no-drift": [
+        {
+          "path": "scripts/terraform-integration.sh",
+          "contains": [
+            "terraform -chdir=\"${terraform_dir}\" plan",
+            "Expected a no-drift plan (exit 0)"
+          ]
+        }
+      ],
+      "terraform-destroy": [
+        {
+          "path": "scripts/terraform-integration.sh",
+          "contains": [
+            "terraform -chdir=\"${terraform_dir}\" destroy",
+            "cloudsql_instance_url"
+          ]
+        }
+      ]
+    },
+    "status": "local-passed-uncommitted",
+    "references": [
+      {
+        "package": "pkg/shims/cloudsql",
+        "tests": [
+          "TestCloudSQLRestartReconciliationLiveDocker"
+        ]
+      },
+      {
+        "package": "scripts",
+        "tests": [
+          "TestCloudSQLTerraformFixtureUsesBoundedSupportedVersion",
+          "TestCloudSQLRestartMakeTargetContract",
+          "TestCriticalCloudSQLRestartWorkflowContract",
+          "TestCloudSQLRestartLiveDockerEvidenceContract"
+        ]
+      }
+    ],
+    "script": "scripts/terraform-integration.sh",
+    "makeTarget": "test-cloudsql-restart-integration",
+    "sourceSha256": "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25",
+    "diffSha256": "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033",
+    "note": "The stable uncommitted snapshot passed the guarded live POSTGRES_16 recovery test: one SQL row survived same-container MiniSky restart and volume-only container replacement around the exact proven named volume, followed by exact-owned cleanup without altering an unrelated sentinel. The same certification passed the bounded Google provider 7.41.0 Cloud SQL apply, zero-drift plan, and destroy lifecycle. This is local source/diff fingerprint evidence, not a commit or external run.",
     "ci": {
       "status": "configured-unverified",
       "workflow": ".github/workflows/critical-integration.yml",
-      "job": "memcache-integration",
-      "note": "The required pull-request and main-branch Memcached lifecycle job is configured, but no external run URL or commit is recorded."
+      "job": "cloudsql-restart-integration",
+      "note": "The required Cloud SQL restart recovery job is configured in the working tree, but no external run URL, job URL, or commit exists for this uncommitted gate."
     }
   }
 ]

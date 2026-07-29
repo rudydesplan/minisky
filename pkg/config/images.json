@@ -2,13 +2,13 @@
   "emulators": {
     "storage.googleapis.com": {
       "name": "minisky-gcs",
-      "image": "fsouza/fake-gcs-server:latest",
+      "image": "fsouza/fake-gcs-server:latest@sha256:91afded49de804aa61b5f3eb6c7cd65205acf9e5c5e047cf0ba7d9507af806c8",
       "port": "4443/tcp",
       "cmd": ["-scheme", "http"]
     },
     "pubsub.googleapis.com": {
       "name": "minisky-pubsub",
-      "image": "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators",
+      "image": "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators@sha256:f098583c0387cf0fe4c64068ed1e1cf0dbc73e04f0621642b9a7e1f8b26ca287",
       "port": "8085/tcp",
       "cmd": ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085"]
     },

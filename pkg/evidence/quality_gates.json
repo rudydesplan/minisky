@@ -1,0 +1,31 @@
+[
+  {
+    "id": "windows-state-markers",
+    "name": "Native Windows pinned state-marker lifecycle",
+    "requiredBy": [
+      "quality"
+    ],
+    "localPrerequisites": {
+      "status": "local-passed-uncommitted",
+      "references": [
+        {
+          "package": "scripts",
+          "tests": [
+            "TestCIWindowsStateMarkerLifecycleContract",
+            "TestCIQualityDependsOnWindowsStateMarkers",
+            "TestCIQualityRequiresWindowsStateMarkerSuccess"
+          ]
+        }
+      ],
+      "sourceSha256": "328b4cb13c6ca1705ca51d0e3fb543a830cd6a4af2be8aa8ef3ebda456873a25",
+      "diffSha256": "25318c4dffcf6f04931fe84d1b7cb27218cc0c3a4f8cb63e46f8ff1f90469033",
+      "note": "On the stable uncommitted snapshot, Windows cross-compilation and the workflow/quality-aggregate structural contracts passed locally. These checks prove that the focused test binary builds and that quality requires the native job; they do not execute TestWindowsPinnedLocalMarker on Windows."
+    },
+    "nativeCI": {
+      "status": "configured-unverified",
+      "workflow": ".github/workflows/ci.yml",
+      "job": "windows-state-markers",
+      "note": "The required windows-latest state-marker lifecycle job is configured and is an authoritative dependency of the quality aggregate. No native Windows run URL, job URL, or commit is recorded for the uncommitted snapshot."
+    }
+  }
+]

@@ -20,10 +20,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
-    name: Test, lint, and build
+  quality-ui:
+    name: UI quality and build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -64,6 +64,20 @@ jobs:
           path: ui/dist
           if-no-files-found: error
 
+  quality-go-static:
+    name: Go static checks
+    needs: quality-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
@@ -79,11 +93,71 @@ jobs:
       - name: Vet Go code
         run: go vet ./cmd/... ./pkg/... ./ui
 
+  quality-go-race:
+    name: Go race tests
+    needs: quality-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
       - name: Test Go code with race detector
         run: go test -race ./cmd/... ./pkg/... ./ui
 
+  quality-scripts:
+    name: Integration script contracts
+    needs: quality-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
       - name: Test integration script contracts
         run: go test -count=1 ./scripts
+
+  quality-build:
+    name: Build and local action smoke test
+    needs: quality-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: Build MiniSky
         run: go build -trimpath ./cmd/minisky
@@ -112,6 +186,49 @@ jobs:
         run: |
           ruby -e "require 'yaml'; YAML.safe_load(File.read('.gitlab/ci/minisky.yml'), aliases: true)"
           docker compose -f deployments/docker-compose.yml config >/dev/null
+
+  quality:
+    name: Test, lint, and build
+    if: always()
+    needs:
+      - quality-ui
+      - quality-go-static
+      - quality-go-race
+      - quality-scripts
+      - quality-build
+      - windows-state-markers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify all quality components succeeded
+        run: |
+          test "${{ needs.quality-ui.result }}" = "success"
+          test "${{ needs.quality-go-static.result }}" = "success"
+          test "${{ needs.quality-go-race.result }}" = "success"
+          test "${{ needs.quality-scripts.result }}" = "success"
+          test "${{ needs.quality-build.result }}" = "success"
+          test "${{ needs.windows-state-markers.result }}" = "success"
+
+  windows-state-markers:
+    name: Windows state marker lifecycle
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Windows state marker lifecycle tests
+        shell: pwsh
+        run: go test -count=1 -run '^TestWindowsPinnedLocalMarker' ./pkg/state
 
   dependency-scan:
     name: Scan Go dependencies
@@ -339,21 +456,17 @@ jobs:
 
   release-snapshot:
     name: Validate release configuration
+    needs: quality-ui
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Install UI dependencies
-        working-directory: ui
-        run: npm ci
+          name: ui-dist
+          path: ui/dist
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -378,7 +491,7 @@ jobs:
         with:
           distribution: goreleaser
           version: v2.17.0
-          args: build --snapshot --clean --id linux-amd64
+          args: build --snapshot --clean --id linux-amd64 --skip=before
 
   linux-packages:
     name: Install Linux packages (${{ matrix.name }})
